@@ -50,7 +50,7 @@ import {
   findCommitGroups,
   laneBranchFor,
 } from "../src/commit_lookup.ts";
-import { SELECTION_SCHEMA_VERSION } from "../src/selection_sidecar.ts";
+import { FOLLOWUP_VERDICT_SCHEMA_VERSION } from "../src/selection_sidecar.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   deriveDepthBand,
@@ -67,6 +67,7 @@ import {
   gitHeadSha,
   gitInit,
   gitLogCount,
+  fakeCommand as installCommandFake,
   parseCliOutput,
   runCli,
   scaffoldEpic,
@@ -120,6 +121,25 @@ describe("close-preflight success envelope + brief", () => {
     // test_close_preflight.py::TestSuccessEnvelope::test_envelope_is_content_blind
     const proj = getProj();
     const { epicId, taskIds } = makeEpic(proj, ["done", "done"]);
+    const keeper = installCommandFake("keeper", {
+      stdout: JSON.stringify({
+        ok: true,
+        kind: "deconflict",
+        incident: {
+          conflict: {
+            instance_event_id: 81,
+            attempt_id: 13,
+            claim: {
+              session_id: "session-closer",
+              pid: 8181,
+              start_time: "proc:8181:1",
+              claimed_at: 1_700_000_001,
+            },
+          },
+          grant_ref: "/state/grants/grant-close.json",
+        },
+      }),
+    });
     const r = runCli(["close-preflight", epicId, "--project", proj.root], {
       cwd: proj.root,
       home: proj.home,
@@ -135,6 +155,21 @@ describe("close-preflight success envelope + brief", () => {
     expect(tasks.map((t) => t.status)).toEqual(["done", "done"]);
     expect("snippet_context" in env).toBe(false);
     expect("commit_groups" in env).toBe(false);
+    expect(env.incident).toEqual({
+      incident_id: `close::${epicId}`,
+      kind: "deconflict",
+      instance_event_id: 81,
+      attempt_id: 13,
+      brief_ref: `close::${epicId}`,
+      grant_ref: "/state/grants/grant-close.json",
+      claim: {
+        session_id: "session-closer",
+        pid: 8181,
+        start_time: "proc:8181:1",
+        claimed_at: 1_700_000_001,
+      },
+    });
+    expect(keeper.calls()).toEqual([["escalation-brief", `close::${epicId}`]]);
   });
 
   test("envelope hash matches the brief's hash (canonical over groups)", () => {
@@ -296,8 +331,17 @@ function seedSelectionPhase(
     input_hash: inputHash,
   });
   writeJsonArtifact(verdict, {
-    schema_version: SELECTION_SCHEMA_VERSION,
-    cells: { "1": { tier: "medium", model: "opus" } },
+    schema_version: FOLLOWUP_VERDICT_SCHEMA_VERSION,
+    cells: {
+      "1": {
+        tier: "medium",
+        model: "opus",
+        rationale: "fixture non-Spark selection",
+        confidence: 0.8,
+        spark_fit: false,
+        spark_exclusion: "spark-not-on-axis",
+      },
+    },
     selection: {
       harness: "subagent",
       model: "plan:model-selector",
@@ -306,6 +350,7 @@ function seedSelectionPhase(
       shuffle_seed: 7,
       outcome: "completed",
       verdict_raw: "fixture",
+      spark_axis_present: false,
     },
   });
   return verdict;
@@ -375,9 +420,20 @@ describe("close-preflight durable phase resume", () => {
         input_hash:
           "c55d4ed083a013f6038d9447b772f982db45b7ae75190004345544c084bded61",
       });
-      expect(readArtifactJson(verdict, SELECTION_SCHEMA_VERSION)).toEqual({
-        schema_version: SELECTION_SCHEMA_VERSION,
-        cells: { "1": { tier: "medium", model: "opus" } },
+      expect(
+        readArtifactJson(verdict, FOLLOWUP_VERDICT_SCHEMA_VERSION),
+      ).toEqual({
+        schema_version: FOLLOWUP_VERDICT_SCHEMA_VERSION,
+        cells: {
+          "1": {
+            tier: "medium",
+            model: "opus",
+            rationale: "fixture non-Spark selection",
+            confidence: 0.8,
+            spark_fit: false,
+            spark_exclusion: "spark-not-on-axis",
+          },
+        },
         selection: {
           harness: "subagent",
           model: "plan:model-selector",
@@ -387,6 +443,7 @@ describe("close-preflight durable phase resume", () => {
           shuffle_seed: 7,
           outcome: "completed",
           verdict_raw: "fixture",
+          spark_axis_present: false,
         },
       });
       expect(() => readArtifactJson(brief)).toThrow(ArtifactSchemaTooNewError);
@@ -419,6 +476,40 @@ describe("close-preflight durable phase resume", () => {
       followup_present: true,
       selection_verdict_path: null,
     });
+  });
+
+  test("selection resume rejects legacy and incomplete v2 provenance", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    const followup = seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, {
+      followup: true,
+    }) as string;
+    const verdict = seedSelectionPhase(proj.root, epicId, followup);
+    const parsed = JSON.parse(readFileSync(verdict, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    const unfinished = {
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "unfinished",
+      findings: 1,
+      fatal: false,
+      followup_present: true,
+      selection_verdict_path: null,
+    };
+
+    writeJsonArtifact(verdict, { ...parsed, schema_version: 1 });
+    expect(preflight(proj, epicId).phase_resume).toEqual(unfinished);
+
+    const incomplete = JSON.parse(JSON.stringify(parsed)) as Record<
+      string,
+      unknown
+    >;
+    delete (incomplete.selection as Record<string, unknown>).spark_axis_present;
+    writeJsonArtifact(verdict, incomplete);
+    expect(preflight(proj, epicId).phase_resume).toEqual(unfinished);
   });
 
   test("a moved commit set invalidates audit and every downstream phase", () => {

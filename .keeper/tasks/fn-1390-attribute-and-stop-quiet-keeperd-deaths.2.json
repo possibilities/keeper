@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-20T20:24:45.863000Z",
+  "depends_on": [
+    "fn-1390-attribute-and-stop-quiet-keeperd-deaths.1"
+  ],
+  "epic": "fn-1390-attribute-and-stop-quiet-keeperd-deaths",
+  "id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.2",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Add OS kill evidence and RSS ramp to the enrich verdict",
+  "updated_at": "2026-07-21T06:32:08.840000Z",
+  "worker_done_at": "2026-07-21T06:32:08.840000Z"
+}

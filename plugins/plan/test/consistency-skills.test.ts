@@ -1109,3 +1109,136 @@ describe("close skill auditor fixtures", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// brain — the model-invocable Agentbrain routing/safety skill, and the one
+// concise /hack delegation pointer to it outside hack's BAKE regions.
+// ---------------------------------------------------------------------------
+
+const BRAIN_SKILL = join(REPO, "skills", "brain", "SKILL.md");
+const HACK_SKILL = join(REPO, "skills", "hack", "SKILL.md");
+
+describe("brain skill consistency", () => {
+  test("exists as tracked source at the documented path", () => {
+    expect(existsSync(BRAIN_SKILL)).toBe(true);
+  });
+
+  test("name: is the bare verb brain", () => {
+    const fm = parseFrontmatter(frontmatterBlock(BRAIN_SKILL));
+    expect(fm.name).toBe("brain");
+  });
+
+  test("is model-invocable, not slash-only", () => {
+    const fm = parseFrontmatter(frontmatterBlock(BRAIN_SKILL));
+    expect(fm["disable-model-invocation"]).toBeUndefined();
+  });
+
+  test("grants only Agentbrain-scoped Bash access", () => {
+    const fm = parseFrontmatter(frontmatterBlock(BRAIN_SKILL));
+    expect(fm["allowed-tools"]).toBe("Bash(agentbrain:*)");
+  });
+
+  test("description names every positive trigger", () => {
+    const fm = parseFrontmatter(frontmatterBlock(BRAIN_SKILL));
+    // Fold the hand-rolled parser's literal "\n" continuations to spaces —
+    // matches how a real YAML ">-" folded scalar renders to the model.
+    const description = (fm.description ?? "").replace(/\s+/g, " ");
+    for (const needle of [
+      "here's a link",
+      "store an article",
+      "watch or check a supported blog or X source",
+      "already saved",
+      "durable-knowledge question",
+      "queued, blocked, or failed",
+    ]) {
+      expect(description).toContain(needle);
+    }
+  });
+
+  test("description routes every near miss away from Agentbrain", () => {
+    const fm = parseFrontmatter(frontmatterBlock(BRAIN_SKILL));
+    const description = (fm.description ?? "").replace(/\s+/g, " ");
+    for (const needle of [
+      "repository code question",
+      "keeper history",
+      "WebSearch",
+      "Gmail",
+      "Scrapectl",
+    ]) {
+      expect(description).toContain(needle);
+    }
+  });
+
+  test("body distinguishes an unsupported connector from an implemented one", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    expect(text).toContain("not supported");
+  });
+
+  test("retrieval guidance names every citation field", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    for (const field of ["document_id", "chunk_id", "title", "source_uri"]) {
+      expect(text).toContain(field);
+    }
+  });
+
+  test("retrieval guidance discloses truncation and treats retrieved content as untrusted", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    expect(text).toContain("truncated");
+    expect(text).toContain("untrusted");
+  });
+
+  test("queue guidance reports job_id, distinguishes attempts, and gates reveal", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    expect(text).toContain("job_id");
+    expect(text).toContain("attempt");
+    expect(text).toContain("--reveal-content");
+  });
+
+  test("queue guidance forbids tight polling and blind retry", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    expect(text.toLowerCase()).toContain("don't poll tightly");
+  });
+
+  test("carries no retired Linkctl reference", () => {
+    const text = readFileSync(BRAIN_SKILL, "utf-8");
+    expect(text.toLowerCase()).not.toContain("linkctl");
+  });
+});
+
+describe("hack delegates to brain outside its BAKE regions", () => {
+  test("references brain via the Skill tool exactly once", () => {
+    const text = readFileSync(HACK_SKILL, "utf-8");
+    const matches = text.match(/invoke `brain`/g) ?? [];
+    expect(matches.length).toBe(1);
+  });
+
+  test("the delegation line sits outside every BAKE guard", () => {
+    const text = readFileSync(HACK_SKILL, "utf-8");
+    const lines = text.split("\n");
+    let inBake = false;
+    let sawDelegation = false;
+    for (const line of lines) {
+      if (line.includes("BAKE:BEGIN")) inBake = true;
+      if (line.includes("BAKE:END")) inBake = false;
+      if (line.includes("invoke `brain`")) {
+        expect(inBake).toBe(false);
+        sawDelegation = true;
+      }
+    }
+    expect(sawDelegation).toBe(true);
+  });
+
+  test("hack keeps its full complement of BAKE guards (drift gate covers byte content)", () => {
+    const text = readFileSync(HACK_SKILL, "utf-8");
+    const begins = text.match(/<!-- BAKE:BEGIN/g) ?? [];
+    const ends = text.match(/<!-- BAKE:END/g) ?? [];
+    expect(begins.length).toBe(7);
+    expect(ends.length).toBe(7);
+  });
+
+  test("does not duplicate an Agentbrain CLI recipe inline", () => {
+    const text = readFileSync(HACK_SKILL, "utf-8");
+    expect(text).not.toContain("agentbrain submit");
+    expect(text).not.toContain("agentbrain search");
+  });
+});

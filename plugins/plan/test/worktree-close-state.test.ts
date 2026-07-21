@@ -193,7 +193,17 @@ function seedLiveSelectionBrief(
       selector_config_hash: "cfg-hash",
       input_hash: "input-hash",
       shuffle_seed: 1,
-      tasks: taskIds.map((id) => ({ task_id: id })),
+      tasks: taskIds.map((id) => ({
+        task_id: id,
+        candidate_cells: [
+          { model: "opus", tier: "medium" },
+          { model: "opus", tier: "high" },
+          { model: "opus", tier: "max" },
+          { model: "sonnet", tier: "medium" },
+          { model: "sonnet", tier: "high" },
+          { model: "sonnet", tier: "max" },
+        ],
+      })),
       models: ["opus", "sonnet"],
       efforts: ["medium", "high", "max"],
     }),
@@ -210,6 +220,24 @@ function readTaskCell(
   return { tier: def.tier as string, model: def.model as string };
 }
 
+/** A complete non-Spark selector cell. Keeping these cross-cwd fixtures on the
+ * trusted verdict schema ensures they reach the plan-state routing seam. */
+function nonSparkCell(
+  taskId: string,
+  tier: string,
+  model: string,
+): Record<string, unknown> {
+  return {
+    task_id: taskId,
+    tier,
+    model,
+    rationale: "not a Spark fit",
+    confidence: 0.8,
+    spark_fit: false,
+    spark_exclusion: "spark-not-on-axis",
+  };
+}
+
 describe("apply-selection resolves plan-state to primary from a lane", () => {
   test("a guided apply from a lane cwd with --project=primary finds the brief and lands researched cells, not defaults", () => {
     const { primary, lane, home, epicId, taskIds } = makeLaneScenario(
@@ -220,8 +248,8 @@ describe("apply-selection resolves plan-state to primary from a lane", () => {
 
     const verdict = JSON.stringify({
       cells: [
-        { task_id: taskIds[0], tier: "high", model: "sonnet", rationale: "r1" },
-        { task_id: taskIds[1], tier: "max", model: "opus" },
+        nonSparkCell(taskIds[0] as string, "high", "sonnet"),
+        nonSparkCell(taskIds[1] as string, "max", "opus"),
       ],
     });
     const before = gitLogCount(primary);
@@ -270,7 +298,7 @@ describe("apply-selection resolves plan-state to primary from a lane", () => {
     seedLiveSelectionBrief(primary, epicId, taskIds);
 
     const verdict = JSON.stringify({
-      cells: [{ task_id: taskIds[0], tier: "high", model: "sonnet" }],
+      cells: [nonSparkCell(taskIds[0] as string, "high", "sonnet")],
     });
     const r = runCli(["apply-selection", epicId, "--file", "-"], {
       cwd: lane,
@@ -298,7 +326,7 @@ describe("apply-selection resolves plan-state to primary from a lane", () => {
       cwd: lane,
       home,
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "high", model: "sonnet" }],
+        cells: [nonSparkCell(taskIds[0] as string, "high", "sonnet")],
       }),
     });
     expect(r.code).toBe(1);

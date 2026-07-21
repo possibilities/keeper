@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Retire dispatch machinery",
-  "updated_at": "2026-07-19T23:09:17.916000Z"
+  "updated_at": "2026-07-21T11:52:53.998000Z",
+  "worker_done_at": "2026-07-21T11:52:53.998000Z"
 }

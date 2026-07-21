@@ -17,14 +17,29 @@ import {
   type LiveProofReport,
   QUOTA_WAIVABLE_CLAUSES,
   reportDegradedVerdict,
+  reportQuotaScope,
 } from "../integrations/pi-codex-pool/src/proof.ts";
-import { poolConfigBinding } from "../integrations/pi-codex-pool/src/state.ts";
+import {
+  type PoolAliasPolicy,
+  poolAliasPolicyBinding,
+  poolConfigBinding,
+} from "../integrations/pi-codex-pool/src/state.ts";
+
+export { poolAliasPolicyBinding };
+
 import type { CodexRoutingInspection } from "./codex-account-router.ts";
 import {
   CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
   exactKeys,
   record,
 } from "./codex-pool-proof-window.ts";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_QUOTA_SCOPES,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+  isCodexQuotaScope,
+} from "./codex-quota-scope.ts";
 import { FileLock } from "./file-lock.ts";
 
 export {
@@ -43,6 +58,7 @@ export type CodexPoolActivationMode =
   | "native"
   | "active"
   | "active-degraded"
+  | "active-scoped"
   | "recovery-required";
 
 export const CODEX_POOL_DEGRADED_VERDICT = "proven-degraded-single-alias";
@@ -67,6 +83,11 @@ export interface CodexPoolActivationAuthorization {
   degraded_verdict: typeof CODEX_POOL_DEGRADED_VERDICT;
 }
 
+export interface CodexPoolScopedMarker {
+  proof_scope: CodexQuotaScope;
+  authorized_aliases: PoolAliasPolicy;
+}
+
 export interface CodexPoolBindings {
   revision: string;
   aliases: string[];
@@ -86,6 +107,7 @@ export interface CodexPoolActivationState {
   alias_binding: string;
   aliases: string[];
   degraded: CodexPoolDegradedMarker | null;
+  scoped?: CodexPoolScopedMarker | null;
   updated_at_ms: number;
 }
 
@@ -199,12 +221,69 @@ function parseCodexPoolDegradedMarker(
   };
 }
 
+function emptyCodexPoolAliasPolicy(): PoolAliasPolicy {
+  return {
+    [CODEX_GENERIC_QUOTA_SCOPE]: [],
+    [CODEX_SPARK_QUOTA_SCOPE]: [],
+  };
+}
+
+function parseScopedAliasList(
+  value: unknown,
+  aliases: readonly string[],
+): string[] | null {
+  if (!Array.isArray(value) || value.length > aliases.length) return null;
+  const enrolled = new Set(aliases);
+  const selected = new Set<string>();
+  for (const alias of value) {
+    if (!isOpaqueAlias(alias) || !enrolled.has(alias) || selected.has(alias)) {
+      return null;
+    }
+    selected.add(alias);
+  }
+  return aliases.filter((alias) => selected.has(alias));
+}
+
+function parseCodexPoolScopedMarker(
+  value: unknown,
+  aliases: readonly string[],
+): CodexPoolScopedMarker | null {
+  const marker = record(value);
+  if (marker === null) return null;
+  const policy = record(marker.authorized_aliases);
+  if (
+    !exactKeys(marker, ["proof_scope", "authorized_aliases"]) ||
+    !isCodexQuotaScope(marker.proof_scope) ||
+    policy === null ||
+    !exactKeys(policy, [...CODEX_QUOTA_SCOPES])
+  ) {
+    return null;
+  }
+  const authorized = emptyCodexPoolAliasPolicy();
+  for (const scope of CODEX_QUOTA_SCOPES) {
+    const parsed = parseScopedAliasList(policy[scope], aliases);
+    if (parsed === null) return null;
+    authorized[scope] = parsed;
+  }
+  if (
+    authorized[marker.proof_scope].length === 0 ||
+    authorized[CODEX_SPARK_QUOTA_SCOPE].length === 0
+  ) {
+    return null;
+  }
+  return {
+    proof_scope: marker.proof_scope,
+    authorized_aliases: authorized,
+  };
+}
+
 export function parseCodexPoolActivationState(
   value: unknown,
 ): CodexPoolActivationState | null {
   const input = record(value);
   if (input === null) return null;
   const hasDegraded = "degraded" in input;
+  const hasScoped = "scoped" in input;
   const allowedKeys = [
     "schema_version",
     "mode",
@@ -214,15 +293,21 @@ export function parseCodexPoolActivationState(
     "aliases",
     "updated_at_ms",
   ];
+  const expectedKeys = [
+    ...allowedKeys,
+    ...(hasDegraded ? ["degraded"] : []),
+    ...(hasScoped ? ["scoped"] : []),
+  ];
   if (
-    !exactKeys(
-      input,
-      hasDegraded ? [...allowedKeys, "degraded"] : allowedKeys,
-    ) ||
+    !exactKeys(input, expectedKeys) ||
     input.schema_version !== CODEX_POOL_WORKFLOW_SCHEMA_VERSION ||
-    !["native", "active", "active-degraded", "recovery-required"].includes(
-      String(input.mode),
-    ) ||
+    ![
+      "native",
+      "active",
+      "active-degraded",
+      "active-scoped",
+      "recovery-required",
+    ].includes(String(input.mode)) ||
     !isRevision(input.revision) ||
     !isBinding(input.config_binding) ||
     !isBinding(input.alias_binding) ||
@@ -238,6 +323,7 @@ export function parseCodexPoolActivationState(
     return null;
   }
   const rawDegraded = hasDegraded ? input.degraded : null;
+  const rawScoped = hasScoped ? input.scoped : null;
   let degraded: CodexPoolDegradedMarker | null = null;
   if (input.mode === "active-degraded") {
     degraded = parseCodexPoolDegradedMarker(rawDegraded, aliases);
@@ -245,7 +331,14 @@ export function parseCodexPoolActivationState(
   } else if (rawDegraded !== null && rawDegraded !== undefined) {
     return null;
   }
-  return {
+  let scoped: CodexPoolScopedMarker | null = null;
+  if (input.mode === "active-scoped") {
+    scoped = parseCodexPoolScopedMarker(rawScoped, aliases);
+    if (scoped === null) return null;
+  } else if (rawScoped !== null && rawScoped !== undefined) {
+    return null;
+  }
+  const state: CodexPoolActivationState = {
     schema_version: CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
     mode: input.mode as CodexPoolActivationMode,
     revision: input.revision,
@@ -255,6 +348,8 @@ export function parseCodexPoolActivationState(
     degraded,
     updated_at_ms: input.updated_at_ms as number,
   };
+  if (scoped !== null) state.scoped = scoped;
+  return state;
 }
 
 export function codexPoolAliasesFromEnvironment(
@@ -371,8 +466,9 @@ function stateFor(
   bindings: CodexPoolBindings,
   nowMs: number,
   degraded: CodexPoolDegradedMarker | null = null,
+  scoped: CodexPoolScopedMarker | null = null,
 ): CodexPoolActivationState {
-  return {
+  const state: CodexPoolActivationState = {
     schema_version: CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
     mode,
     revision: bindings.revision,
@@ -382,6 +478,81 @@ function stateFor(
     degraded,
     updated_at_ms: Math.floor(nowMs),
   };
+  if (scoped !== null) state.scoped = scoped;
+  return state;
+}
+
+function canonicalPolicy(
+  policy: PoolAliasPolicy,
+  aliases: readonly string[],
+): PoolAliasPolicy {
+  const canonical = emptyCodexPoolAliasPolicy();
+  for (const scope of CODEX_QUOTA_SCOPES) {
+    const selected = new Set(policy[scope]);
+    canonical[scope] = aliases.filter((alias) => selected.has(alias));
+  }
+  return canonical;
+}
+
+function sameAliasList(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameAliasPolicy(
+  left: PoolAliasPolicy,
+  right: PoolAliasPolicy,
+): boolean {
+  return CODEX_QUOTA_SCOPES.every((scope) =>
+    sameAliasList(left[scope], right[scope]),
+  );
+}
+
+function policyIncludesSpark(policy: PoolAliasPolicy): boolean {
+  return policy[CODEX_SPARK_QUOTA_SCOPE].length > 0;
+}
+
+function policyAuthorizesAllGeneric(
+  policy: PoolAliasPolicy,
+  aliases: readonly string[],
+): boolean {
+  return sameAliasList(policy[CODEX_GENERIC_QUOTA_SCOPE], aliases);
+}
+
+export function codexPoolAliasPolicyForActivation(
+  state: CodexPoolActivationState,
+): PoolAliasPolicy {
+  if (state.mode === "active") {
+    return {
+      [CODEX_GENERIC_QUOTA_SCOPE]: [...state.aliases],
+      [CODEX_SPARK_QUOTA_SCOPE]: [],
+    };
+  }
+  if (state.mode === "active-degraded" && state.degraded !== null) {
+    return {
+      [CODEX_GENERIC_QUOTA_SCOPE]: [state.degraded.pinned_alias],
+      [CODEX_SPARK_QUOTA_SCOPE]: [],
+    };
+  }
+  if (state.mode === "active-scoped" && state.scoped != null) {
+    return canonicalPolicy(state.scoped.authorized_aliases, state.aliases);
+  }
+  return emptyCodexPoolAliasPolicy();
+}
+
+export function codexPoolVerificationScopeForActivation(
+  state: CodexPoolActivationState,
+): CodexQuotaScope | null {
+  if (state.mode === "active") return CODEX_GENERIC_QUOTA_SCOPE;
+  if (state.mode === "active-degraded" && state.degraded !== null) {
+    return CODEX_GENERIC_QUOTA_SCOPE;
+  }
+  if (state.mode === "active-scoped" && state.scoped != null) {
+    return state.scoped.proof_scope;
+  }
+  return null;
 }
 
 function matchesBindings(
@@ -455,7 +626,7 @@ export function effectiveCodexPoolActivation(
   store: Pick<CodexPoolActivationStore, "readActivation" | "transactionExists">,
   bindings: CodexPoolBindings,
 ): {
-  mode: "native" | "active" | "active-degraded";
+  mode: "native" | "active" | "active-degraded" | "active-scoped";
   problem_code: CodexPoolProblemCode | null;
   state: CodexPoolActivationState | null;
 } {
@@ -491,6 +662,9 @@ export function effectiveCodexPoolActivation(
   if (state.mode === "active-degraded" && state.degraded !== null) {
     return { mode: "active-degraded", problem_code: null, state };
   }
+  if (state.mode === "active-scoped" && state.scoped != null) {
+    return { mode: "active-scoped", problem_code: null, state };
+  }
   return {
     mode: "native",
     problem_code:
@@ -512,7 +686,9 @@ export function codexPoolStatus(
   );
   let healthy = false;
   if (
-    (effective.mode === "active" || effective.mode === "active-degraded") &&
+    (effective.mode === "active" ||
+      effective.mode === "active-degraded" ||
+      effective.mode === "active-scoped") &&
     effective.state !== null
   ) {
     try {
@@ -601,6 +777,62 @@ function rollbackAfterFailure(
   }
 }
 
+function currentlyAuthorizedAliasPolicy(
+  store: Pick<CodexPoolActivationStore, "readActivation" | "transactionExists">,
+  bindings: CodexPoolBindings,
+): PoolAliasPolicy {
+  const effective = effectiveCodexPoolActivation(store, bindings);
+  return effective.problem_code === null && effective.state !== null
+    ? codexPoolAliasPolicyForActivation(effective.state)
+    : emptyCodexPoolAliasPolicy();
+}
+
+function stateForAliasPolicy(
+  bindings: CodexPoolBindings,
+  nowMs: number,
+  proofScope: CodexQuotaScope,
+  policy: PoolAliasPolicy,
+  degraded: CodexPoolDegradedMarker | null,
+): CodexPoolActivationState | null {
+  const authorized = canonicalPolicy(policy, bindings.aliases);
+  if (policyIncludesSpark(authorized)) {
+    return stateFor("active-scoped", bindings, nowMs, null, {
+      proof_scope: proofScope,
+      authorized_aliases: authorized,
+    });
+  }
+  if (
+    degraded !== null &&
+    sameAliasList(authorized[CODEX_GENERIC_QUOTA_SCOPE], [
+      degraded.pinned_alias,
+    ])
+  ) {
+    return stateFor("active-degraded", bindings, nowMs, degraded);
+  }
+  if (policyAuthorizesAllGeneric(authorized, bindings.aliases)) {
+    return stateFor("active", bindings, nowMs);
+  }
+  return null;
+}
+
+function activationStateMatchesCandidate(
+  persisted: CodexPoolActivationState,
+  candidate: CodexPoolActivationState,
+  bindings: CodexPoolBindings,
+): boolean {
+  return (
+    matchesBindings(persisted, bindings) &&
+    persisted.mode === candidate.mode &&
+    codexPoolVerificationScopeForActivation(persisted) ===
+      codexPoolVerificationScopeForActivation(candidate) &&
+    JSON.stringify(persisted.degraded) === JSON.stringify(candidate.degraded) &&
+    sameAliasPolicy(
+      codexPoolAliasPolicyForActivation(persisted),
+      codexPoolAliasPolicyForActivation(candidate),
+    )
+  );
+}
+
 export function activateCodexPool(
   deps: CodexPoolActivationDeps,
   source?: string,
@@ -615,16 +847,23 @@ export function activateCodexPool(
       return result("activate", false, "native", "recovery-required");
     }
     const input = deps.store.readReport(source);
-    const proof = proofResult(input, deps.bindings, deps.nowMs());
+    const nowMs = deps.nowMs();
+    const proof = proofResult(input, deps.bindings, nowMs);
     if (proof === null) {
       return result("activate", false, "native", "proof-missing");
     }
-    // A full proven report activates (and upgrades any prior degraded state);
-    // a degraded verdict activates ONLY behind the explicit operator flag; an
-    // incomplete or failed verdict is refused.
-    let candidate: CodexPoolActivationState;
+    const proofScope = reportQuotaScope(input);
+    if (proofScope === null) {
+      return result("activate", false, "native", "proof-failed", proof);
+    }
+    // A full proven report replaces authorization for its quota scope with all
+    // enrolled aliases. A degraded verdict replaces only that scope with the
+    // explicitly authorized pin. Other effective scopes are preserved only when
+    // their stored activation still matches the operational bindings.
+    const policy = currentlyAuthorizedAliasPolicy(deps.store, deps.bindings);
+    let degraded: CodexPoolDegradedMarker | null = null;
     if (proof.verdict === "proven") {
-      candidate = stateFor("active", deps.bindings, deps.nowMs());
+      policy[proofScope] = [...deps.bindings.aliases];
     } else if (proof.verdict === CODEX_POOL_DEGRADED_VERDICT) {
       if (authorization?.degraded_verdict !== CODEX_POOL_DEGRADED_VERDICT) {
         return result(
@@ -644,11 +883,12 @@ export function activateCodexPool(
       ) {
         return result("activate", false, "native", "proof-failed", proof);
       }
-      candidate = stateFor("active-degraded", deps.bindings, deps.nowMs(), {
+      degraded = {
         cause: degradedVerdict.cause,
         waived_clauses: [...degradedVerdict.waived_clauses],
         pinned_alias: pinnedAlias,
-      });
+      };
+      policy[proofScope] = [pinnedAlias];
     } else {
       return result(
         "activate",
@@ -657,6 +897,16 @@ export function activateCodexPool(
         proof.verdict === "incomplete" ? "proof-incomplete" : "proof-failed",
         proof,
       );
+    }
+    const candidate = stateForAliasPolicy(
+      deps.bindings,
+      nowMs,
+      proofScope,
+      policy,
+      degraded,
+    );
+    if (candidate === null) {
+      return result("activate", false, "native", "proof-failed", proof);
     }
     try {
       deps.store.beginTransaction();
@@ -676,8 +926,7 @@ export function activateCodexPool(
     );
     if (
       persisted === null ||
-      !matchesBindings(persisted, deps.bindings) ||
-      persisted.mode !== candidate.mode ||
+      !activationStateMatchesCandidate(persisted, candidate, deps.bindings) ||
       !deps.verify(candidate)
     ) {
       return rollbackAfterFailure(deps, "activate");
@@ -727,7 +976,9 @@ export function verifyCodexPool(
 ): CodexPoolWorkflowResult {
   const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
   if (
-    (effective.mode !== "active" && effective.mode !== "active-degraded") ||
+    (effective.mode !== "active" &&
+      effective.mode !== "active-degraded" &&
+      effective.mode !== "active-scoped") ||
     effective.state === null
   ) {
     return result(
@@ -751,38 +1002,78 @@ export function verifyCodexPool(
   );
 }
 
+function inspectionHasExactAuthorizedAliases(
+  inspection: CodexRoutingInspection,
+  enrolledAliases: readonly string[],
+  authorizedAliases: readonly string[],
+): boolean {
+  const enrolled = new Set(enrolledAliases);
+  const expected = new Set(authorizedAliases);
+  if (expected.size !== authorizedAliases.length || expected.size === 0) {
+    return false;
+  }
+  const authorized = new Set<string>();
+  for (const entry of inspection.candidates) {
+    if (
+      entry.quota_scope !== inspection.quota_scope ||
+      !enrolled.has(entry.alias)
+    ) {
+      return false;
+    }
+    if (!entry.authorized) continue;
+    if (authorized.has(entry.alias)) return false;
+    authorized.add(entry.alias);
+  }
+  return (
+    authorized.size === expected.size &&
+    [...expected].every((alias) => authorized.has(alias))
+  );
+}
+
 export function codexPoolObservationVerifies(
   candidate: CodexPoolActivationState,
   inspection: CodexRoutingInspection,
+  explicitVerificationScope?: CodexQuotaScope,
 ): boolean {
+  const verificationScope =
+    explicitVerificationScope ??
+    codexPoolVerificationScopeForActivation(candidate);
   if (
+    verificationScope === null ||
     inspection.config_binding !== candidate.config_binding ||
+    inspection.quota_scope !== verificationScope ||
     inspection.health !== "ready" ||
     !inspection.fresh ||
     inspection.verdict.kind !== "pooled"
   ) {
     return false;
   }
-  // A degraded activation must route to exactly the pinned healthy alias — the
-  // quota-dead alias is enrolled but never the live route, so a single healthy
-  // candidate is expected rather than the two a full activation requires.
-  if (candidate.mode === "active-degraded") {
-    const pinned = candidate.degraded?.pinned_alias;
+  const policy = codexPoolAliasPolicyForActivation(candidate);
+  const authorizedAliases = policy[verificationScope];
+  if (
+    !inspectionHasExactAuthorizedAliases(
+      inspection,
+      candidate.aliases,
+      authorizedAliases,
+    ) ||
+    !authorizedAliases.includes(inspection.verdict.alias)
+  ) {
+    return false;
+  }
+  if (candidate.mode === "active") {
     return (
-      pinned !== undefined &&
-      inspection.verdict.alias === pinned &&
-      candidate.aliases.includes(pinned) &&
-      inspection.candidates.some((entry) => entry.alias === pinned)
+      verificationScope === CODEX_GENERIC_QUOTA_SCOPE &&
+      authorizedAliases.length >= 2
     );
   }
-  return (
-    candidate.mode === "active" &&
-    candidate.aliases.includes(inspection.verdict.alias) &&
-    inspection.candidates.length >= 2 &&
-    inspection.candidates.every((entry) =>
-      candidate.aliases.includes(entry.alias),
-    )
-  );
+  if (candidate.mode === "active-degraded") {
+    return (
+      verificationScope === CODEX_GENERIC_QUOTA_SCOPE &&
+      authorizedAliases.length === 1 &&
+      authorizedAliases[0] === candidate.degraded?.pinned_alias
+    );
+  }
+  return candidate.mode === "active-scoped" && authorizedAliases.length > 0;
 }
 
 export function codexPoolConfigDigest(state: CodexPoolActivationState): string {

@@ -1,0 +1,41 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.75,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Reworks integrateRepoUnderLease so trunk integration runs in a private scratch worktree while preserving subtle correctness invariants: temp worktree+branch removed on every exit path, no MERGE_HEAD ever visible in the shared checkout, lease acquire/release semantics, and all existing typed outcomes; it must also design a new visible self-clearing typed outcome for the deferred-ff case. Contract-shaped finalize logic where a wrong abstraction propagates into the distress/paging machinery \u2014 opus for the invariant/contract reasoning, xhigh for contract-touching depth.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1392-integrate-trunk-merges-in-a-private.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Test matrix over the deferred-ff edge paths (dirty-tracked, untracked, off-branch, racing origin, conflict, gate-red) via the pure seams task 1 establishes, plus docs updates to problem-codes.md, the close skill prose, and CONTEXT.md vocabulary. Bulk is pattern-following, but the repo's strict docs discipline (forward-facing only, prune-not-append, no history narration) and vocabulary alignment need delicate idiom-matching \u2014 sonnet over a GPT tier; no opus-level invariant work since task 1 owns the invariants. High for multi-file known-pattern execution.",
+      "spark_exclusion": "ambiguous-or-judgment-heavy",
+      "spark_fit": false,
+      "task_id": "fn-1392-integrate-trunk-merges-in-a-private.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T06:31:54.523000Z",
+  "epic_id": "fn-1392-integrate-trunk-merges-in-a-private",
+  "input_hash": "ad13661553ae98e65b88ea21fa62599b01ad0407fc1a9bcd835133ccee55712c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2903729685,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1392-integrate-trunk-merges-in-a-private.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Reworks integrateRepoUnderLease so trunk integration runs in a private scratch worktree while preserving subtle correctness invariants: temp worktree+branch removed on every exit path, no MERGE_HEAD ever visible in the shared checkout, lease acquire/release semantics, and all existing typed outcomes; it must also design a new visible self-clearing typed outcome for the deferred-ff case. Contract-shaped finalize logic where a wrong abstraction propagates into the distress/paging machinery \\u2014 opus for the invariant/contract reasoning, xhigh for contract-touching depth.\", \"confidence\": 0.75, \"spark_fit\": false, \"spark_exclusion\": \"subtle-invariant-reasoning\"}, {\"task_id\": \"fn-1392-integrate-trunk-merges-in-a-private.2\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Test matrix over the deferred-ff edge paths (dirty-tracked, untracked, off-branch, racing origin, conflict, gate-red) via the pure seams task 1 establishes, plus docs updates to problem-codes.md, the close skill prose, and CONTEXT.md vocabulary. Bulk is pattern-following, but the repo's strict docs discipline (forward-facing only, prune-not-append, no history narration) and vocabulary alignment need delicate idiom-matching \\u2014 sonnet over a GPT tier; no opus-level invariant work since task 1 owns the invariants. High for multi-file known-pattern execution.\", \"confidence\": 0.6, \"spark_fit\": false, \"spark_exclusion\": \"ambiguous-or-judgment-heavy\"}]}"
+}

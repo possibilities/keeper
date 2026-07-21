@@ -33,6 +33,7 @@ import {
 } from "../commit_lookup.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
+import { resolveIncident } from "../incident.ts";
 import {
   contextForRoot,
   type ProjectContext,
@@ -479,6 +480,12 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
   const blockingFollowup =
     gated !== null ? { id: gated.epicId, status: gated.status ?? null } : null;
 
+  // Surface any unresolved close-sink merge incident on THIS epic's
+  // `close::<epicId>` sticky row so the closer can record ownership via
+  // `keeper incident claim` — sourced read-only from the incident read surface,
+  // never a plan-plugin DB read. Null on the ordinary no-incident close.
+  const incident = resolveIncident(`close::${epicId}`);
+
   formatOutput(
     {
       success: true,
@@ -489,6 +496,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       commit_set_hash: commitSetHash,
       blocking_followup: blockingFollowup,
       phase_resume: phaseResume,
+      incident,
     },
     format,
   );

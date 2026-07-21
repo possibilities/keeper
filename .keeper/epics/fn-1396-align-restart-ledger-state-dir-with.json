@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "closer_done_at": "2026-07-21T07:24:33.192000Z",
+  "created_at": "2026-07-21T06:49:12.602000Z",
+  "created_by_close_of": "fn-1390-attribute-and-stop-quiet-keeperd-deaths",
+  "depends_on_epics": [
+    "fn-1390-attribute-and-stop-quiet-keeperd-deaths"
+  ],
+  "id": "fn-1396-align-restart-ledger-state-dir-with",
+  "last_validated_at": "2026-07-21T07:00:13.138000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "done",
+  "title": "Align restart-ledger state-dir with install.sh",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-21T07:24:33.192000Z"
+}

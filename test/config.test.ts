@@ -92,9 +92,15 @@ test("retired quota registry keys are silently ignored", () => {
   expect(cfg.roots).toEqual(["~/code"]);
 });
 
+test("buildbot_url is ignored as a retired config key", () => {
+  writeConfig("buildbot_url: http://localhost:8010\nroots:\n  - ~/code\n");
+  const cfg = resolveConfig();
+  expect(cfg).not.toHaveProperty("buildbotUrl");
+  expect(cfg.roots).toEqual(["~/code"]);
+});
+
 // ---------------------------------------------------------------------------
 // dispatch_prompt_prefix (fn-861) — non-empty-string only, else undefined
-// (mirrors buildbot_url's independent best-effort string-key pattern)
 // ---------------------------------------------------------------------------
 
 test("dispatchPromptPrefix defaults to undefined when the file is absent", () => {

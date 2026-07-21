@@ -31,6 +31,19 @@ export interface NormalizedWindow {
   resetsAt: string | null;
 }
 
+export type ClaudeSubscriptionType = "pro" | "max";
+export type CapacityMultiplier = 1 | 5 | 20;
+
+export interface AccountCapacityMetadata {
+  subscriptionType?: ClaudeSubscriptionType;
+  rateLimitMultiplier?: CapacityMultiplier;
+}
+
+export interface AccountUsageMeasurement {
+  windows: NormalizedWindow[];
+  measuredAtMs: number;
+}
+
 /** Every current Claude route is a claude-swap managed slot. */
 export type RouteKind = "managed";
 
@@ -56,9 +69,9 @@ export type AccountObservationIssue =
   | "keychain-unavailable"
   | "no-credentials"
   | "api-key"
+  | "usage-unavailable"
   | "account-unavailable"
   | "missing-freshness"
-  | "measurement-stale"
   | "missing-windows"
   | "malformed-scoped-windows";
 
@@ -74,6 +87,10 @@ export interface Observation {
   health: ObservationHealth;
   routes: Route[];
   claude_accounts: ClaudeAccountDisplay;
+  /** Optional managed route id → bounded account-category/capacity metadata. */
+  account_capacity?: Record<string, AccountCapacityMetadata>;
+  /** Display-grade last-good usage for unavailable, unrouteable accounts. */
+  account_measurements?: Record<string, AccountUsageMeasurement>;
   /** Managed route id → bounded PII-free reason the account was excluded. */
   account_issues: Record<string, AccountObservationIssue>;
   notes: string[];
@@ -91,6 +108,8 @@ export interface CswapInventory {
   health: ObservationHealth;
   routes: Route[];
   accountOrdinals: Record<string, number>;
+  accountCapacity: Record<string, AccountCapacityMetadata>;
+  accountMeasurements: Record<string, AccountUsageMeasurement>;
   accountIssues: Record<string, AccountObservationIssue>;
   notes: string[];
 }
@@ -168,8 +187,23 @@ function statusIssue(status: unknown): AccountObservationIssue {
       return "no-credentials";
     case "api_key":
       return "api-key";
+    case "unavailable":
+      return "usage-unavailable";
     default:
       return "account-unavailable";
+  }
+}
+
+function statusDiagnostic(status: unknown): string {
+  switch (status) {
+    case "relogin_required":
+    case "token_expired":
+    case "keychain_unavailable":
+    case "no_credentials":
+    case "api_key":
+      return status;
+    default:
+      return "unavailable";
   }
 }
 
@@ -181,6 +215,8 @@ function emptyInventory(
     health,
     routes: [],
     accountOrdinals: {},
+    accountCapacity: {},
+    accountMeasurements: {},
     accountIssues: {},
     notes: [note],
   };
@@ -188,14 +224,13 @@ function emptyInventory(
 
 /**
  * Parse the managed inventory. Every valid slot keeps its stable display ordinal,
- * while only fresh `usageStatus:"ok"` rows carrying quota windows become launch
+ * while only `usageStatus:"ok"` rows carrying required quota windows become launch
  * candidates. The active slot is retained as an ordinary managed route: Keeper
  * always launches through `cswap run`, including claude-swap's same-account path.
  */
 export function parseCswapList(
   outcome: ProviderRunOutcome,
   nowMs: number,
-  freshnessCeilingMs: number,
 ): CswapInventory {
   if (outcome.code === null) {
     return emptyInventory("absent", "cswap: unavailable");
@@ -208,10 +243,7 @@ export function parseCswapList(
     return emptyInventory("error", "cswap: reported error");
   }
   if (parsed.schemaVersion !== CSWAP_SUPPORTED_SCHEMA_MAJOR) {
-    return emptyInventory(
-      "unsupported",
-      `cswap: unsupported schema ${String(parsed.schemaVersion)}`,
-    );
+    return emptyInventory("unsupported", "cswap: unsupported schema");
   }
   if (!Array.isArray(parsed.accounts)) {
     return emptyInventory("unsupported", "cswap: no accounts array");
@@ -226,6 +258,8 @@ export function parseCswapList(
   const routes: Route[] = [];
   const notes: string[] = [];
   const accountOrdinals: Record<string, number> = {};
+  const accountCapacity: Record<string, AccountCapacityMetadata> = {};
+  const accountMeasurements: Record<string, AccountUsageMeasurement> = {};
   const accountIssues: Record<string, AccountObservationIssue> = {};
   const seenAccounts = new Set<number>();
   const seenRoutes = new Set<number>();
@@ -240,11 +274,16 @@ export function parseCswapList(
         !seenAccounts.has(slot)
       ) {
         seenAccounts.add(slot);
-        accountOrdinals[managedRouteId(slot)] = seenAccounts.size - 1;
+        const routeId = managedRouteId(slot);
+        accountOrdinals[routeId] = seenAccounts.size - 1;
+        const capacity = parseAccountCapacity(row);
+        if (capacity !== null) accountCapacity[routeId] = capacity;
+        const measurement = parseLastGoodMeasurement(row, nowMs);
+        if (measurement !== null) accountMeasurements[routeId] = measurement;
       }
     }
 
-    const parsedRow = parseCswapAccount(row, nowMs, freshnessCeilingMs);
+    const parsedRow = parseCswapAccount(row, nowMs);
     if (parsedRow.note) notes.push(parsedRow.note);
     const rowSlot = isRecord(row) ? row.number : null;
     const rowRouteId =
@@ -270,15 +309,49 @@ export function parseCswapList(
     health: "ok",
     routes,
     accountOrdinals,
+    accountCapacity,
+    accountMeasurements,
     accountIssues,
     notes: boundNotes(notes),
   };
 }
 
+function parseAccountCapacity(
+  row: Record<string, unknown>,
+): AccountCapacityMetadata | null {
+  const capacity: AccountCapacityMetadata = {};
+  if (row.subscriptionType === "pro" || row.subscriptionType === "max") {
+    capacity.subscriptionType = row.subscriptionType;
+  }
+  if (
+    row.rateLimitMultiplier === 1 ||
+    row.rateLimitMultiplier === 5 ||
+    row.rateLimitMultiplier === 20
+  ) {
+    capacity.rateLimitMultiplier = row.rateLimitMultiplier;
+  }
+  return Object.keys(capacity).length === 0 ? null : capacity;
+}
+
+function parseLastGoodMeasurement(
+  row: Record<string, unknown>,
+  nowMs: number,
+): AccountUsageMeasurement | null {
+  if (row.usageStatus !== "unavailable") return null;
+  const measuredAtMs = measuredAtMsFrom(
+    row.lastGoodFetchedAt,
+    row.lastGoodAgeSeconds,
+    nowMs,
+  );
+  if (measuredAtMs === null) return null;
+  const parsed = parseCswapWindows(row.lastGoodUsage);
+  if (parsed.scopedMalformed || parsed.windows.length === 0) return null;
+  return { windows: parsed.windows, measuredAtMs };
+}
+
 function parseCswapAccount(
   row: unknown,
   nowMs: number,
-  freshnessCeilingMs: number,
 ): { route?: Route; note?: string; issue?: AccountObservationIssue } {
   if (!isRecord(row)) return { note: "cswap: non-object row" };
   const slot = row.number;
@@ -287,22 +360,19 @@ function parseCswapAccount(
   }
   if (row.usageStatus !== CSWAP_ROUTEABLE_STATUS) {
     return {
-      note: `cswap: slot ${slot} not routeable (${String(row.usageStatus)})`,
+      note: `cswap: slot ${slot} not routeable (${statusDiagnostic(row.usageStatus)})`,
       issue: statusIssue(row.usageStatus),
     };
   }
-  const measuredAtMs = cswapMeasuredAtMs(row, nowMs);
+  const measuredAtMs = measuredAtMsFrom(
+    row.usageFetchedAt,
+    row.usageAgeSeconds,
+    nowMs,
+  );
   if (measuredAtMs === null) {
     return {
       note: `cswap: slot ${slot} has no freshness signal`,
       issue: "missing-freshness",
-    };
-  }
-  const ageMs = nowMs - measuredAtMs;
-  if (ageMs < 0 || ageMs > freshnessCeilingMs) {
-    return {
-      note: `cswap: slot ${slot} measurement stale`,
-      issue: "measurement-stale",
     };
   }
   const parsedWindows = parseCswapWindows(row.usage);
@@ -313,9 +383,12 @@ function parseCswapAccount(
     };
   }
   const { windows } = parsedWindows;
-  if (windows.length === 0) {
+  if (
+    !windows.some((window) => window.key === "session") ||
+    !windows.some((window) => window.key === "week")
+  ) {
     return {
-      note: `cswap: slot ${slot} has no windows`,
+      note: `cswap: slot ${slot} has no required windows`,
       issue: "missing-windows",
     };
   }
@@ -330,15 +403,17 @@ function parseCswapAccount(
   };
 }
 
-function cswapMeasuredAtMs(
-  row: Record<string, unknown>,
+function measuredAtMsFrom(
+  fetchedAt: unknown,
+  ageSeconds: unknown,
   nowMs: number,
 ): number | null {
-  const fetched = tzAwareEpochMs(row.usageFetchedAt);
+  const fetched = tzAwareEpochMs(fetchedAt);
   if (fetched !== null) return fetched;
-  const age = row.usageAgeSeconds;
+  const age = ageSeconds;
   if (typeof age === "number" && Number.isFinite(age) && age >= 0) {
-    return nowMs - age * 1000;
+    const measuredAtMs = nowMs - age * 1000;
+    return Number.isFinite(measuredAtMs) ? measuredAtMs : null;
   }
   return null;
 }
@@ -415,6 +490,12 @@ export function buildObservation(input: {
       count: Object.keys(cswap.accountOrdinals).length,
       ordinals: { ...cswap.accountOrdinals },
     },
+    ...(Object.keys(cswap.accountCapacity).length === 0
+      ? {}
+      : { account_capacity: { ...cswap.accountCapacity } }),
+    ...(Object.keys(cswap.accountMeasurements).length === 0
+      ? {}
+      : { account_measurements: { ...cswap.accountMeasurements } }),
     account_issues: { ...cswap.accountIssues },
     notes: boundNotes(cswap.notes),
   };
@@ -463,8 +544,21 @@ export function validateObservation(data: unknown): Observation | null {
   }
   const display = validateClaudeAccountDisplay(data.claude_accounts);
   if (display === null) return null;
+  const accountCapacity = validateAccountCapacity(
+    data.account_capacity,
+    display,
+  );
+  if (accountCapacity === null) return null;
+  const accountMeasurements = validateAccountMeasurements(
+    data.account_measurements,
+    display,
+  );
+  if (accountMeasurements === null) return null;
   const accountIssues = validateAccountIssues(data.account_issues, display);
   if (accountIssues === null) return null;
+  for (const routeId of Object.keys(accountMeasurements)) {
+    if (accountIssues[routeId] !== "usage-unavailable") return null;
+  }
 
   const routes: Route[] = [];
   const routeIds = new Set<string>();
@@ -494,9 +588,66 @@ export function validateObservation(data: unknown): Observation | null {
     health: data.health,
     routes,
     claude_accounts: display,
+    ...(Object.keys(accountCapacity).length === 0
+      ? {}
+      : { account_capacity: accountCapacity }),
+    ...(Object.keys(accountMeasurements).length === 0
+      ? {}
+      : { account_measurements: accountMeasurements }),
     account_issues: accountIssues,
     notes: boundNotes(notes),
   };
+}
+
+function validateAccountMeasurements(
+  data: unknown,
+  display: ClaudeAccountDisplay,
+): Record<string, AccountUsageMeasurement> | null {
+  if (data === undefined) return {};
+  if (!isRecord(data)) return null;
+  const measurements: Record<string, AccountUsageMeasurement> = {};
+  for (const [routeId, value] of Object.entries(data)) {
+    if (
+      display.ordinals[routeId] === undefined ||
+      !isRecord(value) ||
+      typeof value.measuredAtMs !== "number" ||
+      !Number.isFinite(value.measuredAtMs) ||
+      !Array.isArray(value.windows) ||
+      value.windows.length === 0
+    ) {
+      return null;
+    }
+    const windows: NormalizedWindow[] = [];
+    const keys = new Set<string>();
+    for (const raw of value.windows) {
+      const window = validateWindow(raw);
+      if (window === null || keys.has(window.key.toLowerCase())) return null;
+      keys.add(window.key.toLowerCase());
+      windows.push(window);
+    }
+    measurements[routeId] = {
+      measuredAtMs: value.measuredAtMs,
+      windows,
+    };
+  }
+  return measurements;
+}
+
+function validateAccountCapacity(
+  data: unknown,
+  display: ClaudeAccountDisplay,
+): Record<string, AccountCapacityMetadata> | null {
+  if (data === undefined) return {};
+  if (!isRecord(data)) return null;
+  const capacity: Record<string, AccountCapacityMetadata> = {};
+  for (const [routeId, value] of Object.entries(data)) {
+    if (display.ordinals[routeId] === undefined || !isRecord(value))
+      return null;
+    const metadata = parseAccountCapacity(value);
+    if (metadata === null) return null;
+    capacity[routeId] = metadata;
+  }
+  return capacity;
 }
 
 function validateClaudeAccountDisplay(
@@ -544,9 +695,9 @@ function isAccountObservationIssue(
     value === "keychain-unavailable" ||
     value === "no-credentials" ||
     value === "api-key" ||
+    value === "usage-unavailable" ||
     value === "account-unavailable" ||
     value === "missing-freshness" ||
-    value === "measurement-stale" ||
     value === "missing-windows" ||
     value === "malformed-scoped-windows"
   );
@@ -586,11 +737,16 @@ function validateRoute(data: unknown): Route | null {
     return null;
   }
   const windows: NormalizedWindow[] = [];
+  const windowKeys = new Set<string>();
   for (const raw of data.windows) {
     const window = validateWindow(raw);
     if (window === null) return null;
+    const normalizedKey = window.key.toLowerCase();
+    if (windowKeys.has(normalizedKey)) return null;
+    windowKeys.add(normalizedKey);
     windows.push(window);
   }
+  if (!windowKeys.has("session") || !windowKeys.has("week")) return null;
   return {
     id: data.id,
     kind: "managed",
@@ -604,9 +760,7 @@ function validateWindow(data: unknown): NormalizedWindow | null {
   if (
     !isRecord(data) ||
     typeof data.key !== "string" ||
-    !/^(?:session|week|spend|model:[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,63})$/u.test(
-      data.key,
-    ) ||
+    !isValidWindowKey(data.key) ||
     typeof data.utilization !== "number" ||
     !Number.isFinite(data.utilization) ||
     data.utilization < 0 ||
@@ -623,6 +777,17 @@ function validateWindow(data: unknown): NormalizedWindow | null {
     utilization: data.utilization,
     resetsAt,
   };
+}
+
+function isValidWindowKey(key: string): boolean {
+  if (key === "session" || key === "week" || key === "spend") return true;
+  if (!key.startsWith("model:")) return false;
+  const name = key.slice("model:".length);
+  return (
+    name === name.trim() &&
+    name.length <= 64 &&
+    /^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$/u.test(name)
+  );
 }
 
 function isObservationHealth(value: unknown): value is ObservationHealth {
@@ -645,7 +810,7 @@ export function isObservationFresh(
   return ageMs >= 0 && maxAgeMs >= 0 && ageMs <= maxAgeMs;
 }
 
-/** Revalidate one route at use time so a fresh sidecar cannot extend old usage. */
+/** Classify Measurement age for diagnostics without changing route admission. */
 export function isRouteMeasurementFresh(
   route: Route,
   nowMs: number,

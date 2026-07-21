@@ -34,6 +34,8 @@ function account(
     number,
     email: `private-${number}@example.test`,
     organizationUuid: `secret-${number}`,
+    subscriptionType: "max",
+    rateLimitMultiplier: 20,
     usageStatus: "ok",
     usageFetchedAt: "2026-07-17T23:59:30Z",
     usage: {
@@ -51,24 +53,28 @@ function inventory(accounts: unknown[], activeAccountNumber = 1) {
 
 describe("parseCswapList", () => {
   test("classifies unavailable, malformed, provider error, and unsupported schema", () => {
-    expect(parseCswapList({ code: null, stdout: "" }, NOW, 60_000).health).toBe(
+    expect(parseCswapList({ code: null, stdout: "" }, NOW).health).toBe(
       "absent",
     );
-    expect(parseCswapList({ code: 0, stdout: "{" }, NOW, 60_000).health).toBe(
+    expect(parseCswapList({ code: 0, stdout: "{" }, NOW).health).toBe(
       "malformed",
     );
     expect(
-      parseCswapList(outcome({ schemaVersion: 1, error: {} }, 1), NOW, 60_000)
-        .health,
+      parseCswapList(outcome({ schemaVersion: 1, error: {} }, 1), NOW).health,
     ).toBe("error");
-    expect(
-      parseCswapList(outcome({ schemaVersion: 2, accounts: [] }), NOW, 60_000)
-        .health,
-    ).toBe("unsupported");
+    const unsupported = parseCswapList(
+      outcome({ schemaVersion: "private-account@example.test", accounts: [] }),
+      NOW,
+    );
+    expect(unsupported.health).toBe("unsupported");
+    expect(unsupported.notes).toEqual(["cswap: unsupported schema"]);
+    expect(JSON.stringify(unsupported)).not.toContain(
+      "private-account@example.test",
+    );
     const tooMany = Array.from({ length: MAX_CSWAP_ACCOUNTS + 1 }, (_, index) =>
       account(index + 1),
     );
-    const bounded = parseCswapList(outcome(inventory(tooMany)), NOW, 60_000);
+    const bounded = parseCswapList(outcome(inventory(tooMany)), NOW);
     expect(bounded.health).toBe("unsupported");
     expect(bounded.notes).toEqual([
       `cswap: account count exceeds ${MAX_CSWAP_ACCOUNTS}`,
@@ -79,7 +85,6 @@ describe("parseCswapList", () => {
     const parsed = parseCswapList(
       outcome(inventory([account(7), account(2)], 7)),
       NOW,
-      60_000,
     );
     expect(parsed.health).toBe("ok");
     expect(parsed.routes.map((route) => route.id)).toEqual([
@@ -95,18 +100,30 @@ describe("parseCswapList", () => {
       "claude-swap:7": 0,
       "claude-swap:2": 1,
     });
+    expect(parsed.accountCapacity).toEqual({
+      "claude-swap:7": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+      "claude-swap:2": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+    });
   });
 
   test("keeps stable ordinals for known but unrouteable rows", () => {
     const parsed = parseCswapList(
       outcome(
         inventory([
-          account(4, { usageStatus: "relogin_required" }),
+          account(4, {
+            usageStatus: "relogin_required",
+            usageFetchedAt: undefined,
+          }),
           account(9),
         ]),
       ),
       NOW,
-      60_000,
     );
     expect(parsed.routes.map((route) => route.id)).toEqual(["claude-swap:9"]);
     expect(parsed.accountOrdinals).toEqual({
@@ -116,36 +133,172 @@ describe("parseCswapList", () => {
     expect(parsed.accountIssues).toEqual({
       "claude-swap:4": "relogin-required",
     });
+    expect(parsed.accountCapacity["claude-swap:4"]).toEqual({
+      subscriptionType: "max",
+      rateLimitMultiplier: 20,
+    });
     expect(parsed.notes).toContain(
       "cswap: slot 4 not routeable (relogin_required)",
     );
   });
 
-  test("requires freshness and quota windows", () => {
+  test("admits only bounded account capacity metadata", () => {
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(1, { subscriptionType: "pro", rateLimitMultiplier: 1 }),
+          account(2, {
+            subscriptionType: "private-enterprise-plan",
+            rateLimitMultiplier: 100,
+          }),
+          account(3, { subscriptionType: "max", rateLimitMultiplier: 5 }),
+        ]),
+      ),
+      NOW,
+    );
+    expect(parsed.accountCapacity).toEqual({
+      "claude-swap:1": {
+        subscriptionType: "pro",
+        rateLimitMultiplier: 1,
+      },
+      "claude-swap:3": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 5,
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("private-enterprise-plan");
+  });
+
+  test("keeps display-grade last-good usage separate from routing", () => {
+    const fetchedAt = "2026-07-17T22:30:00Z";
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(5, {
+            usageStatus: "unavailable",
+            usage: undefined,
+            usageFetchedAt: undefined,
+            usageAgeSeconds: undefined,
+            lastGoodUsage: {
+              fiveHour: { pct: 25, resetsAt: "2026-07-18T02:00:00Z" },
+              sevenDay: { pct: 50, resetsAt: "2026-07-20T00:00:00Z" },
+              scoped: [],
+            },
+            lastGoodFetchedAt: fetchedAt,
+            lastGoodAgeSeconds: 5_400,
+          }),
+          account(6, {
+            usageStatus: "unavailable",
+            usage: undefined,
+            usageFetchedAt: undefined,
+            lastGoodUsage: { fiveHour: { pct: "owner@example.test" } },
+            lastGoodFetchedAt: "owner@example.test",
+          }),
+        ]),
+      ),
+      NOW,
+    );
+    expect(parsed.routes).toEqual([]);
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:5": "usage-unavailable",
+      "claude-swap:6": "usage-unavailable",
+    });
+    expect(parsed.accountMeasurements).toEqual({
+      "claude-swap:5": {
+        measuredAtMs: Date.parse(fetchedAt),
+        windows: [
+          {
+            key: "session",
+            utilization: 0.25,
+            resetsAt: "2026-07-18T02:00:00.000Z",
+          },
+          {
+            key: "week",
+            utilization: 0.5,
+            resetsAt: "2026-07-20T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("owner@example.test");
+  });
+
+  test("maps unknown provider statuses without retaining provider text", () => {
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(5, { usageStatus: "private-account@example.test" }),
+        ]),
+      ),
+      NOW,
+    );
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:5": "account-unavailable",
+    });
+    expect(parsed.notes).toEqual(["cswap: slot 5 not routeable (unavailable)"]);
+    expect(JSON.stringify(parsed)).not.toContain(
+      "private-account@example.test",
+    );
+  });
+
+  test("requires provenance and base windows but not a measurement age", () => {
+    const oldFetchedAt = "2001-01-01T00:00:00Z";
+    const futureFetchedAt = "2099-01-01T00:00:00Z";
     const parsed = parseCswapList(
       outcome(
         inventory([
           account(1, { usageFetchedAt: undefined, usageAgeSeconds: undefined }),
-          account(2, { usageFetchedAt: "2026-07-17T23:00:00Z" }),
+          account(2, { usageFetchedAt: oldFetchedAt }),
           account(3, { usage: { scoped: [] } }),
           account(4, { usageFetchedAt: undefined, usageAgeSeconds: 10 }),
+          account(5, { usageFetchedAt: futureFetchedAt }),
+          account(6, {
+            usageFetchedAt: oldFetchedAt,
+            usageAgeSeconds: 1,
+          }),
+          account(7, {
+            usageFetchedAt: "private-account@example.test",
+            usageAgeSeconds: undefined,
+          }),
+          account(8, {
+            usage: {
+              fiveHour: { pct: "unknown" },
+              sevenDay: { pct: 40 },
+              scoped: [],
+            },
+          }),
         ]),
       ),
       NOW,
-      60_000,
     );
-    expect(parsed.routes.map((route) => route.id)).toEqual(["claude-swap:4"]);
+    expect(parsed.routes.map((route) => route.id)).toEqual([
+      "claude-swap:2",
+      "claude-swap:4",
+      "claude-swap:5",
+      "claude-swap:6",
+    ]);
+    expect(parsed.routes.map((route) => route.measuredAtMs)).toEqual([
+      Date.parse(oldFetchedAt),
+      NOW - 10_000,
+      Date.parse(futureFetchedAt),
+      Date.parse(oldFetchedAt),
+    ]);
     expect(parsed.accountIssues).toEqual({
       "claude-swap:1": "missing-freshness",
-      "claude-swap:2": "measurement-stale",
       "claude-swap:3": "missing-windows",
+      "claude-swap:7": "missing-freshness",
+      "claude-swap:8": "missing-windows",
     });
     expect(parsed.notes).toEqual(
       expect.arrayContaining([
         "cswap: slot 1 has no freshness signal",
-        "cswap: slot 2 measurement stale",
-        "cswap: slot 3 has no windows",
+        "cswap: slot 3 has no required windows",
+        "cswap: slot 7 has no freshness signal",
+        "cswap: slot 8 has no required windows",
       ]),
+    );
+    expect(JSON.stringify(parsed)).not.toContain(
+      "private-account@example.test",
     );
   });
 
@@ -180,7 +333,6 @@ describe("parseCswapList", () => {
         ]),
       ),
       NOW,
-      60_000,
     );
     expect(parsed.routes.map((route) => route.id)).toEqual([
       "claude-swap:1",
@@ -229,7 +381,6 @@ describe("parseCswapList", () => {
         ]),
       ),
       NOW,
-      60_000,
     );
     expect(parsed.routes).toEqual([]);
     expect(parsed.accountIssues).toEqual({
@@ -253,7 +404,6 @@ describe("parseCswapList", () => {
         ]),
       ),
       NOW,
-      60_000,
     );
     expect(
       parsed.routes[0]?.windows.find((window) => window.key === "model:Fable")
@@ -263,11 +413,7 @@ describe("parseCswapList", () => {
   });
 
   test("normalizes account and scoped windows without retaining PII", () => {
-    const parsed = parseCswapList(
-      outcome(inventory([account(3)])),
-      NOW,
-      60_000,
-    );
+    const parsed = parseCswapList(outcome(inventory([account(3)])), NOW);
     expect(parsed.routes[0]?.windows.map((window) => window.key)).toEqual([
       "session",
       "week",
@@ -278,9 +424,10 @@ describe("parseCswapList", () => {
   });
 });
 
-describe("schema-v6 observation sidecar", () => {
+describe("schema-v7 observation sidecar", () => {
   test("builds a managed-only observation", () => {
-    const cswap = parseCswapList(outcome(inventory([account(5)])), NOW, 60_000);
+    expect(OBSERVATION_SCHEMA_VERSION).toBe(7);
+    const cswap = parseCswapList(outcome(inventory([account(5)])), NOW);
     const observation = buildObservation({ observedAtMs: NOW, cswap });
     expect(observation).toMatchObject({
       schema_version: OBSERVATION_SCHEMA_VERSION,
@@ -289,6 +436,12 @@ describe("schema-v6 observation sidecar", () => {
       claude_accounts: {
         count: 1,
         ordinals: { "claude-swap:5": 0 },
+      },
+      account_capacity: {
+        "claude-swap:5": {
+          subscriptionType: "max",
+          rateLimitMultiplier: 20,
+        },
       },
       account_issues: {},
     });
@@ -301,14 +454,14 @@ describe("schema-v6 observation sidecar", () => {
     const path = join(root, "observation.json");
     const observation = buildObservation({
       observedAtMs: NOW,
-      cswap: parseCswapList(outcome(inventory([account(6)])), NOW, 60_000),
+      cswap: parseCswapList(outcome(inventory([account(6)])), NOW),
     });
     writeObservationSidecar(path, observation);
     expect(readObservationSidecar(path)).toEqual(observation);
     expect(
       validateObservation({
         ...observation,
-        schema_version: OBSERVATION_SCHEMA_VERSION - 1,
+        schema_version: 6,
       }),
     ).toBeNull();
     expect(
@@ -330,13 +483,35 @@ describe("schema-v6 observation sidecar", () => {
     expect(
       validateObservation({
         ...observation,
-        account_issues: { "claude-swap:6": "measurement-stale" },
+        account_issues: { "claude-swap:6": "account-unavailable" },
       }),
     ).toBeNull();
     expect(
       validateObservation({
         ...observation,
-        account_issues: { "claude-swap:99": "measurement-stale" },
+        account_capacity: {
+          "claude-swap:99": {
+            subscriptionType: "max",
+            rateLimitMultiplier: 20,
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_measurements: {
+          "claude-swap:6": {
+            measuredAtMs: NOW - 5_400_000,
+            windows: observation.routes[0]?.windows,
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_issues: { "claude-swap:99": "account-unavailable" },
       }),
     ).toBeNull();
     expect(
@@ -349,6 +524,24 @@ describe("schema-v6 observation sidecar", () => {
               ? { ...window, resetsAt: "private@example.test\nZ" }
               : window,
           ),
+        })),
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        routes: observation.routes.map((route) => ({
+          ...route,
+          windows: route.windows.filter((window) => window.key !== "week"),
+        })),
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        routes: observation.routes.map((route) => ({
+          ...route,
+          windows: [...route.windows, route.windows[0]],
         })),
       }),
     ).toBeNull();
@@ -371,7 +564,7 @@ describe("schema-v6 observation sidecar", () => {
   test("freshness rejects future and old sidecars", () => {
     const observation = buildObservation({
       observedAtMs: NOW,
-      cswap: parseCswapList(outcome(inventory([account(1)])), NOW, 60_000),
+      cswap: parseCswapList(outcome(inventory([account(1)])), NOW),
     });
     expect(isObservationFresh(observation, NOW, 1)).toBe(true);
     expect(isObservationFresh(observation, NOW - 1, 60_000)).toBe(false);

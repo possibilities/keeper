@@ -708,6 +708,8 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     "worker_provider",
     // Atomic canonical Fable-focus policy JSON; NULL means policy off.
     "fable_focus",
+    // Separate cells keep either scope's malformed delivery from contaminating its sibling.
+    "non_fable_focus",
   ],
   pk: "id",
   version: "last_event_id",
@@ -716,7 +718,7 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
   filters: {
     id: "id",
   },
-  jsonColumns: new Set(["fable_focus"]),
+  jsonColumns: new Set(["fable_focus", "non_fable_focus"]),
 };
 
 /**
@@ -848,43 +850,6 @@ export const PROVIDER_LEG_OWNERSHIP_DESCRIPTOR: CollectionDescriptor = {
     sql: "leg_session_id IN (SELECT job_id FROM jobs WHERE state IN ('working', 'stopped'))",
     params: [],
   },
-  jsonColumns: new Set(),
-};
-
-/**
- * The `builds` descriptor — one row per registered buildbot builder, keyed by
- * builder NAME (`project`). A reducer projection produced by synthetic
- * `BuildSnapshot` / `BuildDeleted` events; the `keeper builds` dashboard
- * subscribes over the socket. All scalar columns (no JSON). `version:
- * 'last_event_id'` so the diff fires on every fold; default sort is stable by
- * pk so the dashboard renders builders alphabetically.
- */
-export const BUILDS_DESCRIPTOR: CollectionDescriptor = {
-  name: "builds",
-  table: "builds",
-  columns: [
-    "project",
-    "builder_id",
-    "build_number",
-    "complete",
-    "results",
-    "state_string",
-    "started_at",
-    "complete_at",
-    "last_event_id",
-    "updated_at",
-  ],
-  pk: "project",
-  version: "last_event_id",
-  sortable: new Set([
-    "project",
-    "build_number",
-    "results",
-    "last_event_id",
-    "updated_at",
-  ]),
-  defaultSort: { column: "project", dir: "asc" },
-  filters: { project: "project" },
   jsonColumns: new Set(),
 };
 
@@ -1100,7 +1065,6 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [DISPATCH_CLAIMS_DESCRIPTOR.name, DISPATCH_CLAIMS_DESCRIPTOR],
   [PROVIDER_LEG_OWNERSHIP_DESCRIPTOR.name, PROVIDER_LEG_OWNERSHIP_DESCRIPTOR],
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
-  [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
   [AWAITS_DESCRIPTOR.name, AWAITS_DESCRIPTOR],
@@ -1136,7 +1100,6 @@ export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
   "pending_dispatches",
   "dispatch_claims",
   "armed_epics",
-  "builds",
   "block_escalations",
   "handoffs",
   "awaits",

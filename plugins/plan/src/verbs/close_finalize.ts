@@ -43,7 +43,7 @@
 // delegation calls bun's OWN ported runEpicClose / runScaffold with stdout
 // captured (never a subprocess of itself).
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   readdirSync,
@@ -56,6 +56,17 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolveAbs } from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
+
+import { CommitWorkLock } from "../../../../src/commit-work/flock.ts";
+import {
+  decideTrunkIntegrationFence,
+  readTrunkLeaseLeaf,
+  TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+  trunkLeaseIsValid,
+  writeTrunkLeaseRequest,
+} from "../../../../src/grant-leaf.ts";
+import { keeperStateDir } from "../../../../src/keeper-state-dir.ts";
 
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
@@ -74,19 +85,25 @@ import {
 import { resolveEpicGlobally } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
+import { effectiveMatrix } from "../host_matrix.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import { configuredEfforts, configuredModels } from "../models.ts";
 import {
   contextForRoot,
   type ProjectContext,
   resolveProject,
 } from "../project.ts";
+import { computeSelectionInputHash } from "../selection_input_hash.ts";
 import {
+  FOLLOWUP_VERDICT_SCHEMA_VERSION,
+  isSparkExclusionReason,
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
+  SPARK_MODEL,
+  type SparkExclusionReason,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
+import { resolvePlanSessionId } from "../session_id.ts";
 import { clearCloseMarker } from "../session_markers.ts";
 import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
@@ -567,6 +584,764 @@ function synthesizeVerdictIfZeroFindings(
   };
 }
 
+export interface TrunkGitResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** The verdict of running a merge-suite gate against the merged tree in the
+ * private scratch worktree (ADR 0102), mirroring the daemon's own
+ * `MergeSuiteVerdict`. `green` clears the integration to land; `red` is a
+ * semantic-merge breakage (two individually-green sides whose merged tree fails
+ * the suite) that aborts the land visibly; `cannot-run` is a gate that could not
+ * produce a verdict (install/suite crash/timeout) and DEFERS — never a silent
+ * land, never a false red. */
+export type MergeSuiteVerdict =
+  | { kind: "green" }
+  | { kind: "red"; detail: string }
+  | { kind: "cannot-run"; detail: string };
+
+/** The result of a bounded lease-acquire request/poll round-trip — a typed
+ * value instead of an in-band `emitFinalizeError` exit, so the caller decides
+ * which typed error to raise (and a test can inject a deps bundle that never
+ * touches process.exit). */
+export type TrunkLeaseRequestResult =
+  | { ok: true; lease: TrunkLeaseLeaf }
+  | { ok: false; reason: "request_failed" | "pending" };
+
+/** The trunk-merge orchestration's pure seam: every git spawn, the commit-work
+ * lock, and the lease request/release round-trip the verb performs, bundled
+ * behind one injectable object. Production threads {@link
+ * realTrunkIntegrationDeps} through every call by default; a saga test injects
+ * a fake bundle so `integrateRepoUnderLease` / `integrateEpicBases` run
+ * against scripted git + lease responses with zero real git or daemon
+ * round-trip. Mirrors the daemon-side `TrunkLeaseSweepDeps` seam. */
+export interface TrunkIntegrationDeps {
+  git(args: string[], cwd: string): TrunkGitResult;
+  acquireLock(repoRoot: string): { release(): void } | null;
+  requestLease(
+    stateDir: string,
+    epicId: string,
+    repoRoot: string,
+    sourceBranch: string,
+    claimantSessionId: string,
+    minimumToken: number,
+  ): TrunkLeaseRequestResult;
+  releaseLease(stateDir: string, lease: TrunkLeaseLeaf): boolean;
+  readLeaseLeaf(stateDir: string, repoRoot: string): TrunkLeaseLeaf | null;
+  /** OPTIONAL merge-suite gate probe (ADR 0102) run against the merged tree in
+   * the private scratch worktree BEFORE the epic lands. `worktreePath` is the
+   * scratch checkout holding the merge; `mergedCommit` is its HEAD. Undefined →
+   * the plan CLI skips the gate: the AUTHORITATIVE merge-suite gate stays
+   * daemon-owned (it re-runs against the same integrated commit the closer
+   * produces), so `realTrunkIntegrationDeps` leaves this unset and the saga tests
+   * inject a fake to drive the green / red / cannot-run decision deterministically. */
+  runMergeSuite?(args: {
+    worktreePath: string;
+    mergedCommit: string;
+  }): MergeSuiteVerdict;
+}
+
+function trunkGit(args: string[], cwd: string): TrunkGitResult {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+  ]) {
+    delete env[key];
+  }
+  try {
+    const proc = Bun.spawnSync(["git", ...args], {
+      cwd,
+      env,
+      timeout: 30_000,
+    });
+    return {
+      code: proc.exitCode,
+      stdout: proc.stdout.toString(),
+      stderr: proc.stderr.toString(),
+    };
+  } catch (err) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function waitBriefly(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireTrunkLock(repoRoot: string): CommitWorkLock | null {
+  const gitDir = trunkGit(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    repoRoot,
+  );
+  const path =
+    gitDir.code === 0 && gitDir.stdout.trim() !== ""
+      ? join(gitDir.stdout.trim(), "keeper-commit-work.lock")
+      : join(repoRoot, ".git", "keeper-commit-work.lock");
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const lock = CommitWorkLock.tryAcquire(path);
+    if (lock !== null) return lock;
+    waitBriefly(50);
+  }
+  return null;
+}
+
+function requestTrunkLease(
+  stateDir: string,
+  epicId: string,
+  repoRoot: string,
+  sourceBranch: string,
+  claimantSessionId: string,
+  minimumToken: number,
+): TrunkLeaseRequestResult {
+  const requestId = randomBytes(16).toString("hex");
+  const requested = writeTrunkLeaseRequest(stateDir, {
+    schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+    action: "acquire",
+    epic_id: epicId,
+    repo_root: repoRoot,
+    source_branch: sourceBranch,
+    claimant_session_id: claimantSessionId,
+    request_id: requestId,
+    fencing_token: null,
+    requested_at: Date.now(),
+  });
+  if (requested === null) {
+    return { ok: false, reason: "request_failed" };
+  }
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const leaf = readTrunkLeaseLeaf(stateDir, repoRoot);
+    if (
+      leaf !== null &&
+      leaf.fencing_token >= minimumToken &&
+      leaf.acquisition_id === requestId &&
+      trunkLeaseIsValid(
+        leaf,
+        {
+          epicId,
+          repoRoot,
+          sourceBranch,
+          claimantSessionId,
+        },
+        Date.now(),
+      )
+    ) {
+      return { ok: true, lease: leaf };
+    }
+    waitBriefly(100);
+  }
+  return { ok: false, reason: "pending" };
+}
+
+function releaseTrunkLease(stateDir: string, lease: TrunkLeaseLeaf): boolean {
+  const requested = writeTrunkLeaseRequest(stateDir, {
+    schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+    action: "release",
+    epic_id: lease.epic_id,
+    repo_root: lease.repo_root,
+    source_branch: lease.source_branch,
+    claimant_session_id: lease.claimant_session_id,
+    request_id: randomBytes(16).toString("hex"),
+    fencing_token: lease.fencing_token,
+    requested_at: Date.now(),
+  });
+  if (requested === null) return false;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const current = readTrunkLeaseLeaf(stateDir, lease.repo_root);
+    if (
+      current !== null &&
+      (current.fencing_token !== lease.fencing_token || !current.active)
+    ) {
+      return true;
+    }
+    waitBriefly(100);
+  }
+  return false;
+}
+
+/** Production wiring for {@link TrunkIntegrationDeps} — verbatim git spawns,
+ * the real flock-backed commit-work lock, and the real daemon-mediated lease
+ * request/release round-trip. Every trunk-merge call site defaults to this;
+ * a saga test overrides it with a fake bundle. `runMergeSuite` is deliberately
+ * unset: the AUTHORITATIVE merge-suite gate stays daemon-owned (it re-runs
+ * against the same integrated commit the closer publishes), so the plan CLI
+ * relocates the merge into a private worktree without shelling a heavyweight
+ * suite of its own — the saga tests inject a fake gate to drive the decision. */
+const realTrunkIntegrationDeps: TrunkIntegrationDeps = {
+  git: trunkGit,
+  acquireLock: acquireTrunkLock,
+  requestLease: requestTrunkLease,
+  releaseLease: releaseTrunkLease,
+  readLeaseLeaf: readTrunkLeaseLeaf,
+};
+
+function ancestryProbe(
+  repoRoot: string,
+  sourceBranch: string,
+  defaultBranch: string,
+  deps: TrunkIntegrationDeps,
+): "ancestor" | "not-ancestor" | "inconclusive" {
+  const probe = deps.git(
+    ["merge-base", "--is-ancestor", sourceBranch, defaultBranch],
+    repoRoot,
+  );
+  return probe.code === 0
+    ? "ancestor"
+    : probe.code === 1
+      ? "not-ancestor"
+      : "inconclusive";
+}
+
+/** Reconciles the ancestor re-grade path with the SKILL.md recovery contract
+ * (Phase 4: "its integration grade adopts and releases the still-live trunk
+ * lease before close"). A prior attempt may have conflicted mid-merge,
+ * retained its fenced lease (TRUNK_INTEGRATION_CONFLICT), and then been
+ * resolved out-of-band (the deconflict/merge-resolver path lands the merge
+ * directly against the checkout) — a re-grade here reads "ancestor" with that
+ * ORIGINAL lease still active. Adopting means releasing it under the SAME
+ * claimant identity that acquired it (this closer's own session, re-entering
+ * finalize per the Phase 4 recovery contract), never a fresh acquire. A leaf
+ * absent, expired, or held by a different claimant/epic/branch is left alone.
+ * Best-effort: a release failure here is never fatal — the daemon's
+ * claimant-death reclaim remains the fallback once the lease's TTL or
+ * claimant liveness lapses. */
+function adoptLingeringLease(
+  stateDir: string,
+  epicId: string,
+  repoRoot: string,
+  sourceBranch: string,
+  claimantSessionId: string,
+  deps: TrunkIntegrationDeps,
+): void {
+  const leaf = deps.readLeaseLeaf(stateDir, repoRoot);
+  if (leaf === null) {
+    return;
+  }
+  if (
+    !trunkLeaseIsValid(
+      leaf,
+      { epicId, repoRoot, sourceBranch, claimantSessionId },
+      Date.now(),
+    )
+  ) {
+    return;
+  }
+  deps.releaseLease(stateDir, leaf);
+}
+
+/** The private scratch worktree + temp branch one lease attempt cuts from the
+ * local default tip: the epic base merges HERE, never in the shared checkout, so
+ * the shared checkout is only ever fast-forwarded and no `MERGE_HEAD` is ever
+ * visible in it (ADR 0102). Keyed on the epic + a random suffix so a retried or
+ * concurrent attempt never collides; reaped on EVERY exit path. */
+interface TrunkScratch {
+  path: string;
+  branch: string;
+}
+
+function trunkScratchFor(epicId: string): TrunkScratch {
+  const token = randomBytes(8).toString("hex");
+  const slug = epicId.replace(/[^A-Za-z0-9._-]/g, "-");
+  return {
+    path: join(tmpdir(), `keeper-trunk-integrate-${slug}-${token}`),
+    branch: `keeper/trunk-integrate/${slug}-${token}`,
+  };
+}
+
+/** Best-effort teardown of the scratch worktree + temp branch — run on EVERY exit
+ * path (success, conflict, gate-red, publish-fail, drift) so an integration attempt
+ * never leaks a worktree or branch. Each step ignores its own result; a leftover
+ * admin husk is swept by the trailing prune. `--force` clears a scratch tree left
+ * dirty or mid-merge (the conflict path). */
+function reapTrunkScratch(
+  deps: TrunkIntegrationDeps,
+  repoRoot: string,
+  scratch: TrunkScratch,
+): void {
+  deps.git(["worktree", "remove", "--force", scratch.path], repoRoot);
+  deps.git(["branch", "-D", scratch.branch], repoRoot);
+  deps.git(["worktree", "prune"], repoRoot);
+}
+
+/** Cut the private scratch worktree at the leased default tip on a fresh temp
+ * branch. Reaps any stale residue first (a crashed prior attempt) so the add never
+ * collides. Returns a typed failure the caller defers on rather than throwing. */
+function provisionTrunkScratch(
+  deps: TrunkIntegrationDeps,
+  repoRoot: string,
+  scratch: TrunkScratch,
+  baseOid: string,
+): { ok: true } | { ok: false; detail: string } {
+  reapTrunkScratch(deps, repoRoot, scratch);
+  const add = deps.git(
+    ["worktree", "add", "-b", scratch.branch, scratch.path, baseOid],
+    repoRoot,
+  );
+  if (add.code !== 0) {
+    reapTrunkScratch(deps, repoRoot, scratch);
+    return { ok: false, detail: (add.stdout + add.stderr).trim() };
+  }
+  return { ok: true };
+}
+
+export function integrateRepoUnderLease(
+  epicId: string,
+  repoRoot: string,
+  sourceBranch: string,
+  claimantSessionId: string,
+  format: OutputFormat | null,
+  deps: TrunkIntegrationDeps = realTrunkIntegrationDeps,
+): void {
+  const stateDir = keeperStateDir();
+  let minimumToken = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const requested = deps.requestLease(
+      stateDir,
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+      minimumToken,
+    );
+    if (!requested.ok) {
+      if (requested.reason === "request_failed") {
+        emitFinalizeError(
+          "TRUNK_LEASE_REQUEST_FAILED",
+          `could not publish the trunk-integration lease request for ${repoRoot}`,
+          format,
+          { repo_root: repoRoot },
+        );
+      }
+      emitFinalizeError(
+        "TRUNK_LEASE_PENDING",
+        `the trunk-integration lease for ${repoRoot} was not published before the bounded wait expired; release any live holder and re-run /plan:close ${epicId}`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const lease = requested.lease;
+    const releaseOrFail = (): void => {
+      if (!deps.releaseLease(stateDir, lease)) {
+        emitFinalizeError(
+          "TRUNK_LEASE_RELEASE_FAILED",
+          `the daemon did not acknowledge release of trunk lease ${lease.fencing_token} for ${repoRoot}; no successor may integrate until claimant death is observed`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+    };
+
+    const lock = deps.acquireLock(repoRoot);
+    if (lock === null) {
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_LOCK_TIMEOUT",
+        `the commit-work lock for ${repoRoot} stayed occupied through the bounded deadline; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    // ADR 0102: the epic base merges in a PRIVATE scratch worktree cut from the
+    // leased default tip, never in the shared checkout. Unrelated dirt in the
+    // shared checkout, or the shared checkout sitting on another branch, does
+    // not block integration, and no MERGE_HEAD is ever visible in the shared
+    // checkout. The shared checkout is only ever fast-forwarded, and only when
+    // it is clean AND on the default branch.
+    const sourceTip = deps.git(
+      ["rev-parse", "--verify", `refs/heads/${sourceBranch}^{commit}`],
+      repoRoot,
+    );
+    const sourceOid = sourceTip.stdout.trim();
+    if (sourceTip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(sourceOid)) {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `the in-fence source tip for ${sourceBranch} could not be resolved; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    const liveTip = deps.git(
+      ["rev-parse", "--verify", `refs/heads/${lease.default_branch}^{commit}`],
+      repoRoot,
+    );
+    const liveOid = liveTip.stdout.trim();
+    const reprobe = ancestryProbe(
+      repoRoot,
+      sourceBranch,
+      lease.default_branch,
+      deps,
+    );
+    const fence = deps.readLeaseLeaf(stateDir, repoRoot);
+    const decision = decideTrunkIntegrationFence({
+      leaseValid:
+        fence !== null &&
+        trunkLeaseIsValid(
+          fence,
+          {
+            epicId,
+            repoRoot,
+            sourceBranch,
+            claimantSessionId,
+            fencingToken: lease.fencing_token,
+          },
+          Date.now(),
+        ),
+      ancestry: reprobe,
+      observedDefaultTip: lease.observed_default_tip,
+      liveDefaultTip: liveTip.code === 0 ? liveOid : null,
+    });
+    if (decision.kind === "already-integrated") {
+      lock.release();
+      releaseOrFail();
+      return;
+    }
+    if (decision.kind === "defer") {
+      lock.release();
+      releaseOrFail();
+      if (decision.reason === "ancestry-inconclusive") {
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_DEFERRED",
+          `the in-fence ancestry re-probe for ${sourceBranch} and ${lease.default_branch} was inconclusive; no merge was attempted`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+      minimumToken = lease.fencing_token + 1;
+      waitBriefly(150);
+      continue;
+    }
+
+    // Cut the private scratch worktree at the leased default tip and merge the epic
+    // base THERE — reaped on EVERY exit path below (success, conflict, gate-red,
+    // drift), so an attempt never leaks a worktree or branch.
+    const scratch = trunkScratchFor(epicId);
+    const provisioned = provisionTrunkScratch(deps, repoRoot, scratch, liveOid);
+    if (!provisioned.ok) {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not provision a scratch worktree at ${lease.default_branch} (${liveOid}) in ${repoRoot}: ${provisioned.detail}; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+
+    const merged = deps.git(["merge", "--no-edit", sourceOid], scratch.path);
+    if (merged.code !== 0) {
+      const conflictHead = deps.git(
+        ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        scratch.path,
+      );
+      const conflicts = deps.git(
+        ["diff", "--name-only", "--diff-filter=U"],
+        scratch.path,
+      );
+      const conflicted =
+        conflictHead.code === 0 && conflictHead.stdout.trim() !== "";
+      const mergeHeadOid = conflictHead.stdout.trim();
+      const conflictedFiles = conflicts.stdout
+        .split("\n")
+        .map((p) => p.trim())
+        .filter(Boolean);
+      // Reap the conflicted scratch worktree (its MERGE_HEAD never touches the
+      // shared checkout) BEFORE surfacing the typed receipt.
+      reapTrunkScratch(deps, repoRoot, scratch);
+      if (conflicted) {
+        // Preserve the existing conflict outcome: the closer RETAINS its fenced
+        // lease (no release) so the downstream worktree-merge-conflict resolver /
+        // plan:deconflicter path owns resolution while this closer stays the live
+        // trunk owner.
+        lock.release();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_CONFLICT",
+          `merging ${sourceBranch} into ${lease.default_branch} conflicted under trunk lease ${lease.fencing_token}; route the typed receipt through plan:deconflicter`,
+          format,
+          {
+            repo_root: repoRoot,
+            source_branch: sourceBranch,
+            default_branch: lease.default_branch,
+            fencing_token: lease.fencing_token,
+            merge_head: mergeHeadOid,
+            conflicted_files: conflictedFiles,
+          },
+        );
+      }
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_FAILED",
+        `git merge failed without merge residue in the scratch worktree for ${repoRoot}: ${(merged.stdout + merged.stderr).trim()}`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    const mergedCommit = deps
+      .git(["rev-parse", "HEAD"], scratch.path)
+      .stdout.trim();
+    // Objective containment: git merge reported success, but prove the source tip
+    // is actually contained in the merged HEAD before landing anything.
+    const contained = deps.git(
+      ["merge-base", "--is-ancestor", sourceOid, "HEAD"],
+      scratch.path,
+    );
+    if (contained.code !== 0) {
+      reapTrunkScratch(deps, repoRoot, scratch);
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_UNVERIFIED",
+        `git merge returned success but ${sourceBranch} is not provably contained in the merged tree; teardown remains fenced off`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+
+    // Merge-suite gate (ADR 0102): run the injected gate against the MERGED tree in
+    // the scratch worktree. red aborts the land visibly; cannot-run DEFERS; a
+    // missing probe means the authoritative gate is daemon-owned (see the dep doc).
+    if (deps.runMergeSuite !== undefined) {
+      const verdict = deps.runMergeSuite({
+        worktreePath: scratch.path,
+        mergedCommit,
+      });
+      if (verdict.kind === "red") {
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_SUITE_RED",
+          `the merge-suite gate failed against the merged tree for ${epicId} in ${repoRoot} (merged commit ${mergedCommit}): ${verdict.detail}`,
+          format,
+          {
+            repo_root: repoRoot,
+            fencing_token: lease.fencing_token,
+            merged_commit: mergedCommit,
+          },
+        );
+      }
+      if (verdict.kind === "cannot-run") {
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_DEFERRED",
+          `the merge-suite gate could not run against the merged tree for ${epicId} in ${repoRoot} (${verdict.detail}); no merge was landed`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+    }
+
+    // Publish the merge to the LOCAL default branch. The shared checkout is only
+    // ever fast-forwarded, and only when it is clean AND on the default branch;
+    // otherwise ONLY the fast-forward is deferred — the ref still advances so the
+    // epic lands, and the trailing shared checkout is left to the existing
+    // shared-checkout-desync producer (a visible, self-clearing signal), never a
+    // refusal of the whole integration.
+    const sharedHead = deps.git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+    const onDefault =
+      sharedHead.code === 0 &&
+      sharedHead.stdout.trim() === lease.default_branch;
+    const sharedDirty = deps.git(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      repoRoot,
+    );
+    const sharedClean =
+      sharedDirty.code === 0 && sharedDirty.stdout.trim() === "";
+    if (onDefault && sharedClean) {
+      // Clean, on-branch shared checkout: fast-forward it (ref + working tree) to
+      // the merged commit exactly as before.
+      const ff = deps.git(["merge", "--ff-only", mergedCommit], repoRoot);
+      if (ff.code !== 0) {
+        // The default drifted out from under the fence between the tip read and the
+        // fast-forward; reap and retry from a fresh tip.
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        minimumToken = lease.fencing_token + 1;
+        waitBriefly(150);
+        continue;
+      }
+    } else {
+      // Dirty or off-branch shared checkout: DEFER ONLY THE FF. Advance the default
+      // ref (compare-and-swap against the leased tip) so the merge lands locally,
+      // leaving the working tree trailing for the shared-checkout-desync producer.
+      const advance = deps.git(
+        [
+          "update-ref",
+          `refs/heads/${lease.default_branch}`,
+          mergedCommit,
+          liveOid,
+        ],
+        repoRoot,
+      );
+      if (advance.code !== 0) {
+        // A concurrent local advance won the CAS (the default moved under the
+        // fence); reap and retry from a fresh tip.
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        minimumToken = lease.fencing_token + 1;
+        waitBriefly(150);
+        continue;
+      }
+    }
+
+    reapTrunkScratch(deps, repoRoot, scratch);
+    lock.release();
+    releaseOrFail();
+    return;
+  }
+  emitFinalizeError(
+    "TRUNK_TIP_DRIFT",
+    `${repoRoot} default advanced during three independently fenced lease attempts; no stale merge was attempted`,
+    format,
+    { repo_root: repoRoot },
+  );
+}
+
+function resolveTrunkDefaultBranch(
+  repoRoot: string,
+  deps: TrunkIntegrationDeps,
+): string | null {
+  const symbolic = deps.git(
+    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    repoRoot,
+  );
+  const fromOrigin =
+    symbolic.code === 0 ? symbolic.stdout.trim().replace(/^origin\//, "") : "";
+  if (fromOrigin !== "") return fromOrigin;
+  for (const candidate of ["main", "master", "trunk"]) {
+    if (
+      deps.git(
+        ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+        repoRoot,
+      ).code === 0
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+export function integrateEpicBases(
+  epicId: string,
+  primaryRepo: string,
+  touchedRepos: string[] | null | undefined,
+  format: OutputFormat | null,
+  deps: TrunkIntegrationDeps = realTrunkIntegrationDeps,
+): void {
+  if ((process.env.KEEPER_PLAN_WORKTREE ?? "").trim() === "") return;
+  const claimantSessionId = resolvePlanSessionId();
+  if (claimantSessionId === null) {
+    emitFinalizeError(
+      "TRUNK_LEASE_IDENTITY_MISSING",
+      `worktree close for ${epicId} has no tracked session identity; refusing ownerless trunk integration`,
+      format,
+    );
+  }
+  const stateDir = keeperStateDir();
+  const sourceBranch = `keeper/epic/${epicId}`;
+  const repos = new Set<string>([primaryRepo]);
+  for (const repo of touchedRepos ?? []) {
+    try {
+      repos.add(realpathOr(repo));
+    } catch {
+      // The source probe below owns the typed defer for a usable repo.
+    }
+  }
+  for (const repoRoot of [...repos].sort()) {
+    const toplevel = deps.git(["rev-parse", "--show-toplevel"], repoRoot);
+    const observedRoot = toplevel.stdout.trim();
+    if (
+      toplevel.code !== 0 ||
+      observedRoot === "" ||
+      realpathOr(observedRoot) !== repoRoot
+    ) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not verify ${repoRoot} as an available git checkout; refusing to grade its epic base as absent`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const source = deps.git(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${sourceBranch}^{commit}`,
+      ],
+      repoRoot,
+    );
+    if (source.code === 1) continue;
+    if (source.code !== 0) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not resolve ${sourceBranch} in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const defaultBranch = resolveTrunkDefaultBranch(repoRoot, deps);
+    if (defaultBranch === null) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not resolve the local default branch in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const grade = ancestryProbe(repoRoot, sourceBranch, defaultBranch, deps);
+    if (grade === "ancestor") {
+      // Phase 4's recovery contract (SKILL.md): a conflicted attempt that
+      // retained its fenced lease and was later resolved out-of-band leaves
+      // this re-grade reading "ancestor" with that lease still active —
+      // adopt and release it here rather than leaving it for daemon
+      // claimant-death reclaim.
+      adoptLingeringLease(
+        stateDir,
+        epicId,
+        repoRoot,
+        sourceBranch,
+        claimantSessionId,
+        deps,
+      );
+      continue;
+    }
+    if (grade === "inconclusive") {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not grade ${sourceBranch} against ${defaultBranch} in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    integrateRepoUnderLease(
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+      format,
+      deps,
+    );
+  }
+}
+
 export interface CloseFinalizeArgs {
   epicId: string;
   project: string | null;
@@ -652,6 +1427,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     if (gatedFollowup.status === "done") {
       // The follow-up landed — adopt it and close the source (the ordinary
       // closed_with_followup terminal).
+      integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
       closeEpic(stateCtx, epicId);
       emitOutcome(
         CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -773,6 +1549,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   // 7. zero surviving decisions → clean close.
   const expected = expectedClusterOrdinals(verdict);
   if (expected.size === 0) {
+    integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
     closeEpic(stateCtx, epicId);
     emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format, stateCtx);
     return;
@@ -784,6 +1561,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   const existing = findFollowupEpic(stateCtx.dataDir, epicId);
   if (existing !== null) {
     if (existing.actualTasks === expectedCount) {
+      integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
       closeEpic(stateCtx, epicId);
       emitOutcome(
         CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -891,6 +1669,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     return;
   }
 
+  integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
   closeEpic(stateCtx, epicId);
   emitOutcome(
     CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -987,8 +1766,10 @@ function emitOutcome(
 interface VerdictCell {
   tier: string;
   model: string;
-  rationale: string | null;
-  confidence: number | string | null;
+  rationale: string;
+  confidence: number;
+  sparkFit: boolean;
+  sparkExclusion: SparkExclusionReason | null;
 }
 
 /** The selector's own provenance block, shape-mirroring the sidecar's. */
@@ -999,6 +1780,7 @@ interface SelectionProvenance {
   shuffleSeed: number | null;
   outcome: string;
   verdictRaw: string | null;
+  sparkAxisPresent: boolean;
 }
 
 /** The verdict-load result: a guided selection (all cells in-axis + full
@@ -1046,7 +1828,7 @@ function loadSelectionVerdict(
   followupText: string,
   taskCount: number | null,
 ): SelectionResult {
-  const followupHash = sha256(followupText);
+  const followupHash = computeSelectionInputHash(followupText);
   const degrade = (reason: string): SelectionResult => ({
     kind: "degraded",
     reason,
@@ -1072,7 +1854,13 @@ function loadSelectionVerdict(
     return degrade("verdict-not-object");
   }
   const sv = parsed.schema_version;
-  if (typeof sv === "number" && sv > SELECTION_SCHEMA_VERSION) {
+  if (typeof sv !== "number" || !Number.isInteger(sv)) {
+    return degrade("verdict-schema-invalid");
+  }
+  if (sv < FOLLOWUP_VERDICT_SCHEMA_VERSION) {
+    return degrade("verdict-schema-legacy");
+  }
+  if (sv > FOLLOWUP_VERDICT_SCHEMA_VERSION) {
     return degrade("verdict-schema-too-new");
   }
   if (!isPlainObject(parsed.cells)) {
@@ -1085,13 +1873,25 @@ function loadSelectionVerdict(
   if (provenance === null) {
     return degrade("verdict-provenance-invalid");
   }
+  if (provenance.inputHash !== followupHash) {
+    return degrade("verdict-input-hash-mismatch");
+  }
   if (taskCount === null) {
     return degrade("followup-unparseable");
   }
 
-  const efforts = configuredEfforts();
-  const models = configuredModels();
+  const effective = effectiveMatrix();
+  const models = effective.models;
+  const sparkAxisPresent = provenance.sparkAxisPresent;
   const cells = new Map<number, VerdictCell>();
+  const allowedCellKeys = new Set([
+    "tier",
+    "model",
+    "rationale",
+    "confidence",
+    "spark_fit",
+    "spark_exclusion",
+  ]);
   for (const [key, raw] of Object.entries(parsed.cells)) {
     if (!/^[1-9][0-9]*$/.test(key)) {
       return degrade("verdict-cell-key-invalid");
@@ -1099,20 +1899,77 @@ function loadSelectionVerdict(
     if (!isPlainObject(raw)) {
       return degrade("verdict-cell-not-object");
     }
+    for (const rawKey of Object.keys(raw)) {
+      if (!allowedCellKeys.has(rawKey)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+    }
+    for (const requiredKey of allowedCellKeys) {
+      if (!(requiredKey in raw)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+    }
     const tier = raw.tier;
     const model = raw.model;
-    if (typeof tier !== "string" || !efforts.includes(tier)) {
-      return degrade("verdict-cell-out-of-axis");
-    }
     if (typeof model !== "string" || !models.includes(model)) {
       return degrade("verdict-cell-out-of-axis");
     }
-    const rationale = typeof raw.rationale === "string" ? raw.rationale : null;
-    const confidence =
-      typeof raw.confidence === "number" || typeof raw.confidence === "string"
-        ? raw.confidence
-        : null;
-    cells.set(Number.parseInt(key, 10), { tier, model, rationale, confidence });
+    if (
+      typeof tier !== "string" ||
+      !effective.effortsFor(model).includes(tier)
+    ) {
+      return degrade("verdict-cell-out-of-axis");
+    }
+    const rationale = raw.rationale;
+    if (typeof rationale !== "string" || rationale.trim() === "") {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const confidence = raw.confidence;
+    if (
+      typeof confidence !== "number" ||
+      !Number.isFinite(confidence) ||
+      confidence < 0 ||
+      confidence > 1
+    ) {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const sparkFit = raw.spark_fit;
+    if (typeof sparkFit !== "boolean") {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const sparkExclusionRaw = raw.spark_exclusion;
+    let sparkExclusion: SparkExclusionReason | null = null;
+    if (sparkExclusionRaw !== null) {
+      if (!isSparkExclusionReason(sparkExclusionRaw)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+      sparkExclusion = sparkExclusionRaw;
+    }
+    if (model === SPARK_MODEL) {
+      if (sparkFit !== true || sparkExclusion !== null) {
+        return degrade("verdict-cell-spark-inconsistent");
+      }
+    } else if (sparkFit !== false || sparkExclusion === null) {
+      return degrade("verdict-cell-spark-inconsistent");
+    }
+    if (!sparkAxisPresent) {
+      if (sparkFit !== false || sparkExclusion !== "spark-not-on-axis") {
+        return degrade("verdict-cell-spark-axis-mismatch");
+      }
+    } else if (
+      model !== SPARK_MODEL &&
+      sparkExclusion === "spark-not-on-axis"
+    ) {
+      return degrade("verdict-cell-spark-axis-mismatch");
+    }
+    cells.set(Number.parseInt(key, 10), {
+      tier,
+      model,
+      rationale,
+      confidence,
+      sparkFit,
+      sparkExclusion,
+    });
   }
 
   // Full-set coverage: exactly the ordinals 1..taskCount, no gaps or extras.
@@ -1130,7 +1987,8 @@ function loadSelectionVerdict(
 
 /** Validate the verdict's `selection:` provenance block — harness, model,
  * config_hash, input_hash, outcome as non-empty strings; shuffle_seed an integer
- * or absent; verdict_raw a string or absent. Returns null on any violation. */
+ * or absent; verdict_raw a string or absent; spark_axis_present a required
+ * boolean. Returns null on any violation. */
 function parseSelectionProvenance(
   sel: Record<string, unknown>,
 ): SelectionProvenance | null {
@@ -1170,6 +2028,11 @@ function parseSelectionProvenance(
       return null;
     }
   }
+  const sap = sel.spark_axis_present;
+  if (typeof sap !== "boolean") {
+    return null;
+  }
+  const sparkAxisPresent = sap;
   return {
     selector: { harness, model },
     configHash,
@@ -1177,6 +2040,7 @@ function parseSelectionProvenance(
     shuffleSeed,
     outcome,
     verdictRaw,
+    sparkAxisPresent,
   };
 }
 
@@ -1289,6 +2153,8 @@ function writeCloseSelectionSidecar(
           model: m.model,
           rationale: c?.rationale ?? null,
           confidence: c?.confidence ?? null,
+          spark_fit: c?.sparkFit ?? null,
+          spark_exclusion: c?.sparkExclusion ?? null,
           label_source: "heuristic-guided",
         };
       }),
@@ -1310,15 +2176,13 @@ function writeCloseSelectionSidecar(
         model: m.model,
         rationale: null,
         confidence: null,
+        spark_fit: null,
+        spark_exclusion: null,
         label_source: "heuristic-default",
       })),
     };
   }
   writeSelectionSidecar(dataDir, sidecar);
-}
-
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

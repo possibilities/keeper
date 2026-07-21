@@ -1,0 +1,36 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Reaping leaves while keeping the write-grant exclusion lock, fencing-token monotonicity, and fail-open discipline intact is validating a subtle safety-critical correctness invariant whose breach doubles writers on one tree.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1395-harden-repair-sweep-grant-reaping-and.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Guaranteeing exactly-once mint across the unfolded-projection race and overlapping-tick reentrancy is adjudicating a subtle concurrency/idempotence invariant, though execution is bounded to a guard plus deterministic dedup key.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1395-harden-repair-sweep-grant-reaping-and.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T06:19:22.479000Z",
+  "epic_id": "fn-1395-harden-repair-sweep-grant-reaping-and",
+  "input_hash": "b3224305fbd617b11faeea37a05c8f006744c2bd21ed670d140f7ef281223188",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3005367045,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Reaping leaves while keeping the write-grant exclusion lock, fencing-token monotonicity, and fail-open discipline intact is validating a subtle safety-critical correctness invariant whose breach doubles writers on one tree.\",\"confidence\":0.8,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"},{\"task_id\":\"2\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Guaranteeing exactly-once mint across the unfolded-projection race and overlapping-tick reentrancy is adjudicating a subtle concurrency/idempotence invariant, though execution is bounded to a guard plus deterministic dedup key.\",\"confidence\":0.72,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"}]}\n"
+}

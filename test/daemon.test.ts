@@ -19,6 +19,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -28,6 +29,11 @@ import { join } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
 import { checkRaceGuard, type QueryFn } from "../cli/dispatch";
 import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
+import {
+  materializeNonFableFocusPolicy,
+  readNonFableFocusLeaf,
+  serializeNonFableFocusPolicy,
+} from "../src/account-focus";
 import {
   appendBackstopRecord,
   BackstopCounters,
@@ -49,6 +55,7 @@ import {
   appendDurableRestartBoot,
   appendFencedDispatchClear,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   auditReadyEscalationDecision,
   BIRTH_STUCK_STATUS,
   BLOCK_ESCALATION_SKIP_CATEGORY,
@@ -71,6 +78,8 @@ import {
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
   buildDispatchClearedData,
+  buildIncidentOwnerPageBody,
+  buildMaintenanceScaffoldYaml,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildRetryDispatchResultMessage,
@@ -84,49 +93,66 @@ import {
   checkKeeperAgentPresence,
   classifyBaselineForRepair,
   classifyEscalationOutcome,
+  classifyExitVerdict,
   classifyRestartProvenance,
   classifyWorkResolverOutcome,
   collapseRestartLedger,
   compactRestartLedger,
   countLiveEscalationSessions,
+  createExitAttributionRecorder,
   DEAD_LETTER_RETENTION_MS,
   type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
   decideDispatchClearLiveness,
+  decideExitAttribution,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
   decideServeBusDistress,
+  decideServeLagAttributionLog,
   decideServeLivenessWatchdog,
   dispatchClearFencesAtAppend,
   dispatchEscalationSession,
   drainToCompletion,
   type EscalationDispatchDeps,
   type EscalationDispatchOutcome,
+  type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
   epicHasLiveUnblock,
   escalationCheckoutOccupiedBy,
   escalationSessionLiveFor,
+  findOsMemoryKillEvidence,
   foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
+  HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
+  type IncidentClaimSweepDeps,
+  type IncidentOwnerPageSweepDeps,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
+  MAINTENANCE_TASK_TITLE_PREFIX,
   MAX_LIVE_ESCALATION_SESSIONS,
+  type MaintenanceMintOutcome,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
+  MUTATION_PATH_BACKFILL_INTERVAL_MS,
+  maintenanceEpicTitle,
   matchCrashReportToBoot,
+  matchOperatorReloadAttribution,
   mergeConflictBaseCheckout,
+  OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingBlockHumanNotify,
+  type PendingIncidentOwnerPage,
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
@@ -149,14 +175,16 @@ import {
   probeSettleStep,
   pruneRecoveredDeadLetters,
   publishFableFocusProjection,
+  publishNonFableFocusProjection,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
+  RETENTION_INTERVAL_MS,
   type RepairCandidate,
   type RepairCandidateDropClass,
   type RepairEscalationSweepDeps,
-  type RepairGroup,
   type RepairHumanNotifiedOutcome,
+  type RepairNotifyVerdict,
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
@@ -164,7 +192,10 @@ import {
   type RestartBootLine,
   type RestartLedgerLine,
   type RestartProvenance,
+  readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
+  readServeHealthHistory,
   readSpillDocument,
   readTaskBlockedReason,
   reclassifyPoisonDeadLetter,
@@ -173,26 +204,37 @@ import {
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
   resolvePoisonDeadLetter,
   resolveProbeArming,
+  resolveServeHealthHistoryPath,
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
+  runIncidentClaimSweep,
+  runIncidentOwnerPageSweep,
   runMergeEscalationSweep,
   runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
   runSharedCheckoutPageSweep,
+  runTrunkLeaseSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
+  SERVE_HEALTH_HISTORY_MAX_REPORTS,
+  SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
+  SERVE_LAG_ATTRIBUTION_LOG_STREAK,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  SERVE_LAG_P99_THRESHOLD_MS,
   SERVE_PROBE_MAX_FAIL_STREAK,
   SERVE_REPORT_MUTE_THRESHOLD_MS,
   SERVE_STARVATION_MAX_BREACH_STREAK,
   SERVE_WATCHDOG_BOOT_GRACE_MS,
   SERVE_WATCHDOG_INITIAL_STATE,
   SERVE_WATCHDOG_INTERVAL_MS,
+  type ServeHealthHistory,
   type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
   type SharedCheckoutNotifiedOutcome,
@@ -204,6 +246,7 @@ import {
   selectPendingBlockEscalations,
   selectPendingBlockHumanNotifications,
   selectPendingHumanNotifications,
+  selectPendingIncidentOwnerPages,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   selectPendingWorkMergeEscalations,
@@ -213,14 +256,17 @@ import {
   selectWorkerNames,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
+  shouldEnrichPriorExitAttribution,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
+  type TrunkLeaseSweepDeps,
   WAL_AUTOCHECKPOINT_PAGES,
   WORK_RESOLVER_LEASE_SEC,
   type WorkMergeHumanNotifySweepDeps,
   withBootDrainCheckpointTuning,
   workLaneBusyForResolver,
   writeRestartLedger,
+  writeServeHealthHistory,
 } from "../src/daemon";
 import {
   clearDispatchMintGate,
@@ -240,6 +286,9 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  EVENTS_INGEST_STALL_DISTRESS_ID,
+  EVENTS_INGEST_STALL_DISTRESS_REASON,
+  EVENTS_INGEST_STALL_DISTRESS_VERB,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
@@ -260,13 +309,33 @@ import {
   serializeFableFocusPolicy,
 } from "../src/fable-focus";
 import {
+  decideTrunkIntegrationFence,
+  type GrantLeaf,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+} from "../src/grant-leaf";
+import {
   classifyAgentbotPageOutcome,
   resolveAgentbotBinaryPath,
   sendAgentbotPage,
 } from "../src/integrity-probe";
+import { MAIN_MAINTENANCE_TICK_BUDGET_MS } from "../src/maintenance-budget";
 import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
-import type { ResolverOutcome } from "../src/reconcile-core";
-import { classifyResolverOutcome } from "../src/reconcile-core";
+import type {
+  ReconcileSnapshot,
+  ReconcileState,
+  ResolverOutcome,
+} from "../src/reconcile-core";
+import {
+  classifyResolverOutcome,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  nextIncidentOwnerAttachmentMarker,
+  reconcile,
+  WORKER_EFFORT,
+  WORKER_MODEL,
+} from "../src/reconcile-core";
 import {
   __resetEpicIndexMemoForTest,
   drain,
@@ -284,7 +353,7 @@ import {
   runQuery,
   sliceFanout,
 } from "../src/server-worker";
-import type { Event, Job } from "../src/types";
+import type { Epic, Event, Job, Task } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
@@ -692,6 +761,25 @@ test("gcUnretryableDispatchFailures: bus-degraded is producer-owned until its pr
     BUS_DEGRADED_DISTRESS_VERB,
     BUS_DEGRADED_DISTRESS_ID,
     BUS_DEGRADED_DISTRESS_REASON,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  expect(
+    gcUnretryableDispatchFailures(db, (verb, id) => cleared.push({ verb, id })),
+  ).toBe(0);
+  expect(cleared).toEqual([]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: events-ingest-stalled is producer-owned until backlog clears", () => {
+  const { db } = freshMemDb();
+  db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
+  ).run(
+    EVENTS_INGEST_STALL_DISTRESS_VERB,
+    EVENTS_INGEST_STALL_DISTRESS_ID,
+    EVENTS_INGEST_STALL_DISTRESS_REASON,
   );
 
   const cleared: { verb: string; id: string }[] = [];
@@ -1517,6 +1605,30 @@ const SWD_STARVATION_BREACH = {
   sampleCount: 100,
 } as const;
 
+test("main maintenance budget cannot span a busy-lag breach streak", () => {
+  const budgetedBreachWindows = Math.ceil(
+    (MAIN_MAINTENANCE_TICK_BUDGET_MS + SERVE_LAG_P99_THRESHOLD_MS) /
+      SERVE_WATCHDOG_INTERVAL_MS,
+  );
+  const maintenanceIntervalMs = Math.min(
+    RETENTION_INTERVAL_MS,
+    MUTATION_PATH_BACKFILL_INTERVAL_MS,
+  );
+  const cleanWindowsBeforeNextMaintenance =
+    Math.floor(maintenanceIntervalMs / SERVE_WATCHDOG_INTERVAL_MS) -
+    budgetedBreachWindows;
+
+  expect(MAIN_MAINTENANCE_TICK_BUDGET_MS).toBeLessThan(
+    SERVE_LAG_P99_THRESHOLD_MS,
+  );
+  expect(budgetedBreachWindows).toBeLessThan(
+    SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  );
+  expect(cleanWindowsBeforeNextMaintenance).toBeGreaterThanOrEqual(
+    SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  );
+});
+
 test("decideServeLivenessWatchdog: healthy — live probes, no lag, fresh report → ok", () => {
   expect(swd().verdict).toEqual({ kind: "ok" });
 });
@@ -1639,6 +1751,33 @@ test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer th
       { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 2 },
     ).verdict,
   ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLagAttributionLog: streak reaching 3 emits one bounded active-work line", () => {
+  let state = { ...SERVE_LAG_ATTRIBUTION_INITIAL_STATE };
+  const lines: string[] = [];
+  for (const streak of [1, 2, SERVE_LAG_ATTRIBUTION_LOG_STREAK, 4, 5]) {
+    const result = decideServeLagAttributionLog({
+      state,
+      lagBreachStreak: streak,
+      lagP99Ms: 1234.4,
+      activeWork: "maintenance:mutation_path_backfill",
+    });
+    state = result.state;
+    if (result.line !== null) lines.push(result.line);
+  }
+  expect(lines).toEqual([
+    "[keeperd] serve-liveness watchdog: busy-lag breach streak=3 active_work=maintenance:mutation_path_backfill lag_p99_ms=1234",
+  ]);
+
+  const reset = decideServeLagAttributionLog({
+    state,
+    lagBreachStreak: 0,
+    lagP99Ms: 5,
+    activeWork: null,
+  });
+  expect(reset.line).toBeNull();
+  expect(reset.state.emittedForCurrentStreak).toBe(false);
 });
 
 test("decideServeLivenessWatchdog: serve-report-mute — no report within the staleness bound (main's arrival clock)", () => {
@@ -2320,6 +2459,41 @@ test("parseRestartLedgerLine: a native-crash enrich line needs no fatal reason a
   });
 });
 
+test("parseRestartLedgerLine: parses a typed verdict + bounds its evidence, ignores an invalid verdict kind", () => {
+  expect(
+    parseRestartLedgerLine(
+      JSON.stringify({
+        kind: "enrich",
+        boot_id: "abc",
+        ts: 1400,
+        reason: "jetsam killing process 999",
+        verdict: "os-memory-kill",
+        verdict_evidence: "x".repeat(1_000),
+      }),
+    ),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "abc",
+    ts: 1400,
+    reason: "jetsam killing process 999",
+    verdict: "os-memory-kill",
+    verdict_evidence: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+  });
+  // An unrecognized verdict kind is dropped (defensive parse), but the line
+  // stays valid on its `reason` alone.
+  expect(
+    parseRestartLedgerLine(
+      JSON.stringify({
+        kind: "enrich",
+        boot_id: "abc",
+        ts: 1400,
+        reason: "boom",
+        verdict: "not-a-real-verdict",
+      }),
+    ),
+  ).toEqual({ kind: "enrich", boot_id: "abc", ts: 1400, reason: "boom" });
+});
+
 test("parseRestartLedgerLine: a torn / partial trailing line folds to null (never corrupts)", () => {
   expect(parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts')).toBeNull();
   expect(parseRestartLedgerLine("")).toBeNull();
@@ -2501,6 +2675,42 @@ test("collapse + compact restart ledger preserve fatal and native-crash enrich f
     reason: "watchdog",
     died_at_ms: 1100,
     native_crash_report_id: "incident-mixed",
+  });
+});
+
+test("collapse + compact restart ledger carry a typed verdict forward, later write wins", () => {
+  const lines: RestartLedgerLine[] = [
+    bootLine("mixed", 1000, "launchd", null),
+    {
+      kind: "enrich",
+      boot_id: "mixed",
+      ts: 1200,
+      reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+      verdict: "no-evidence",
+      verdict_evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+    },
+    {
+      kind: "enrich",
+      boot_id: "mixed",
+      ts: 1400,
+      reason: "jetsam killing process 999",
+      verdict: "os-memory-kill",
+      verdict_evidence: "jetsam killing process 999",
+    },
+  ];
+  const collapsed = collapseRestartLedger(lines);
+  expect(collapsed[0]).toMatchObject({
+    reason: "jetsam killing process 999",
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 999",
+  });
+  expect(
+    collapseRestartLedger(
+      compactRestartLedger(lines, { nowMs: 2000, windowMs: 2000, cap: 10 }),
+    )[0],
+  ).toMatchObject({
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 999",
   });
 });
 
@@ -3069,6 +3279,407 @@ test("readRestartLedger / writeRestartLedger: NDJSON round-trip through a real f
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("exit-attribution records each soft exit path once with a bounded synced leaf", () => {
+  const stateDir = join(tmpDir, "state");
+  const restartLedgerPath = join(stateDir, "restart-ledger.json");
+  const cases: Array<{
+    name: string;
+    attribution: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+    expected: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+  }> = [
+    {
+      name: "fatal",
+      attribution: { kind: "fatal_exit", reason: "x".repeat(1_000) },
+      expected: {
+        kind: "fatal_exit",
+        reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+      },
+    },
+    {
+      name: "uncaught",
+      attribution: { kind: "uncaught_exception", reason: "uncaught" },
+      expected: { kind: "uncaught_exception", reason: "uncaught" },
+    },
+    {
+      name: "rejection",
+      attribution: { kind: "unhandled_rejection", reason: "rejected" },
+      expected: { kind: "unhandled_rejection", reason: "rejected" },
+    },
+    {
+      name: "term",
+      attribution: { kind: "signal", signal: "SIGTERM" },
+      expected: { kind: "signal", signal: "SIGTERM" },
+    },
+    {
+      name: "int",
+      attribution: { kind: "signal", signal: "SIGINT" },
+      expected: { kind: "signal", signal: "SIGINT" },
+    },
+    {
+      name: "hup",
+      attribution: { kind: "signal", signal: "SIGHUP" },
+      expected: { kind: "signal", signal: "SIGHUP" },
+    },
+    {
+      name: "clean",
+      attribution: { kind: "clean_shutdown" },
+      expected: { kind: "clean_shutdown" },
+    },
+  ];
+
+  expect(resolveExitAttributionPath(restartLedgerPath)).toBe(
+    join(stateDir, "exit-attribution.json"),
+  );
+  for (const { name, attribution, expected } of cases) {
+    const path = join(stateDir, `${name}.json`);
+    const recorder = createExitAttributionRecorder({
+      bootId: `boot-${name}`,
+      path,
+      nowMs: () => 123,
+    });
+    recorder.record(attribution);
+    recorder.record({ kind: "clean_shutdown" });
+    expect(readExitAttribution(path)).toEqual({
+      boot_id: `boot-${name}`,
+      ts: 123,
+      ...expected,
+    });
+    expect(readFileSync(path, "utf8").endsWith("\n")).toBe(true);
+  }
+});
+
+test("decideExitAttribution prefers operator, then the leaf, then native evidence, then OS memory kill, then hard kill", () => {
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 10,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+  const nativeCrash = {
+    native_crash_signal: "SIGSEGV",
+    native_crash_report_id: "report-prior",
+  };
+  const operatorReload = {
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 15,
+  };
+  const osMemoryKill = { reason: "jetsam killing process 123" };
+
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: leaf,
+      nativeCrash,
+      operatorReload,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "install.sh launchctl-reload",
+    verdict: "operator",
+    verdict_evidence: "install.sh launchctl-reload",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: leaf,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "signal: SIGTERM",
+    verdict: "signal",
+    verdict_evidence: "signal: SIGTERM",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    ...nativeCrash,
+    verdict: "signal",
+    verdict_evidence: "native crash: SIGSEGV",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash: null,
+      osMemoryKill,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "jetsam killing process 123",
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 123",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash: null,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+    verdict: "no-evidence",
+    verdict_evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  });
+});
+
+test("classifyExitVerdict: watchdog vs. generic soft-exit-leaf reasons", () => {
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "serve-liveness-watchdog: busy-lag lag-breaches=3/3",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "watchdog",
+    evidence: "serve-liveness-watchdog: busy-lag lag-breaches=3/3",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "git-seed-watchdog: surface stuck after 3 re-seed attempt(s)",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "watchdog",
+    evidence: "git-seed-watchdog: surface stuck after 3 re-seed attempt(s)",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "single-instance admission refused",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "soft-exit-leaf",
+    evidence: "single-instance admission refused",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: { boot_id: "b", ts: 1, kind: "clean_shutdown" },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "soft-exit-leaf",
+    evidence: "exit attribution: clean_shutdown",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: null,
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "no-evidence",
+    evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  });
+});
+
+test("findOsMemoryKillEvidence: matches a real jetsam-kill line naming the pid, ignores background noise and other pids", () => {
+  const window = { pid: 56332, startedAtMs: 0, diedAtMs: 1_000 };
+  // Ambient runningboardd chatter that mentions jetsam constantly but never kills.
+  const noise = [
+    "2026-07-20 16:15:28 runningboardd: [jetsam] memorystatus_control error: MEMORYSTATUS_CMD_CONVERT_MEMLIMIT_MB(-1) returned -1 22 (Invalid argument)",
+    "2026-07-20 16:15:28 runningboardd: [anon<bun>(501):56332] is not RunningBoard jetsam managed.",
+    "2026-07-20 16:15:28 runningboardd: [anon<bun>(501):56332] Ignoring jetsam update because this process is not memory-managed",
+  ].join("\n");
+  expect(findOsMemoryKillEvidence(noise, window)).toBeNull();
+  expect(findOsMemoryKillEvidence("", window)).toBeNull();
+
+  // A real kill line naming a DIFFERENT pid must not match this boot's window.
+  const otherPid =
+    "2026-07-20 16:15:30 kernel: memorystatus_kill_process: killing pid 99999 [bun] (jetsam) - highwater";
+  expect(findOsMemoryKillEvidence(otherPid, window)).toBeNull();
+
+  const realKill =
+    "2026-07-20 16:15:30 kernel: memorystatus_kill_process: killing pid 56332 [bun] (jetsam) - highwater, reason: highwater";
+  expect(findOsMemoryKillEvidence(`${noise}\n${realKill}`, window)).toEqual({
+    reason: realKill,
+  });
+
+  const lowSwap =
+    "2026-07-20 16:15:30 kernel: low swap: killing largest process with pid 56332 (bun) to reclaim memory";
+  expect(findOsMemoryKillEvidence(lowSwap, window)).toEqual({
+    reason: lowSwap,
+  });
+
+  const bounded = `2026-07-20 kernel: jetsam killing pid 56332 ${"x".repeat(500)}`;
+  const result = findOsMemoryKillEvidence(bounded, window);
+  expect(result?.reason.length).toBeLessThanOrEqual(
+    OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
+  );
+});
+
+test("resolveOperatorReloadAttributionPath: sibling of the restart ledger, never the exit-attribution leaf", () => {
+  const restartLedgerPath = join(tmpDir, "restart-ledger.json");
+  expect(resolveOperatorReloadAttributionPath(restartLedgerPath)).toBe(
+    join(tmpDir, "install-reload-attribution.json"),
+  );
+});
+
+test("readOperatorReloadAttribution: reads install.sh's leaf, fails closed on missing/malformed", () => {
+  const path = join(tmpDir, "install-reload-attribution.json");
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+  writeFileSync(
+    path,
+    `${JSON.stringify({
+      schema_version: 1,
+      source: "install.sh",
+      action: "launchctl-reload",
+      ts_ms: 12_345,
+      fingerprint: "abc",
+    })}\n`,
+  );
+  expect(readOperatorReloadAttribution(path)).toEqual({
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 12_345,
+  });
+  writeFileSync(path, "not json");
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+  writeFileSync(path, JSON.stringify({ source: "install.sh" }));
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+});
+
+test("matchOperatorReloadAttribution: only explains a death whose stamp falls inside the dying boot's own lifetime", () => {
+  const attribution = {
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 1_000,
+  };
+  expect(
+    matchOperatorReloadAttribution(attribution, {
+      startedAtMs: 500,
+      diedAtMs: 1_500,
+    }),
+  ).toEqual(attribution);
+  expect(
+    matchOperatorReloadAttribution(attribution, {
+      startedAtMs: 1_100,
+      diedAtMs: 1_500,
+    }),
+  ).toBeNull();
+  expect(
+    matchOperatorReloadAttribution(null, { startedAtMs: 0, diedAtMs: 1 }),
+  ).toBeNull();
+});
+
+test("serve-health history: bounded ring buffer, durable round trip, and resolved sibling path", () => {
+  const restartLedgerPath = join(tmpDir, "restart-ledger.json");
+  expect(resolveServeHealthHistoryPath(restartLedgerPath)).toBe(
+    join(tmpDir, "serve-health-history.json"),
+  );
+  let history: ServeHealthHistory = { boot_id: "boot-1", reports: [] };
+  for (let i = 0; i < SERVE_HEALTH_HISTORY_MAX_REPORTS + 5; i += 1) {
+    history = appendServeHealthReportSample(history, {
+      ts: i,
+      rss_bytes: 1_000_000 + i,
+    });
+  }
+  expect(history.reports.length).toBe(SERVE_HEALTH_HISTORY_MAX_REPORTS);
+  // Oldest samples drop first; the ring buffer keeps the most recent tail.
+  expect(history.reports[0].ts).toBe(5);
+  expect(history.reports.at(-1)?.ts).toBe(SERVE_HEALTH_HISTORY_MAX_REPORTS + 4);
+
+  const path = join(tmpDir, "serve-health-history.json");
+  expect(readServeHealthHistory(path)).toBeNull();
+  writeServeHealthHistory(path, history);
+  expect(readServeHealthHistory(path)).toEqual(history);
+});
+
+test("prior exit attribution skips boots already attributed in the restart ledger", () => {
+  const prior = {
+    ...bootLine("prior", 1, "launchd", null),
+    pid: 1,
+    start_time: "darwin:2025-01-01T00:00:00.000Z",
+  };
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 2,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, reason: "clean shutdown" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, native_crash_signal: "SIGSEGV" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: leaf,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(true);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(true);
 });
 
 test("appendRestartLedgerLine: appends one line without overwriting existing content", () => {
@@ -4842,6 +5453,102 @@ test("Fable-focus Projection publication rehydrates the exact policy identity on
   }
 });
 
+test("Non-Fable-focus Projection publication verifies identity independently", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-non-fable-daemon-"));
+  const policy = materializeNonFableFocusPolicy(
+    { target_route: "claude-swap:3", lifetime: { kind: "permanent" } },
+    8,
+    1_752_840_060,
+  );
+  if (policy === null) throw new Error("expected policy");
+  db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, non_fable_focus)
+     VALUES (1, 1, 8, 1, 1, ?)`,
+    [serializeNonFableFocusPolicy(policy)],
+  );
+  try {
+    expect(publishNonFableFocusProjection(db, root)).toEqual({
+      schema_version: 1,
+      policy,
+    });
+    expect(
+      readNonFableFocusLeaf(join(root, "non-fable-focus-policy.json")),
+    ).toEqual({
+      available: true,
+      policy,
+    });
+    expect(() =>
+      publishNonFableFocusProjection(db, root, {
+        publish: () => {},
+        read: () => ({ available: true, policy: null }),
+      }),
+    ).toThrow("Non-Fable-focus launch leaf does not match the Projection");
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one Account-focus publication failure leaves the sibling leaf untouched", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-focus-isolation-"));
+  const fable = materializeFableFocusPolicy(
+    { target_route: "claude-swap:2", lifetime: { kind: "permanent" } },
+    7,
+    1_752_840_000,
+  );
+  const nonFable = materializeNonFableFocusPolicy(
+    { target_route: "claude-swap:3", lifetime: { kind: "permanent" } },
+    8,
+    1_752_840_060,
+  );
+  if (fable === null || nonFable === null) throw new Error("expected policies");
+  db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, fable_focus, non_fable_focus)
+     VALUES (1, 1, 8, 1, 1, ?, ?)`,
+    [serializeFableFocusPolicy(fable), serializeNonFableFocusPolicy(nonFable)],
+  );
+  try {
+    publishFableFocusProjection(db, root);
+    publishNonFableFocusProjection(db, root);
+    const siblingPath = join(root, "fable-focus-policy.json");
+    const siblingBefore = readFileSync(siblingPath, "utf8");
+    expect(() =>
+      publishNonFableFocusProjection(db, root, {
+        publish: () => {
+          throw new Error("injected Non-Fable write failure");
+        },
+      }),
+    ).toThrow("injected Non-Fable write failure");
+    expect(readFileSync(siblingPath, "utf8")).toBe(siblingBefore);
+    expect(readFableFocusLeaf(siblingPath)).toEqual({
+      available: true,
+      policy: fable,
+    });
+
+    const reverseSiblingPath = join(root, "non-fable-focus-policy.json");
+    const reverseSiblingBefore = readFileSync(reverseSiblingPath, "utf8");
+    expect(() =>
+      publishFableFocusProjection(db, root, {
+        publish: () => {
+          throw new Error("injected Fable write failure");
+        },
+      }),
+    ).toThrow("injected Fable write failure");
+    expect(readFileSync(reverseSiblingPath, "utf8")).toBe(reverseSiblingBefore);
+    expect(readNonFableFocusLeaf(reverseSiblingPath)).toEqual({
+      available: true,
+      policy: nonFable,
+    });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Fable-focus mutation acknowledgement fails closed on leaf publication failure", () => {
   const { db } = openDb(":memory:");
   const root = mkdtempSync(join(tmpdir(), "keeper-fable-daemon-"));
@@ -5134,7 +5841,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(137);
+  expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(138);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5995,6 +6702,782 @@ test("pending-dispatch sweep telemetry round-trips to the sidecar; empty sweep b
   expect(rollups[0]?.class).toBe("timeout");
   expect(rollups[0]?.fires_total).toBe(2);
   expect(rollups[0]?.rescues_total).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Incident claim producer
+// ---------------------------------------------------------------------------
+
+type IncidentSpoolEntry = ReturnType<
+  IncidentClaimSweepDeps["readRequests"]
+>[number];
+
+function incidentSpoolEntry(
+  action: "claim" | "release",
+  overrides: Partial<IncidentSpoolEntry["request"]> = {},
+): IncidentSpoolEntry {
+  return {
+    path: `/spool/${action}-${overrides.id ?? "fn-3-incident.1"}.json`,
+    request: {
+      schema_version: 1,
+      action,
+      verb: "work",
+      id: "fn-3-incident.1",
+      instance_event_id: 41,
+      claimant_session_id: "session-new",
+      requested_at: 1_700_000_000_000,
+      ...overrides,
+    },
+  };
+}
+
+function incidentSweepDeps(
+  overrides: Partial<IncidentClaimSweepDeps> = {},
+): IncidentClaimSweepDeps {
+  return {
+    readRequests: () => [],
+    removeRequest: () => {},
+    lookupIncident: () => ({
+      instanceEventId: 41,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    }),
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    mintClaimed: () => {},
+    mintReleased: () => {},
+    selectClaimed: () => [],
+    now: () => 1_700_000_001,
+    ...overrides,
+  };
+}
+
+test("incident claim sweep mints one claim for a live verified claimant and removes the request", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result).toEqual({
+    claimed: 1,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  });
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "work",
+      id: "fn-3-incident.1",
+      instanceEventId: 41,
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+      ts: 1_700_000_001,
+    },
+  ]);
+});
+
+test("incident claim sweep refuses dead and unverifiable claimants", () => {
+  for (const verification of [
+    null,
+    { pid: 4242, startTime: "proc:4242:1", live: false },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        verifyClaimant: () => verification,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.refused).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep verifies the claimant against the owning verb and id", () => {
+  const entry = incidentSpoolEntry("claim");
+  const seen: string[][] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      verifyClaimant: (sessionId, verb, id) => {
+        seen.push([sessionId, verb, id]);
+        return null;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(seen).toEqual([["session-new", "work", "fn-3-incident.1"]]);
+});
+
+test("incident claim sweep discards missing and mismatched incident fences as stale", () => {
+  for (const incident of [
+    null,
+    {
+      instanceEventId: 42,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        lookupIncident: () => incident,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.stale).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep refuses takeover while a different claimant is still live", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: () => true,
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep permits takeover after positive evidence that the prior claimant died", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-dead",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: (pid) => pid !== 3131,
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.refused).toBe(0);
+  expect(minted).toHaveLength(1);
+});
+
+test("incident claim sweep mints one fenced release and removes the request", () => {
+  const entry = incidentSpoolEntry("release", {
+    verb: "close",
+    id: "fn-3-incident-close",
+    claimant_session_id: "session-owner",
+  });
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintReleased: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.released).toBe(1);
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "close",
+      id: "fn-3-incident-close",
+      instanceEventId: 41,
+      claimSessionId: "session-owner",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    },
+  ]);
+});
+
+test("pending fan-in incident claim and release round-trip keeps the same fence", () => {
+  let incident = {
+    instanceEventId: 41,
+    claimSessionId: null as string | null,
+    claimPid: null as number | null,
+    claimStartTime: null as string | null,
+  };
+  const claim = incidentSpoolEntry("claim");
+  const claimed = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [claim],
+      lookupIncident: () => incident,
+      mintClaimed: (payload) => {
+        incident = {
+          instanceEventId: payload.instanceEventId,
+          claimSessionId: payload.claimSessionId,
+          claimPid: payload.claimPid,
+          claimStartTime: payload.claimStartTime,
+        };
+      },
+    }),
+  );
+
+  expect(claimed.claimed).toBe(1);
+  expect(incident).toEqual({
+    instanceEventId: 41,
+    claimSessionId: "session-new",
+    claimPid: 4242,
+    claimStartTime: "proc:4242:1",
+  });
+
+  const release = incidentSpoolEntry("release");
+  const released = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [release],
+      lookupIncident: () => incident,
+      mintReleased: (payload) => {
+        expect(payload.instanceEventId).toBe(41);
+        incident = {
+          instanceEventId: 41,
+          claimSessionId: null,
+          claimPid: null,
+          claimStartTime: null,
+        };
+      },
+    }),
+  );
+
+  expect(released.released).toBe(1);
+  expect(incident.claimSessionId).toBeNull();
+});
+
+test("incident release refuses a dead or non-owning claimant", () => {
+  const entry = incidentSpoolEntry("release", {
+    claimant_session_id: "session-owner",
+  });
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      verifyClaimant: () => null,
+      mintReleased: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.released).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep consumes duplicate claims without growing the event log", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.stale).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+  expect(removed).toEqual([entry.path]);
+});
+
+test("incident claim sweep coalesces duplicate spooled tuples before projection refresh", () => {
+  const first = incidentSpoolEntry("claim");
+  const second = {
+    ...incidentSpoolEntry("claim"),
+    path: "/spool/duplicate.json",
+  };
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [first, second],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.stale).toBe(1);
+  expect(mints).toBe(1);
+  expect(removed).toEqual([first.path, second.path]);
+});
+
+test("incident claim sweep refreshes a resumed claimant's process generation", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(minted).toEqual([
+    expect.objectContaining({
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    }),
+  ]);
+});
+
+test("incident claim sweep preserves requests when the synthetic mint fails", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => false,
+    }),
+  );
+
+  expect(result.claimed).toBe(0);
+  expect(removed).toEqual([]);
+});
+
+test("incident claim sweep refuses takeover when the recorded holder generation is unverifiable", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: null,
+        claimStartTime: null,
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(mints).toBe(0);
+});
+
+test("incident claim expiry releases dead claimants and leaves live claimants alone", () => {
+  const released: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      selectClaimed: () => [
+        {
+          verb: "work",
+          id: "fn-4-dead.1",
+          instanceEventId: 50,
+          claimSessionId: "session-dead",
+          claimPid: 5000,
+          claimStartTime: "proc:5000:1",
+        },
+        {
+          verb: "close",
+          id: "fn-5-live",
+          instanceEventId: 60,
+          claimSessionId: "session-live",
+          claimPid: 6000,
+          claimStartTime: "proc:6000:1",
+        },
+      ],
+      probeClaimantLive: (pid) => pid === 6000,
+      mintReleased: (payload) => {
+        released.push(payload);
+      },
+    }),
+  );
+
+  expect(result.expired).toBe(1);
+  expect(released).toEqual([
+    {
+      verb: "work",
+      id: "fn-4-dead.1",
+      instanceEventId: 50,
+      claimSessionId: "session-dead",
+      claimPid: 5000,
+      claimStartTime: "proc:5000:1",
+    },
+  ]);
+});
+
+test("incident claim sweep isolates a throwing request and continues processing siblings", () => {
+  const broken = incidentSpoolEntry("claim", { id: "fn-6-broken.1" });
+  const healthy = incidentSpoolEntry("claim", { id: "fn-7-healthy.1" });
+  const removed: string[] = [];
+  const minted: string[] = [];
+  const results: ReturnType<typeof runIncidentClaimSweep>[] = [];
+
+  expect(() => {
+    results.push(
+      runIncidentClaimSweep(
+        incidentSweepDeps({
+          readRequests: () => [broken, healthy],
+          removeRequest: (path) => removed.push(path),
+          lookupIncident: (_verb, id) => {
+            if (id === "fn-6-broken.1") throw new Error("fixture failure");
+            return {
+              instanceEventId: 41,
+              claimSessionId: null,
+              claimPid: null,
+              claimStartTime: null,
+            };
+          },
+          mintClaimed: (payload) => {
+            minted.push(payload.id);
+          },
+        }),
+      ),
+    );
+  }).not.toThrow();
+
+  expect(results[0]?.claimed).toBe(1);
+  expect(minted).toEqual(["fn-7-healthy.1"]);
+  expect(removed).toEqual([healthy.path]);
+});
+
+test("INCIDENT_CLAIM_SWEEP_INTERVAL_MS is a prompt positive cadence", () => {
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBe(3_000);
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Trunk-integration lease producer
+// ---------------------------------------------------------------------------
+
+function trunkRequest(
+  action: "acquire" | "release",
+  repoRoot: string,
+  token: number | null = null,
+): SpooledTrunkLeaseRequest {
+  return {
+    path: `/spool/${action}-${repoRoot.slice(1)}.json`,
+    request: {
+      schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+      action,
+      epic_id: "fn-1350-owner",
+      repo_root: repoRoot,
+      source_branch: "keeper/epic/fn-1350-owner",
+      claimant_session_id: "close-session",
+      request_id: "11111111111111111111111111111111",
+      fencing_token: token,
+      requested_at: 1_700_000_000_000,
+    },
+  };
+}
+
+function trunkLeaseSweepHarness(initialRequests: SpooledTrunkLeaseRequest[]) {
+  const requests = [...initialRequests];
+  const leases = new Map<string, TrunkLeaseLeaf>();
+  const removed: string[] = [];
+  const residues: Array<{ repo: string; detail: string }> = [];
+  const deps: TrunkLeaseSweepDeps = {
+    readRequests: () => [...requests],
+    removeRequest: (path) => {
+      removed.push(path);
+      const index = requests.findIndex((entry) => entry.path === path);
+      if (index >= 0) requests.splice(index, 1);
+    },
+    readLeases: () => [...leases.values()],
+    readLease: (repoRoot) => leases.get(repoRoot) ?? null,
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    observeRepo: (request) => ({
+      repoRoot: request.repo_root,
+      defaultBranch: "main",
+      defaultTip:
+        request.repo_root === "/repo-a"
+          ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }),
+    publishLease: (leaf) => {
+      leases.set(leaf.repo_root, { ...leaf });
+      return true;
+    },
+    probeResidue: () => null,
+    recordResidue: (leaf, detail) =>
+      residues.push({ repo: leaf.repo_root, detail }),
+    now: () => 1_700_000_001_000,
+    ttlMs: 60_000,
+    residueState: new Map(),
+  };
+  return { requests, leases, removed, residues, deps };
+}
+
+test("trunk lease round-trip preserves per-repo monotonic fencing tokens", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  const first = h.leases.get("/repo-a");
+  expect(first).toMatchObject({
+    schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+    active: true,
+    fencing_token: 1,
+    writable_root: "/repo-a",
+    observed_default_tip: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  expect(runTrunkLeaseSweep(h.deps).released).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+});
+
+test("trunk leases fence multi-repo groups independently", () => {
+  const h = trunkLeaseSweepHarness([
+    trunkRequest("acquire", "/repo-a"),
+    trunkRequest("acquire", "/repo-b"),
+  ]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(1);
+  expect(h.leases.get("/repo-b")?.fencing_token).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).not.toBe(
+    h.leases.get("/repo-b")?.fencing_token,
+  );
+  expect(h.leases.get("/repo-a")?.observed_default_tip).not.toBe(
+    h.leases.get("/repo-b")?.observed_default_tip,
+  );
+});
+
+test("trunk integration fence defers inconclusive ancestry and tip drift", () => {
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "inconclusive",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "defer", reason: "ancestry-inconclusive" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "bbbbbbbb",
+    }),
+  ).toEqual({ kind: "defer", reason: "tip-drift" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "merge" });
+});
+
+test("an expired live trunk lease remains authoritative and renews through a fresh fencing token", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+
+  const expired = runTrunkLeaseSweep(h.deps);
+  expect(expired).toMatchObject({ dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+    expires_at: 1,
+  });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+    expires_at: 1_700_000_061_000,
+  });
+});
+
+test("an expired live holder cannot be replaced by another claimant", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+  const rival = trunkRequest("acquire", "/repo-a");
+  rival.request.claimant_session_id = "rival-close-session";
+  h.requests.push(rival);
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.deferred).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    claimant_session_id: "close-session",
+    fencing_token: 1,
+  });
+});
+
+test("a live trunk owner retains its lease while merge residue becomes an incident", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result).toMatchObject({ residues: 1, dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+  });
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+});
+
+test("a persisting merge residue mints exactly once across successive sweep ticks", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+
+  const first = runTrunkLeaseSweep(h.deps);
+  expect(first.residues).toBe(1);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+
+  const second = runTrunkLeaseSweep(h.deps);
+  const third = runTrunkLeaseSweep(h.deps);
+  expect(second.residues).toBe(0);
+  expect(third.residues).toBe(0);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+
+  h.deps.probeResidue = () => null;
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+  const reappeared = runTrunkLeaseSweep(h.deps);
+  expect(reappeared.residues).toBe(1);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+});
+
+test("dead trunk lease holder releases and records merge residue", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeClaimantLive = () => false;
+  h.deps.probeResidue = () => "MERGE_HEAD=deadbeef";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.dead).toBe(1);
+  expect(result.residues).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=deadbeef" },
+  ]);
+});
+
+test("fenced release with residue routes one conflict receipt and stale release cannot clear a successor", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=cafebabe";
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const released = runTrunkLeaseSweep(h.deps);
+  expect(released).toMatchObject({ released: 1, residues: 1 });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  runTrunkLeaseSweep(h.deps);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const stale = runTrunkLeaseSweep(h.deps);
+  expect(stale.stale).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -7545,37 +9028,65 @@ function repairRow(
   };
 }
 
+function repairGrant(overrides: Partial<GrantLeaf> = {}): GrantLeaf {
+  return {
+    schema_version: 1,
+    parent_job_id: "job-fn-1-foo.2",
+    agent_type: "plan:repairer",
+    incident_id: "repair::repo-abc",
+    owner_task_id: "fn-1-foo.2",
+    attempt_id: "41:fp1",
+    instance_event_id: 51,
+    writable_root: "/repo",
+    role: "repair",
+    expires_at: 2_000_000,
+    fencing_token: 7,
+    ...overrides,
+  };
+}
+
 function fakeRepairSweepDeps(opts: {
   candidates?: RepairCandidate[];
   rows?: PendingRepairRow[];
-  /** repo_dirs whose shared checkout is DIRTY (DEFER). */
+  grants?: GrantLeaf[];
   dirty?: Set<string>;
-  /** repo_dir → active shared-checkout-dirty distress row id (defer-note naming). */
   activeDirty?: Map<string, string>;
-  /** repo_dirs whose base reads GREEN (positive-evidence clear gate). */
   green?: Set<string>;
-  dispatch?: (group: RepairGroup) => Promise<EscalationDispatchOutcome>;
-  repairOutcome?: (token: string) => ResolverOutcome;
-  repairWorking?: (token: string) => boolean;
-  nowSec?: number;
-  terminalGraceSec?: number;
+  ownerTask?: string | null;
+  holderLiveness?: "live" | "dead" | "inconclusive";
+  ownerOutcome?: ResolverOutcome;
+  nowMs?: number;
+  publish?: (grant: GrantLeaf) => boolean;
   notify?: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
   candidatesThrow?: boolean;
   rowsThrow?: boolean;
+  maintenanceOpen?: boolean;
+  maintenanceOutcome?: MaintenanceMintOutcome;
+  maintenanceThrows?: boolean;
 }): {
   deps: RepairEscalationSweepDeps;
   mints: RepairMint[];
-  dispatches: RepairGroup[];
-  notifies: { token: string; verdict: "declined" | "died" }[];
+  grants: GrantLeaf[];
+  published: GrantLeaf[];
+  expired: GrantLeaf[];
+  unblocked: string[];
+  notifies: { token: string; verdict: RepairNotifyVerdict }[];
   notes: string[];
+  maintenanceProbed: string[];
+  maintenanceMinted: string[];
 } {
   const mints: RepairMint[] = [];
-  const dispatches: RepairGroup[] = [];
-  const notifies: { token: string; verdict: "declined" | "died" }[] = [];
+  const grants = [...(opts.grants ?? [])];
+  const published: GrantLeaf[] = [];
+  const expired: GrantLeaf[] = [];
+  const unblocked: string[] = [];
+  const notifies: { token: string; verdict: RepairNotifyVerdict }[] = [];
   const notes: string[] = [];
+  const maintenanceProbed: string[] = [];
+  const maintenanceMinted: string[] = [];
   const deps: RepairEscalationSweepDeps = {
     noteLine: (line) => notes.push(line),
     selectCandidates: () => {
@@ -7586,18 +9097,43 @@ function fakeRepairSweepDeps(opts: {
       if (opts.rowsThrow) throw new Error("row read boom");
       return opts.rows ?? [];
     },
+    selectGrants: () => grants,
+    selectOwner: (_group, candidates) => {
+      if (opts.ownerTask === null) return null;
+      const taskId =
+        opts.ownerTask ??
+        candidates.find((candidate) => candidate.epic_id !== "")?.task_id;
+      const candidate = candidates.find((entry) => entry.task_id === taskId);
+      return candidate == null
+        ? null
+        : {
+            epic_id: candidate.epic_id,
+            task_id: candidate.task_id,
+            parent_job_id: `job-${candidate.task_id}`,
+          };
+    },
+    grantHolderLiveness: () => opts.holderLiveness ?? "live",
+    grantOwnerOutcome: () => opts.ownerOutcome ?? { terminal: false },
     isDirtyCheckout: (dir) => opts.dirty?.has(dir) ?? false,
     activeDirtyDistressId: (dir) => opts.activeDirty?.get(dir) ?? null,
     isBaseGreen: (dir) => opts.green?.has(dir) ?? false,
-    dispatchRepair: async (group) => {
-      dispatches.push(group);
-      return (await opts.dispatch?.(group)) ?? "dispatched";
+    nowMs: () => opts.nowMs ?? 1_000_000,
+    publishGrant: (grant) => {
+      const ok = opts.publish?.(grant) ?? true;
+      if (ok) {
+        grants.push(grant);
+        published.push(grant);
+      }
+      return ok;
     },
-    repairOutcome:
-      opts.repairOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
-    repairSessionWorking: opts.repairWorking ?? (() => false),
-    nowSec: () => opts.nowSec ?? 1_000,
-    terminalGraceSec: opts.terminalGraceSec ?? 300,
+    expireGrant: (grant, nowMs) => {
+      grant.expires_at = Math.min(grant.expires_at, nowMs);
+      expired.push(grant);
+    },
+    unblockTask: async (candidate) => {
+      unblocked.push(candidate.task_id);
+      return true;
+    },
     notifyHuman: async (row, verdict) => {
       notifies.push({ token: row.id, verdict });
       return (await opts.notify?.(row, verdict)) ?? "notified";
@@ -7614,12 +9150,32 @@ function fakeRepairSweepDeps(opts: {
     mintNotified: (token, outcome) =>
       mints.push({ kind: "notified", token, outcome }),
     clearRow: (row) => mints.push({ kind: "clear", token: row.id }),
+    hasOpenMaintenanceTask: (group) => {
+      maintenanceProbed.push(group.repo_token);
+      return opts.maintenanceOpen ?? false;
+    },
+    mintMaintenanceTask: async (group) => {
+      maintenanceMinted.push(group.repo_token);
+      if (opts.maintenanceThrows) throw new Error("maintenance mint boom");
+      return opts.maintenanceOutcome ?? "minted";
+    },
   };
-  return { deps, mints, dispatches, notifies, notes };
+  return {
+    deps,
+    mints,
+    grants,
+    published,
+    expired,
+    unblocked,
+    notifies,
+    notes,
+    maintenanceProbed,
+    maintenanceMinted,
+  };
 }
 
-test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE repo+fingerprint → exactly one dispatch + one sticky row", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: coalesced blocked owners mint one row before grant election", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: [
       repairCandidate("fn-1-foo", "fn-1-foo.2"),
       repairCandidate("fn-1-foo", "fn-1-foo.3"),
@@ -7627,10 +9183,7 @@ test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE r
     ],
   });
   await runRepairEscalationSweep(deps);
-  // Coalesced to ONE repair for the repo token.
-  expect(dispatches).toEqual([
-    { repo_token: "repo-abc", repo_dir: "/repo", fingerprint: "fp1" },
-  ]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([
     {
       kind: "row",
@@ -7638,12 +9191,35 @@ test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE r
       reason: "shared-base-broken:fp1",
       dir: "/repo",
     },
+  ]);
+});
+
+test("runRepairEscalationSweep: concurrent affected owners receive exactly one grant and no session dispatch", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-1-foo", "fn-1-foo.3"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
+    rows: [repairRow()],
+  });
+  await runRepairEscalationSweep(deps);
+  expect(published).toHaveLength(1);
+  expect(published[0]).toMatchObject({
+    parent_job_id: "job-fn-1-foo.2",
+    owner_task_id: "fn-1-foo.2",
+    incident_id: "repair::repo-abc",
+    writable_root: "/repo",
+    role: "repair",
+    fencing_token: 1,
+  });
+  expect(mints).toEqual([
     { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
   ]);
 });
 
-test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (independent tokens)", async () => {
-  const { deps, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: distinct repos elect independent grants", async () => {
+  const { deps, published } = fakeRepairSweepDeps({
     candidates: [
       repairCandidate("fn-1-foo", "fn-1-foo.2", {
         repo_dir: "/a",
@@ -7656,26 +9232,27 @@ test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (
         fingerprint: "fpb",
       }),
     ],
+    rows: [
+      repairRow({ id: "a-111", dir: "/a", instance_event_id: 61 }),
+      repairRow({ id: "b-222", dir: "/b", instance_event_id: 62 }),
+    ],
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.map((g) => g.repo_token).sort()).toEqual([
-    "a-111",
-    "b-222",
+  expect(published.map((grant) => grant.incident_id).sort()).toEqual([
+    "repair::a-111",
+    "repair::b-222",
   ]);
 });
 
-test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, no row minted, no attempt, but leaves an observable trace", async () => {
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a dirty shared checkout defers grant publication with an observable trace", async () => {
+  const { deps, mints, published, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow()],
     dirty: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([]);
-  // Regression guard (fn-1198): the incident dirty-defer was invisible — every defer
-  // MUST now emit a class-stable, token+dir-keyed diagnostic so a starving repair route
-  // is greppable instead of looking like a dead feature. With no ACTIVE dirt distress row
-  // yet (sustained dirt has not crossed grace), the note carries no `distress=` suffix.
   expect(notes).toEqual([
     "# repair-defer token=repo-abc class=dirty_checkout dir=/repo",
   ]);
@@ -7687,14 +9264,14 @@ test("runRepairEscalationSweep: a dirty defer NAMES the active shared-checkout-d
   // needs-human row are the one incident — the whole point of routing the two consumers
   // (the sweep defer + the distress family) through one `shared-checkout-dirty:<hash>` id.
   const distressId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+  const { deps, mints, published, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow()],
     dirty: new Set(["/repo"]),
     activeDirty: new Map([["/repo", distressId]]),
   });
   await runRepairEscalationSweep(deps);
-  // Still a pure DEFER — no dispatch, no repair row minted (the naming is diagnostic-only).
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([]);
   expect(notes).toEqual([
     `# repair-defer token=repo-abc class=dirty_checkout dir=/repo distress=${distressId}`,
@@ -7752,149 +9329,106 @@ test("buildSharedDirtyObservation: candidate-scoped GENUINE dirt mints; unseeded
   expect([...obs.keys()].sort()).toEqual([dirtyRepo, staleRepo].sort());
 });
 
-test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps), with an observable skip trace", async () => {
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a grant publication failure records a retryable failed attempt", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    dispatch: async () => "at_cap",
+    rows: [repairRow()],
+    publish: () => false,
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  // The latch is minted (durable), but repair_dispatched_at stays NULL (no RepairDispatched).
+  expect(published).toEqual([]);
   expect(mints).toEqual([
-    {
-      kind: "row",
-      token: "repo-abc",
-      reason: "shared-base-broken:fp1",
-      dir: "/repo",
-    },
+    { kind: "dispatched", token: "repo-abc", outcome: "dispatch_failed" },
   ]);
-  expect(notes).toEqual(["# repair-skip token=repo-abc class=at_cap"]);
 });
 
-test("runRepairEscalationSweep: a dispatch_failed mints RepairDispatched{dispatch_failed} (non-terminal, re-sweeps)", async () => {
-  const { deps, mints } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    dispatch: async () => "dispatch_failed",
+test("runRepairEscalationSweep: an unexpired grant prevents every sibling election", async () => {
+  const { deps, mints, published, notifies } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-1-foo", "fn-1-foo.3"),
+    ],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    grants: [repairGrant()],
   });
   await runRepairEscalationSweep(deps);
+  expect(published).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: expiry without positive holder death never re-elects", async () => {
+  for (const liveness of ["live", "inconclusive"] as const) {
+    const fixture = fakeRepairSweepDeps({
+      candidates: [repairCandidate("fn-1-foo", "fn-1-foo.3")],
+      rows: [repairRow()],
+      grants: [repairGrant({ expires_at: 900_000 })],
+      holderLiveness: liveness,
+    });
+    await runRepairEscalationSweep(fixture.deps);
+    expect(fixture.published).toEqual([]);
+    expect(fixture.notes).toEqual([
+      `# repair-grant-hold token=repo-abc class=holder_${liveness}`,
+    ]);
+  }
+});
+
+test("runRepairEscalationSweep: an expired positively-dead holder is fenced before re-election", async () => {
+  const { deps, published, expired, mints } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.3")],
+    rows: [repairRow()],
+    grants: [repairGrant({ expires_at: 900_000, fencing_token: 7 })],
+    holderLiveness: "dead",
+    ownerTask: "fn-1-foo.3",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(expired).toHaveLength(1);
+  expect(published).toHaveLength(1);
+  expect(published[0]).toMatchObject({
+    parent_job_id: "job-fn-1-foo.3",
+    owner_task_id: "fn-1-foo.3",
+    fencing_token: 8,
+  });
   expect(mints).toContainEqual({
     kind: "dispatched",
     token: "repo-abc",
-    outcome: "dispatch_failed",
+    outcome: "dispatched",
   });
 });
 
-test("runRepairEscalationSweep: a LIVE repair (row dispatched, session not terminal) → no re-dispatch, no page", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a terminal granted owner pages once without launching repair", async () => {
+  const { deps, mints, published, notifies } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "declined" },
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a stopped repair without a terminal outcome waits inside grace", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 800 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => false,
-    nowSec: 1_000,
-    terminalGraceSec: 300,
-  });
-  await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a stopped repair past grace promotes to declined, pages once, and retry re-arms dispatch", async () => {
-  const candidate = repairCandidate("fn-1-foo", "fn-1-foo.2");
-  const stale = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow({ repair_dispatched_at: 600 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => false,
-    nowSec: 1_000,
-    terminalGraceSec: 300,
-  });
-  await runRepairEscalationSweep(stale.deps);
-  expect(stale.notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
-  expect(stale.mints).toEqual([
-    { kind: "notified", token: "repo-abc", outcome: "notified" },
-  ]);
-
-  // The folded page marker makes every later sweep inert: exactly one page.
-  const paged = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow({ repair_dispatched_at: 600, human_notified_at: 1_000 })],
-    nowSec: 2_000,
-  });
-  await runRepairEscalationSweep(paged.deps);
-  expect(paged.notifies).toEqual([]);
-  expect(paged.dispatches).toEqual([]);
-
-  // retry_dispatch clears the once markers while retaining the sticky row. The next
-  // sweep therefore dispatches exactly one fresh repair instead of re-notifying.
-  const retried = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow()],
-  });
-  await runRepairEscalationSweep(retried.deps);
-  expect(retried.notifies).toEqual([]);
-  expect(retried.dispatches).toHaveLength(1);
-  expect(retried.mints).toEqual([
-    { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
-  ]);
-});
-
-test("runRepairEscalationSweep: an old but working repair never grace-promotes", async () => {
-  const { deps, mints, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 1 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
-    nowSec: 100_000,
-    terminalGraceSec: 1,
-  });
-  await runRepairEscalationSweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a DECLINED repair (dispatched, terminal, candidates remain) pages the human ONCE", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 100 })],
-    repairOutcome: () => ({ terminal: true, verdict: "declined" }),
-  });
-  await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
   expect(mints).toEqual([
     { kind: "notified", token: "repo-abc", outcome: "notified" },
   ]);
 });
 
-test("runRepairEscalationSweep: an already-paged repair does NOT re-page and does NOT re-dispatch (sticky until retry)", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a stamped page marker suppresses repeat owner pages", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100, human_notified_at: 200 })],
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "died" },
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
   expect(notifies).toEqual([]);
   expect(mints).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a notify_failed leaves the page marker unset (re-sweepable, never silent)", async () => {
+test("runRepairEscalationSweep: a failed owner page remains re-sweepable", async () => {
   const { deps, mints } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100 })],
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "died" },
     notify: async () => "notify_failed",
   });
   await runRepairEscalationSweep(deps);
@@ -7903,14 +9437,13 @@ test("runRepairEscalationSweep: a notify_failed leaves the page marker unset (re
   ]);
 });
 
-test("runRepairEscalationSweep: positive-evidence CLEAR — a row with zero candidates + green base clears", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a candidate-free green baseline clears the incident", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
     candidates: [],
     rows: [repairRow({ repair_dispatched_at: 100 })],
     green: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
   expect(mints).toEqual([{ kind: "clear", token: "repo-abc" }]);
 });
 
@@ -7924,33 +9457,169 @@ test("runRepairEscalationSweep: a row with zero candidates but a NON-green base 
   expect(mints).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a row whose token STILL has candidates is never cleared (owned by dispatch/notify)", async () => {
-  const { deps, mints } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+test("runRepairEscalationSweep: objective green unblocks every parked owner and expires the grant", async () => {
+  const { deps, mints, unblocked, expired } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
     rows: [repairRow({ repair_dispatched_at: 100 })],
-    green: new Set(["/repo"]), // green, but candidates remain → NOT cleared
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
+    grants: [repairGrant()],
+    green: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(mints.find((m) => m.kind === "clear")).toBeUndefined();
+  expect(unblocked).toEqual(["fn-1-foo.2", "fn-2-bar.1"]);
+  expect(expired).toHaveLength(1);
+  expect(mints.find((mint) => mint.kind === "clear")).toBeUndefined();
+});
+
+test("runRepairEscalationSweep: owners without a shared-checkout session park visibly and never receive a grant", async () => {
+  const { deps, published, notes } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
+    rows: [repairRow()],
+    ownerTask: null,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(published).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
+    "# repair-park task=fn-2-bar.1 token=repo-abc class=shared_checkout_owner_unavailable",
+  ]);
+});
+
+test("runRepairEscalationSweep: trunk red with NO blocked consumer mints a maintenance task instead of parking", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes, published } =
+    fakeRepairSweepDeps({
+      candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+      rows: [repairRow()],
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual(["repo-abc"]);
+  expect(published).toEqual([]);
+  expect(notes.some((line) => line.startsWith("# repair-park"))).toBe(false);
+});
+
+test("runRepairEscalationSweep: an already-open maintenance task suppresses re-mint", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOpen: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a failed maintenance mint pages exactly once", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+  expect(mints).toContainEqual({
+    kind: "notified",
+    token: "repo-abc",
+    outcome: "notified",
+  });
+
+  // A second sweep against the marker the fold would have stamped never re-pages.
+  const resweep = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow({ human_notified_at: 100 })],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(resweep.deps);
+  expect(resweep.notifies).toEqual([]);
+  // The mint keeps retrying silently — only the PAGE is once.
+  expect(resweep.maintenanceMinted).toEqual(["repo-abc"]);
+});
+
+test("runRepairEscalationSweep: a throwing maintenance mint degrades to mint_failed (non-fatal)", async () => {
+  const { deps, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceThrows: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+});
+
+test("runRepairEscalationSweep: a MIXED group (a real candidate plus a task-less one) still parks — has a live task row to elect from", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes } =
+    fakeRepairSweepDeps({
+      candidates: [
+        repairCandidate("fn-1-foo", "fn-1-foo.2"),
+        repairCandidate("", "baseline-tip::repo-abc"),
+      ],
+      rows: [repairRow()],
+      ownerTask: null,
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual([]);
+  expect(maintenanceMinted).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
+  ]);
+});
+
+test("maintenanceEpicTitle: deterministic per (repo, fingerprint) — the daemon's own re-probe key", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+  };
+  expect(maintenanceEpicTitle(group)).toBe(
+    `${MAINTENANCE_TASK_TITLE_PREFIX}: repo-abc fp1`,
+  );
+  // A different fingerprint (a distinct defect) yields a distinct title.
+  expect(maintenanceEpicTitle({ ...group, fingerprint: "fp2" })).not.toBe(
+    maintenanceEpicTitle(group),
+  );
+});
+
+test("buildMaintenanceScaffoldYaml: carries the failing-tests digest and baseline leaf key in the task spec", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+    baseline_diagnosis: {
+      baseline_leaf_key: "k-deadbee",
+      failing_tests_digest: "alpha_fail; beta_fail",
+    },
+  };
+  const yamlDoc = buildMaintenanceScaffoldYaml(group);
+  expect(yamlDoc).toContain(JSON.stringify(maintenanceEpicTitle(group)));
+  expect(yamlDoc).toContain("k-deadbee");
+  expect(yamlDoc).toContain("alpha_fail; beta_fail");
+  expect(yamlDoc).toContain("tier: xhigh");
+  expect(yamlDoc).toContain("model: opus");
+  expect(yamlDoc).toContain("## Description");
+  expect(yamlDoc).toContain("## Acceptance");
+  expect(yamlDoc).toContain("## Done summary");
+  expect(yamlDoc).toContain("## Evidence");
 });
 
 test("runRepairEscalationSweep: empty candidates + empty rows is a no-op", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({});
+  const { deps, mints, published } = fakeRepairSweepDeps({});
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidatesThrow: true,
     rows: [repairRow()],
   });
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
 });
 
 // ---- runSharedCheckoutPageSweep (dirty/desync distress page-once, injected deps) --
@@ -8252,13 +9921,13 @@ test("selectRepairCandidates: a SHARED_BASE_BROKEN block written by the real wri
   );
   expect(candidates.length).toBe(1);
   expect(candidates[0]?.task_id).toBe("fn-1-foo.1");
-  expect(candidates[0]?.repo_dir).toBe(proj);
+  expect(candidates[0]?.repo_dir).toBe(realpathSync(proj));
   // A produced candidate drops nothing → no diagnostic.
   expect(notes).toEqual([]);
   db.close();
 });
 
-test("selectRepairCandidates: the real round-trip drives an actual dispatch decision at the pure sweep seam (clean checkout)", async () => {
+test("selectRepairCandidates: the real round-trip feeds one owner grant election", async () => {
   const { db } = freshMemDb();
   const proj = join(tmpDir, "proj");
   writeBlockedStateFile(
@@ -8271,30 +9940,24 @@ test("selectRepairCandidates: the real round-trip drives an actual dispatch deci
   ]);
   seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
 
-  // Feed the REAL candidate selector into the sweep; clean checkout (dirty set empty).
-  const dispatches: RepairGroup[] = [];
-  await runRepairEscalationSweep({
-    selectCandidates: () => selectRepairCandidates(db, readTaskBlockedReason),
-    selectRepairRows: () => [],
-    isDirtyCheckout: () => false,
-    isBaseGreen: () => false,
-    dispatchRepair: async (group) => {
-      dispatches.push(group);
-      return "dispatched";
-    },
-    repairOutcome: () => ({ terminal: false }),
-    repairSessionWorking: () => true,
-    nowSec: () => 1_000,
-    terminalGraceSec: 300,
-    notifyHuman: async () => "notified",
-    mintRow: () => {},
-    mintDispatched: () => {},
-    mintNotified: () => {},
-    clearRow: () => {},
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason);
+  const candidate = candidates[0] as RepairCandidate;
+  const fixture = fakeRepairSweepDeps({
+    candidates,
+    rows: [
+      repairRow({
+        id: candidate.repo_token,
+        dir: candidate.repo_dir,
+        instance_event_id: 71,
+      }),
+    ],
   });
-  // One sweep invocation → one repair dispatch decision for the repo.
-  expect(dispatches.length).toBe(1);
-  expect(dispatches[0]?.repo_dir).toBe(proj);
+  await runRepairEscalationSweep(fixture.deps);
+  expect(fixture.published).toHaveLength(1);
+  expect(fixture.published[0]).toMatchObject({
+    owner_task_id: "fn-1-foo.1",
+    writable_root: realpathSync(proj),
+  });
   db.close();
 });
 
@@ -8631,26 +10294,24 @@ test("buildBaselineRepairCandidates: infra / timeout / green / null / empty-dir 
   expect(notes).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a confirmed-red baseline candidate with ZERO blocked tasks drives ONE dispatch + one sticky row", async () => {
+test("runRepairEscalationSweep: baseline red with no blocked consumer mints only the incident row", async () => {
   const baseline = buildBaselineRepairCandidates([
     { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
   ]);
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: baseline,
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect((dispatches[0] as RepairGroup).repo_token).toBe(repoToken("/repo"));
-  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
-  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+  expect(published).toEqual([]);
+  expect(mints.filter((mint) => mint.kind === "row")).toHaveLength(1);
+  expect(mints.filter((mint) => mint.kind === "dispatched")).toHaveLength(0);
 });
 
-test("runRepairEscalationSweep: a worker-stamped block + a baseline-red candidate on one repo+fingerprint coalesce to ONE sticky", async () => {
+test("runRepairEscalationSweep: a worker block coalesces with baseline evidence into one owner grant", async () => {
   const baseline = buildBaselineRepairCandidates([
     { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
   ]);
   const bc = baseline[0] as RepairCandidate;
-  // A worker-sourced candidate on the SAME repo (same token) + SAME fingerprint.
   const worker: RepairCandidate = {
     epic_id: "fn-9-x",
     task_id: "fn-9-x.1",
@@ -8658,15 +10319,16 @@ test("runRepairEscalationSweep: a worker-stamped block + a baseline-red candidat
     repo_token: bc.repo_token,
     fingerprint: bc.fingerprint,
   };
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+  const { deps, published } = fakeRepairSweepDeps({
     candidates: [worker, bc],
+    rows: [
+      repairRow({ id: bc.repo_token, dir: bc.repo_dir, instance_event_id: 81 }),
+    ],
   });
   await runRepairEscalationSweep(deps);
-  // Coalesced by repo token → exactly one dispatch + one sticky row.
-  expect(dispatches.length).toBe(1);
-  expect((dispatches[0] as RepairGroup).repo_token).toBe(bc.repo_token);
-  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
-  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+  expect(published).toHaveLength(1);
+  expect(published[0]?.owner_task_id).toBe("fn-9-x.1");
+  expect(published[0]?.incident_id).toBe(`repair::${bc.repo_token}`);
 });
 
 test("repairCheckoutDirty (DEFER gate): dirty (>0) or unseeded (null) defers; a clean 0 does not", () => {
@@ -9048,6 +10710,278 @@ function seedMergeFailureRow(
     ],
   );
 }
+
+function ownerIncidentPage(
+  overrides: Partial<PendingIncidentOwnerPage> = {},
+): PendingIncidentOwnerPage {
+  return {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: mergeConflictReason(
+      "keeper/epic/fn-1350-owner--fn-1350-owner.2",
+      "keeper/epic/fn-1350-owner",
+    ),
+    dir: "/repo/lane",
+    claimSessionId: null,
+    instanceEventId: 50,
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+    humanNotifiedAt: null,
+    ...overrides,
+  };
+}
+
+function routerTask(overrides: Partial<Task> = {}): Task {
+  return {
+    task_id: "fn-1350-owner.1",
+    epic_id: "fn-1350-owner",
+    task_number: 1,
+    title: "integrate",
+    target_repo: null,
+    tier: null,
+    model: null,
+    worker_phase: "open",
+    runtime_status: "todo",
+    depends_on: [],
+    jobs: [],
+    ...overrides,
+  };
+}
+
+function routerEpic(overrides: Partial<Epic> = {}): Epic {
+  return {
+    epic_id: "fn-1350-owner",
+    epic_number: 1350,
+    title: "owner router",
+    project_dir: "/repo",
+    status: "open",
+    last_event_id: 1,
+    updated_at: 1,
+    depends_on_epics: [],
+    tasks: [routerTask()],
+    jobs: [],
+    job_links: [],
+    resolved_epic_deps: null,
+    last_validated_at: "2026-07-19T00:00:00Z",
+    question: null,
+    blocks_closing_of: null,
+    ...overrides,
+  };
+}
+
+function routerSnapshot(
+  epics: Epic[],
+  incidentOwnerKeys: Set<string>,
+  failedKeys: Set<string> = new Set(incidentOwnerKeys),
+): ReconcileSnapshot {
+  return {
+    readinessDegraded: false,
+    epics,
+    jobs: new Map(),
+    subagentInvocations: [],
+    gitStatusByProjectDir: new Map(),
+    failedKeys,
+    incidentOwnerKeys,
+    claimedIncidentKeys: new Set(),
+    recoverFailureIds: new Set(),
+    finalizeFailureIds: new Set(),
+    slotOccupancyFailures: [],
+    liveTabKeys: new Set(),
+    dispatchClaims: new Map(),
+    harnessActivityByJobId: new Map(),
+    livePaneIds: new Set(),
+    paneCommandById: new Map(),
+    provenDeadJobIds: new Set(),
+    pendingDispatches: [],
+    mode: "yolo",
+    armedIds: new Set(),
+    unseededRoots: new Set(),
+    workModel: WORKER_MODEL,
+    workEffort: WORKER_EFFORT,
+    closeModel: WORKER_MODEL,
+    closeEffort: WORKER_EFFORT,
+    hostMatrix: {
+      ok: true,
+      models: ["opus", "sonnet"],
+      effortsByModel: new Map(),
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map([
+        ["opus", "native"],
+        ["sonnet", "native"],
+      ]),
+    },
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+    worktreeMode: false,
+    worktreeRepoByEpicId: new Map(),
+  };
+}
+
+function routerState(paused = false): ReconcileState {
+  return {
+    paused,
+    inFlight: new Set(),
+    redispatchCooldown: new Map(),
+    finalizerGuard: new Map(),
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+  };
+}
+
+test("owner incident attachment slots are classified by typed row route and bounded durably", () => {
+  const first = ownerIncidentPage({
+    resolverDispatchedAt: null,
+    mergeEscalatedAt: null,
+  });
+  expect(nextIncidentOwnerAttachmentMarker(first)).toBe("resolver");
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      resolverDispatchedAt: 10,
+    }),
+  ).toBe("merge");
+  expect(nextIncidentOwnerAttachmentMarker(ownerIncidentPage())).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      reason: "tooling-failure: surface and stop",
+    }),
+  ).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      claimSessionId: "live-owner",
+    }),
+  ).toBeNull();
+  expect(INCIDENT_OWNER_ATTACHMENT_LIMIT).toBe(2);
+});
+
+test("reconcile routes only exact owner incidents through ordinary work/close dispatch and pause holds both", () => {
+  const workKey = "work::fn-1350-owner.1";
+  const work = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(work.launches.map((launch) => launch.key)).toEqual([workKey]);
+  expect(work.launches[0]?.verb).toBe("work");
+
+  const paused = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(true),
+    100,
+  );
+  expect(paused.launches).toEqual([]);
+  expect(paused.withholds.get("fn-1350-owner.1")?.code).toBe(
+    "autopilot-paused",
+  );
+
+  const suppressed = reconcile(
+    routerSnapshot([routerEpic()], new Set(), new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(suppressed.launches).toEqual([]);
+  expect(suppressed.withholds.get("fn-1350-owner.1")?.code).toBe("failed-key");
+
+  const closeKey = "close::fn-1350-owner";
+  const done = routerEpic({
+    status: "done",
+    tasks: [
+      routerTask({
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const close = reconcile(
+    routerSnapshot([done], new Set([closeKey])),
+    routerState(),
+    100,
+  );
+  expect(close.launches.map((launch) => launch.key)).toEqual([closeKey]);
+  expect(close.launches[0]?.verb).toBe("close");
+});
+
+test("exhausted incident attachments page once after the owner yields and never dispatch an escalation verb", async () => {
+  const row = ownerIncidentPage();
+  const paged = new Set<string>();
+  const notified: string[] = [];
+  const minted: string[] = [];
+  const deps: IncidentOwnerPageSweepDeps = {
+    selectPending: () => (paged.has(`${row.verb}::${row.id}`) ? [] : [row]),
+    stillPending: () => true,
+    ownerActive: () => false,
+    notifyHuman: async (candidate) => {
+      notified.push(buildIncidentOwnerPageBody(candidate));
+      return "notified";
+    },
+    mintNotified: (candidate, outcome) => {
+      minted.push(`${candidate.verb}::${candidate.id}:${outcome}`);
+      if (outcome === "notified") {
+        paged.add(`${candidate.verb}::${candidate.id}`);
+      }
+    },
+  };
+  await runIncidentOwnerPageSweep(deps);
+  await runIncidentOwnerPageSweep(deps);
+  expect(minted).toEqual(["work::fn-1350-owner.1:notified"]);
+  expect(notified).toHaveLength(1);
+  expect(notified[0]).toContain("No escalation session was launched");
+  expect(notified[0]).not.toContain("resolve::");
+  expect(notified[0]).not.toContain("deconflict::");
+});
+
+test("incident owner page selector excludes claims, non-incidents, and unexhausted attachments", () => {
+  const { db } = freshMemDb();
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: ownerIncidentPage().reason,
+    dir: "/repo/lane",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-1350-owner",
+    reason: ownerIncidentPage({ verb: "close" }).reason,
+    resolverDispatchedAt: 10,
+  });
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-other.1",
+    reason: "launch_failed: not an incident",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = 'owner' WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db)).toEqual([]);
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = NULL WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db).map((row) => row.id)).toEqual([
+    "fn-1350-owner.1",
+  ]);
+  db.close();
+});
+
+test("incident owner page sweep defers while the final ordinary owner is active", async () => {
+  const notified: string[] = [];
+  await runIncidentOwnerPageSweep({
+    selectPending: () => [ownerIncidentPage()],
+    stillPending: () => true,
+    ownerActive: () => true,
+    notifyHuman: async () => {
+      notified.push("unexpected");
+      return "notified";
+    },
+    mintNotified: () => notified.push("unexpected-mint"),
+  });
+  expect(notified).toEqual([]);
+});
 
 test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token, a NULL escalate marker, and a dispatched resolver", () => {
   const { db } = freshMemDb();
@@ -11422,7 +13356,7 @@ test("runMergeEscalationSweep + classifyWorkResolverOutcome: a leased-out crashe
 
 test("worker selection defaults to the complete ordered worker set", () => {
   expect(selectWorkerNames()).toEqual([...ALL_WORKERS]);
-  expect(selectWorkerNames()).toHaveLength(22);
+  expect(selectWorkerNames()).toHaveLength(21);
 });
 
 test("worker selection retains only requested workers in production order", () => {

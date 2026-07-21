@@ -82,6 +82,7 @@ export const AUTOPILOT_STATE_REBUILD_COPY_LISTS = {
     "drift_behind_threshold",
     "drift_age_threshold_days",
     "fable_focus",
+    "non_fable_focus",
   ],
 } as const;
 
@@ -2202,11 +2203,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v63→v64: add the empty `builds` projection table (the `keeper builds`
-      // buildbot dashboard surface). A reducer projection, in the
-      // rewind-and-redrain DELETE list; created unconditionally above so it
-      // exists before any earlier-version rewind that wipes it. No backfill —
-      // the live builds-worker poll repopulates it from the buildbot REST API.
       db.run(CREATE_BUILDS);
     },
   },
@@ -4486,7 +4482,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     },
   },
   {
-    // Provisional tail version; fan-in renumbers this singleton ladder entry.
     version: 137,
     kind: "additive",
     apply: (ctx) => {
@@ -4496,6 +4491,55 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         "owner_redispatch_attempts",
         "INTEGER NOT NULL DEFAULT 0",
       );
+    },
+  },
+  {
+    // Incident-claim columns on `dispatch_failures`. A live
+    // owning session pulls a merge incident and claims it (spool → producer →
+    // `IncidentClaimed` fold); the claim records the claimant identity, its
+    // recycle-safe process generation `(pid, start_time)`, and the claim event ts
+    // (freshness). Cleared by an `IncidentReleased` fold (self-release or a
+    // producer-driven dead-claimant expiry). All four nullable, NO DEFAULT (a
+    // DEFAULT poisons the NULL=unclaimed invariant and breaks re-fold byte-identity)
+    // and PRESERVED across the `DispatchFailed` UPSERT re-emit exactly like the
+    // sibling once-markers (`merge_escalated_at` / `resolver_dispatched_at` /
+    // `human_notified_at` / `instance_event_id`), so a live owner's claim survives a
+    // re-failure of the same open incident instance. Kept OUT of the
+    // CREATE_DISPATCH_FAILURES literal (mirrors every prior marker add), appended
+    // here so column order is fresh-vs-migrated identical. Plain additive ALTER — no
+    // cursor rewind (the fold that writes them reads only the payload + event.ts).
+    // Provisional tail version; fan-in renumbers this singleton ladder entry.
+    version: 138,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "claim_session_id",
+        "TEXT",
+      );
+      addColumnIfMissing(ctx.db, "dispatch_failures", "claim_pid", "INTEGER");
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "claim_start_time",
+        "TEXT",
+      );
+      addColumnIfMissing(ctx.db, "dispatch_failures", "claimed_at", "REAL");
+    },
+  },
+  {
+    version: 139,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(ctx.db, "autopilot_state", "non_fable_focus", "TEXT");
+    },
+  },
+  {
+    version: 140,
+    kind: "drop",
+    apply: (ctx) => {
+      ctx.db.run("DROP TABLE IF EXISTS builds");
     },
   },
 ];
@@ -4518,7 +4562,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v137:10674ec48efce92fc6f8c3b516e4b46ece73044986aa43516fdbf0a7f522fdc3";
+  "v140:95c9ccd85b6d99d30c1874e3acd65a155a47e065d89dd1a416608a1cb49e27e4";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4653,10 +4697,6 @@ export interface KeeperConfig {
   repoCloneRoot: string;
   repoForkRoot: string;
   claudeProjectsRoot?: string;
-  // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
-  // builds` dashboard's poller. Independent best-effort key with NO default:
-  // absent/empty/garbage → undefined → the builds worker is not spawned.
-  buildbotUrl?: string;
   // Global prompt prefix for `keeper dispatch` FREE-FORM dispatches: when set
   // (e.g. `/hack`), it is prepended with a single space to a free-form prompt
   // so the worker launches with `<prefix> <prompt>`. Independent best-effort key
@@ -4798,9 +4838,6 @@ export function resolveConfig(): KeeperConfig {
   let repoCloneRoot = DEFAULT_REPO_CLONE_ROOT;
   let repoForkRoot = DEFAULT_REPO_FORK_ROOT;
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
-  // No default — absent leaves `buildbotUrl` undefined so the builds worker
-  // never spawns.
-  let buildbotUrl: string | undefined;
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
@@ -4851,12 +4888,6 @@ export function resolveConfig(): KeeperConfig {
         .claude_projects_root;
       if (typeof cpr === "string" && cpr.length > 0) {
         claudeProjectsRoot = cpr;
-      }
-      // Independent best-effort key — non-empty string only; garbage/absent
-      // leaves `buildbotUrl` undefined and the builds worker un-spawned.
-      const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
-      if (typeof bbu === "string" && bbu.length > 0) {
-        buildbotUrl = bbu;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `dispatchPromptPrefix` undefined and no free-form prompt prefix
@@ -4914,7 +4945,6 @@ export function resolveConfig(): KeeperConfig {
     repoCloneRoot,
     repoForkRoot,
     claudeProjectsRoot,
-    buildbotUrl,
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
@@ -4963,17 +4993,6 @@ function firstNonEmpty(
     }
   }
   return undefined;
-}
-
-/**
- * Resolve the buildbot master base URL for the `keeper builds` poller, or null
- * when it is unconfigured. Independent best-effort key with NO default — the
- * builds worker spawn is gated on a non-null return here. No tilde-expansion or
- * existence check (it's a URL, validated by the poller degrading to silent
- * staleness on any fetch failure).
- */
-export function resolveBuildbotUrl(): string | null {
-  return resolveConfig().buildbotUrl ?? null;
 }
 
 /** Expand a leading `~`/`~/` via `homedir()`; pass an absolute path through. */
@@ -5137,7 +5156,21 @@ export function resolveBackstopLogPath(): string {
 }
 
 /**
- * `KEEPER_RESTART_LEDGER` env wins; else `~/.local/state/keeper/restart-ledger.json`.
+ * `${XDG_STATE_HOME:-$HOME/.local/state}/keeper`, matching install.sh's
+ * `fingerprint_dir` convention — the daemon-state directory root shared by the
+ * restart ledger and the operator-reload attribution leaf install.sh writes
+ * alongside it. Pure.
+ */
+export function resolveKeeperStateDir(): string {
+  const xdgStateHome = (process.env.XDG_STATE_HOME ?? "").trim();
+  if (xdgStateHome !== "") {
+    return join(xdgStateHome, "keeper");
+  }
+  return join(homedir(), ".local", "state", "keeper");
+}
+
+/**
+ * `KEEPER_RESTART_LEDGER` env wins; else `resolveKeeperStateDir()/restart-ledger.json`.
  * The durable crash-loop restart ledger: main appends each boot's timestamp here so a
  * self-restart storm is detectable from the NEXT boot. Deliberately a plain state-dir
  * sidecar, NOT keeper.db and NOT a fold — it must survive the very crash it measures.
@@ -5149,7 +5182,7 @@ export function resolveRestartLedgerPath(): string {
   if (override && override.length > 0) {
     return override;
   }
-  return join(homedir(), ".local", "state", "keeper", "restart-ledger.json");
+  return join(resolveKeeperStateDir(), "restart-ledger.json");
 }
 
 /**
@@ -6292,7 +6325,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     worker_provider TEXT,
     drift_behind_threshold INTEGER,
     drift_age_threshold_days INTEGER,
-    fable_focus TEXT
+    fable_focus TEXT,
+    non_fable_focus TEXT
 )
 `;
 
@@ -6312,21 +6346,6 @@ CREATE TABLE IF NOT EXISTS armed_epics (
 )
 `;
 
-/**
- * `builds` projection table — one row per registered buildbot builder, the
- * `keeper builds` dashboard surface. Keyed by builder NAME (`project`), stable
- * across master DB rebuilds where the numeric `builder_id` is not. Produced by
- * synthetic `BuildSnapshot` (UPSERT) / `BuildDeleted` (tombstone DELETE) events
- * the builds-worker mints from the buildbot REST API. A reducer projection
- * (re-fold deterministic, in the rewind-and-redrain DELETE list); starts empty
- * on a fresh DB — no backfill, the live poll repopulates it.
- *
- * `results` is NULL while a build is running (`complete:false`); `complete_at`
- * is NULL until the build finishes. `state_string` is projected for display but
- * EXCLUDED from the worker change-gate so a running→finished transition emits
- * exactly two events (start, finish). `updated_at` is the event `ts`, never a
- * wall-clock read (re-fold determinism).
- */
 const CREATE_BUILDS = `
 CREATE TABLE IF NOT EXISTS builds (
     project TEXT PRIMARY KEY,

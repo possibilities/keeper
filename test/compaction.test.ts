@@ -26,12 +26,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BACKFILL_WATERMARK_KEY } from "../src/backfill-mutation-path";
 import {
   computeColdWatermark,
   countAbsentBlobs,
   deleteColdTmuxFocusRows,
   deleteNoopSnapshotRows,
   drainColdPayloads,
+  formatRetentionShedProgressLogLine,
   RECLAIMABLE_LOG_STEP_BYTES,
   RETENTION_KEEP_CLASS_PREDICATE,
   RETENTION_SHED_PREDICATE,
@@ -39,7 +41,14 @@ import {
   reclaimableFreelistBytes,
   reclaimableLogStep,
   retainColdPayloads,
+  retentionShedProgressLogStep,
+  runYieldingRetentionBatches,
+  runYieldingRetentionPass,
 } from "../src/compaction";
+import {
+  createMaintenanceTimeBudget,
+  MAIN_MAINTENANCE_TICK_BUDGET_MS,
+} from "../src/maintenance-budget";
 import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
@@ -131,6 +140,20 @@ function drainAll(): number {
     total += n;
   } while (n > 0);
   return total;
+}
+
+function foldedEventFreshnessAgeMs(): number {
+  const latest = (
+    db.query("SELECT MAX(ts) AS ts FROM events").get() as {
+      ts: number | null;
+    }
+  ).ts;
+  const cursor = readFoldCursor(db);
+  const folded = db.query("SELECT ts FROM events WHERE id = ?").get(cursor) as {
+    ts: number;
+  } | null;
+  if (latest == null || folded == null) return 0;
+  return latest - folded.ts;
 }
 
 /** Snapshot the projection tables the seeded stream touches, for refold compare. */
@@ -697,6 +720,364 @@ test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across 
   expect(result2.shed).toBe(15);
 });
 
+test("yielding retention gives control RPCs a turn between one-transaction steps", async () => {
+  const trace: string[] = [];
+  let step = 0;
+
+  const results = await runYieldingRetentionBatches(
+    () => {
+      step += 1;
+      trace.push(`batch-${step}`);
+      return { batches: 1, moreLikely: step < 3 };
+    },
+    {
+      yieldTurn: async () => {
+        trace.push("yield");
+      },
+    },
+  );
+
+  expect(results).toHaveLength(3);
+  expect(trace).toEqual(["batch-1", "yield", "batch-2", "yield", "batch-3"]);
+});
+
+test("wall-clock budget stops an oversized retention chain and the next tick resumes its durable watermark", async () => {
+  const ids = Array.from({ length: 5 }, (_, i) =>
+    insertMutation(`/repo/budget-${i}.ts`),
+  );
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+  const projectionsBefore = projectionSnapshot();
+
+  let now = 0;
+  const firstTick = await runYieldingRetentionBatches(
+    () => {
+      const result = retainColdPayloads(db, {
+        recentRetentionMargin: 0,
+        batchSize: 2,
+        scanBatchSize: 2,
+        maxBatches: 1,
+        incrementalVacuumPages: 0,
+      });
+      now += MAIN_MAINTENANCE_TICK_BUDGET_MS + 1;
+      return result;
+    },
+    {
+      maxBatches: 20,
+      budget: createMaintenanceTimeBudget({ now: () => now }),
+      yieldTurn: async () => {},
+    },
+  );
+
+  expect(firstTick).toHaveLength(1);
+  expect(firstTick[0]?.shed).toBe(2);
+  expect(
+    ids.map(
+      (id) =>
+        (
+          db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+            data: string | null;
+          }
+        ).data === null,
+    ),
+  ).toEqual([true, true, false, false, false]);
+
+  now = 1_000;
+  const secondTick = await runYieldingRetentionBatches(
+    () =>
+      retainColdPayloads(db, {
+        recentRetentionMargin: 0,
+        batchSize: 2,
+        scanBatchSize: 2,
+        maxBatches: 1,
+        incrementalVacuumPages: 0,
+      }),
+    {
+      maxBatches: 20,
+      budget: createMaintenanceTimeBudget({ now: () => now }),
+      yieldTurn: async () => {},
+    },
+  );
+
+  expect(secondTick.reduce((sum, result) => sum + result.shed, 0)).toBe(3);
+  expect(
+    ids.map(
+      (id) =>
+        (
+          db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+            data: string | null;
+          }
+        ).data === null,
+    ),
+  ).toEqual([true, true, true, true, true]);
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
+  drainAll();
+  expect(projectionSnapshot()).toEqual(projectionsBefore);
+});
+
+test("default budgeted retention drains a representative shed backlog to the cold boundary", async () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID, ts: 0 });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: TEST_UUID,
+    ts: 1,
+    data: JSON.stringify({ prompt: "keep this prompt body" }),
+  });
+  db.transaction(() => {
+    for (let i = 0; i < 10_500; i++) {
+      insertMutation(`/repo/representative-${i}.ts`, { ts: 2 + i });
+    }
+  })();
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID, ts: 20_000 });
+  const maxId = (
+    db.query("SELECT MAX(id) AS id FROM events").get() as {
+      id: number;
+    }
+  ).id;
+  db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [maxId]);
+
+  const expectedActiveColdBoundary = maxId - 1;
+  expect(computeColdWatermark(db, 1)).toBe(expectedActiveColdBoundary);
+  const now = 0;
+  const result = await runYieldingRetentionPass(db, {
+    recentRetentionMargin: 1,
+    incrementalVacuumPages: 0,
+    budget: createMaintenanceTimeBudget({ now: () => now }),
+    yieldTurn: async () => {},
+  });
+
+  expect(result?.bodies.shed).toBe(10_500);
+  expect(result?.bodies.batches).toBe(21);
+  expect(result?.bodies.moreLikely).toBe(false);
+  expect(result?.bodies.scanWatermark).toBe(expectedActiveColdBoundary);
+  expect(
+    db
+      .query(
+        `SELECT hook_event, tool_name FROM events
+          WHERE data IS NOT NULL
+          ORDER BY id`,
+      )
+      .all(),
+  ).toEqual([
+    { hook_event: "SessionStart", tool_name: null },
+    { hook_event: "UserPromptSubmit", tool_name: null },
+    { hook_event: "Stop", tool_name: null },
+  ]);
+});
+
+test("interleaved shed backlog yields keep reducer ingest freshness under five seconds", async () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID, ts: 0 });
+  db.transaction(() => {
+    for (let i = 0; i < 2_000; i++) {
+      insertMutation(`/repo/fresh-${i}.ts`, { ts: 1 + i });
+    }
+  })();
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID, ts: 3_000 });
+  drainAll();
+
+  let simulatedTs = 3_000;
+  let maxObservedAgeMs = 0;
+  let now = 0;
+  const observeFreshness = () => {
+    const age = foldedEventFreshnessAgeMs();
+    maxObservedAgeMs = Math.max(maxObservedAgeMs, age);
+    expect(age).toBeLessThanOrEqual(5_000);
+  };
+
+  const results = await runYieldingRetentionBatches(
+    () => {
+      const result = retainColdPayloads(db, {
+        recentRetentionMargin: 1,
+        batchSize: 100,
+        scanBatchSize: 101,
+        maxBatches: 1,
+        incrementalVacuumPages: 0,
+      });
+      simulatedTs += 1_000;
+      insertEvent({
+        hook_event: "Stop",
+        session_id: TEST_UUID,
+        ts: simulatedTs,
+      });
+      now += 1;
+      observeFreshness();
+      return result;
+    },
+    {
+      maxBatches: 12,
+      budget: createMaintenanceTimeBudget({ now: () => now }),
+      yieldTurn: async () => {
+        drainAll();
+        observeFreshness();
+      },
+    },
+  );
+
+  drainAll();
+  observeFreshness();
+  expect(results).toHaveLength(12);
+  expect(results.reduce((sum, result) => sum + result.shed, 0)).toBe(1_200);
+  expect(results.at(-1)?.moreLikely).toBe(true);
+  expect(maxObservedAgeMs).toBeLessThanOrEqual(1_000);
+});
+
+test("yielding retention pass applies the batch cap independently to all three surfaces", async () => {
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "SessionStart" });
+  }
+  db.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
+  let yields = 0;
+
+  const result = await runYieldingRetentionPass(db, {
+    batchSize: 1,
+    maxBatches: 2,
+    scanBatchSize: 1,
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+    yieldTurn: async () => {
+      yields += 1;
+    },
+  });
+
+  expect(result?.bodies.batches).toBe(2);
+  expect(result?.noopSnapshots.batches).toBe(2);
+  expect(result?.tmuxFocus.batches).toBe(2);
+  expect(result?.budgetExhausted).toBe(false);
+  expect(yields).toBe(6);
+});
+
+test("one retention budget is shared across body shed and cold-row compaction", async () => {
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "SessionStart" });
+  }
+  db.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
+  let now = 0;
+
+  const result = await runYieldingRetentionPass(db, {
+    batchSize: 1,
+    maxBatches: 3,
+    scanBatchSize: 1,
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+    budget: createMaintenanceTimeBudget({ now: () => now }),
+    yieldTurn: async () => {
+      now += MAIN_MAINTENANCE_TICK_BUDGET_MS + 1;
+    },
+  });
+
+  expect(result?.bodies.batches).toBe(1);
+  expect(result?.noopSnapshots.batches).toBe(0);
+  expect(result?.tmuxFocus.batches).toBe(0);
+  expect(result?.budgetExhausted).toBe(true);
+});
+
+test("retention persists bounded primary-key progress across a keep-only history prefix", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 40; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  const mutationId = insertMutation("/repo/late.ts");
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  // One batch may inspect only ten existing rows. The late mutation must NOT be
+  // found by a whole-history class-index scan on this first pass.
+  const first = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 1,
+    scanBatchSize: 10,
+    maxBatches: 1,
+    incrementalVacuumPages: 0,
+  });
+  expect(first.shed).toBe(0);
+  expect(first.batches).toBe(1);
+  expect(first.moreLikely).toBe(true);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).not.toBeNull();
+
+  // The catch-up loop continues across zero-mutation windows, reaches the late
+  // row, and records a terminal fully-scanned pass.
+  const drained = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 1,
+    scanBatchSize: 10,
+    maxBatches: 1,
+    maxPasses: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(drained.shed).toBe(1);
+  expect(drained.hitPassCap).toBe(false);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+});
+
+test("retention revisits a row when mutation-path backfill progress changes", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const mutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/later.ts" } }),
+    mutation_path: null,
+  });
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  const beforeBackfill = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    scanBatchSize: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(beforeBackfill.shed).toBe(0);
+  expect(beforeBackfill.moreLikely).toBe(false);
+
+  // Mirror the backfill's atomic column + watermark advance. The watermark is
+  // part of the body-scan signature, so this newly eligible row cannot remain
+  // stranded behind the persisted retention cursor.
+  db.transaction(() => {
+    db.run("UPDATE events SET mutation_path = ? WHERE id = ?", [
+      "/repo/later.ts",
+      mutationId,
+    ]);
+    db.run(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [BACKFILL_WATERMARK_KEY, String(mutationId)],
+    );
+  }).immediate();
+
+  const afterBackfill = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    scanBatchSize: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(afterBackfill.shed).toBe(1);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+});
+
 test("retention shrinks the inline footprint; per-batch incremental_vacuum reclaims on an INCREMENTAL DB", () => {
   // A minimal DB born with auto_vacuum=INCREMENTAL so incremental_vacuum actually
   // returns freed overflow pages (the .4 reclaimDb bakes this into the live file).
@@ -715,6 +1096,7 @@ test("retention shrinks the inline footprint; per-batch incremental_vacuum recla
   idb.run(
     "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
   );
+  idb.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
 
   // Seed 40 shed-class mutation rows with bodies large enough to spill onto
@@ -1067,6 +1449,7 @@ test("deleteNoopSnapshotRows reclaims freed pages via per-batch incremental_vacu
   idb.run(
     "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
   );
+  idb.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
 
   // 40 no-op-snapshot rows with bodies large enough to spill onto overflow pages.
@@ -1359,4 +1742,42 @@ test("reclaimableLogStep re-logs after a drain lowers the latch and the pool reg
 
 test("reclaimableLogStep clamps negative input to step 0", () => {
   expect(reclaimableLogStep(-1, 0)).toEqual({ shouldLog: false, step: 0 });
+});
+
+test("retention shed progress log is step-latched and reports scan position plus remaining estimate", () => {
+  expect(retentionShedProgressLogStep(99, 0)).toEqual({
+    shouldLog: false,
+    step: 0,
+  });
+  expect(retentionShedProgressLogStep(100, 0)).toEqual({
+    shouldLog: true,
+    step: 1,
+  });
+  expect(retentionShedProgressLogStep(199, 1)).toEqual({
+    shouldLog: false,
+    step: 1,
+  });
+  expect(retentionShedProgressLogStep(200, 1)).toEqual({
+    shouldLog: true,
+    step: 2,
+  });
+
+  expect(
+    formatRetentionShedProgressLogLine(
+      {
+        shed: 50_000,
+        batches: 100,
+        coldWatermark: 25_003,
+        cursor: 25_004,
+        reclaimedPages: 0,
+        scanWatermark: 5_000,
+        remainingScanRows: 20_003,
+        estimatedRemainingBatches: 41,
+        moreLikely: true,
+      },
+      100,
+    ),
+  ).toBe(
+    "[keeperd] retention: shed progress 100 body batch(es), scan id<=5000/25003, ~20003 cold row(s) remain (~41 scan batch(es))",
+  );
 });

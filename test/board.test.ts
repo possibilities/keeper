@@ -337,6 +337,16 @@ const HEADER_MODEL: BoardHeaderViewModel = {
     reason: "target-focused",
     diagnostic: "none",
   },
+  nonFableFocus: {
+    configured: true,
+    state: "active",
+    target_route: "claude-swap:3",
+    lifetime: { kind: "permanent" },
+    target_eligible: true,
+    outcome: "focused",
+    reason: "target-focused",
+    diagnostic: "none",
+  },
 };
 
 test("board semantic header keeps full labels and wraps without condensing", () => {
@@ -351,6 +361,12 @@ test("board semantic header keeps full labels and wraps without condensing", () 
     "  lifetime: permanent",
     "  target currently eligible: yes",
     "  effective routing state: focused",
+    "Non-Fable focus",
+    "  target account route: claude-swap:3",
+    "  lifetime: permanent",
+    "  target currently eligible: yes",
+    "  effective routing state: focused",
+    "  diagnostic: none",
     "summary",
     "  tasks: 3 open / 1 running",
     "  epics: 2 open / 1 running / 1 closing",
@@ -380,6 +396,7 @@ test("board semantic header keeps full labels and wraps without condensing", () 
   expect(narrowText).not.toContain("cap ");
   expect(narrowText).toContain("maximum concurrent jobs");
   expect(narrowText).toContain("target account route:");
+  expect(narrowText).toContain("Non-Fable focus");
 
   expect(
     wrapBoardHeaderLine("  target account route: claude-swap:2", 16),
@@ -400,14 +417,27 @@ test("board semantic header preserves Fable fallback and unavailable evidence", 
       },
     },
   } satisfies BoardHeaderViewModel;
-  expect(
-    formatBoardHeader({
-      viewModel: absolute,
-      width: 120,
-      now: 1_700_000_000_001,
-    }),
-  ).toContain(
+  const expiredRows = formatBoardHeader({
+    viewModel: absolute,
+    width: 120,
+    now: 1_700_000_000_001,
+    timeZone: "America/New_York",
+  });
+  expect(expiredRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (expired less than 1 minute ago)",
+  );
+  expect(expiredRows).toContain(
     "  effective routing state: fallback to normal account balancing",
+  );
+
+  const activeRows = formatBoardHeader({
+    viewModel: absolute,
+    width: 120,
+    now: 1_699_991_000_000,
+    timeZone: "America/New_York",
+  });
+  expect(activeRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (2 hours 30 minutes remaining)",
   );
 
   const unavailable = {
@@ -437,16 +467,137 @@ test("board semantic header preserves Fable fallback and unavailable evidence", 
   expect(rows.join("\n")).not.toContain("\x1b[");
 });
 
+test("board semantic header renders Non-Fable off, active, expired, and unavailable states", () => {
+  const off = {
+    ...HEADER_MODEL,
+    nonFableFocus: {
+      configured: false,
+      state: "off" as const,
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off" as const,
+      reason: "policy-off" as const,
+      diagnostic: "none",
+    },
+  } satisfies BoardHeaderViewModel;
+  const offRows = formatBoardHeader({
+    viewModel: off,
+    width: 120,
+    now: 1_700_000_000_000,
+  });
+  expect(offRows.indexOf("Non-Fable focus: off")).toBe(
+    offRows.indexOf("  effective routing state: focused") + 1,
+  );
+
+  const sameTarget = {
+    ...HEADER_MODEL,
+    nonFableFocus: {
+      ...HEADER_MODEL.nonFableFocus,
+      target_route: HEADER_MODEL.fableFocus.target_route,
+    },
+  } satisfies BoardHeaderViewModel;
+  expect(
+    formatBoardHeader({
+      viewModel: sameTarget,
+      width: 120,
+      now: 1_700_000_000_000,
+    }).filter((line) => line === "  target account route: claude-swap:2"),
+  ).toHaveLength(2);
+
+  const fallback = {
+    ...HEADER_MODEL,
+    nonFableFocus: {
+      ...HEADER_MODEL.nonFableFocus,
+      target_route: "claude-swap:4" as const,
+      target_eligible: false,
+      outcome: "fallback" as const,
+      reason: "target-ineligible" as const,
+    },
+  } satisfies BoardHeaderViewModel;
+  const fallbackRows = formatBoardHeader({
+    viewModel: fallback,
+    width: 120,
+    now: 1_700_000_000_000,
+  });
+  const fallbackStart = fallbackRows.indexOf("Non-Fable focus");
+  expect(fallbackRows.slice(fallbackStart, fallbackStart + 6)).toEqual([
+    "Non-Fable focus",
+    "  target account route: claude-swap:4",
+    "  lifetime: permanent",
+    "  target currently eligible: no",
+    "  effective routing state: fallback to normal account balancing",
+    "  diagnostic: none",
+  ]);
+
+  const expired = {
+    ...HEADER_MODEL,
+    nonFableFocus: {
+      ...HEADER_MODEL.nonFableFocus,
+      state: "expired" as const,
+      lifetime: {
+        kind: "absolute" as const,
+        deadline_at: "2023-11-14T22:13:20.000Z",
+      },
+      outcome: "fallback" as const,
+      reason: "policy-inactive" as const,
+    },
+  } satisfies BoardHeaderViewModel;
+  const expiredRows = formatBoardHeader({
+    viewModel: expired,
+    width: 120,
+    now: 1_700_000_000_001,
+    timeZone: "America/New_York",
+  });
+  expect(expiredRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (expired less than 1 minute ago)",
+  );
+  expect(expiredRows).toContain(
+    "  effective routing state: fallback to normal account balancing",
+  );
+
+  const unavailable = {
+    ...HEADER_MODEL,
+    nonFableFocus: {
+      ...HEADER_MODEL.nonFableFocus,
+      configured: false,
+      state: "unavailable" as const,
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "fallback" as const,
+      reason: "policy-unavailable" as const,
+      diagnostic: "delivery-malformed",
+    },
+  } satisfies BoardHeaderViewModel;
+  const unavailableRows = formatBoardHeader({
+    viewModel: unavailable,
+    width: 120,
+    now: 1_700_000_000_000,
+  });
+  expect(unavailableRows).toContain("Non-Fable focus");
+  expect(unavailableRows).toContain("  target account route: unavailable");
+  expect(unavailableRows).toContain("  lifetime: unavailable");
+  expect(unavailableRows).toContain("  target currently eligible: unknown");
+  expect(unavailableRows).toContain(
+    "  effective routing state: unavailable; using normal account balancing",
+  );
+  expect(unavailableRows).toContain("  diagnostic: delivery-malformed");
+  expect(unavailableRows).toContain("  target account route: claude-swap:2");
+});
+
 test("board frame state records the exact semantic header inputs", () => {
   const state = boardFrameStateJson([], new Map(), {
     viewModel: HEADER_MODEL,
     width: 100,
     renderedAtMs: 1_700_000_000_000,
+    timeZone: "America/New_York",
   });
   expect(state.header).toEqual({
     viewModel: HEADER_MODEL,
     width: 100,
     renderedAtMs: 1_700_000_000_000,
+    timeZone: "America/New_York",
   });
 });
 

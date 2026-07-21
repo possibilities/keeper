@@ -16,6 +16,10 @@ import {
   writeCodexObservationSidecar,
 } from "../src/codex-account-observation";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
+import {
   createUsagePoller,
   loadUsageSnapshot,
   renderUsageLines,
@@ -54,6 +58,11 @@ function claudeObservation(): Observation {
         measuredAtMs: NOW,
         windows: [
           {
+            key: "session",
+            utilization: 0.21,
+            resetsAt: new Date(NOW + 4 * 60 * 60_000).toISOString(),
+          },
+          {
             key: "week",
             utilization: 0.44,
             resetsAt: new Date(NOW + 2 * 24 * 60 * 60_000).toISOString(),
@@ -70,7 +79,34 @@ function claudeObservation(): Observation {
       count: 2,
       ordinals: { "claude-swap:1": 0, "claude-swap:2": 1 },
     },
-    account_issues: { "claude-swap:1": "relogin-required" },
+    account_capacity: {
+      "claude-swap:1": {
+        subscriptionType: "pro",
+        rateLimitMultiplier: 1,
+      },
+      "claude-swap:2": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+    },
+    account_measurements: {
+      "claude-swap:1": {
+        measuredAtMs: NOW - 85 * 60_000,
+        windows: [
+          {
+            key: "session",
+            utilization: 0.25,
+            resetsAt: new Date(NOW + 2 * 60 * 60_000).toISOString(),
+          },
+          {
+            key: "week",
+            utilization: 0.5,
+            resetsAt: new Date(NOW + 24 * 60 * 60_000).toISOString(),
+          },
+        ],
+      },
+    },
+    account_issues: { "claude-swap:1": "usage-unavailable" },
     notes: [],
   };
 }
@@ -85,23 +121,28 @@ function codexObservation(): CodexCapacityObservation {
       {
         alias: "keeper-codex-a",
         status: "healthy",
+        account_category: "pro",
         observed_at_ms: NOW,
         expires_at_ms: NOW + 60_000,
         windows: [
           {
             role: "primary",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
             key: "week",
             label: "weekly",
             window_seconds: 604_800,
             used_percent: 38,
+            exhausted: false,
             reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
           },
           {
             role: "additional",
+            quota_scope: CODEX_SPARK_QUOTA_SCOPE,
             key: "meter:95e633c373a9cdcf6cdc5e63:primary",
             label: "GPT-5.3-Codex-Spark",
             window_seconds: 604_800,
             used_percent: 5,
+            exhausted: false,
             reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
           },
         ],
@@ -123,14 +164,62 @@ describe("usage observation view", () => {
     const text = renderUsageLines(snapshot).join("\n");
 
     expect(text).toContain("[claude] fresh 0s");
-    expect(text).toContain("Claude 1  [issue] · relogin-required");
+    expect(text).toContain("Claude 1 · Pro 1×  [unavailable] · measured 1h");
+    expect(text).toContain("Claude 2 · Max 20×  measured 0s");
+    expect(text).toContain("25%");
     expect(text).toContain("weekly");
     expect(text).toContain("Fable");
     expect(text).toContain("[codex] fresh 0s");
-    expect(text).toContain("Codex 1");
+    expect(text).toContain("Codex 1 · Pro");
+    expect(text).not.toContain("Codex 1  measured");
     expect(text).toContain("GPT-5.3-Codex-Spark");
     expect(text).toContain("38%");
     expect(text).toContain("5%");
+  });
+
+  test("omits unavailable account metadata without placeholders", () => {
+    const target = paths();
+    const claude = claudeObservation();
+    delete claude.account_capacity;
+    const codex = codexObservation();
+    if (codex.aliases[0]) delete codex.aliases[0].account_category;
+    writeObservationSidecar(target.claude, claude);
+    writeCodexObservationSidecar(target.codex, codex);
+
+    const text = renderUsageLines(loadUsageSnapshot(target, NOW)).join("\n");
+    expect(text).toContain("Claude 2  measured 0s");
+    expect(text).not.toContain("Claude 2 ·");
+    expect(text).not.toContain("Codex 1 ·");
+    expect(text).not.toContain("?×");
+  });
+
+  test("renders admitted Claude meters with old and clock-skewed Measurement provenance", () => {
+    const target = paths();
+    const claude = claudeObservation();
+    const route = claude.routes[0];
+    if (route === undefined) throw new Error("invalid Claude fixture");
+    route.measuredAtMs = NOW - 3 * 60 * 60_000;
+    writeObservationSidecar(target.claude, claude);
+    writeCodexObservationSidecar(target.codex, codexObservation());
+
+    let snapshot = loadUsageSnapshot(target, NOW);
+    expect(snapshot.claude.status).toBe("ok");
+    expect(snapshot.claude.accounts[1]).toMatchObject({
+      status: "ok",
+      measuredAtMs: NOW - 3 * 60 * 60_000,
+    });
+    let text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("Claude 2 · Max 20×  measured 3h");
+    expect(text).not.toContain("Claude 2  [stale]");
+    expect(text).toContain("weekly");
+    expect(text).toContain("Fable");
+
+    route.measuredAtMs = NOW + 60_000;
+    writeObservationSidecar(target.claude, claude);
+    snapshot = loadUsageSnapshot(target, NOW);
+    expect(snapshot.claude.accounts[1]?.status).toBe("ok");
+    text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("Claude 2 · Max 20×  measured clock skew");
   });
 
   test("disambiguates two windows carried by one named Codex meter", () => {
@@ -183,10 +272,15 @@ describe("usage observation view", () => {
     writeHealthySidecars(target);
     snapshot = loadUsageSnapshot(target, NOW + 6 * 60_000);
     expect(snapshot.claude.status).toBe("stale");
+    expect(snapshot.claude.accounts[1]?.status).toBe("stale");
     expect(snapshot.codex.status).toBe("stale");
+    const text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("[claude] [stale] · 6m");
+    expect(text).toContain("Claude 2 · Max 20×  [stale] · measured 6m");
+    expect(text).toContain("Fable");
   });
 
-  test("heartbeat timestamps repaint locally without forging data changes", () => {
+  test("age and countdown timestamps repaint without forging semantic changes", () => {
     const target = paths();
     writeHealthySidecars(target);
     const first = loadUsageSnapshot(target, NOW);
@@ -196,10 +290,18 @@ describe("usage observation view", () => {
       claude: { ...first.claude, observedAtMs: NOW + 1_000 },
       codex: { ...first.codex, observedAtMs: NOW + 1_000 },
     };
-    expect(usageSemanticFingerprint(heartbeat)).toBe(
+    const repaintOnly = structuredClone(heartbeat);
+    const repaintAccount = repaintOnly.claude.accounts[1];
+    const repaintMeter = repaintAccount?.meters[0];
+    if (!repaintAccount || !repaintMeter) {
+      throw new Error("invalid repaint snapshot");
+    }
+    repaintAccount.measuredAtMs = NOW - 3 * 60 * 60_000;
+    repaintMeter.resetAtMs = NOW + 4 * 24 * 60 * 60_000;
+    expect(usageSemanticFingerprint(repaintOnly)).toBe(
       usageSemanticFingerprint(first),
     );
-    const changed = structuredClone(heartbeat);
+    const changed = structuredClone(repaintOnly);
     const changedMeter = changed.codex.accounts[0]?.meters[0];
     if (!changedMeter) throw new Error("invalid changed snapshot");
     changedMeter.usedPercent = 39;

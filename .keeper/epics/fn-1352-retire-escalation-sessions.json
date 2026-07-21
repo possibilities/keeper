@@ -5,7 +5,8 @@
   "depends_on_epics": [
     "fn-1351-repair-under-write-grant",
     "fn-1346-retire-torn-down-lane-git-rows",
-    "fn-1375-reap-stopped-sessions-release-claims"
+    "fn-1375-reap-stopped-sessions-release-claims",
+    "fn-1386-harden-trunk-lease-integration"
   ],
   "id": "fn-1352-retire-escalation-sessions",
   "last_validated_at": "2026-07-19T23:09:19.059000Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T23:09:19.059000Z"
+  "updated_at": "2026-07-20T13:06:06.058000Z"
 }

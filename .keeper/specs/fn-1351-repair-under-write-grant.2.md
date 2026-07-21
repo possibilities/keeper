@@ -34,5 +34,5 @@ In-process with an injected subprocess seam: no-consumer red mints once; existin
 - [ ] All suites green via named gates
 
 ## Done summary
-
+The repair sweep now mints an idempotent, arm-and-dispatch maintenance plan task (via a bounded scaffold/validate subprocess pair) for a trunk-red group with no live blocked consumer, instead of holding the incident ownerless; a failed mint pages once through the existing decline/death notify path.
 ## Evidence

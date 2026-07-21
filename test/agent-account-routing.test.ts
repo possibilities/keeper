@@ -19,6 +19,11 @@ import {
   observationSidecarPath,
 } from "../src/account-routing-config";
 import { main, seedClaudeWorkspaceTrust } from "../src/agent/main";
+import { poolAliasPolicyBinding } from "../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
 import {
   expectExit,
   makeHarness,
@@ -27,6 +32,22 @@ import {
 
 const CSWAP = "/fake-home/.local/bin/cswap";
 const UUID = "11111111-1111-1111-1111-111111111111";
+const CODEX_ALIASES = ["keeper-codex-a", "keeper-codex-b"];
+
+function aliasPolicy(generic: string[], spark: string[]) {
+  return {
+    [CODEX_GENERIC_QUOTA_SCOPE]: generic,
+    [CODEX_SPARK_QUOTA_SCOPE]: spark,
+  };
+}
+
+function aliasPolicyEnv(generic: string[], spark: string[]): string {
+  return JSON.stringify(aliasPolicy(generic, spark));
+}
+
+function aliasPolicyBindingEnv(generic: string[], spark: string[]): string {
+  return poolAliasPolicyBinding(CODEX_ALIASES, aliasPolicy(generic, spark));
+}
 
 function selection(slot: number, accountOrdinal?: number): RouteSelection {
   return {
@@ -362,6 +383,22 @@ describe("selection remains independent per invocation", () => {
     expect(explicit.deps.env.KEEPER_FABLE_INTENT).toBe("0");
   });
 
+  test("an unresolved continuation preserves unknown intent", async () => {
+    const observed: Array<boolean | null | undefined> = [];
+    const h = makeHarness({
+      argv: ["claude", "--resume", UUID],
+      rawArgv: true,
+      resolveFableIntent: async () => null,
+      selectAccountRoute: (_model, fableIntent) => {
+        observed.push(fableIntent);
+        return { ok: true, selection: selection(6) };
+      },
+    });
+    await runAndCapture(h, main);
+    expect(observed).toEqual([null]);
+    expect(h.deps.env.KEEPER_FABLE_INTENT).toBeUndefined();
+  });
+
   test("Pi launches never consult claude-swap routing", async () => {
     const h = makeHarness({ argv: ["pi", "hello"], rawArgv: true });
     const command = await runAndCapture(h, main);
@@ -468,7 +505,7 @@ describe("keeper agent accounts fable-focus", () => {
     }
   });
 
-  test("absolute, cycle-end, and guarded current-reset setters preserve stable route identity", async () => {
+  test("focus setters preserve stable routes with old measurement provenance", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "keeper-focus-lifetimes-"));
     const now = Date.parse("2026-07-18T00:00:00Z");
     const resetAt = "2026-07-18T01:00:00.900Z";
@@ -483,7 +520,7 @@ describe("keeper agent accounts fable-focus", () => {
             id: "claude-swap:2",
             kind: "managed",
             slot: 2,
-            measuredAtMs: now,
+            measuredAtMs: Date.parse("2001-01-01T00:00:00Z"),
             windows: [
               { key: "session", utilization: 0.2, resetsAt: null },
               { key: "week", utilization: 0.3, resetsAt: null },
@@ -633,8 +670,236 @@ describe("keeper agent accounts fable-focus", () => {
   });
 });
 
+describe("keeper agent accounts non-fable-focus", () => {
+  const offFable = {
+    configured: false,
+    state: "off" as const,
+    target_route: null,
+    lifetime: null,
+    target_eligible: null,
+    outcome: "off" as const,
+    reason: "policy-off" as const,
+    diagnostic: "none",
+  };
+  const offNonFable = { ...offFable };
+  const baseInspection = {
+    model_scope: "non-fable",
+    health: "ok" as const,
+    observed_at_ms: Date.parse("2026-07-18T00:00:00Z"),
+    age_ms: 0,
+    fresh: true,
+    enabled: true,
+    error: null,
+    would_choose: null,
+    candidates: [
+      {
+        id: "claude-swap:2",
+        kind: "managed" as const,
+        slot: 2,
+        worst_utilization: 0.2,
+        fable_remaining: 0.6,
+      },
+    ],
+    fable_focus: offFable,
+    non_fable_focus: offNonFable,
+  };
+
+  test("show exposes the canonical PII-free sibling view", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "non-fable-focus", "show", "--json"],
+      rawArgv: true,
+      inspectRouting: (intent) => {
+        expect(intent).toBe(false);
+        return {
+          ...baseInspection,
+          non_fable_focus: {
+            configured: true,
+            state: "active",
+            target_route: "claude-swap:2",
+            lifetime: { kind: "permanent" },
+            target_eligible: true,
+            outcome: "focused",
+            reason: "target-focused",
+            diagnostic: "none",
+          },
+        };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const envelope = JSON.parse(h.out.join(""));
+    expect(envelope).toMatchObject({
+      schema_version: 1,
+      ok: true,
+      data: {
+        target_route: "claude-swap:2",
+        outcome: "focused",
+        reason: "target-focused",
+      },
+    });
+    expect(JSON.stringify(envelope)).not.toContain("@");
+  });
+
+  test("stable and cN targets persist only stable routes with supported lifetimes", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "keeper-non-fable-focus-"));
+    const now = Date.parse("2026-07-18T00:00:00Z");
+    const applied: unknown[] = [];
+    try {
+      writeObservationSidecar(observationSidecarPath(stateDir), {
+        schema_version: OBSERVATION_SCHEMA_VERSION,
+        observed_at_ms: now,
+        health: "ok",
+        routes: [
+          {
+            id: "claude-swap:2",
+            kind: "managed",
+            slot: 2,
+            measuredAtMs: now,
+            windows: [
+              { key: "session", utilization: 0.2, resetsAt: null },
+              { key: "week", utilization: 0.3, resetsAt: null },
+            ],
+          },
+        ],
+        claude_accounts: {
+          count: 1,
+          ordinals: { "claude-swap:2": 0 },
+        },
+        account_issues: {},
+        notes: [],
+      });
+      const runSet = async (args: string[]): Promise<void> => {
+        const h = makeHarness({
+          argv: ["accounts", "non-fable-focus", "set", ...args, "--json"],
+          rawArgv: true,
+          env: { KEEPER_ACCOUNT_ROUTING_ROOT: stateDir },
+          now: () => now,
+          inspectRouting: () => baseInspection,
+          setNonFableFocus: async (focus) => {
+            applied.push(focus);
+            return { ok: true };
+          },
+        });
+        expect(await expectExit(main(h.deps))).toBe(0);
+      };
+      await runSet(["claude-swap:2", "permanent"]);
+      await runSet([
+        "c0",
+        "absolute",
+        "2026-07-19T03:00:00+03:00",
+        "--require-eligible",
+      ]);
+      expect(applied).toEqual([
+        {
+          target_route: "claude-swap:2",
+          lifetime: { kind: "permanent" },
+        },
+        {
+          target_route: "claude-swap:2",
+          lifetime: {
+            kind: "absolute",
+            deadline_at: "2026-07-19T00:00:00.000Z",
+          },
+        },
+      ]);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("elapsed deadline and stale or ineligible guarded activation refuse before mutation", async () => {
+    const now = Date.parse("2026-07-18T00:00:00Z");
+    for (const testCase of [
+      {
+        args: ["claude-swap:2", "absolute", "2026-07-18T00:00:00Z"],
+        inspection: baseInspection,
+        code: "focus_deadline_elapsed",
+      },
+      {
+        args: ["claude-swap:2", "permanent", "--require-eligible"],
+        inspection: {
+          ...baseInspection,
+          fresh: false,
+          enabled: false,
+          health: "ok" as const,
+        },
+        code: "focus_observation_unavailable",
+      },
+      {
+        args: ["claude-swap:3", "permanent", "--require-eligible"],
+        inspection: baseInspection,
+        code: "focus_target_ineligible",
+      },
+    ]) {
+      let mutations = 0;
+      const h = makeHarness({
+        argv: [
+          "accounts",
+          "non-fable-focus",
+          "set",
+          ...testCase.args,
+          "--json",
+        ],
+        rawArgv: true,
+        now: () => now,
+        inspectRouting: () => testCase.inspection,
+        setNonFableFocus: async () => {
+          mutations += 1;
+          return { ok: true };
+        },
+      });
+      expect(await expectExit(main(h.deps))).toBe(2);
+      expect(mutations).toBe(0);
+      expect(JSON.parse(h.out.join("")).error.code).toBe(testCase.code);
+    }
+  });
+
+  test("clear is idempotent and uncertain mutation acknowledgement is explicit", async () => {
+    const clear = makeHarness({
+      argv: ["accounts", "non-fable-focus", "clear", "--json"],
+      rawArgv: true,
+      inspectRouting: () => baseInspection,
+      setNonFableFocus: async () => {
+        throw new Error("idempotent clear must not mutate");
+      },
+    });
+    expect(await expectExit(main(clear.deps))).toBe(0);
+
+    const uncertain = makeHarness({
+      argv: [
+        "accounts",
+        "non-fable-focus",
+        "set",
+        "claude-swap:2",
+        "permanent",
+        "--json",
+      ],
+      rawArgv: true,
+      inspectRouting: () => baseInspection,
+      setNonFableFocus: async () => ({
+        ok: false,
+        code: "focus_rpc_unreachable",
+        message: "acknowledgement unavailable",
+      }),
+    });
+    expect(await expectExit(main(uncertain.deps))).toBe(1);
+    expect(JSON.parse(uncertain.out.join(""))).toEqual({
+      schema_version: 1,
+      ok: false,
+      error: {
+        code: "focus_rpc_unreachable",
+        message: "acknowledgement unavailable",
+        recovery:
+          "Re-read Non-Fable focus state before retrying an uncertain update.",
+      },
+      data: null,
+    });
+  });
+});
+
 describe("keeper agent accounts codex-pool", () => {
   test("an explicitly armed fresh Pi launch receives one bounded pooled proof window", async () => {
+    const launches: Array<[boolean | undefined, string | null | undefined]> =
+      [];
     const h = makeHarness({
       argv: [
         "pi",
@@ -652,14 +917,24 @@ describe("keeper agent accounts codex-pool", () => {
         health: "ready",
         problem_code: null,
       }),
-      codexPoolLaunchContext: () => ({
-        mode: "native",
-        aliases: ["keeper-codex-a", "keeper-codex-b"],
-        config_binding: "b".repeat(64),
-        revision: "c".repeat(40),
-        initial_alias: null,
-        problem_code: "activation-pending",
-      }),
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
+        launches.push([reserve, modelId]);
+        return {
+          mode: "native",
+          activation_mode: "native",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: [],
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          config_binding: "b".repeat(64),
+          revision: "c".repeat(40),
+          initial_alias: null,
+          problem_code: "activation-pending",
+        };
+      },
     });
     const command = await runAndCapture(h, main);
     expect(command).toContain("/fake/pi-codex-pool.ts");
@@ -667,6 +942,15 @@ describe("keeper agent accounts codex-pool", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
       '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("c".repeat(40));
@@ -686,6 +970,62 @@ describe("keeper agent accounts codex-pool", () => {
       h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBeUndefined();
+    expect(launches).toEqual([[false, "openai-codex/gpt-5.4-mini"]]);
+  });
+
+  test("a Spark proof window overrides generic active policy only for Spark", async () => {
+    const launches: Array<[boolean | undefined, string | null | undefined]> =
+      [];
+    const h = makeHarness({
+      argv: [
+        "pi",
+        "--x-codex-pool-proof-window=arm",
+        "--model",
+        "openai-codex/gpt-5.3-codex-spark",
+        "prove spark routing",
+      ],
+      rawArgv: true,
+      now: () => 1_000_000,
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
+        launches.push([reserve, modelId]);
+        return {
+          mode: "active",
+          activation_mode: "active",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+          config_binding: "d".repeat(64),
+          revision: "e".repeat(40),
+          initial_alias: null,
+          problem_code: null,
+        };
+      },
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], CODEX_ALIASES),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], CODEX_ALIASES),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("e".repeat(40));
+    expect(launches).toEqual([[false, "openai-codex/gpt-5.3-codex-spark"]]);
   });
 
   test("an absent arm clears inherited proof state and leaves native launch behavior", async () => {
@@ -716,6 +1056,15 @@ describe("keeper agent accounts codex-pool", () => {
     const command = await runAndCapture(h, main);
     expect(command).toContain("/fake/pi-codex-pool.ts");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
@@ -770,6 +1119,15 @@ describe("keeper agent accounts codex-pool", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
       '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
     );
   });
 
@@ -926,6 +1284,16 @@ describe("keeper agent accounts check", () => {
       reason: "policy-off" as const,
       diagnostic: "none",
     },
+    non_fable_focus: {
+      configured: true,
+      state: "active" as const,
+      target_route: "claude-swap:2" as const,
+      lifetime: { kind: "permanent" as const },
+      target_eligible: true,
+      outcome: "focused" as const,
+      reason: "target-focused" as const,
+      diagnostic: "none",
+    },
   };
 
   test("--json emits the read-only snapshot", async () => {
@@ -990,6 +1358,7 @@ describe("keeper agent accounts check", () => {
         config_binding: "a".repeat(64),
         observed_at_ms: 1000,
         fresh: true,
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         refresh_failure_state: {
           schema_version: 1 as const,
           consecutive_failures: 3,
@@ -1005,16 +1374,28 @@ describe("keeper agent accounts check", () => {
         candidates: [
           {
             alias: "keeper-codex-a",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            used_percent: 80,
             worst_used_percent: 80,
             pressure: 0,
             cooldown_until_ms: 0,
+            shared_cooldown_until_ms: 0,
+            quota_cooldown_until_ms: 0,
+            capacity_cooldown_until_ms: 0,
+            authorized: true,
             eligible: true,
           },
           {
             alias: "keeper-codex-b",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            used_percent: 10,
             worst_used_percent: 10,
             pressure: 0,
             cooldown_until_ms: 0,
+            shared_cooldown_until_ms: 0,
+            quota_cooldown_until_ms: 0,
+            capacity_cooldown_until_ms: 0,
+            authorized: true,
             eligible: true,
           },
         ],
@@ -1064,6 +1445,7 @@ describe("keeper agent accounts check", () => {
           config_binding: "a".repeat(64),
           observed_at_ms: 1000,
           fresh: true,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
           verdict: {
             kind: "pooled" as const,
             provider: "openai-codex" as const,
@@ -1073,9 +1455,15 @@ describe("keeper agent accounts check", () => {
           candidates: [
             {
               alias: "keeper-codex-a",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+              used_percent: 10,
               worst_used_percent: 10,
               pressure: 0,
               cooldown_until_ms: 0,
+              shared_cooldown_until_ms: 0,
+              quota_cooldown_until_ms: 0,
+              capacity_cooldown_until_ms: 0,
+              authorized: true,
               eligible: true,
             },
           ],

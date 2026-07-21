@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T06:19:22.114000Z",
+  "depends_on": [],
+  "epic": "fn-1395-harden-repair-sweep-grant-reaping-and",
+  "id": "fn-1395-harden-repair-sweep-grant-reaping-and.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Idempotent maintenance-task mint",
+  "updated_at": "2026-07-21T06:19:22.114000Z"
+}

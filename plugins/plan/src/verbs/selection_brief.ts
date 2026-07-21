@@ -33,6 +33,7 @@ import {
   resolvePlanStateContext,
   tryResolveOwningProjectForId,
 } from "../project.ts";
+import { computeSelectionInputHash } from "../selection_input_hash.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
 import { loadYamlInput, parseYamlInput } from "../yaml_input.ts";
 
@@ -295,7 +296,7 @@ export function runSelectionBrief(args: SelectionBriefArgs): void {
     : collectLiveSource(ctx, epicId, format, matrixYaml);
 
   const configHash = sha256(selectorConfigYaml);
-  const inputHash = sha256(source.inputForHash);
+  const inputHash = computeSelectionInputHash(source.inputForHash);
   const shuffleSeed = Number.parseInt(inputHash.slice(0, 8), 16);
   const briefTasks = source.briefTasksBase.map((t) => ({
     ...t,

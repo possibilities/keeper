@@ -174,10 +174,10 @@ export const REPROBE_MS = 60_000;
 /**
  * Launch-race age gate (seconds). A freshly-launched job whose pid we read
  * before the SessionStart hook's `(pid, start_time)` fully settled must not be
- * reaped — mirror the sitter's `STUCK_JOB_MIN_AGE_SECS` (5 min). The gate keys
- * on `created_at` (NOT `updated_at`, which late git-count/title/monitor writes
- * reset on a stopped row); the dead-pid conjunct carries correctness, the age
- * gate only suppresses the launch-race false positive.
+ * reaped. The gate keys on `created_at` (NOT `updated_at`, which late
+ * git-count/title/monitor writes reset on a stopped row); the dead-pid conjunct
+ * carries correctness, the age gate only suppresses the launch-race false
+ * positive.
  */
 export const REPROBE_MIN_AGE_SECS = 5 * 60;
 

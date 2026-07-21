@@ -250,7 +250,7 @@ function accountLabel(rawOrdinal: string): string {
   if (!/^(0|[1-9]\d*)$/.test(rawOrdinal)) {
     return "";
   }
-  return `c${BigInt(rawOrdinal) + 1n}`;
+  return `claude-${BigInt(rawOrdinal) + 1n}`;
 }
 
 function resolveGitBranch(

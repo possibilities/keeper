@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { NormalizedNonFableFocusInput } from "./account-focus";
 import type {
   DeadLetterOperatorOutcome,
   DeadLetterOperatorRequest,
@@ -64,6 +65,7 @@ export interface ReplayBridge {
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
     fable_focus?: NormalizedFableFocusInput | null;
+    non_fable_focus?: NormalizedNonFableFocusInput | null;
   }): Promise<{
     ok: boolean;
     error?: string;

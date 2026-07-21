@@ -31,11 +31,8 @@ import {
 import {
   __resetEpicIndexMemoForTest,
   applyEvent,
-  type BuildSnapshotPayload,
   drain,
   eventTsToIso,
-  extractBuildSnapshot,
-  serializeBuildSnapshot,
 } from "../src/reducer";
 import type { Event } from "../src/types";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
@@ -653,6 +650,10 @@ function getDispatchFailure(verb: string, id: string) {
     updated_at: number;
     instance_event_id: number | null;
     attempt_id: number | null;
+    claim_session_id: string | null;
+    claim_pid: number | null;
+    claim_start_time: string | null;
+    claimed_at: number | null;
   } | null;
 }
 
@@ -890,6 +891,341 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
     .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
     .all();
   expect(after).toEqual(before);
+});
+
+function incidentClaimedEvent(
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimantSessionId: string,
+  ts: number,
+  claimPid = 4242,
+  claimStartTime: string | null = "proc:1",
+): number {
+  return insertEvent({
+    hook_event: "IncidentClaimed",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      instance_event_id: instanceEventId,
+      claim_session_id: claimantSessionId,
+      claim_pid: claimPid,
+      claim_start_time: claimStartTime,
+      ts,
+    }),
+  });
+}
+
+function incidentReleasedEvent(
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimantSessionId: string,
+  claimPid = 4242,
+  claimStartTime = "proc:1",
+): number {
+  return insertEvent({
+    hook_event: "IncidentReleased",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      instance_event_id: instanceEventId,
+      claim_session_id: claimantSessionId,
+      claim_pid: claimPid,
+      claim_start_time: claimStartTime,
+    }),
+  });
+}
+
+test("IncidentClaimed records claimant identity, process generation, and freshness on the fenced incident", () => {
+  const fence = dispatchFailedEvent(
+    "work",
+    "fn-950-incident-claim.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-950-incident-claim.1",
+    fence,
+    "session-owner",
+    1750,
+    9876,
+    "proc:9876:1",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("work", "fn-950-incident-claim.1")).toMatchObject({
+    instance_event_id: fence,
+    claim_session_id: "session-owner",
+    claim_pid: 9876,
+    claim_start_time: "proc:9876:1",
+    claimed_at: 1750,
+  });
+});
+
+test("IncidentClaimed malformed, mismatched, and missing-row payloads are safe no-ops", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-951-incident-fence",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-951-incident-fence",
+    fence + 1,
+    "stale-owner",
+    1750,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-952-missing-incident",
+    fence,
+    "missing-owner",
+    1751,
+  );
+  const malformedId = insertEvent({
+    hook_event: "IncidentClaimed",
+    session_id: "close::fn-951-incident-fence",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-951-incident-fence",
+      instance_event_id: fence,
+      claim_session_id: "bad-owner",
+      claim_pid: 0,
+      ts: 1752,
+    }),
+  });
+
+  expect(() => drainAll()).not.toThrow();
+  expect(getDispatchFailure("close", "fn-951-incident-fence")).toMatchObject({
+    claim_session_id: null,
+    claim_pid: null,
+    claim_start_time: null,
+    claimed_at: null,
+  });
+  expect(getDispatchFailure("close", "fn-952-missing-incident")).toBeNull();
+  expect(getCursor()).toBe(malformedId);
+});
+
+test("IncidentReleased clears only the claimant named by the current incident fence", () => {
+  const fence = dispatchFailedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "first-owner",
+    1740,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "fresh-owner",
+    1750,
+    5252,
+    "proc:5252:2",
+  );
+  incidentReleasedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "first-owner",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("work", "fn-953-incident-release.1")).toMatchObject(
+    {
+      claim_session_id: "fresh-owner",
+      claim_pid: 5252,
+      claim_start_time: "proc:5252:2",
+      claimed_at: 1750,
+    },
+  );
+
+  incidentReleasedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "fresh-owner",
+    5252,
+    "proc:5252:2",
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-953-incident-release.1")).toMatchObject(
+    {
+      claim_session_id: null,
+      claim_pid: null,
+      claim_start_time: null,
+      claimed_at: null,
+    },
+  );
+});
+
+test("IncidentReleased cannot clear a resumed claimant's fresh process generation", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-953-resumed-release",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    1740,
+    3131,
+    "proc:3131:1",
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    1750,
+    4242,
+    "proc:4242:2",
+  );
+  incidentReleasedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    3131,
+    "proc:3131:1",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("close", "fn-953-resumed-release")).toMatchObject({
+    claim_session_id: "session-owner",
+    claim_pid: 4242,
+    claim_start_time: "proc:4242:2",
+    claimed_at: 1750,
+  });
+});
+
+test("DispatchFailed re-emits preserve all claim columns on the same open incident", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+    "reconciler",
+    10,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    fence,
+    "session-owner",
+    1750,
+    7777,
+    "proc:7777:3",
+  );
+  drainAll();
+
+  dispatchFailedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    "worktree-merge-conflict",
+    "/repo-new",
+    1800,
+    "reconciler",
+    11,
+  );
+  drainAll();
+
+  expect(getDispatchFailure("close", "fn-954-incident-upsert")).toMatchObject({
+    instance_event_id: fence,
+    attempt_id: 11,
+    claim_session_id: "session-owner",
+    claim_pid: 7777,
+    claim_start_time: "proc:7777:3",
+    claimed_at: 1750,
+  });
+});
+
+test("incident claim and release folds reproduce dispatch_failures byte-identically", () => {
+  const workFence = dispatchFailedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "old-owner",
+    1710,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "current-owner",
+    1720,
+  );
+  incidentReleasedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "old-owner",
+  );
+  dispatchFailedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    "worktree-merge-conflict",
+    "/repo-new",
+    1730,
+  );
+
+  const closeFence = dispatchFailedEvent(
+    "close",
+    "fn-955-incident-refold",
+    "worktree-merge-conflict",
+    "/repo",
+    1740,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-955-incident-refold",
+    closeFence,
+    "closing-owner",
+    1750,
+  );
+  incidentReleasedEvent(
+    "close",
+    "fn-955-incident-refold",
+    closeFence,
+    "closing-owner",
+  );
+  drainAll();
+
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  expect(
+    db.query("SELECT * FROM dispatch_failures ORDER BY verb, id").all(),
+  ).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
@@ -5421,6 +5757,7 @@ function autopilotConfigSetEvent(
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
     fable_focus?: unknown;
+    non_fable_focus?: unknown;
   },
   sessionId = "autopilot",
 ): number {
@@ -5447,6 +5784,7 @@ function getAutopilotStateConfig() {
     drift_behind_threshold: number | null;
     drift_age_threshold_days: number | null;
     fable_focus: string | null;
+    non_fable_focus: string | null;
   } | null;
 }
 
@@ -5550,46 +5888,57 @@ test("AutopilotConfigSet malformed/empty/non-positive payloads behave like the c
   }
 });
 
-test("AutopilotConfigSet atomically sets, preserves, clears, and re-folds Fable focus", () => {
+test("AutopilotConfigSet independently sets, preserves, clears, and re-folds both Account focuses", () => {
   const firstId = autopilotConfigSetEvent({
     fable_focus: {
       target_route: "claude-swap:2",
       lifetime: { kind: "permanent" },
     },
+    non_fable_focus: {
+      target_route: "claude-swap:3",
+      lifetime: {
+        kind: "absolute",
+        deadline_at: "2026-07-20T23:59:59Z",
+      },
+    },
   });
   drainAll();
-  expect(
-    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
-  ).toMatchObject({
-    schema_version: 1,
+  const initial = getAutopilotStateConfig();
+  expect(JSON.parse(initial?.fable_focus ?? "null")).toMatchObject({
     policy_id: `event:${firstId}`,
     target_route: "claude-swap:2",
     fable_intent: true,
-    lifetime: { kind: "permanent" },
+  });
+  expect(JSON.parse(initial?.non_fable_focus ?? "null")).toMatchObject({
+    policy_id: `event:${firstId}`,
+    target_route: "claude-swap:3",
+    fable_intent: false,
+    lifetime: {
+      kind: "absolute",
+      deadline_at: "2026-07-20T23:59:59.000Z",
+    },
   });
 
-  // An unrelated patch and a malformed structured field preserve the whole cell;
-  // the malformed event still advances the global cursor.
-  autopilotConfigSetEvent({ max_concurrent_jobs: 9 });
+  const fableBefore = initial?.fable_focus;
+  const nonFableBefore = initial?.non_fable_focus;
   const malformedId = autopilotConfigSetEvent({
-    fable_focus: {
+    non_fable_focus: {
       target_route: "person@example.com",
       lifetime: { kind: "permanent" },
     },
   });
   drainAll();
   expect(getCursor()).toBe(malformedId);
-  expect(
-    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
-  ).toMatchObject({
-    policy_id: `event:${firstId}`,
-    target_route: "claude-swap:2",
-  });
-  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  expect(getAutopilotStateConfig()?.fable_focus).toBe(fableBefore);
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBe(nonFableBefore);
 
   autopilotConfigSetEvent({ fable_focus: null });
   drainAll();
   expect(getAutopilotStateConfig()?.fable_focus).toBeNull();
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBe(nonFableBefore);
+  autopilotConfigSetEvent({ non_fable_focus: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBeNull();
 
   const before = db.query("SELECT * FROM autopilot_state ORDER BY id").all();
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
@@ -9291,213 +9640,23 @@ test("fn-836.3 idx_events_mutation_path serves the flipped file-attribution scan
   expect(details.some((d) => /^SCAN events\b/.test(d.trim()))).toBe(false);
 });
 
-// ---------------------------------------------------------------------------
-// Schema v64 (fn-781 task .1) — `builds` reducer projection. The server-side
-// builds-worker mints `BuildSnapshot` (UPSERT) / `BuildDeleted` (tombstone)
-// synthetic events from the buildbot REST API; they fold purely (no
-// `Date.now`, no liveness re-probe) into the `builds` table keyed by builder
-// NAME (`event.session_id`). `updated_at` is the event `ts`. A from-scratch
-// re-fold (rewind cursor, DELETE FROM builds, re-drain) MUST reproduce the
-// table byte-identically.
-// ---------------------------------------------------------------------------
-
-const RUNNING_BUILD: BuildSnapshotPayload = {
-  builder_id: 7,
-  build_number: 42,
-  complete: 0,
-  results: null,
-  state_string: "building",
-  started_at: 1_700_000_000,
-  complete_at: null,
-};
-
-const FINISHED_BUILD: BuildSnapshotPayload = {
-  builder_id: 7,
-  build_number: 42,
-  complete: 1,
-  results: 0,
-  state_string: "build successful",
-  started_at: 1_700_000_000,
-  complete_at: 1_700_000_300,
-};
-
-function buildSnapshotEvent(
-  project: string,
-  payload: BuildSnapshotPayload,
-): number {
-  return insertEvent({
+test("retired build events advance the cursor without creating jobs", () => {
+  const snapshotId = insertEvent({
     hook_event: "BuildSnapshot",
-    session_id: project,
-    data: serializeBuildSnapshot(payload),
+    session_id: "retired-builder",
+    data: JSON.stringify({ build_number: 1 }),
   });
-}
-
-function buildDeletedEvent(project: string): number {
-  return insertEvent({
+  const deletedId = insertEvent({
     hook_event: "BuildDeleted",
-    session_id: project,
+    session_id: "retired-builder",
   });
-}
 
-function getBuild(project: string) {
-  return db.query("SELECT * FROM builds WHERE project = ?").get(project) as {
-    project: string;
-    builder_id: number | null;
-    build_number: number | null;
-    complete: number | null;
-    results: number | null;
-    state_string: string | null;
-    started_at: number | null;
-    complete_at: number | null;
-    last_event_id: number;
-    updated_at: number;
-  } | null;
-}
-
-test("serializeBuildSnapshot → extractBuildSnapshot round-trips every payload field", () => {
-  // fn-651 contract pin: each projection-meaningful field must survive
-  // serializer → event.data → extractor identically, or it folds NULL forever.
-  const eventId = buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  const ev = db
-    .query("SELECT * FROM events WHERE id = ?")
-    .get(eventId) as Event;
-  expect(extractBuildSnapshot(ev)).toEqual(FINISHED_BUILD);
-
-  // Running shape (results / complete_at NULL) round-trips too.
-  const runId = buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  const runEv = db
-    .query("SELECT * FROM events WHERE id = ?")
-    .get(runId) as Event;
-  expect(extractBuildSnapshot(runEv)).toEqual(RUNNING_BUILD);
-});
-
-test("extractBuildSnapshot folds malformed / empty / partial blobs null-safely", () => {
-  // Empty + malformed data → null (the fold no-ops, never throws).
-  const emptyEv = { id: 1, ts: 1, session_id: "x", data: "" } as Event;
-  expect(extractBuildSnapshot(emptyEv)).toBeNull();
-  const badEv = { id: 1, ts: 1, session_id: "x", data: "{not json" } as Event;
-  expect(extractBuildSnapshot(badEv)).toBeNull();
-  // A partial blob folds the absent fields to null rather than poisoning.
-  const partialEv = {
-    id: 1,
-    ts: 1,
-    session_id: "x",
-    data: JSON.stringify({ build_number: 9 }),
-  } as Event;
-  expect(extractBuildSnapshot(partialEv)).toEqual({
-    builder_id: null,
-    build_number: 9,
-    complete: null,
-    results: null,
-    state_string: null,
-    started_at: null,
-    complete_at: null,
-  });
-});
-
-test("BuildSnapshot UPSERTs a running builds row keyed by builder name and advances the cursor", () => {
-  const eventId = buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  expect(drainAll()).toBe(1);
-  const row = getBuild("acme-ci");
-  expect(row).not.toBeNull();
-  expect(row?.project).toBe("acme-ci");
-  expect(row?.builder_id).toBe(7);
-  expect(row?.build_number).toBe(42);
-  expect(row?.complete).toBe(0);
-  // Running build → results NULL, complete_at NULL.
-  expect(row?.results).toBeNull();
-  expect(row?.complete_at).toBeNull();
-  expect(row?.state_string).toBe("building");
-  expect(row?.started_at).toBe(1_700_000_000);
-  expect(row?.last_event_id).toBe(eventId);
-  // updated_at is the event ts (never a wall-clock read).
-  const eventTs = (
-    db.query("SELECT ts FROM events WHERE id = ?").get(eventId) as {
-      ts: number;
-    }
-  ).ts;
-  expect(row?.updated_at).toBe(eventTs);
-  expect(getCursor()).toBe(eventId);
-});
-
-test("a build emits exactly two folds (start, finish): the finished BuildSnapshot UPSERTs the same row", () => {
-  buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  const finishId = buildSnapshotEvent("acme-ci", FINISHED_BUILD);
   expect(drainAll()).toBe(2);
-  // Still ONE row (UPSERT keyed on builder NAME, not build number).
-  const count = db
-    .query("SELECT COUNT(*) AS n FROM builds WHERE project = 'acme-ci'")
-    .get() as { n: number };
-  expect(count.n).toBe(1);
-  const row = getBuild("acme-ci");
-  expect(row?.complete).toBe(1);
-  expect(row?.results).toBe(0);
-  expect(row?.state_string).toBe("build successful");
-  expect(row?.complete_at).toBe(1_700_000_300);
-  expect(row?.last_event_id).toBe(finishId);
-});
-
-test("BuildDeleted tombstones the builds row keyed by the same builder name", () => {
-  buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  drainAll();
-  expect(getBuild("acme-ci")).not.toBeNull();
-  const delId = buildDeletedEvent("acme-ci");
-  expect(drainAll()).toBe(1);
-  expect(getBuild("acme-ci")).toBeNull();
-  // The tombstone still advanced the cursor.
-  expect(getCursor()).toBe(delId);
-});
-
-test("a malformed BuildSnapshot blob no-ops with the cursor still advanced", () => {
-  const eventId = insertEvent({
-    hook_event: "BuildSnapshot",
-    session_id: "acme-ci",
-    data: "{ not valid json",
-  });
-  expect(drainAll()).toBe(1);
-  // No row written, but the cursor advanced past the malformed event.
-  expect(getBuild("acme-ci")).toBeNull();
-  expect(getCursor()).toBe(eventId);
-});
-
-test("a BuildSnapshot with an empty builder name no-ops with the cursor advanced", () => {
-  const eventId = insertEvent({
-    hook_event: "BuildSnapshot",
-    session_id: "",
-    data: serializeBuildSnapshot(FINISHED_BUILD),
-  });
-  expect(drainAll()).toBe(1);
-  const count = db.query("SELECT COUNT(*) AS n FROM builds").get() as {
-    n: number;
-  };
-  expect(count.n).toBe(0);
-  expect(getCursor()).toBe(eventId);
-});
-
-test("builds is re-fold deterministic: rewind + DELETE + re-drain reproduces it byte-for-byte", () => {
-  buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  buildSnapshotEvent("widget-build", RUNNING_BUILD);
-  buildDeletedEvent("widget-build");
-  buildSnapshotEvent("gizmo-build", FINISHED_BUILD);
-  drainAll();
-
-  const before = db
-    .query("SELECT * FROM builds ORDER BY project")
-    .all() as unknown[];
-  // acme-ci finished + gizmo-build finished survive; widget-build tombstoned.
-  expect(before.length).toBe(2);
-
-  // Rewind cursor + wipe the projection + re-drain on the same connection. The
-  // re-folded rows must equal the pre-rewind rows byte-for-byte (pure function
-  // of the event log; updated_at derives from event.ts, no wall-clock).
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM builds");
-  drainAll();
-  const after = db
-    .query("SELECT * FROM builds ORDER BY project")
-    .all() as unknown[];
-  expect(after).toEqual(before);
+  expect(getCursor()).toBe(deletedId);
+  expect(snapshotId).toBeLessThan(deletedId);
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

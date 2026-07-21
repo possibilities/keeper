@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 /** Sidecars are transient; an old schema is treated as absent, never migrated. */
-export const OBSERVATION_SCHEMA_VERSION = 6;
+export const OBSERVATION_SCHEMA_VERSION = 7;
 
 /** A version mismatch discards incompatible reservation state. */
 export const LEDGER_SCHEMA_VERSION = 2;
@@ -27,8 +27,8 @@ export const KEEPER_ACCOUNT_ROUTE_ENV = "KEEPER_ACCOUNT_ROUTE";
 /** Optional zero-based display position in the ordered cswap inventory. */
 export const KEEPER_ACCOUNT_ORDINAL_ENV = "KEEPER_ACCOUNT_ORDINAL";
 
-/** Bound every external CLI call. */
-export const SUBPROCESS_TIMEOUT_MS = 15_000;
+/** Bound every external CLI call beyond cswap's refresh + usage request path. */
+export const SUBPROCESS_TIMEOUT_MS = 30_000;
 
 /** Refuse oversized provider output instead of parsing a truncation. */
 export const MAX_OUTPUT_BYTES = 262_144;
@@ -45,11 +45,11 @@ export const OBSERVATION_FRESHNESS_CEILING_MS = 5 * 60_000;
 /** Maximum age of one account's usage measurement. */
 export const ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS = 10 * 60_000;
 
-/** Base interval between observer cycles. */
-export const OBSERVE_INTERVAL_MS = 30_000;
+/** Base interval between observer cycles, aligned with cswap's provider floor. */
+export const OBSERVE_INTERVAL_MS = 3 * 60_000;
 
 /** Uniform jitter added to each observer sleep. */
-export const OBSERVE_JITTER_MS = 5_000;
+export const OBSERVE_JITTER_MS = 30_000;
 
 /** Short-lived launch reservation lifetime. */
 export const RESERVATION_TTL_MS = 90_000;
@@ -65,8 +65,8 @@ export const MAX_OBSERVATION_NOTES = 16;
 export const MAX_NOTE_LENGTH = 200;
 
 export const CODEX_OBSERVER_ENVELOPE_SCHEMA_VERSION = 1;
-export const CODEX_OBSERVATION_SCHEMA_VERSION = 1;
-export const CODEX_PRESSURE_LEDGER_SCHEMA_VERSION = 1;
+export const CODEX_OBSERVATION_SCHEMA_VERSION = 2;
+export const CODEX_PRESSURE_LEDGER_SCHEMA_VERSION = 2;
 export const CODEX_MAX_ALIASES = 8;
 export const CODEX_MAX_WINDOWS_PER_ALIAS = 6;
 export const CODEX_MAX_OBSERVER_OUTPUT_BYTES = 16 * 1024;
@@ -94,6 +94,11 @@ export function observationSidecarPath(root: string): string {
 /** Durable-Projection delivery leaf consumed by the SQLite-free launcher. */
 export function fableFocusPolicyPath(root: string): string {
   return join(root, "fable-focus-policy.json");
+}
+
+/** Kept separate so a delivery fault cannot disable Fable focus. */
+export function nonFableFocusPolicyPath(root: string): string {
+  return join(root, "non-fable-focus-policy.json");
 }
 
 export function ledgerPath(root: string): string {

@@ -5,6 +5,10 @@ import {
   codexPoolProofSeamActive,
 } from "../../../src/codex-pool-proof-window.ts";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../../../src/codex-quota-scope.ts";
+import {
   type CredentialStorage,
   CredentialVault,
   MemoryCredentialStorage,
@@ -24,6 +28,23 @@ const KEEPER_JOB_ID = "keeper-proof-job";
 const ARMED_WINDOW = armCodexPoolProofWindow(1_000_000, PARENT_PID);
 const ALIAS = "keeper-codex-a";
 const FORCE_REQUEST = { schema_version: 1, alias: ALIAS } as const;
+
+function routeState(
+  aliases: readonly string[] = [ALIAS],
+  now: () => number = () => NOW,
+): PoolRouteState {
+  return new PoolRouteState(
+    aliases,
+    null,
+    now,
+    undefined,
+    CODEX_GENERIC_QUOTA_SCOPE,
+    {
+      [CODEX_GENERIC_QUOTA_SCOPE]: [...aliases],
+      [CODEX_SPARK_QUOTA_SCOPE]: [],
+    },
+  );
+}
 const INITIAL_CREDENTIAL: StoredOAuthCredential = {
   type: "oauth",
   access: "initial-access",
@@ -497,7 +518,7 @@ describe("classified fault proof seam", () => {
       createPooledCodexStream(
         {
           vault: new CredentialVault(storage, async () => ROTATED_CREDENTIAL),
-          routes: new PoolRouteState([ALIAS], null, () => NOW),
+          routes: routeState([ALIAS], () => NOW),
           delegate: () => eventStream([]) as never,
           nativeDelegate: () => eventStream([]) as never,
           warn: () => {},
@@ -535,7 +556,7 @@ describe("classified fault proof seam", () => {
         () => NOW,
       );
     let preOutputCalls = 0;
-    const preOutputRoutes = new PoolRouteState(aliases, null, () => NOW);
+    const preOutputRoutes = routeState(aliases, () => NOW);
     const preOutputEvents = await collect(
       createPooledCodexStream(
         {
@@ -574,7 +595,7 @@ describe("classified fault proof seam", () => {
     );
 
     let midStreamCalls = 0;
-    const midStreamRoutes = new PoolRouteState(aliases, null, () => NOW);
+    const midStreamRoutes = routeState(aliases, () => NOW);
     const midStreamEvents = await collect(
       createPooledCodexStream(
         {
@@ -671,7 +692,7 @@ describe("classified fault proof seam", () => {
             async (credential) => credential,
             () => NOW,
           ),
-          routes: new PoolRouteState(aliases, null, () => NOW),
+          routes: routeState(aliases, () => NOW),
           delegate: () => {
             calls += 1;
             if (calls === 1) {

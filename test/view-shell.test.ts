@@ -931,7 +931,11 @@ test("snapshot prepends the semantic header to stdout and its accepted sidecar",
     renderBody: (snap) => ({
       bodyLines: snap.body,
       semanticHeader: {
-        lines: ["Fable focus: c2 · permanent · focused", "autopilot: playing"],
+        lines: [
+          "Fable focus: c2 · permanent · focused",
+          "Non-Fable focus: off",
+          "autopilot: playing",
+        ],
       },
       stateJson: { header: "exact" },
     }),
@@ -941,11 +945,11 @@ test("snapshot prepends the semantic header to stdout and its accepted sidecar",
 
   const printed = h.stdout.join("");
   expect(printed).toContain(
-    "Fable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+    "Fable focus: c2 · permanent · focused\nNon-Fable focus: off\nautopilot: playing\nepic body\n",
   );
   const framePath = `/tmp/keeper-${sidecarBase}.${process.pid}.frame.1.txt`;
   expect(readFileSync(framePath, "utf8")).toBe(
-    "---\nFable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+    "---\nFable focus: c2 · permanent · focused\nNon-Fable focus: off\nautopilot: playing\nepic body\n",
   );
 });
 
@@ -1393,7 +1397,11 @@ test("frames serialize the same semantic header as snapshots", () => {
     renderBody: (snap) => ({
       bodyLines: snap.body,
       semanticHeader: {
-        lines: ["Fable focus: c2 · permanent · focused", "autopilot: playing"],
+        lines: [
+          "Fable focus: c2 · permanent · focused",
+          "Non-Fable focus: off",
+          "autopilot: playing",
+        ],
       },
       stateJson: { policy: "focused" },
     }),
@@ -1405,7 +1413,7 @@ test("frames serialize the same semantic header as snapshots", () => {
   expect(typeof framePath).toBe("string");
   expect(typeof statePath).toBe("string");
   expect(h.files.get(framePath as string)).toBe(
-    "Fable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+    "Fable focus: c2 · permanent · focused\nNon-Fable focus: off\nautopilot: playing\nepic body\n",
   );
   expect(JSON.parse(h.files.get(statePath as string) ?? "null")).toEqual({
     policy: "focused",

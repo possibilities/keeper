@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T06:49:12.602000Z",
+  "depends_on": [],
+  "epic": "fn-1396-align-restart-ledger-state-dir-with",
+  "id": "fn-1396-align-restart-ledger-state-dir-with.1",
+  "model": "gpt-5.3-codex-spark",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Honor XDG_STATE_HOME for the leaf",
+  "updated_at": "2026-07-21T07:20:29.040000Z",
+  "worker_done_at": "2026-07-21T07:20:29.040000Z"
+}

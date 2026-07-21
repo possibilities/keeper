@@ -45,6 +45,10 @@ import type {
   CodexPoolActivationAuthorization,
   CodexPoolWorkflowResult,
 } from "../../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../../src/codex-quota-scope";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -134,6 +138,9 @@ export interface Harness {
   requestedAccountOrdinals: () => number[];
 }
 
+type HarnessRoutingInspection = Omit<RoutingInspection, "non_fable_focus"> &
+  Partial<Pick<RoutingInspection, "non_fable_focus">>;
+
 export interface HarnessOptions {
   argv: string[];
   /**
@@ -183,7 +190,10 @@ export interface HarnessOptions {
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
   resolvePiCodexPoolExtension?: () => PiCodexPoolExtensionResolution;
-  codexPoolLaunchContext?: (reserve?: boolean) => CodexPoolLaunchContext;
+  codexPoolLaunchContext?: (
+    reserve?: boolean,
+    modelId?: string | null,
+  ) => CodexPoolLaunchContext;
   inspectCodexSessionRouting?: () => CodexSessionRoutingInspection;
   refreshCodexObservation?: () => Promise<void>;
   runCodexPoolWorkflow?: (
@@ -228,9 +238,10 @@ export interface HarnessOptions {
   ) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
-  inspectRouting?: () => RoutingInspection;
+  inspectRouting?: (fableIntent?: boolean | null) => HarnessRoutingInspection;
   resolveFableIntent?: (target: string) => Promise<boolean | null>;
   setFableFocus?: MainDeps["setFableFocusFn"];
+  setNonFableFocus?: MainDeps["setNonFableFocusFn"];
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
@@ -377,7 +388,14 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.codexPoolLaunchContext ??
       (() => ({
         mode: "native",
+        activation_mode: "native",
         aliases: ["keeper-codex-a", "keeper-codex-b"],
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: [],
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+        initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
         config_binding: "a".repeat(64),
         initial_alias: null,
         problem_code: "activation-pending",
@@ -399,6 +417,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
           config_binding: null,
           observed_at_ms: null,
           fresh: false,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
           verdict: {
             kind: "native-fallback",
             provider: "openai-codex",
@@ -472,11 +491,11 @@ export function makeHarness(opts: HarnessOptions): Harness {
     },
     resolveFableIntentFn: opts.resolveFableIntent ?? (async () => null),
     setFableFocusFn: opts.setFableFocus ?? (async () => ({ ok: true })),
-    inspectRoutingFn:
-      opts.inspectRouting ??
-      (() => ({
+    setNonFableFocusFn: opts.setNonFableFocus ?? (async () => ({ ok: true })),
+    inspectRoutingFn: (fableIntent) => {
+      const inspection = opts.inspectRouting?.(fableIntent) ?? {
         model_scope: null,
-        health: "no-observation",
+        health: "no-observation" as const,
         observed_at_ms: null,
         age_ms: null,
         fresh: false,
@@ -486,6 +505,18 @@ export function makeHarness(opts: HarnessOptions): Harness {
         candidates: [],
         fable_focus: {
           configured: false,
+          state: "off" as const,
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off" as const,
+          reason: "policy-off" as const,
+          diagnostic: "none",
+        },
+      };
+      return {
+        non_fable_focus: {
+          configured: false,
           state: "off",
           target_route: null,
           lifetime: null,
@@ -494,7 +525,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
           reason: "policy-off",
           diagnostic: "none",
         },
-      })),
+        ...inspection,
+      };
+    },
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),
     cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",

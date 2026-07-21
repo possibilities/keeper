@@ -40,7 +40,6 @@ export const SUBCOMMANDS = [
   "dead-letter",
   "git",
   "autopilot",
-  "builds",
   "usage",
   "frames",
   "dash",
@@ -60,6 +59,7 @@ export const SUBCOMMANDS = [
   "resume",
   "show-job",
   "escalation-brief",
+  "incident",
   "plan",
   "prompt",
   "projects",
@@ -291,7 +291,7 @@ Flags:
   --help, -h     Show this help (\`--help --json\` → machine-readable command index)
   --version, -V  Show keeper version
 
-The six snapshot-capable viewer subcommands (board/jobs/git/autopilot/builds/usage)
+The five snapshot-capable viewer subcommands (board/jobs/git/autopilot/usage)
 auto-detect a non-TTY stdout (piped, redirected, CI) and emit ONE current frame
 followed by a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of
 streaming forever. Override per subcommand with \`--snapshot\` (force one-shot on a
@@ -575,7 +575,6 @@ export async function main(): Promise<void> {
     "dead-letter": async (argv) => (await import("./dead-letter")).main(argv),
     git: async (argv) => (await import("./git")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
-    builds: async (argv) => (await import("./builds")).main(argv),
     usage: async (argv) => (await import("./usage")).main(argv),
     frames: async (argv) => (await import("./frames")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
@@ -596,6 +595,7 @@ export async function main(): Promise<void> {
     "show-job": async (argv) => (await import("./show-job")).main(argv),
     "escalation-brief": async (argv) =>
       (await import("./escalation-brief")).main(argv),
+    incident: async (argv) => (await import("./incident")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
     prompt: async (argv) => (await import("./prompt")).main(argv),
     projects: async (argv) => (await import("./projects")).main(argv),

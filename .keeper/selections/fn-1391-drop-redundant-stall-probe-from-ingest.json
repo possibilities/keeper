@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Single-file, fully-specified mechanical removal of a redundant onmessage call (exact lines named) while preserving the fallback timer and possibly adding a straight test, so bounded well-specified work routes GPT-first with the hand-tuned Spark preference at the medium band for the small test-coverage judgment.",
+      "task_id": "fn-1391-drop-redundant-stall-probe-from-ingest.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T21:05:13.621000Z",
+  "epic_id": "fn-1391-drop-redundant-stall-probe-from-ingest",
+  "input_hash": "7a6ad2820fe1e2b691bc543de9e8df04775636b3cf7f7906e47f61654678c9e9",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2053821058,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Single-file, fully-specified mechanical removal of a redundant onmessage call (exact lines named) while preserving the fallback timer and possibly adding a straight test, so bounded well-specified work routes GPT-first with the hand-tuned Spark preference at the medium band for the small test-coverage judgment.\",\"confidence\":0.8}]}\n"
+}

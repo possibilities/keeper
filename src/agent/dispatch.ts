@@ -51,6 +51,11 @@ export type Dispatch =
       operation: "show" | "set" | "clear";
       rest: string[];
     }
+  | {
+      kind: "accounts-non-fable-focus";
+      operation: "show" | "set" | "clear";
+      rest: string[];
+    }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
   // in one process; `wait-capture` runs wait→show on an already-launched handle.
@@ -98,10 +103,13 @@ Usage:
   keeper agent accounts codex-pool proof capture <report> [--json]
   keeper agent accounts codex-pool proof verdict [report] [--json]
   keeper agent accounts codex-pool activate [report] [--json]
-                                    Operate the versioned proof-gated Codex pool.
+                                    Operate the quota-scoped proof-gated Codex pool.
   keeper agent accounts fable-focus show|clear [--json]
   keeper agent accounts fable-focus set <route|cN> <permanent|absolute|current-reset|cycle-end> [deadline] [--expect-reset <UTC>] [--json]
                                     Inspect or atomically replace durable Fable focus.
+  keeper agent accounts non-fable-focus show|clear [--json]
+  keeper agent accounts non-fable-focus set <route|cN> <permanent|absolute> [deadline] [--require-eligible] [--json]
+                                    Inspect or atomically replace durable Non-Fable focus.
   keeper agent providers resolve <model> <effort>
                                     Emit the cost-ordered serving candidates for a
                                     model from the host matrix (no_route exit 3 for
@@ -141,8 +149,8 @@ Usage:
                                     timed_out leaves the Partner resident and
                                     resumable, never reaped. The one-shot
                                     panel-leg posture; a plain run stays resident
-                                    without it. To arm a Codex pool proof window, run
-                                    \`keeper agent run pi --x-codex-pool-proof-window=arm <prompt>\`;
+                                    without it. To arm a scope-specific Codex pool proof window, run
+                                    \`keeper agent run pi [--model <codex-model>] --x-codex-pool-proof-window=arm <prompt>\`;
                                     it requires a fresh managed Pi session.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
@@ -288,10 +296,10 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         --x-tmux-session, NOT the transcript id);
                                         --output atomically writes the SAME envelope
                                         to <path> (temp+rename) on every outcome, in
-                                        addition to stdout. To arm a Codex pool
-                                        proof window, run \`keeper agent run pi
-                                        --x-codex-pool-proof-window=arm <prompt>\`;
-                                        it requires a fresh managed Pi session.
+                                        addition to stdout. To arm a scope-specific
+                                        Codex pool proof window, run \`keeper agent run
+                                        pi [--model <codex-model>] --x-codex-pool-proof-window=arm
+                                        <prompt>\`; it requires a fresh managed Pi session.
                                         Emits the uniform envelope
                                         {schema_version, agent, handle,
                                         transcript_path, resume_target, message,
@@ -502,6 +510,21 @@ export function splitSubcommand(argv: string[]): Dispatch {
         };
       }
       return { kind: "usage", unknown: "accounts fable-focus" };
+    }
+    if (argv[1] === "non-fable-focus") {
+      const operation = argv[2];
+      if (
+        operation === "show" ||
+        operation === "set" ||
+        operation === "clear"
+      ) {
+        return {
+          kind: "accounts-non-fable-focus",
+          operation,
+          rest: argv.slice(3),
+        };
+      }
+      return { kind: "usage", unknown: "accounts non-fable-focus" };
     }
     return { kind: "usage", unknown: `accounts ${argv[1] ?? ""}`.trim() };
   }

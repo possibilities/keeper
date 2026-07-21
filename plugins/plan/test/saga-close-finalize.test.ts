@@ -12,7 +12,7 @@
 // zero drift. The outcome-exhaustiveness node imports CLOSE_OUTCOMES from src;
 // the retired `epic followup-of` node asserts the unknown-subcommand error.
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -25,6 +25,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import {
+  TRUNK_LEASE_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+} from "../../../src/grant-leaf.ts";
 import {
   AUDIT_SCHEMA_VERSION,
   computeCommitSetHash,
@@ -39,6 +43,11 @@ import {
 import {
   CLOSE_OUTCOMES,
   type CloseOutcome,
+  integrateEpicBases,
+  integrateRepoUnderLease,
+  type TrunkGitResult,
+  type TrunkIntegrationDeps,
+  type TrunkLeaseRequestResult,
 } from "../src/verbs/close_finalize.ts";
 import {
   armInProgressOp,
@@ -55,6 +64,7 @@ import {
   runCli,
   scaffoldEpic,
   withProject,
+  withTmpdir,
 } from "./harness.ts";
 
 // The set of outcomes the /plan:close coordinator switches on (mirrors the saga).
@@ -210,8 +220,17 @@ function seedFreshResumeReceipts(
     selectionVerdict,
     `${JSON.stringify(
       {
-        schema_version: 1,
-        cells: { "1": { tier: "high", model: "sonnet" } },
+        schema_version: 2,
+        cells: {
+          "1": {
+            tier: "high",
+            model: "sonnet",
+            rationale: "fixture non-Spark selection",
+            confidence: 0.8,
+            spark_fit: false,
+            spark_exclusion: "spark-not-on-axis",
+          },
+        },
         selection: {
           harness: "subagent",
           model: "plan:model-selector",
@@ -220,6 +239,7 @@ function seedFreshResumeReceipts(
           shuffle_seed: 17,
           outcome: "completed",
           verdict_raw: "fixture",
+          spark_axis_present: false,
         },
       },
       null,
@@ -791,24 +811,52 @@ function sidecar(root: string, epicId: string): Record<string, unknown> | null {
   return JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
 }
 
+function nonSparkVerdictCell(
+  tier: string,
+  model = "opus",
+  opts: { rationale?: string; confidence?: number } = {},
+): Record<string, unknown> {
+  return {
+    tier,
+    model,
+    rationale: opts.rationale ?? "not a Spark fit",
+    confidence: opts.confidence ?? 0.8,
+    spark_fit: false,
+    spark_exclusion: "spark-not-on-axis",
+  };
+}
+
 // Write a selection-verdict JSON file the CLI reads via --selection-verdict.
 function writeVerdict(
   root: string,
+  epicId: string,
   cells: Record<string, Record<string, unknown>>,
+  opts: {
+    schemaVersion?: unknown;
+    omitSparkAxisPresent?: boolean;
+    sparkAxisPresent?: unknown;
+    inputHash?: string;
+  } = {},
 ): string {
   const p = join(root, "_selection_verdict.json");
+  const followupText = readFileSync(followupPath(root, epicId), "utf-8");
+  const selection: Record<string, unknown> = {
+    harness: "claude",
+    model: "sonnet",
+    config_hash: "cfg-hash",
+    input_hash:
+      opts.inputHash ?? createHash("sha256").update(followupText).digest("hex"),
+    shuffle_seed: 42,
+    outcome: "completed",
+    verdict_raw: "picked cells",
+  };
+  if (!opts.omitSparkAxisPresent) {
+    selection.spark_axis_present = opts.sparkAxisPresent ?? false;
+  }
   const doc = {
-    schema_version: 1,
+    schema_version: opts.schemaVersion ?? 2,
     cells,
-    selection: {
-      harness: "claude",
-      model: "sonnet",
-      config_hash: "cfg-hash",
-      input_hash: "in-hash",
-      shuffle_seed: 42,
-      outcome: "completed",
-      verdict_raw: "picked cells",
-    },
+    selection,
   };
   writeFileSync(p, `${JSON.stringify(doc)}\n`, "utf-8");
   return p;
@@ -825,11 +873,33 @@ function keptOrdinals(n: number): Array<Record<string, unknown>> {
 
 describe("close-finalize selection pre-selection", () => {
   const getProj = withProject("planctl-cf-select-");
+  const claudeAndPiMatrix = readFileSync(
+    join(import.meta.dir, "fixtures", "matrix-claude-and-pi.yaml"),
+    "utf-8",
+  );
+
+  function restrictedSparkMatrixEnv(proj: {
+    home: string;
+  }): Record<string, string> {
+    const dir = join(proj.home, "restricted-spark-matrix");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "matrix.yaml"),
+      claudeAndPiMatrix.replace(
+        "      - openai-codex/gpt-5.3-codex-spark",
+        "      - id: openai-codex/gpt-5.3-codex-spark\n" +
+          "        efforts: [low, medium, high]",
+      ),
+      "utf-8",
+    );
+    return { KEEPER_CONFIG_DIR: dir };
+  }
 
   function finalizeWithVerdict(
     proj: { root: string; home: string },
     epicId: string,
     verdictPath: string,
+    env?: Record<string, string>,
   ): { code: number; env: Record<string, unknown> } {
     const r = runCli(
       [
@@ -840,7 +910,7 @@ describe("close-finalize selection pre-selection", () => {
         "--selection-verdict",
         verdictPath,
       ],
-      { cwd: proj.root, home: proj.home },
+      { cwd: proj.root, home: proj.home, env },
     );
     return { code: r.code, env: parseCliOutput(r.output) };
   }
@@ -854,14 +924,15 @@ describe("close-finalize selection pre-selection", () => {
       "Guided select",
     );
     seedFollowupYaml(proj.root, epicId, epicId, 2);
-    const vp = writeVerdict(proj.root, {
-      "1": {
-        tier: "high",
-        model: "sonnet",
+    const inputHash = createHash("sha256")
+      .update(readFileSync(followupPath(proj.root, epicId), "utf-8"))
+      .digest("hex");
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": nonSparkVerdictCell("high", "sonnet", {
         rationale: "task 1 is subtle",
         confidence: 0.9,
-      },
-      "2": { tier: "max", model: "opus" },
+      }),
+      "2": nonSparkVerdictCell("max", "opus"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);
@@ -887,7 +958,7 @@ describe("close-finalize selection pre-selection", () => {
     expect(s.outcome).toBe("completed");
     expect(s.selector).toEqual({ harness: "claude", model: "sonnet" });
     expect(s.config_hash).toBe("cfg-hash");
-    expect(s.input_hash).toBe("in-hash");
+    expect(s.input_hash).toBe(inputHash);
     const sCells = s.cells as Array<Record<string, unknown>>;
     expect(sCells).toHaveLength(2);
     expect(sCells[0]).toMatchObject({
@@ -895,12 +966,16 @@ describe("close-finalize selection pre-selection", () => {
       tier: "high",
       model: "sonnet",
       rationale: "task 1 is subtle",
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
       label_source: "heuristic-guided",
     });
     expect(sCells[1]).toMatchObject({
       task_id: `${newEpicId}.2`,
       tier: "max",
       model: "opus",
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
       label_source: "heuristic-guided",
     });
 
@@ -916,6 +991,40 @@ describe("close-finalize selection pre-selection", () => {
       ),
     ) as Record<string, unknown>;
     expect(newDef.last_validated_at).not.toBeNull();
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("mismatched follow-up input hash degrades without applying guided cells", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Mismatched follow-up hash",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(
+      proj.root,
+      epicId,
+      { "1": nonSparkVerdictCell("high", "sonnet") },
+      { inputHash: "different-follow-up-document-hash" },
+    );
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-input-hash-mismatch");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
     expect(epicStatus(proj.root, epicId)).toBe("done");
   });
 
@@ -950,6 +1059,8 @@ describe("close-finalize selection pre-selection", () => {
       task_id: `${newEpicId}.1`,
       tier: "medium",
       model: "opus",
+      spark_fit: null,
+      spark_exclusion: null,
       label_source: "heuristic-default",
     });
 
@@ -971,8 +1082,9 @@ describe("close-finalize selection pre-selection", () => {
       "Bad cell",
     );
     seedFollowupYaml(proj.root, epicId, epicId, 1);
-    const vp = writeVerdict(proj.root, {
-      "1": { tier: "ultra", model: "sonnet" }, // "ultra" is not a configured effort
+    const vp = writeVerdict(proj.root, epicId, {
+      // "ultra" is not a configured effort, but the cell shape is otherwise exact.
+      "1": nonSparkVerdictCell("ultra", "sonnet"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);
@@ -987,9 +1099,138 @@ describe("close-finalize selection pre-selection", () => {
     const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
     expect(s.outcome).toBe("degraded:verdict-cell-out-of-axis");
     expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
       label_source: "heuristic-default",
     });
     expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("ragged matrix rejects a staged Spark effort unsupported by that model", () => {
+    const proj = getProj();
+    const env = restrictedSparkMatrixEnv(proj);
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Restricted Spark close",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": {
+        tier: "xhigh",
+        model: "gpt-5.3-codex-spark",
+        rationale: "Spark cannot render this effort",
+        confidence: 0.7,
+        spark_fit: true,
+        spark_exclusion: null,
+      },
+    });
+
+    const { code, env: result } = finalizeWithVerdict(proj, epicId, vp, env);
+    expect(code).toBe(0);
+    expect(result.outcome).toBe("closed_with_followup");
+    const newEpicId = result.new_epic_id as string;
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-cell-out-of-axis");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
+  });
+
+  test("legacy v1 follow-up verdict degrades even with v2 Spark fields", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Legacy v1 selection verdict",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(
+      proj.root,
+      epicId,
+      { "1": nonSparkVerdictCell("high", "sonnet") },
+      { schemaVersion: 1 },
+    );
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-schema-legacy");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
+  });
+
+  test("missing or invalid v2 Spark axis provenance degrades", () => {
+    for (const [title, opts] of [
+      ["missing", { omitSparkAxisPresent: true }],
+      ["invalid", { sparkAxisPresent: "yes" }],
+    ] as const) {
+      const proj = getProj();
+      const { epicId } = doneEpic(
+        proj,
+        1,
+        { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+        `Bad Spark axis ${title}`,
+      );
+      seedFollowupYaml(proj.root, epicId, epicId, 1);
+      const vp = writeVerdict(
+        proj.root,
+        epicId,
+        { "1": nonSparkVerdictCell("high", "sonnet") },
+        opts,
+      );
+
+      const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+      expect(code).toBe(0);
+      expect(env.outcome).toBe("closed_with_followup");
+      const newEpicId = env.new_epic_id as string;
+      const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+      expect(s.outcome).toBe("degraded:verdict-provenance-invalid");
+      expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+        spark_fit: null,
+        spark_exclusion: null,
+        label_source: "heuristic-default",
+      });
+    }
+  });
+
+  test("malformed follow-up verdict missing Spark fields degrades, never rejects finalize", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Legacy selection verdict",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": { tier: "high", model: "sonnet" },
+    });
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-cell-shape-invalid");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
   });
 
   test("adopt path runs no selection even with a verdict supplied", () => {
@@ -1014,8 +1255,8 @@ describe("close-finalize selection pre-selection", () => {
     fDef.created_by_close_of = epicId;
     writeFileSync(fPath, JSON.stringify(fDef), "utf-8");
     seedFollowupYaml(proj.root, epicId, epicId, 1);
-    const vp = writeVerdict(proj.root, {
-      "1": { tier: "high", model: "sonnet" },
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": nonSparkVerdictCell("high", "sonnet"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);
@@ -1540,5 +1781,823 @@ describe("close-finalize gates + exhaustiveness + retired verb", () => {
     });
     expect(r.code).not.toBe(0);
     expect(r.output.toLowerCase().includes("no such command")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trunk-lease integration saga — integrateRepoUnderLease / integrateEpicBases,
+// driven directly (not through runCli/close-finalize) behind the pure
+// TrunkIntegrationDeps git+lease seam. No real git spawn, no real daemon
+// round-trip: every git call and every lease request/release is a scripted
+// fake, so the fenced retry saga's typed exits are asserted deterministically.
+// ---------------------------------------------------------------------------
+
+const TRUNK_EPIC_ID = "fn-1-demo";
+const TRUNK_SOURCE_BRANCH = `keeper/epic/${TRUNK_EPIC_ID}`;
+const TRUNK_DEFAULT_BRANCH = "main";
+const TRUNK_CLAIMANT = "test-session-fixture";
+const TRUNK_REPO_ROOT = "/repo-a";
+
+function gitOk(stdout = ""): TrunkGitResult {
+  return { code: 0, stdout, stderr: "" };
+}
+
+function gitFail(code = 1, stderr = ""): TrunkGitResult {
+  return { code, stdout: "", stderr };
+}
+
+function baseLeaseFor(overrides: Partial<TrunkLeaseLeaf> = {}): TrunkLeaseLeaf {
+  return {
+    schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+    active: true,
+    epic_id: TRUNK_EPIC_ID,
+    claimant_session_id: TRUNK_CLAIMANT,
+    claimant_pid: 4242,
+    claimant_start_time: "0",
+    acquisition_id: "acq-1",
+    repo_root: TRUNK_REPO_ROOT,
+    writable_root: TRUNK_REPO_ROOT,
+    source_branch: TRUNK_SOURCE_BRANCH,
+    default_branch: TRUNK_DEFAULT_BRANCH,
+    observed_default_tip: "base000",
+    expires_at: Date.now() + 120_000,
+    fencing_token: 1,
+    ...overrides,
+  };
+}
+
+/** Private carrier the patched process.exit throws, so a typed
+ * emitFinalizeError exit unwinds to runTrunkVerb's catch instead of killing
+ * the test process — the same technique runCli uses for the compiled CLI. */
+class TrunkExitSignal {
+  constructor(readonly code: number) {}
+}
+
+/** Call `fn` with process.exit/process.stdout.write patched, returning the
+ * exit code (null when fn returned normally, with no typed exit) plus the
+ * captured stdout for the typed-error envelope. */
+function runTrunkVerb(fn: () => void): { code: number | null; stdout: string } {
+  const priorExit = process.exit;
+  const priorWrite = process.stdout.write;
+  let stdout = "";
+  process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
+    stdout +=
+      typeof chunk === "string"
+        ? chunk
+        : Buffer.from(chunk as Uint8Array).toString("utf-8");
+    const cb = rest.find((r) => typeof r === "function") as
+      | ((err?: Error | null) => void)
+      | undefined;
+    cb?.(null);
+    return true;
+  }) as typeof process.stdout.write;
+  process.exit = ((c?: number): never => {
+    throw new TrunkExitSignal(c ?? 0);
+  }) as typeof process.exit;
+
+  let code: number | null = null;
+  try {
+    fn();
+  } catch (exc) {
+    if (exc instanceof TrunkExitSignal) {
+      code = exc.code;
+    } else {
+      throw exc;
+    }
+  } finally {
+    process.exit = priorExit;
+    process.stdout.write = priorWrite;
+  }
+  return { code, stdout };
+}
+
+function trunkErrorCode(stdout: string): string {
+  const payload = parseCliOutput(stdout) as {
+    error?: { code?: string };
+  };
+  return payload.error?.code ?? "";
+}
+
+interface FakeTrunkDepsOptions {
+  git: TrunkIntegrationDeps["git"];
+  /** Lease minted per acquire attempt (0-based). Defaults to a fresh
+   * baseLeaseFor with an incrementing fencing_token. */
+  leaseFor?: (attempt: number) => TrunkLeaseLeaf;
+  /** release() return value — false exercises TRUNK_LEASE_RELEASE_FAILED. */
+  releaseOk?: boolean;
+  /** acquireLock() returns null (lock contention) when false. */
+  lockOk?: boolean;
+  /** Overrides requestLease's result for a given attempt (0-based). Returning
+   * {ok:false, reason} exercises TRUNK_LEASE_REQUEST_FAILED / TRUNK_LEASE_PENDING;
+   * undefined falls through to the default always-succeeding mint. */
+  requestLeaseResult?: (attempt: number) => TrunkLeaseRequestResult | undefined;
+  /** OPTIONAL merge-suite gate probe (ADR 0102). Omitted → the plan CLI skips
+   * the gate (the daemon owns the authoritative one). */
+  runMergeSuite?: TrunkIntegrationDeps["runMergeSuite"];
+}
+
+/** One recorded git call — the (args, cwd) pair, so a test can assert the private
+ * scratch worktree + temp branch were reaped on the exit path it drives. */
+interface GitCall {
+  args: string[];
+  cwd: string;
+}
+
+/** Build a scripted TrunkIntegrationDeps: the caller supplies only the git
+ * responder (the thing under test), while lock/lease plumbing defaults to an
+ * always-succeeding fake that mirrors whatever lease it last minted back
+ * through readLeaseLeaf — the in-fence "is my lease still valid" re-check
+ * `integrateRepoUnderLease` performs every attempt. Every git call is recorded
+ * so the reap assertions can read them off `gitCalls`. */
+function makeFakeTrunkDeps(opts: FakeTrunkDepsOptions): {
+  deps: TrunkIntegrationDeps;
+  releasedLeases: TrunkLeaseLeaf[];
+  requestAttempts: () => number;
+  gitCalls: GitCall[];
+} {
+  let attempt = 0;
+  let lastLease: TrunkLeaseLeaf | null = null;
+  const releasedLeases: TrunkLeaseLeaf[] = [];
+  const gitCalls: GitCall[] = [];
+  const deps: TrunkIntegrationDeps = {
+    git: (args, cwd) => {
+      gitCalls.push({ args, cwd });
+      return opts.git(args, cwd);
+    },
+    acquireLock: () => (opts.lockOk === false ? null : { release: () => {} }),
+    requestLease: (
+      _stateDir,
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+    ) => {
+      const currentAttempt = attempt;
+      attempt += 1;
+      const scripted = opts.requestLeaseResult?.(currentAttempt);
+      if (scripted !== undefined) {
+        if (scripted.ok) {
+          lastLease = scripted.lease;
+        }
+        return scripted;
+      }
+      const lease = opts.leaseFor
+        ? opts.leaseFor(currentAttempt)
+        : baseLeaseFor({
+            epic_id: epicId,
+            repo_root: repoRoot,
+            writable_root: repoRoot,
+            source_branch: sourceBranch,
+            claimant_session_id: claimantSessionId,
+            fencing_token: currentAttempt + 1,
+          });
+      lastLease = lease;
+      return { ok: true, lease };
+    },
+    releaseLease: (_stateDir, lease) => {
+      releasedLeases.push(lease);
+      return opts.releaseOk ?? true;
+    },
+    readLeaseLeaf: () => lastLease,
+    runMergeSuite: opts.runMergeSuite,
+  };
+  return { deps, releasedLeases, requestAttempts: () => attempt, gitCalls };
+}
+
+/** True when the recorded git calls include a `worktree remove --force <path>`
+ * on some scratch path AND a `branch -D <branch>` — the reap every exit path owes.
+ * The scratch path/branch carry a random suffix, so match on the stable prefixes. */
+function reapedScratch(gitCalls: GitCall[]): boolean {
+  const removed = gitCalls.some(
+    (c) =>
+      c.args[0] === "worktree" &&
+      c.args[1] === "remove" &&
+      c.args.includes("--force") &&
+      (c.args.at(-1) ?? "").includes("keeper-trunk-integrate-"),
+  );
+  const branchDeleted = gitCalls.some(
+    (c) =>
+      c.args[0] === "branch" &&
+      c.args[1] === "-D" &&
+      (c.args[2] ?? "").startsWith("keeper/trunk-integrate/"),
+  );
+  return removed && branchDeleted;
+}
+
+/** The scratch worktree path a `worktree add` was cut at, or null — so a test can
+ * confirm the merge + gate ran INSIDE that private worktree, not the shared checkout. */
+function scratchWorktreePath(gitCalls: GitCall[]): string | null {
+  const add = gitCalls.find(
+    (c) => c.args[0] === "worktree" && c.args[1] === "add",
+  );
+  return add ? (add.args.at(-2) ?? null) : null;
+}
+
+// A scripted git responder for the private-worktree integration flow (ADR 0102).
+// It distinguishes the SHARED checkout (cwd === TRUNK_REPO_ROOT) from the PRIVATE
+// scratch worktree (cwd carries the `keeper-trunk-integrate-` prefix), so a test
+// drives each side independently. Every knob defaults to the happy path: a clean,
+// on-default-branch shared checkout, a not-yet-ancestor source that merges cleanly
+// in the scratch worktree and is objectively contained, and a fast-forwardable
+// shared checkout.
+interface TrunkFlowScript {
+  sourceOid?: string;
+  liveTip?: string;
+  /** Pre-merge reprobe: is source ALREADY an ancestor of default? Default false. */
+  reprobeAncestor?: boolean;
+  mergedCommit?: string;
+  worktreeAddOk?: boolean;
+  /** The scratch `git merge --no-edit` result. Default success. */
+  mergeResult?: TrunkGitResult;
+  /** MERGE_HEAD in the scratch worktree after a failed merge — set to mark a
+   * content conflict, left empty for a residue-free failure. */
+  mergeHeadAfterFail?: string;
+  conflictFiles?: string;
+  /** Objective containment (`merge-base --is-ancestor source HEAD` in scratch).
+   * Default contained. */
+  contained?: boolean;
+  /** Shared checkout HEAD branch. Default the default branch (on-branch). */
+  sharedHead?: string;
+  /** Shared checkout `git status --porcelain` output. Default clean. */
+  sharedStatus?: string;
+  /** Shared checkout `git merge --ff-only` result. Default success. */
+  ffResult?: TrunkGitResult;
+  /** `git update-ref` (deferred-ff advance) result. Default success. */
+  updateRefResult?: TrunkGitResult;
+}
+
+function trunkFlowGit(
+  script: TrunkFlowScript = {},
+): TrunkIntegrationDeps["git"] {
+  const src = script.sourceOid ?? "abc1234";
+  const live = script.liveTip ?? "base000";
+  const merged = script.mergedCommit ?? "merged12345678";
+  return (args, cwd) => {
+    const inScratch = cwd.includes("keeper-trunk-integrate-");
+    // Scratch worktree admin (reap + provision) — always on the shared repo root.
+    if (args[0] === "worktree" && args[1] === "remove") return gitOk();
+    if (args[0] === "worktree" && args[1] === "prune") return gitOk();
+    if (args[0] === "branch" && args[1] === "-D") return gitOk();
+    if (args[0] === "worktree" && args[1] === "add") {
+      return script.worktreeAddOk === false
+        ? gitFail(1, "worktree add failed")
+        : gitOk();
+    }
+    // MERGE_HEAD probe (scratch, only after a failed merge).
+    if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+      return script.mergeHeadAfterFail
+        ? gitOk(script.mergeHeadAfterFail)
+        : gitFail(1);
+    }
+    // Pre-merge source/default tip reads (shared repo root).
+    if (
+      args[0] === "rev-parse" &&
+      args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+    ) {
+      return gitOk(src);
+    }
+    if (
+      args[0] === "rev-parse" &&
+      args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+    ) {
+      return gitOk(live);
+    }
+    // Merged HEAD read (scratch).
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return gitOk(merged);
+    // merge-base --is-ancestor: pre-merge reprobe (shared) vs objective
+    // containment (scratch).
+    if (args[0] === "merge-base") {
+      if (inScratch) return script.contained === false ? gitFail(1) : gitOk();
+      return script.reprobeAncestor ? gitOk() : gitFail(1);
+    }
+    // The epic-base merge (scratch, --no-edit) and the shared-checkout
+    // fast-forward (root, --ff-only).
+    if (args[0] === "merge") {
+      if (inScratch) return script.mergeResult ?? gitOk();
+      return script.ffResult ?? gitOk();
+    }
+    if (args[0] === "diff") return gitOk(script.conflictFiles ?? "");
+    if (args[0] === "symbolic-ref") {
+      return gitOk(script.sharedHead ?? TRUNK_DEFAULT_BRANCH);
+    }
+    if (args[0] === "status") return gitOk(script.sharedStatus ?? "");
+    if (args[0] === "update-ref") return script.updateRefResult ?? gitOk();
+    throw new Error(`unexpected git call: ${cwd} :: ${args.join(" ")}`);
+  };
+}
+
+/** Did a `git merge --no-edit <source>` run INSIDE the private scratch worktree
+ * (never the shared checkout) — the ADR 0102 relocation. */
+function mergedInScratch(gitCalls: GitCall[]): boolean {
+  return gitCalls.some(
+    (c) =>
+      c.args[0] === "merge" &&
+      c.args.includes("--no-edit") &&
+      c.cwd.includes("keeper-trunk-integrate-"),
+  );
+}
+
+/** Did any `git merge` run in the SHARED checkout OTHER than a fast-forward — the
+ * thing that must NEVER happen (no MERGE_HEAD is ever visible in the shared
+ * checkout). */
+function mergedInSharedCheckout(gitCalls: GitCall[]): boolean {
+  return gitCalls.some(
+    (c) =>
+      c.args[0] === "merge" &&
+      !c.args.includes("--ff-only") &&
+      c.cwd === TRUNK_REPO_ROOT,
+  );
+}
+
+function findGitCall(gitCalls: GitCall[], verb: string): GitCall | undefined {
+  return gitCalls.find((c) => c.args[0] === verb);
+}
+
+describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
+  const runIntegrate = (deps: TrunkIntegrationDeps) =>
+    runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+  test("clean on-branch shared checkout: merges in a scratch worktree, fast-forwards, reaps, releases", () => {
+    // The happy path: the epic base merges in a PRIVATE worktree cut from the
+    // leased default tip, the clean on-branch shared checkout is fast-forwarded to
+    // the merged commit, the scratch worktree + temp branch are reaped, and the
+    // lease is released.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    // The shared checkout is fast-forwarded to the exact merged commit.
+    const ff = gitCalls.find(
+      (c) => c.args[0] === "merge" && c.args.includes("--ff-only"),
+    );
+    expect(ff?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(ff?.args.at(-1)).toBe("merged12345678");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("dirty-tracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): an unrelated TRACKED modification in the shared
+    // checkout — integration completes (the merge happens in the scratch worktree),
+    // the default ref advances via update-ref (compare-and-swap against the leased
+    // tip), and ONLY the fast-forward defers (the trailing checkout is the daemon's
+    // shared-checkout-desync producer's job). The old any-dirt refusal is gone.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedStatus: " M unrelated.ts\n" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    // Success returns normally (no error envelope emitted): code null.
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    // The default ref advances via a compare-and-swap update-ref, NOT a working-tree
+    // fast-forward (the dirt is preserved untouched).
+    const advance = findGitCall(gitCalls, "update-ref");
+    expect(advance).toBeDefined();
+    expect(advance?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(advance?.args).toEqual([
+      "update-ref",
+      `refs/heads/${TRUNK_DEFAULT_BRANCH}`,
+      "merged12345678",
+      "base000",
+    ]);
+    // No fast-forward merge ran in the shared checkout.
+    expect(
+      gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
+    ).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("untracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): a bare UNTRACKED path (no tracked modification at
+    // all) trips the same `--untracked-files=all` "not clean" read as a tracked
+    // edit, so the merge still lands and only the fast-forward defers.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedStatus: "?? scratch.txt\n" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    const advance = findGitCall(gitCalls, "update-ref");
+    expect(advance).toBeDefined();
+    expect(advance?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(
+      gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
+    ).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("off-branch shared checkout lands the epic via update-ref, deferring only the ff", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedHead: "some-operator-branch" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(findGitCall(gitCalls, "update-ref")).toBeDefined();
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("the merge-suite gate runs against the MERGED tree in the scratch worktree", () => {
+    // Acceptance: the injected gate is called with the scratch worktree path AND
+    // the merged commit — proving it gates the merged tree, not the shared checkout.
+    const gateCalls: { worktreePath: string; mergedCommit: string }[] = [];
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: (args) => {
+        gateCalls.push(args);
+        return { kind: "green" };
+      },
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(gateCalls).toHaveLength(1);
+    expect(gateCalls[0].mergedCommit).toBe("merged12345678");
+    expect(gateCalls[0].worktreePath).toBe(scratchWorktreePath(gitCalls));
+    expect(gateCalls[0].worktreePath).toContain("keeper-trunk-integrate-");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("gate-red aborts the land with TRUNK_INTEGRATION_SUITE_RED, reaping the worktree and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: () => ({ kind: "red", detail: "3 tests failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_SUITE_RED");
+    // Nothing landed: no fast-forward, no ref advance.
+    expect(findGitCall(gitCalls, "update-ref")).toBeUndefined();
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("gate cannot-run defers with TRUNK_INTEGRATION_DEFERRED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: () => ({ kind: "cannot-run", detail: "install failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DEFERRED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("conflict in the scratch worktree keeps TRUNK_INTEGRATION_CONFLICT, retains the lease, reaps, and never touches the shared checkout", () => {
+    // The conflict materializes in the scratch worktree, NOT the shared checkout —
+    // the closer retains its fenced lease (no release) for the downstream resolver,
+    // the scratch worktree carrying MERGE_HEAD is reaped, and no MERGE_HEAD is ever
+    // visible in the shared checkout.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({
+        mergeResult: gitFail(1, "CONFLICT (content)"),
+        mergeHeadAfterFail: "deadbeef1234",
+        conflictFiles: "path/one.ts\npath/two.ts\n",
+      }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_CONFLICT");
+    const payload = parseCliOutput(result.stdout) as {
+      error: { details: { conflicted_files: string[] } };
+    };
+    expect(payload.error.details.conflicted_files).toEqual([
+      "path/one.ts",
+      "path/two.ts",
+    ]);
+    // Lease RETAINED for the downstream deconflicter.
+    expect(releasedLeases.length).toBe(0);
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+  });
+
+  test("a residue-free merge failure exits TRUNK_INTEGRATION_FAILED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({
+        mergeResult: gitFail(128, "fatal: not something we can merge"),
+        mergeHeadAfterFail: "",
+      }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_FAILED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a merge that does not provably contain the source exits TRUNK_INTEGRATION_UNVERIFIED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ contained: false }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_UNVERIFIED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a scratch worktree that could not be provisioned defers with TRUNK_INTEGRATION_DEFERRED", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ worktreeAddOk: false }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DEFERRED");
+    // No merge was attempted, and the failed provision was reaped.
+    expect(mergedInScratch(gitCalls)).toBe(false);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a lost update-ref compare-and-swap reaps + retries on a fresh tip, then lands", () => {
+    // Racing-origin edge path: the deferred-ff publish is a compare-and-swap ref
+    // advance (ADR 0102's "push" — this single-repo model has no separate remote
+    // to push to). The advance loses its CAS on the first attempt (a concurrent
+    // local advance moved the default under the fence); that attempt reaps its
+    // scratch worktree and retries, and the second attempt's CAS wins.
+    let updateRefCalls = 0;
+    const base = trunkFlowGit({ sharedStatus: " M unrelated.ts\n" });
+    const git: TrunkIntegrationDeps["git"] = (args, cwd) => {
+      if (args[0] === "update-ref") {
+        updateRefCalls += 1;
+        return updateRefCalls === 1 ? gitFail(1, "CAS mismatch") : gitOk();
+      }
+      return base(args, cwd);
+    };
+    const { deps, releasedLeases, requestAttempts, gitCalls } =
+      makeFakeTrunkDeps({ git });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(updateRefCalls).toBe(2);
+    expect(requestAttempts()).toBe(2);
+    // Each attempt released its lease (the failed one on the retry, the winner on
+    // success), and the scratch worktree was reaped on both.
+    expect(releasedLeases.length).toBe(2);
+    expect(reapedScratch(gitCalls)).toBe(true);
+  });
+
+  test("ancestor-skip: an in-fence reprobe already ancestor releases without a scratch worktree", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ reprobeAncestor: true }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(false);
+    expect(findGitCall(gitCalls, "worktree")).toBeUndefined();
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("tip-drift: default advancing every fenced attempt exhausts the 3-try loop before any worktree", () => {
+    const { deps, releasedLeases, requestAttempts, gitCalls } =
+      makeFakeTrunkDeps({
+        git: trunkFlowGit({ liveTip: "drifted-tip" }),
+        leaseFor: (attempt) =>
+          baseLeaseFor({
+            fencing_token: attempt + 1,
+            observed_default_tip: "base000",
+          }),
+      });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_TIP_DRIFT");
+    expect(requestAttempts()).toBe(3);
+    expect(releasedLeases.length).toBe(3);
+    // Drift defers BEFORE the merge — no scratch worktree is ever cut.
+    expect(findGitCall(gitCalls, "worktree")).toBeUndefined();
+  });
+
+  test("release-fail: a landed merge whose release the daemon never acks exits TRUNK_LEASE_RELEASE_FAILED", () => {
+    const { deps, releasedLeases } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      releaseOk: false,
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_RELEASE_FAILED");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a lease request the daemon could not publish exits TRUNK_LEASE_REQUEST_FAILED", () => {
+    const { deps } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      requestLeaseResult: () => ({ ok: false, reason: "request_failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_REQUEST_FAILED");
+  });
+
+  test("a lease request left pending past the bounded wait exits TRUNK_LEASE_PENDING", () => {
+    const { deps } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      requestLeaseResult: () => ({ ok: false, reason: "pending" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_PENDING");
+  });
+
+  test("commit-work lock contention exits TRUNK_INTEGRATION_LOCK_TIMEOUT, releasing the lease", () => {
+    const { deps, releasedLeases } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      lockOk: false,
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe(
+      "TRUNK_INTEGRATION_LOCK_TIMEOUT",
+    );
+    expect(releasedLeases.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2: the ancestor re-grade path reconciled with the SKILL.md recovery
+// contract — a lingering active lease from a resolved conflict is adopted
+// and released rather than left for daemon claimant-death reclaim.
+// ---------------------------------------------------------------------------
+
+describe("integrateEpicBases ancestor re-grade lease adoption (F2)", () => {
+  const getRepo = withTmpdir("trunk-lease-adopt-");
+  let priorWorktree: string | undefined;
+  let priorSession: string | undefined;
+
+  beforeEach(() => {
+    priorWorktree = process.env.KEEPER_PLAN_WORKTREE;
+    priorSession = process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.KEEPER_PLAN_WORKTREE = "worktree-lane-active";
+    process.env.CLAUDE_CODE_SESSION_ID = TRUNK_CLAIMANT;
+  });
+
+  afterEach(() => {
+    if (priorWorktree === undefined) {
+      delete process.env.KEEPER_PLAN_WORKTREE;
+    } else {
+      process.env.KEEPER_PLAN_WORKTREE = priorWorktree;
+    }
+    if (priorSession === undefined) {
+      delete process.env.CLAUDE_CODE_SESSION_ID;
+    } else {
+      process.env.CLAUDE_CODE_SESSION_ID = priorSession;
+    }
+  });
+
+  function ancestorRegradeGit(repoRoot: string): TrunkIntegrationDeps["git"] {
+    return (args) => {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return gitOk(`${repoRoot}\n`);
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "symbolic-ref" &&
+        args.includes("refs/remotes/origin/HEAD")
+      ) {
+        return gitOk(`origin/${TRUNK_DEFAULT_BRANCH}\n`);
+      }
+      if (args[0] === "merge-base") return gitOk(); // already an ancestor
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+  }
+
+  test("adopts and releases a lingering active lease matching this closer", () => {
+    const repoRoot = getRepo();
+    const lease = baseLeaseFor({
+      repo_root: repoRoot,
+      writable_root: repoRoot,
+    });
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => lease,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases).toEqual([lease]);
+  });
+
+  test("leaves an absent lease alone (no adoption when nothing is lingering)", () => {
+    const repoRoot = getRepo();
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => null,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases.length).toBe(0);
+  });
+
+  test("leaves a lease held by a different claimant alone", () => {
+    const repoRoot = getRepo();
+    const lease = baseLeaseFor({
+      repo_root: repoRoot,
+      writable_root: repoRoot,
+      claimant_session_id: "some-other-session",
+    });
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => lease,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases.length).toBe(0);
   });
 });

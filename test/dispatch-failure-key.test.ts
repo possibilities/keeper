@@ -19,7 +19,11 @@ import {
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   DUP_EPIC_NUMBER_DISTRESS_VERB,
+  EVENTS_INGEST_STALL_DISTRESS_ID,
+  EVENTS_INGEST_STALL_DISTRESS_REASON,
+  EVENTS_INGEST_STALL_DISTRESS_VERB,
   isDupEpicNumberDistressKey,
+  isEventsIngestStallDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDesyncDistressKey,
@@ -350,6 +354,30 @@ describe("routeDispatchFailure: representative variant kinds", () => {
     ).toBe("unknown");
   });
 
+  test("events-ingest-stalled distress key → unknown and exact-key matched", () => {
+    expect(
+      routeDispatchFailure(
+        row(
+          EVENTS_INGEST_STALL_DISTRESS_VERB,
+          EVENTS_INGEST_STALL_DISTRESS_ID,
+          `${EVENTS_INGEST_STALL_DISTRESS_REASON}: unread events-log backlog`,
+        ),
+      ).kind,
+    ).toBe("unknown");
+    expect(
+      isEventsIngestStallDistressKey(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        EVENTS_INGEST_STALL_DISTRESS_ID,
+      ),
+    ).toBe(true);
+    expect(
+      isEventsIngestStallDistressKey(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        `${EVENTS_INGEST_STALL_DISTRESS_ID}:other`,
+      ),
+    ).toBe(false);
+  });
+
   test("shared-checkout-wedge distress key → unknown (never enters failedKeys)", () => {
     // Same synthetic-verb discipline as crash-loop, but per-repo: the id carries the
     // repo hash. It must route as `unknown` for EVERY repo hash so no wedge row ever
@@ -670,6 +698,7 @@ describe("single vocabulary source", () => {
       ["parked-launch", "parked-launch"],
       ["daemon-crash-loop", "crash-loop"],
       ["repeated-native-crash", "native-crash"],
+      ["events-ingest-stalled", "events-ingest-stalled"],
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],
       ["shared-checkout-desync", "shared-desync"],

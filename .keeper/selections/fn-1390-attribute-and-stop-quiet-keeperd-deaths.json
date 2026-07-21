@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Correctness-sensitive daemon exit-attribution across signal/fatalExit/uncaught paths with delicate integration into the intricate restart-ledger/enrich idiom, judgment-heavy but not opus-gated, and well-scoped enough for the default band.",
+      "task_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Ambiguous forensic reasoning ruling four invisible daemon deaths in or out plus a report-shape contract touch demands Claude-tuned judgment at a hard band, though no novel-algorithm or architectural-cascade opus gate is nameable.",
+      "task_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T20:26:03.020000Z",
+  "epic_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths",
+  "input_hash": "4130df4b0cb6c2eb1d805f660e447ec1d94b72456de8035c22c4ce72b5826e6a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1093721931,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1390-attribute-and-stop-quiet-keeperd-deaths.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Correctness-sensitive daemon exit-attribution across signal/fatalExit/uncaught paths with delicate integration into the intricate restart-ledger/enrich idiom, judgment-heavy but not opus-gated, and well-scoped enough for the default band.\",\"confidence\":0.7},{\"task_id\":\"fn-1390-attribute-and-stop-quiet-keeperd-deaths.2\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Ambiguous forensic reasoning ruling four invisible daemon deaths in or out plus a report-shape contract touch demands Claude-tuned judgment at a hard band, though no novel-algorithm or architectural-cascade opus gate is nameable.\",\"confidence\":0.66}]}\n"
+}

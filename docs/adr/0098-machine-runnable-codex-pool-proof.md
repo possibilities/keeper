@@ -39,11 +39,20 @@ self-reported clause booleans made fabrication cheap.
    per-clause transcript plus the existing revision/config/alias bindings, so
    a report that cannot be traced to an actually-observed run fails
    verification structurally.
+5. **Proof reports are scope-exact**: schema v2 carries one top-level
+   `quota_scope`, exactly `generic` or `model:gpt-5.3-codex-spark`, and every
+   recorded route must carry that same scope. Mixed route scopes, display
+   labels, older schemas, unknown fields, or unknown scope strings are invalid,
+   not degraded evidence.
+6. **Activation is scope-preserving**: a passing report replaces authorization
+   only for its proved scope. Existing other-scope policy is preserved only when
+   the stored activation is valid and still matches the current operational
+   bindings; stale or malformed policy is dropped rather than inherited.
 
 ## Consequences
 
-- The fn-1356 activation ladder consumes a machine-produced report; activation
-  itself stays behind the ladder, and the report remains evidence-only.
+- The fn-1356 activation ladder consumes a machine-produced, scope-exact report;
+  activation itself stays behind the ladder, and the report remains evidence-only.
 - Proof runs perform real, bounded token rotations (normal OAuth refresh) on
   enrolled accounts; interruption leaves the last atomically-written credential.
 - The companion import graph stays free of `bun:*`; the discipline gains a

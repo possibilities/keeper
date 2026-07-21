@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-21T06:15:18.234000Z",
+  "depends_on_epics": [
+    "fn-1352-retire-escalation-sessions",
+    "fn-1393-treat-a-missing-suite-gate-as-pass-with"
+  ],
+  "id": "fn-1394-probe-close-claim-holder-liveness-and",
+  "last_validated_at": "2026-07-21T06:31:57.372000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Probe close-claim holder liveness and clear markers on kills",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-21T06:31:57.372000Z"
+}

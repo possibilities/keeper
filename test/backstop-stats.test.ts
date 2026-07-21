@@ -90,6 +90,7 @@ test("computes rescue count, percentiles, and rate from the rollup denominator",
   expect(row.p95).toBe(100);
   expect(row.p99).toBe(100);
   expect(row.max).toBe(100);
+  expect("samples" in row).toBe(false);
 });
 
 test("tolerates a torn partial final line", () => {
@@ -168,61 +169,4 @@ test("empty input yields no rows", () => {
   const result = computeStats("");
   expect(result.parsed).toBe(0);
   expect(result.rows).toHaveLength(0);
-});
-
-test("fn-771: mixed-version ndjson surfaces change_to_rescue_ms — present reads through, absent/non-finite read as null", () => {
-  // Three git-heartbeat rescues, oldest→newest by ts:
-  //   1) NEW format with a finite change_to_rescue_ms (90s latency)
-  //   2) OLD format predating the field — must parse clean, sample null
-  //   3) NEW format carrying an explicit null (dirty-only rescue, no anchor)
-  const base = {
-    kind: "backstop-rescue" as const,
-    class: "missed-wake" as const,
-    backstop: "git-heartbeat" as const,
-    worker: "git-worker" as const,
-    fast_path: "fsevents",
-    rescued: true,
-  };
-  const lines = [
-    JSON.stringify({
-      ...base,
-      ts: 1748000000001,
-      staleness_ms: 1_611_000,
-      last_fast_path_at: 1747998389001,
-      change_to_rescue_ms: 90_000,
-    }),
-    // Old line: NO change_to_rescue_ms field at all.
-    JSON.stringify({
-      ...base,
-      ts: 1748000000002,
-      staleness_ms: 5000,
-      last_fast_path_at: 1747999995002,
-    }),
-    // New line with an explicit null anchor (dirty-tree-only rescue).
-    JSON.stringify({
-      ...base,
-      ts: 1748000000003,
-      staleness_ms: 12_000,
-      last_fast_path_at: 1747999988003,
-      change_to_rescue_ms: null,
-    }),
-  ];
-  const result = computeStats(`${lines.join("\n")}\n`);
-  expect(result.rescues).toBe(3);
-  const row = result.rows.find(
-    (r) => r.backstop === "git-heartbeat" && r.class === "missed-wake",
-  );
-  expect(row).toBeDefined();
-  if (!row) return;
-  // Samples are watermark-agnostic and pushed in stream order — every rescue
-  // surfaces its change_to_rescue_ms, mapping absent/null both to null.
-  expect(row.samples.map((s) => s.change_to_rescue_ms)).toEqual([
-    90_000,
-    null,
-    null,
-  ]);
-  // staleness_ms still parsed independently — the new field is additive.
-  expect(row.samples.map((s) => s.staleness_ms)).toEqual([
-    1_611_000, 5000, 12_000,
-  ]);
 });

@@ -1,0 +1,15 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-21T06:15:18.234000Z",
+  "depends_on": [],
+  "epic": "fn-1394-probe-close-claim-holder-liveness-and",
+  "id": "fn-1394-probe-close-claim-holder-liveness-and.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Arbitrate close claims on holder liveness",
+  "updated_at": "2026-07-21T06:31:55.212000Z"
+}

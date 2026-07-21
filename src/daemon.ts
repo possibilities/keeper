@@ -33,9 +33,16 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import {
+  type NonFableFocusDelivery,
+  type NonFableFocusLeaf,
+  publishNonFableFocusLeaf,
+  readNonFableFocusLeaf,
+} from "./account-focus";
 import type { AccountObserverWorkerData } from "./account-observer-worker";
 import {
   fableFocusPolicyPath,
+  nonFableFocusPolicyPath,
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
@@ -47,6 +54,7 @@ import type {
 import {
   projectAutopilotPaused,
   projectFableFocus,
+  projectNonFableFocus,
 } from "./autopilot-projection";
 import type {
   AutopilotWorkerData,
@@ -78,8 +86,8 @@ import type {
   AwaitWorkerData,
 } from "./await-worker";
 import {
-  backfillMutationPath,
   isMutationPathBackfillComplete,
+  runYieldingMutationPathBackfill,
 } from "./backfill-mutation-path";
 import {
   appendBackstopRecord,
@@ -108,9 +116,9 @@ import {
   ownerTupleFromBirthRecord,
   parseBirthIntent,
   parseBirthRecord,
+  probeChildStartTime,
   writeProviderLegGrant,
 } from "./birth-record";
-import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
 import type { CodexAccountObserverWorkerData } from "./codex-account-observer-worker";
 import {
@@ -126,11 +134,11 @@ import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
   DEFAULT_RETENTION_MAX_BATCHES,
-  deleteColdTmuxFocusRows,
-  deleteNoopSnapshotRows,
+  formatRetentionShedProgressLogLine,
   reclaimableFreelistBytes,
   reclaimableLogStep,
-  retainColdPayloads,
+  retentionShedProgressLogStep,
+  runYieldingRetentionPass,
 } from "./compaction";
 import {
   type NativeCrashBootIdentityWindow,
@@ -143,7 +151,6 @@ import {
   recordBootCatchupStats,
   resolveAwaitSpillDir,
   resolveBackstopLogPath,
-  resolveBuildbotUrl,
   resolveBusSockPath,
   resolveClaudeProjectsRoot,
   resolveDbPath,
@@ -193,8 +200,12 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  EVENTS_INGEST_STALL_DISTRESS_ID,
+  EVENTS_INGEST_STALL_DISTRESS_REASON,
+  EVENTS_INGEST_STALL_DISTRESS_VERB,
   isBusDegradedDistressKey,
   isDupEpicNumberDistressKey,
+  isEventsIngestStallDistressKey,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
@@ -263,6 +274,21 @@ import type {
   GitWorkerMessage,
   NudgeVanishedSweepMessage,
 } from "./git-worker";
+import {
+  GRANT_LEAF_SCHEMA_VERSION,
+  type GrantLeaf,
+  listGrantLeaves,
+  listTrunkLeaseLeaves,
+  readTrunkLeaseLeaf,
+  readTrunkLeaseRequests,
+  removeTrunkLeaseRequest,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  TRUNK_LEASE_TTL_MS,
+  type TrunkLeaseLeaf,
+  writeGrantLeaf,
+  writeTrunkLeaseLeaf,
+} from "./grant-leaf";
 import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
 import { handoffSlugExists } from "./handoff-slug";
 import type {
@@ -273,18 +299,28 @@ import type {
   HandoffWorkerData,
 } from "./handoff-worker";
 import {
+  readSpool as readIncidentClaimSpool,
+  removeRequest as removeIncidentClaimRequest,
+  type SpooledRequest as SpooledIncidentClaimRequest,
+} from "./incident-claim-store";
+import {
   type AgentbotPageAbsenceLogLatch,
   type AgentbotPageOutcome,
   sendAgentbotPage,
 } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import { keeperStateDir } from "./keeper-state-dir";
+import { createMaintenanceTimeBudget } from "./maintenance-budget";
 import type {
   BackupResultMessage,
   MaintenanceLogMessage,
   MaintenancePageMessage,
   MaintenanceWorkerData,
 } from "./maintenance-worker";
+import {
+  findOsMemoryKillEvidence,
+  type OsMemoryKillEvidence,
+} from "./os-memory-scan";
 import type {
   PlanCommitChangedMessage,
   PlanWorkerData,
@@ -313,9 +349,13 @@ import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   type HostMatrixAxes,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  type IncidentOwnerFailureFacts,
+  incidentOwnerAttachmentCount,
+  isOwnerRoutableIncident,
   isStoppedJobLive,
   isWrappedCell,
-  REPAIR_TERMINAL_GRACE_SEC,
+  nextIncidentOwnerAttachmentMarker,
   withDispatchAttempt,
   wrappedEnvelopePath,
 } from "./reconcile-core";
@@ -324,12 +364,12 @@ import {
   type DrainOptions,
   drain,
   readFoldWorkMsAccum,
-  serializeBuildSnapshot,
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
 import {
   appendDurableRestartBoot,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   boundRestartReason,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
@@ -337,13 +377,26 @@ import {
   classifyRestartProvenance,
   collapseRestartLedger,
   compactRestartLedger,
+  createExitAttributionRecorder,
   decideCrashLoop,
+  decideExitAttribution,
   decideRepeatedNativeCrash,
+  type ExitAttributionRecorder,
   isNativeCrashAttributed,
+  matchOperatorReloadAttribution,
   planNativeCrashEnrichLines,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
+  readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
+  readServeHealthHistory,
+  removeExitAttribution,
+  resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
+  resolveServeHealthHistoryPath,
+  type ServeHealthHistory,
+  writeServeHealthHistory,
 } from "./restart-ledger";
 import type {
   BackendExecStartMessage,
@@ -887,6 +940,9 @@ export function gcUnretryableDispatchFailures(
     if (isBusDegradedDistressKey(row.verb, row.id)) {
       continue;
     }
+    if (isEventsIngestStallDistressKey(row.verb, row.id)) {
+      continue;
+    }
     // A missing agentbot channel is producer-owned and clears only after a page
     // succeeds, never through the retry-dispatch wire.
     if (isPagingChannelDownDistressKey(row.verb, row.id)) {
@@ -1051,6 +1107,7 @@ export const DISPATCH_MINT_GATE_EVICT_MS = DISPATCH_MINT_GATE_WINDOW_MS * 5;
  * near-free when the dir is unchanged.
  */
 export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
+export const EVENTS_INGEST_STALL_THRESHOLD_MS = 30_000;
 
 /**
  * Heartbeat cadence (ms) for the producer-side retention pass (fn-836.5). Runs
@@ -1493,6 +1550,15 @@ export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
 export const PI_RESUME_REPAIR_SWEEP_INTERVAL_MS = 5_000;
 
 /**
+ * Cadence for the incident-claim producer sweep. A session claims a
+ * merge incident and then proceeds, so the claim wants prompt (few-second, not
+ * minute) round-trip visibility; the sweep is cheap (a spool readdir + point
+ * reads + at most one liveness probe per request), and the dead-claimant expiry
+ * pass it also runs is not latency-sensitive.
+ */
+export const INCIDENT_CLAIM_SWEEP_INTERVAL_MS = 3_000;
+
+/**
  * The ONE blocked category that does NOT escalate to the planner: a
  * `TOOLING_FAILURE` is surface-and-stop (a broken runner / env, not a question a
  * planner can answer on the board). DENYLIST shape — every other worker category
@@ -1792,7 +1858,7 @@ export function auditReadyEscalationDecision(
 export type BlockOwnerLiveness = AuditOrchestratorLiveness;
 
 /** Number of owning-work attachment attempts before the legacy unblock fallback. */
-export const BLOCK_OWNER_REDISPATCH_LIMIT = 2;
+export const BLOCK_OWNER_REDISPATCH_LIMIT = INCIDENT_OWNER_ATTACHMENT_LIMIT;
 
 /** The ordinary blocked-task owner uses the audit gate's established death grace. */
 export const BLOCK_OWNER_GRACE_MS = AUDIT_READY_ORCHESTRATOR_GRACE_MS;
@@ -2330,27 +2396,36 @@ export function buildBlockHumanNotifyBody(args: {
 }
 
 /**
- * Build the ONE structured operator page the repair human-notify sweep sends over
- * agentbot when a `repair::<repo-token>` session DECLINES or DIES. Short by design — the
- * sticky repair row + every affected task carry the full context on the board; this is
- * the courtesy page that names the repo, the verdict, and the re-arm command. Pure.
+ * Build the ONE structured operator page the repair human-notify sweep sends when
+ * the granted work owner declines or dies. The sticky repair row and affected tasks
+ * retain the full context; this page names the repo and re-arm command. Pure.
  */
 export function buildRepairHumanNotifyBody(args: {
   repoToken: string;
   repoDir: string | null;
-  verdict: "declined" | "died";
+  verdict: RepairNotifyVerdict;
 }): string {
+  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+  if (args.verdict === "mint_failed") {
+    return [
+      `🔴 keeper: repair::${args.repoToken} needs you — the shared base at repo`,
+      `${repo} is confirmed red at the default tip with no blocked task to own`,
+      `the fix, and the daemon's maintenance-task mint failed.`,
+      ``,
+      `Fix the shared base by hand, or scaffold the maintenance task yourself:`,
+      `  keeper autopilot retry repair::${args.repoToken}`,
+    ].join("\n");
+  }
   const verdictLine =
     args.verdict === "died"
-      ? `its job DIED before landing a fix`
-      : `it DECLINED (could not repair the shared base, or stayed stopped past grace while parked on a question)`;
-  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+      ? `the granted work owner DIED before landing a fix`
+      : `the in-session repairer DECLINED the repair`;
   return [
-    `🔴 keeper: repair::${args.repoToken} needs you — the autonomous shared-base`,
-    `repair session gave up on the broken base (${verdictLine}); repo ${repo}`,
+    `🔴 keeper: repair::${args.repoToken} needs you — the granted shared-base`,
+    `repair did not land (${verdictLine}); repo ${repo}`,
     `stays broken and every SHARED_BASE_BROKEN task on it stays BLOCKED.`,
     ``,
-    `Fix the shared base by hand, then re-arm the repair:`,
+    `Fix the shared base by hand, then re-arm owner election:`,
     `  keeper autopilot retry repair::${args.repoToken}`,
   ].join("\n");
 }
@@ -2743,13 +2818,19 @@ export function selectRepairCandidates(
       );
       continue;
     }
-    const repoDir = effectiveBlockEscalationRepo(
+    const effectiveRepo = effectiveBlockEscalationRepo(
       row.target_repo,
       row.project_dir,
     );
-    if (repoDir === "") {
+    if (effectiveRepo === "") {
       drop(row.task_id, "empty_repo", "target_repo+project_dir both empty");
       continue;
+    }
+    let repoDir = effectiveRepo;
+    try {
+      repoDir = realpathSync(effectiveRepo);
+    } catch {
+      // An unresolved repo remains visible to the dirty/eligibility defer gates.
     }
     out.push({
       epic_id: row.epic_id,
@@ -2901,85 +2982,153 @@ export function repairTipBaselineGreen(leaf: BaselineResult | null): boolean {
   return leaf != null && leaf.status === "green";
 }
 
-/** The outcome the repair sweep records on `RepairDispatched`. The TERMINAL
- *  `dispatched` stamps `repair_dispatched_at`; `dispatch_failed` is NON-terminal. */
+/** A published grant reuses the existing repair-dispatch marker as its durable
+ *  issued-once/page anchor; no top-level repair session is launched. */
 export type RepairDispatchOutcome = "dispatched" | "dispatch_failed";
 
-/** The outcome the repair sweep records on `RepairHumanNotified`. The TERMINAL
- *  `notified` stamps `human_notified_at`; `notify_failed` is NON-terminal. */
 export type RepairHumanNotifiedOutcome = "notified" | "notify_failed";
 
-/** Injectable dependency surface for {@link runRepairEscalationSweep}. Same fail-open
- *  injectable-deps discipline as the sibling escalation sweeps — the producer is
- *  testable with synthetic candidates + rows and an injected dispatcher, never touching
- *  a real daemon / git / socket, and never throws into the daemon loop. */
+export const REPAIR_GRANT_TTL_MS = 15 * 60_000;
+
+export interface RepairGrantOwner {
+  epic_id: string;
+  task_id: string;
+  parent_job_id: string;
+}
+
+export type RepairGrantHolderLiveness = "live" | "dead" | "inconclusive";
+
+/** The page-once verdict a granted owner's decline/death carries, plus
+ *  `mint_failed` for a maintenance-task mint that could not land — the SAME
+ *  `PendingRepairRow.human_notified_at` marker gates all three, so a page never
+ *  repeats regardless of which arm fired it. */
+export type RepairNotifyVerdict = "declined" | "died" | "mint_failed";
+
+/** The maintenance-task mint outcome for a trunk-red group with NO live blocked
+ *  consumer to elect an owner from ({@link RepairGroup}'s candidates are all
+ *  task-less `baseline-tip::` entries). `minted` means the plan CLI scaffolded
+ *  and armed a fresh single-task epic; `mint_failed` covers a spawn error, a
+ *  non-zero exit, an unparseable envelope, or an arm failure. */
+export type MaintenanceMintOutcome = "minted" | "mint_failed";
+
 export interface RepairEscalationSweepDeps {
-  /** The current `SHARED_BASE_BROKEN` blocked candidates, resolved to (repo, fingerprint)
-   *  (production builds them from {@link selectPendingBlockEscalations} + the fs reason
-   *  read + {@link repoToken} + {@link fingerprintFailure}). */
   readonly selectCandidates: () => RepairCandidate[];
-  /** The existing sticky repair rows (production: `dispatch_failures WHERE verb='repair'`). */
   readonly selectRepairRows: () => PendingRepairRow[];
-  /** True iff the repo's shared checkout is DIRTY / mid-merge — a DEFER at dispatch time
-   *  (no attempt consumed, and no row minted when none exists yet), per the finalize
-   *  dirty-degrade precedent. Production reads the `git_status` projection. */
-  readonly isDirtyCheckout: (repoDir: string) => boolean;
-  /** The id of the ACTIVE `shared-checkout-dirty` distress row for `repoDir`, or null
-   *  when none is open — used ONLY to name the row in the dirty-checkout DEFER diagnostic
-   *  so a starving repair route correlates to the one operator-visible incident row.
-   *  Optional (an absent hook keeps the bare defer note); the row's own mint/level-clear
-   *  lifecycle is owned OUTSIDE the pure sweep, by the sustained-dirt grace tracker. */
-  readonly activeDirtyDistressId?: (repoDir: string) => string | null;
-  /** True iff the repo's shared base reads GREEN — the positive-evidence gate the clear
-   *  requires (combined with zero remaining candidates). Anything else (red / unknown /
-   *  unseeded) RETAINS the sticky row ("retained on no report"). */
-  readonly isBaseGreen: (repoDir: string) => boolean;
-  /** Launch ONE `repair::<token>` escalation session for the group (DELEGATES to the
-   *  shared {@link dispatchEscalationSession} in production, so the global cap + per-key
-   *  occupancy guard apply). Async + fail-open — a SKIP (`at_cap` / `already_live`) mints
-   *  nothing so the row re-sweeps. */
-  readonly dispatchRepair: (
+  readonly selectGrants: () => GrantLeaf[];
+  readonly selectOwner: (
     group: RepairGroup,
-  ) => Promise<EscalationDispatchOutcome>;
-  /** Classify the dispatched `repair::<token>` session's recorded outcome (DELEGATES to
-   *  {@link classifyEscalationOutcome} over the live `jobs` in production). Its existing
-   *  terminal died/declined verdict always wins. A missing terminal verdict is promoted
-   *  producer-side only after the injected grace below. */
-  readonly repairOutcome: (repoToken: string) => ResolverOutcome;
-  /** Fail-safe turn-activity probe. A working repair NEVER grace-promotes, regardless of
-   *  dispatch age. Production returns true on a jobs-read failure. */
-  readonly repairSessionWorking: (repoToken: string) => boolean;
-  /** Producer clock and generous grace, in unix seconds. The durable anchor is the
-   *  existing `repair_dispatched_at` marker; no second timestamp/column is needed. */
-  readonly nowSec: () => number;
-  readonly terminalGraceSec: number;
-  /** Send the ONE agentbot page about a declined/dead `repair::<token>` session. Async +
-   *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
+    candidates: readonly RepairCandidate[],
+  ) => RepairGrantOwner | null;
+  readonly grantHolderLiveness: (grant: GrantLeaf) => RepairGrantHolderLiveness;
+  readonly grantOwnerOutcome: (grant: GrantLeaf) => ResolverOutcome;
+  readonly isDirtyCheckout: (repoDir: string) => boolean;
+  readonly activeDirtyDistressId?: (repoDir: string) => string | null;
+  readonly isBaseGreen: (repoDir: string) => boolean;
+  readonly nowMs: () => number;
+  readonly grantTtlMs?: number;
+  readonly publishGrant: (grant: GrantLeaf) => boolean;
+  readonly expireGrant: (grant: GrantLeaf, nowMs: number) => void;
+  readonly unblockTask: (candidate: RepairCandidate) => Promise<boolean>;
   readonly notifyHuman: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
-  /** Mint the sticky repair row (a `DispatchFailed{verb:'repair', id:token,
-   *  reason:'shared-base-broken:<fp>', dir:repoDir}`) — the durable latch escalation-brief
-   *  reads and the once-page anchor. Idempotent UPSERT (preserves `created_at`). */
   readonly mintRow: (group: RepairGroup) => void;
-  /** Mint a `RepairDispatched{outcome}` synthetic event — the fold stamps
-   *  `repair_dispatched_at` ONLY on the terminal `dispatched`. */
   readonly mintDispatched: (
     repoToken: string,
     outcome: RepairDispatchOutcome,
   ) => void;
-  /** Mint a `RepairHumanNotified{outcome}` synthetic event — the fold stamps
-   *  `human_notified_at` ONLY on the terminal `notified`. */
   readonly mintNotified: (
     repoToken: string,
     outcome: RepairHumanNotifiedOutcome,
   ) => void;
-  /** Mint a `DispatchCleared{verb:'repair', id:token}` — the positive-evidence clear.
-   *  Drops the row + every marker so a fresh breakage re-arms at NULL. */
   readonly clearRow: (row: PendingRepairRow) => void;
-  /** Warn sink for non-fatal diagnostics. */
+  /** Re-probed before every mint attempt — true when an OPEN epic already
+   *  carries this (repo, fingerprint)'s deterministic maintenance-task title, so
+   *  a still-open mint from an earlier tick is never duplicated. */
+  readonly hasOpenMaintenanceTask: (group: RepairGroup) => boolean;
+  /** Scaffold + arm the single-task maintenance epic via the plan CLI. The
+   *  producer only spawns it — the plan CLI is the sole writer of plan state. */
+  readonly mintMaintenanceTask: (
+    group: RepairGroup,
+  ) => Promise<MaintenanceMintOutcome>;
   readonly noteLine?: (line: string) => void;
+}
+
+/** The fixed leading token every maintenance-task title carries — greppable, and
+ *  the stable half of the (repo, fingerprint) idempotence key {@link
+ *  maintenanceEpicTitle} embeds the other half into. */
+export const MAINTENANCE_TASK_TITLE_PREFIX = "keeper trunk repair";
+
+/** The deterministic maintenance-epic/task title for a (repo, fingerprint) pair —
+ *  the ONE key both the daemon's own re-probe ({@link hasOpenMaintenanceTask} at
+ *  the wiring site) and the minted YAML ({@link buildMaintenanceScaffoldYaml}) key
+ *  on, so a still-open mint from an earlier tick is found by exact title match.
+ *  Pure; total. */
+export function maintenanceEpicTitle(group: RepairGroup): string {
+  return `${MAINTENANCE_TASK_TITLE_PREFIX}: ${group.repo_token} ${group.fingerprint}`;
+}
+
+/**
+ * Build the single-task scaffold YAML the maintenance-task mint pipes to
+ * `keeper plan scaffold --file -` — the mechanical default cell (`tier: xhigh`,
+ * `model: opus`; the post-scaffold selector beat does not run for a producer-mint)
+ * carrying the confirmed-red baseline leaf key and failing-tests digest in the
+ * task spec, per {@link RepairGroup.baseline_diagnosis}. Every free-text scalar
+ * rides as a JSON-quoted YAML flow scalar (valid YAML 1.1 double-quoting) so a
+ * test name with a colon or quote can never corrupt the document shape. Pure.
+ */
+export function buildMaintenanceScaffoldYaml(group: RepairGroup): string {
+  const title = JSON.stringify(maintenanceEpicTitle(group));
+  const leafKey = JSON.stringify(
+    group.baseline_diagnosis?.baseline_leaf_key ?? "",
+  );
+  const digest = JSON.stringify(
+    group.baseline_diagnosis?.failing_tests_digest ?? "",
+  );
+  return `epic:
+  title: ${title}
+  spec: |
+    ## Overview
+
+    The shared base at ${group.repo_token} is confirmed red at the default tip
+    with no blocked task to own the fix (a trunk-only regression). Repair it in
+    an ordinary work lane — no repair grant is involved.
+
+    ## Acceptance
+
+    - [ ] The default tip's baseline leaf ${leafKey} reads green after the fix lands
+tasks:
+  - title: ${title}
+    tier: xhigh
+    model: opus
+    spec: |
+      ## Description
+
+      **Size:** M
+      **Files:** (unknown — trunk-wide regression; investigate before touching)
+
+      ### Approach
+
+      Diagnose and fix the trunk regression the daemon's baseline sweep confirmed
+      red at the default tip. Reproduce it locally at HEAD before changing
+      anything, then land the smallest correct fix.
+
+      ### Investigation targets
+
+      **Required** (read before coding):
+      - The confirmed-red baseline leaf ${leafKey} — the diagnosed run this task was minted from
+      - Failing tests: ${digest}
+
+      ## Acceptance
+
+      - [ ] The failing tests named in Investigation targets pass
+      - [ ] The full suite is green via named gates
+
+      ## Done summary
+
+      ## Evidence
+`;
 }
 
 /** Deterministic `(epic_id, task_id)` order — the stable total sort the coalesced
@@ -3042,26 +3191,11 @@ export function buildSharedDirtyObservation(
 }
 
 /**
- * Run one daemon repair-escalation sweep — the producer for the `SHARED_BASE_BROKEN`
- * incident class. Coalesce every shared-base-broken blocked candidate to one group per
- * repo token (representative = the (repo_dir, fingerprint) of the lexicographically-first
- * candidate), then per token:
- *
- *  - A row with `repair_dispatched_at` set and candidates STILL remaining waits for the
- *    recorded repair verdict. A terminal DECLINED / DIED verdict pages immediately; a
- *    stopped/vanished repair with no recorded verdict promotes to DECLINED only after the
- *    injected dispatch-marker grace. A working repair never promotes. The page fires ONCE
- *    via `human_notified_at`, then the row stays sticky until `retry_dispatch` re-arms it.
- *  - A token with no dispatched repair yet DISPATCHES one `repair::<token>` session (the
- *    global cap + per-key occupancy guard apply via `dispatchRepair`), minting the sticky
- *    latch first when none exists. A DIRTY shared checkout DEFERS — no attempt consumed,
- *    and no row minted when none exists yet.
- *  - A sticky row whose repo token has ZERO remaining candidates AND whose base reads
- *    GREEN is CLEARED on positive evidence (an unknown/red base RETAINS it).
- *
- * NEVER throws — every helper edge degrades to a recorded outcome (mirrors the sibling
- * escalation sweeps). The spawn lives ONLY here in the producer, never reachable from
- * `applyEvent`, so a re-fold never re-fires a launch.
+ * Elect one live blocked-task owner for each broken shared checkout and publish a
+ * confined repair grant for that owner's in-session repairer. The grant leaf is
+ * the exclusion lock: an unexpired holder prevents every sibling from writing,
+ * and expiry alone never permits takeover. Re-election requires both expiry and
+ * positive holder-death evidence. No top-level repair session is launched here.
  */
 export async function runRepairEscalationSweep(
   deps: RepairEscalationSweepDeps,
@@ -3069,21 +3203,14 @@ export async function runRepairEscalationSweep(
   const note = deps.noteLine ?? (() => {});
   let candidates: RepairCandidate[];
   let rows: PendingRepairRow[];
+  let grants: GrantLeaf[];
   try {
     candidates = deps.selectCandidates();
-  } catch (err) {
-    note(
-      `# warn: repair-escalation sweep candidate read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  try {
     rows = deps.selectRepairRows();
+    grants = deps.selectGrants();
   } catch (err) {
     note(
-      `# warn: repair-escalation sweep row read threw (non-fatal): ${
+      `# warn: repair-escalation sweep read threw (non-fatal): ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -3091,86 +3218,115 @@ export async function runRepairEscalationSweep(
   }
   if (candidates.length === 0 && rows.length === 0) return;
 
-  // Coalesce to one group per repo token. The candidates are walked in a stable total
-  // order so the representative (repo_dir, fingerprint) is deterministic — a re-key of a
-  // token that gains/loses siblings never flaps.
   const groups = new Map<string, RepairGroup>();
-  for (const c of [...candidates].sort(compareRepairCandidate)) {
-    if (c.repo_token === "" || c.repo_dir === "") {
+  const members = new Map<string, RepairCandidate[]>();
+  for (const candidate of [...candidates].sort(compareRepairCandidate)) {
+    if (candidate.repo_token === "" || candidate.repo_dir === "") {
       emitRepairCandidateDrop(
         note,
-        c.task_id,
+        candidate.task_id,
         "empty_token",
-        `repo_dir=${c.repo_dir || "null"}`,
+        `repo_dir=${candidate.repo_dir || "null"}`,
       );
       continue;
     }
-    if (!groups.has(c.repo_token)) {
-      groups.set(c.repo_token, {
-        repo_token: c.repo_token,
-        repo_dir: c.repo_dir,
-        fingerprint: c.fingerprint,
-        ...(c.baseline_diagnosis == null
+    const groupMembers = members.get(candidate.repo_token) ?? [];
+    groupMembers.push(candidate);
+    members.set(candidate.repo_token, groupMembers);
+    if (!groups.has(candidate.repo_token)) {
+      groups.set(candidate.repo_token, {
+        repo_token: candidate.repo_token,
+        repo_dir: candidate.repo_dir,
+        fingerprint: candidate.fingerprint,
+        ...(candidate.baseline_diagnosis == null
           ? {}
-          : { baseline_diagnosis: c.baseline_diagnosis }),
+          : { baseline_diagnosis: candidate.baseline_diagnosis }),
       });
     }
   }
-  const rowByToken = new Map(rows.map((r) => [r.id, r]));
 
-  // DISPATCH / NOTIFY — one pass over the tokens that still carry a breakage.
+  const nowMs = deps.nowMs();
+  const ttlMs = deps.grantTtlMs ?? REPAIR_GRANT_TTL_MS;
+  const rowByToken = new Map(rows.map((row) => [row.id, row]));
+  let nextToken = grants.reduce(
+    (max, grant) => Math.max(max, grant.fencing_token),
+    0,
+  );
+  const repairGrants = grants.filter(
+    (grant) => grant.role === "repair" && grant.agent_type === "plan:repairer",
+  );
+
   for (const [token, group] of groups) {
+    const groupMembers = members.get(token) ?? [];
     const existing = rowByToken.get(token);
-    if (existing != null && existing.repair_dispatched_at != null) {
-      // A repair already ran, yet the breakage persists (candidates remain) — it
-      // DECLINED / DIED. Page the human ONCE, sequenced behind the session's TERMINAL
-      // verdict; the row then stays sticky until `retry_dispatch`.
-      if (existing.human_notified_at != null) continue; // already paged
-      const outcome = deps.repairOutcome(token);
-      let verdict: "declined" | "died";
-      if (outcome.terminal) {
-        // Preserve the shared classifier's recorded stopped→declined / dead→died split.
-        verdict = outcome.verdict;
-      } else {
-        // A healthy slow repair is exempt forever. Only a non-working session with no
-        // recorded terminal verdict may be promoted, and only after the dispatch-marker
-        // grace. This producer-local fallback deliberately does not alter unblock or
-        // deconflict classification.
-        if (deps.repairSessionWorking(token)) continue;
+    const incidentId = `repair::${token}`;
+    const groupGrants = repairGrants.filter(
+      (grant) =>
+        grant.incident_id === incidentId &&
+        grant.writable_root === group.repo_dir,
+    );
+    const active = groupGrants.find((grant) => nowMs < grant.expires_at);
+
+    if (deps.isBaseGreen(group.repo_dir)) {
+      for (const candidate of groupMembers) {
         if (
-          deps.nowSec() - existing.repair_dispatched_at <
-          deps.terminalGraceSec
+          candidate.epic_id === "" ||
+          candidate.task_id.startsWith("baseline-tip::")
         ) {
           continue;
         }
-        verdict = "declined";
+        try {
+          if (!(await deps.unblockTask(candidate))) {
+            note(`# repair-unblock task=${candidate.task_id} class=failed`);
+          }
+        } catch (err) {
+          note(
+            `# warn: repair unblock threw for ${candidate.task_id} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       }
-      let result: RepairHumanNotifiedOutcome;
-      try {
-        result = await deps.notifyHuman(existing, verdict);
-      } catch (err) {
-        note(
-          `# warn: repair human-notify threw for ${token} (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        result = "notify_failed";
-      }
-      deps.mintNotified(token, result);
+      for (const grant of groupGrants) deps.expireGrant(grant, nowMs);
       continue;
     }
-    // Not yet dispatched (no row, or a minted-but-undispatched row waiting on a cap slot).
-    // A DIRTY shared checkout DEFERS — never launch a write-capable session into a
-    // mid-merge/dirty tree, consume no attempt, and mint no row when none exists yet.
-    // This defer is the gate that silently starved the repair route in production: on a
-    // busy worktree-mode board the shared checkout is rarely clean, so a repeated defer
-    // MUST leave a class-stable trace or a live shared-base breakage looks identical to a
-    // broken feature. Emitted every deferring tick (bounded by the concurrently-broken
-    // token count), keyed so an operator can grep "why is repair not dispatching".
+
+    if (active !== undefined) {
+      const outcome = deps.grantOwnerOutcome(active);
+      if (
+        existing != null &&
+        existing.human_notified_at == null &&
+        outcome.terminal
+      ) {
+        let result: RepairHumanNotifiedOutcome;
+        try {
+          result = await deps.notifyHuman(existing, outcome.verdict);
+        } catch (err) {
+          note(
+            `# warn: repair human-notify threw for ${token} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          result = "notify_failed";
+        }
+        deps.mintNotified(token, result);
+      }
+      continue;
+    }
+
+    const expired = [...groupGrants]
+      .filter((grant) => nowMs >= grant.expires_at)
+      .sort((a, b) => b.fencing_token - a.fencing_token)[0];
+    if (expired !== undefined) {
+      const liveness = deps.grantHolderLiveness(expired);
+      if (liveness !== "dead") {
+        note(`# repair-grant-hold token=${token} class=holder_${liveness}`);
+        continue;
+      }
+      deps.expireGrant(expired, nowMs);
+    }
+
     if (deps.isDirtyCheckout(group.repo_dir)) {
-      // Name the ACTIVE shared-checkout-dirty distress row (once sustained dirt has
-      // crossed grace and minted one) so the greppable defer trace and the one
-      // operator-visible needs-human row are the SAME incident, two consumers.
       const distress = deps.activeDirtyDistressId?.(group.repo_dir) ?? null;
       note(
         `# repair-defer token=${token} class=dirty_checkout dir=${group.repo_dir}` +
@@ -3178,39 +3334,111 @@ export async function runRepairEscalationSweep(
       );
       continue;
     }
-    if (existing == null) deps.mintRow(group); // the durable latch, minted once
-    let outcome: EscalationDispatchOutcome;
+    if (existing == null) {
+      deps.mintRow(group);
+      continue;
+    }
+    if (existing.instance_event_id == null) {
+      note(`# repair-grant-hold token=${token} class=incident_unfolded`);
+      continue;
+    }
+
+    // Trunk red with NO live blocked consumer at all — every candidate in this
+    // group is a task-less `baseline-tip::` entry, so `selectOwner` has no task
+    // row to elect from and would return null unconditionally. Holding the
+    // incident ownerless would starve forever (no worker will ever go blocked
+    // for a defect nobody hit yet); mint a real maintenance plan task instead —
+    // ordinary work dispatch fixes trunk in its own lane, no grant involved.
+    const hasLiveConsumer = groupMembers.some(
+      (candidate) => !candidate.task_id.startsWith("baseline-tip::"),
+    );
+    if (!hasLiveConsumer) {
+      if (!deps.hasOpenMaintenanceTask(group)) {
+        let mintOutcome: MaintenanceMintOutcome;
+        try {
+          mintOutcome = await deps.mintMaintenanceTask(group);
+        } catch (err) {
+          note(
+            `# warn: maintenance-task mint threw for ${token} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          mintOutcome = "mint_failed";
+        }
+        if (
+          mintOutcome === "mint_failed" &&
+          existing.human_notified_at == null
+        ) {
+          let result: RepairHumanNotifiedOutcome;
+          try {
+            result = await deps.notifyHuman(existing, "mint_failed");
+          } catch (err) {
+            note(
+              `# warn: repair human-notify threw for ${token} (non-fatal): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            result = "notify_failed";
+          }
+          deps.mintNotified(token, result);
+        }
+      }
+      continue;
+    }
+
+    const owner = deps.selectOwner(group, groupMembers);
+    if (owner == null) {
+      for (const candidate of groupMembers) {
+        if (!candidate.task_id.startsWith("baseline-tip::")) {
+          note(
+            `# repair-park task=${candidate.task_id} token=${token} ` +
+              `class=shared_checkout_owner_unavailable`,
+          );
+        }
+      }
+      continue;
+    }
+    if (
+      !groupMembers.some((candidate) => candidate.task_id === owner.task_id)
+    ) {
+      note(`# repair-grant-hold token=${token} class=owner_not_affected`);
+      continue;
+    }
+
+    nextToken += 1;
+    const grant: GrantLeaf = {
+      schema_version: GRANT_LEAF_SCHEMA_VERSION,
+      parent_job_id: owner.parent_job_id,
+      agent_type: "plan:repairer",
+      incident_id: incidentId,
+      owner_task_id: owner.task_id,
+      attempt_id: `${existing.attempt_id ?? 0}:${group.fingerprint}`,
+      instance_event_id: existing.instance_event_id,
+      writable_root: group.repo_dir,
+      role: "repair",
+      expires_at: nowMs + ttlMs,
+      fencing_token: nextToken,
+    };
+    let published = false;
     try {
-      outcome = await deps.dispatchRepair(group);
+      published = deps.publishGrant(grant);
     } catch (err) {
       note(
-        `# warn: repair dispatch threw for ${token} (non-fatal): ${
+        `# warn: repair grant publish threw for ${token} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      outcome = "dispatch_failed";
     }
-    // A SKIP (`at_cap` / `already_live` / `checkout_busy`) mints nothing — the row
-    // persists and re-sweeps. `checkout_busy` is structurally unreachable here (the
-    // per-checkout guard only gates the `deconflict` verb), but the shared dispatch
-    // outcome type carries it, so this stays exhaustive.
-    if (
-      outcome === "at_cap" ||
-      outcome === "already_live" ||
-      outcome === "checkout_busy"
-    ) {
-      note(`# repair-skip token=${token} class=${outcome}`);
-      continue;
-    }
-    deps.mintDispatched(token, outcome);
+    deps.mintDispatched(token, published ? "dispatched" : "dispatch_failed");
   }
 
-  // CLEAR — positive-evidence level-clear. A sticky repair row whose repo token no longer
-  // carries ANY shared-base-broken candidate (the breakage is gone) clears IFF the base
-  // reads green; an unknown/red base RETAINS the row (never a false clear on no report).
   for (const row of rows) {
-    if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
-    if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
+    if (groups.has(row.id) || !deps.isBaseGreen(row.dir ?? "")) continue;
+    for (const grant of repairGrants) {
+      if (grant.incident_id === `repair::${row.id}`) {
+        deps.expireGrant(grant, nowMs);
+      }
+    }
     deps.clearRow(row);
   }
 }
@@ -4080,6 +4308,7 @@ export function selectPendingResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'close'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -4477,6 +4706,704 @@ export async function runResolverDispatchSweep(
 }
 
 // ---------------------------------------------------------------------------
+// Incident-claim producer (owner-mediated merge integration).
+// ---------------------------------------------------------------------------
+//
+// A live owning session pulls a merge incident and records its ownership through
+// the SAME spool-request contract as the
+// suite-baseline store: the session writes ONE request leaf, THIS producer
+// validates claimant liveness and mints the synthetic `IncidentClaimed` /
+// `IncidentReleased` event, the fold records the claim. No socket, no RPC, no
+// session DB write. The liveness probe lives ONLY here in the producer, never in
+// a fold, so a re-fold never re-probes a process.
+
+/** The incident row facts the producer reads to fence a claim/release: the sticky
+ *  row's `instance_event_id` and its CURRENT claim (all null when unclaimed). */
+export interface IncidentRowFacts {
+  instanceEventId: number | null;
+  claimSessionId: string | null;
+  claimPid: number | null;
+  claimStartTime: string | null;
+}
+
+/** What the producer learns about a would-be claimant from its owning `jobs`
+ *  row + a liveness probe. A missing/mismatched owner tuple or process generation
+ *  is unverifiable and the request is refused. */
+export interface ClaimantLiveness {
+  pid: number;
+  /** The claimant's RECORDED start_time (the recycle-safe generation). */
+  startTime: string;
+  /** True iff the pid is alive AND its live start_time exactly matches. */
+  live: boolean;
+}
+
+/** A claimed incident row the expiry pass re-probes. */
+export interface ClaimedIncidentRow {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string | null;
+}
+
+/** The `IncidentClaimed` mint payload the producer hands the writable connection. */
+export interface IncidentClaimMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+  ts: number;
+}
+
+/** The `IncidentReleased` mint payload (self-release or dead-claimant expiry). */
+export interface IncidentReleaseMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+}
+
+export interface IncidentClaimSweepDeps {
+  /** Read the spool (fail-open empty when absent). */
+  readRequests: () => SpooledIncidentClaimRequest[];
+  /** Unlink a processed / discarded request (idempotent). */
+  removeRequest: (path: string) => void;
+  /** Read the sticky incident row's fence + current claim, or null when absent. */
+  lookupIncident: (verb: string, id: string) => IncidentRowFacts | null;
+  /** Resolve the owning job tuple and liveness-probe the would-be claimant;
+   *  null when the session is not this incident's owner or is unverifiable. */
+  verifyClaimant: (
+    sessionId: string,
+    verb: string,
+    id: string,
+  ) => ClaimantLiveness | null;
+  /** Positive-evidence liveness probe of a RECORDED (pid, start_time): false ONLY
+   *  on positive evidence of death (pid gone, or start_time recycled). */
+  probeClaimantLive: (pid: number, startTime: string | null) => boolean;
+  /** Mint `IncidentClaimed`; explicit false means the write failed and the
+   *  request must remain spooled. */
+  mintClaimed: (p: IncidentClaimMint) => unknown;
+  /** Mint `IncidentReleased`; explicit false means the write failed and the
+   *  request/expiry remains retryable. */
+  mintReleased: (p: IncidentReleaseMint) => unknown;
+  /** Every currently-claimed incident row (for the dead-claimant expiry pass). */
+  selectClaimed: () => ClaimedIncidentRow[];
+  /** Unix-seconds clock for the claim freshness stamp. */
+  now: () => number;
+  /** Warn sink for non-fatal diagnostics. */
+  noteLine?: (line: string) => void;
+}
+
+/** What one sweep did — surfaced for the daemon.test seam, never a wire value. */
+export interface IncidentClaimSweepResult {
+  claimed: number;
+  released: number;
+  refused: number;
+  stale: number;
+  expired: number;
+}
+
+/**
+ * Run one incident-claim producer sweep. Two passes:
+ *
+ *  1. REQUESTS — for each spooled request, fence it against the live incident row
+ *     (the row must still exist AND carry the request's `instance_event_id`; a
+ *     cleared / re-minted incident discards the request as stale). A CLAIM mints
+ *     `IncidentClaimed` ONLY when the claimant verifies live AND the row is not
+ *     already held by a DIFFERENT live or unverifiable claimant (a positively
+ *     dead prior holder is taken over); an unverifiable / dead new claimant is
+ *     REFUSED. A RELEASE mints only for the recorded holder. Duplicate claims and
+ *     releases are consumed without growing the event log. A failed mint leaves
+ *     its request spooled for retry.
+ *
+ *  2. EXPIRY — for each currently-claimed row, re-probe the RECORDED claimant
+ *     `(pid, start_time)`; on positive evidence of death, mint `IncidentReleased`
+ *     so stale ownership does not survive its process generation.
+ *
+ * NEVER throws — every request is guarded so one malformed entry cannot abort the
+ * sweep. The mint + probe live ONLY here (never reachable from `applyEvent`), so a
+ * re-fold never re-fires a mint or re-probes a process.
+ */
+export function runIncidentClaimSweep(
+  deps: IncidentClaimSweepDeps,
+): IncidentClaimSweepResult {
+  const note = deps.noteLine ?? (() => {});
+  const result: IncidentClaimSweepResult = {
+    claimed: 0,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  };
+  // A successful mint is immediately folded in production, but keep the
+  // request contract idempotent even when a test/custom mint seam delays its
+  // projection update until after this batch.
+  const fulfilledRequests = new Set<string>();
+
+  let requests: SpooledIncidentClaimRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: incident-claim spool read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    requests = [];
+  }
+
+  for (const { path, request } of requests) {
+    try {
+      const requestKey = JSON.stringify([
+        request.action,
+        request.verb,
+        request.id,
+        request.instance_event_id,
+        request.claimant_session_id,
+      ]);
+      if (fulfilledRequests.has(requestKey)) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+      const incident = deps.lookupIncident(request.verb, request.id);
+      // The incident is gone (cleared) or re-minted under a fresh fence — the
+      // request can never attach to it. Discard it as stale.
+      if (
+        incident == null ||
+        incident.instanceEventId == null ||
+        incident.instanceEventId !== request.instance_event_id
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Both actions require the exact owning job tuple and a live,
+      // generation-verifiable process. A pid without an exact start-time match
+      // is not authority to mutate the incident.
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.verb,
+        request.id,
+      );
+      if (claimant == null || !claimant.live) {
+        note(
+          `# incident-claim refused ${request.verb}::${request.id}: claimant ` +
+            `${request.claimant_session_id} is dead or unverifiable`,
+        );
+        result.refused += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      if (request.action === "release") {
+        // A duplicate/non-owner release is an idempotent stale request, not a
+        // synthetic no-op event. Snapshot the complete recorded generation so a
+        // delayed release cannot clear the same session after it resumes.
+        if (
+          incident.claimSessionId !== request.claimant_session_id ||
+          incident.claimPid == null ||
+          incident.claimStartTime == null
+        ) {
+          result.stale += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+        const minted = deps.mintReleased({
+          verb: request.verb,
+          id: request.id,
+          instanceEventId: incident.instanceEventId,
+          claimSessionId: request.claimant_session_id,
+          claimPid: incident.claimPid,
+          claimStartTime: incident.claimStartTime,
+        });
+        if (minted === false) continue;
+        fulfilledRequests.add(requestKey);
+        result.released += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Same incident + same claimant + same process generation is already
+      // satisfied. A resumed claimant with a fresh generation re-stamps the
+      // claim below so expiry never releases it using the dead prior process.
+      if (
+        incident.claimSessionId === request.claimant_session_id &&
+        incident.claimPid === claimant.pid &&
+        incident.claimStartTime === claimant.startTime
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Takeover from a different holder requires positive evidence of death.
+      // Missing generation facts are inconclusive and therefore refuse takeover.
+      if (
+        incident.claimSessionId != null &&
+        incident.claimSessionId !== request.claimant_session_id
+      ) {
+        if (
+          incident.claimPid == null ||
+          deps.probeClaimantLive(incident.claimPid, incident.claimStartTime)
+        ) {
+          note(
+            `# incident-claim refused ${request.verb}::${request.id}: already ` +
+              `held by live or unverifiable claimant ${incident.claimSessionId}`,
+          );
+          result.refused += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+      }
+
+      const minted = deps.mintClaimed({
+        verb: request.verb,
+        id: request.id,
+        instanceEventId: incident.instanceEventId,
+        claimSessionId: request.claimant_session_id,
+        claimPid: claimant.pid,
+        claimStartTime: claimant.startTime,
+        ts: deps.now(),
+      });
+      if (minted === false) continue;
+      fulfilledRequests.add(requestKey);
+      result.claimed += 1;
+      deps.removeRequest(path);
+    } catch (err) {
+      // Defense-in-depth: a surprise throw for ONE request records nothing and
+      // moves on — the request stays spooled for the next tick.
+      note(
+        `# warn: incident-claim request ${request.verb}::${request.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Expiry pass — a dead claimant's claim expires on positive evidence of death.
+  let claimed: ClaimedIncidentRow[];
+  try {
+    claimed = deps.selectClaimed();
+  } catch (err) {
+    note(
+      `# warn: incident-claim expiry read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    claimed = [];
+  }
+  for (const row of claimed) {
+    try {
+      if (deps.probeClaimantLive(row.claimPid, row.claimStartTime)) continue;
+      if (row.claimStartTime == null) continue;
+      const minted = deps.mintReleased({
+        verb: row.verb,
+        id: row.id,
+        instanceEventId: row.instanceEventId,
+        claimSessionId: row.claimSessionId,
+        claimPid: row.claimPid,
+        claimStartTime: row.claimStartTime,
+      });
+      if (minted !== false) result.expired += 1;
+    } catch (err) {
+      note(
+        `# warn: incident-claim expiry for ${row.verb}::${row.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Ownerless merge-incident attachment + page router.
+// ---------------------------------------------------------------------------
+
+/** An exhausted natural-key merge incident waiting for its single human page. */
+export interface PendingIncidentOwnerPage extends IncidentOwnerFailureFacts {
+  verb: "work" | "close";
+  dir: string | null;
+  instanceEventId: number | null;
+}
+
+/** Current exhausted, unclaimed, unpaged merge incidents. */
+export function selectPendingIncidentOwnerPages(
+  db: Database,
+): PendingIncidentOwnerPage[] {
+  const rows = db
+    .query(
+      `SELECT verb, id, reason, dir, claim_session_id, instance_event_id,
+              resolver_dispatched_at, merge_escalated_at, human_notified_at
+         FROM dispatch_failures
+        WHERE verb IN ('work', 'close')
+          AND claim_session_id IS NULL
+          AND resolver_dispatched_at IS NOT NULL
+          AND merge_escalated_at IS NOT NULL
+          AND human_notified_at IS NULL`,
+    )
+    .all() as Array<{
+    verb: "work" | "close";
+    id: string;
+    reason: string;
+    dir: string | null;
+    claim_session_id: string | null;
+    instance_event_id: number | null;
+    resolver_dispatched_at: number | null;
+    merge_escalated_at: number | null;
+    human_notified_at: number | null;
+  }>;
+  return rows
+    .map((row) => ({
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      instanceEventId: row.instance_event_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    }))
+    .filter(
+      (row) =>
+        isOwnerRoutableIncident(row) &&
+        incidentOwnerAttachmentCount(row) >= INCIDENT_OWNER_ATTACHMENT_LIMIT,
+    );
+}
+
+export interface IncidentOwnerPageSweepDeps {
+  readonly selectPending: () => PendingIncidentOwnerPage[];
+  readonly stillPending: (row: PendingIncidentOwnerPage) => boolean;
+  /** True while an ordinary work/close admission or owner turn is active. */
+  readonly ownerActive: (row: PendingIncidentOwnerPage) => boolean;
+  readonly notifyHuman: (
+    row: PendingIncidentOwnerPage,
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  readonly mintNotified: (
+    row: PendingIncidentOwnerPage,
+    outcome: MergeHumanNotifiedOutcome,
+  ) => void;
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Page each exhausted ownerless merge incident once, but only after the final
+ * owning work/close attachment has yielded. Every uncertain read defers through
+ * injected predicates; a failed notification leaves the durable once-marker null.
+ */
+export async function runIncidentOwnerPageSweep(
+  deps: IncidentOwnerPageSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let rows: PendingIncidentOwnerPage[];
+  try {
+    rows = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: incident-owner page sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const row of rows) {
+    if (!isOwnerRoutableIncident(row)) continue;
+    if (!deps.stillPending(row) || deps.ownerActive(row)) continue;
+    let outcome: MergeHumanNotifiedOutcome;
+    try {
+      outcome = await deps.notifyHuman(row);
+    } catch (err) {
+      note(
+        `# warn: incident-owner page threw for ${row.verb}::${row.id} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      outcome = "notify_failed";
+    }
+    // The async transport yields the main loop. Re-fence before stamping so a
+    // clear + fresh incident cannot inherit this older episode's page marker.
+    if (!deps.stillPending(row)) continue;
+    deps.mintNotified(row, outcome);
+  }
+}
+
+/** Human page emitted after the bounded owning-session attachment lease expires. */
+export function buildIncidentOwnerPageBody(
+  row: PendingIncidentOwnerPage,
+): string {
+  return [
+    `🔴 keeper: ${row.verb}::${row.id} needs you — the merge incident remains open`,
+    `after ${INCIDENT_OWNER_ATTACHMENT_LIMIT} owning-session attachment attempts.`,
+    `No escalation session was launched; the sticky incident remains visible.`,
+    `Resolve both intents in ${row.dir ?? "the owning checkout"}, then clear the incident:`,
+    `  keeper autopilot retry ${row.verb}::${row.id}`,
+    ``,
+    `Failure reason: ${row.reason.trim()}`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Trunk-integration lease producer.
+// ---------------------------------------------------------------------------
+
+export interface TrunkLeaseClaimant {
+  pid: number;
+  startTime: string;
+  live: boolean;
+}
+
+export interface TrunkLeaseRepoObservation {
+  repoRoot: string;
+  defaultBranch: string;
+  defaultTip: string;
+}
+
+export interface TrunkLeaseSweepDeps {
+  readRequests: () => SpooledTrunkLeaseRequest[];
+  removeRequest: (path: string) => void;
+  readLeases: () => TrunkLeaseLeaf[];
+  readLease: (repoRoot: string) => TrunkLeaseLeaf | null;
+  verifyClaimant: (
+    sessionId: string,
+    epicId: string,
+  ) => TrunkLeaseClaimant | null;
+  probeClaimantLive: (pid: number, startTime: string) => boolean;
+  observeRepo: (
+    request: SpooledTrunkLeaseRequest["request"],
+  ) => TrunkLeaseRepoObservation | null;
+  publishLease: (leaf: TrunkLeaseLeaf) => boolean;
+  probeResidue: (leaf: TrunkLeaseLeaf) => string | null;
+  recordResidue: (leaf: TrunkLeaseLeaf, detail: string) => void;
+  now: () => number;
+  ttlMs?: number;
+  noteLine?: (line: string) => void;
+  /**
+   * Cross-tick memory of every `(repo_root, fencing_token)` pair with a
+   * currently-open residue incident, keyed `${repo_root}\0${fencing_token}`.
+   * Owned by the CALLER and reused byte-identically across sweep ticks —
+   * this is the durable/live-derived signal that turns "residue detected"
+   * into "residue NEWLY appeared", so {@link recordResidue} mints once per
+   * transition rather than once per tick a live `MERGE_HEAD` persists.
+   * Entries are removed the moment residue clears or the token retires
+   * (dead/released), so a later reappearance under the SAME token mints
+   * again. Omitting it (or passing a fresh Map every call) reverts to
+   * per-tick-only gating — only safe for a single-shot call.
+   */
+  residueState?: Map<string, true>;
+}
+
+export interface TrunkLeaseSweepResult {
+  acquired: number;
+  released: number;
+  expired: number;
+  dead: number;
+  stale: number;
+  deferred: number;
+  residues: number;
+}
+
+/**
+ * Publish per-repo closer leases from the filesystem spool. Active leaves are
+ * released only by an exact fenced release or positive process-death evidence;
+ * expiry is diagnostic and never permits a live holder to be replaced. A release
+ * keeps the leaf as a tombstone, so the next acquisition increments that repo's
+ * token instead of recycling it after a daemon restart.
+ */
+export function runTrunkLeaseSweep(
+  deps: TrunkLeaseSweepDeps,
+): TrunkLeaseSweepResult {
+  const result: TrunkLeaseSweepResult = {
+    acquired: 0,
+    released: 0,
+    expired: 0,
+    dead: 0,
+    stale: 0,
+    deferred: 0,
+    residues: 0,
+  };
+  const note = deps.noteLine ?? (() => {});
+  const now = deps.now();
+  const ttlMs = deps.ttlMs ?? TRUNK_LEASE_TTL_MS;
+  // Durable across ticks (owned by the caller) — gates recordResidue to a
+  // residue-state TRANSITION. `handledResidue` stays per-call: it only
+  // prevents the release-request loop below from re-probing a lease already
+  // resolved by the active-lease loop this same tick.
+  const residueState = deps.residueState ?? new Map<string, true>();
+  const handledResidue = new Set<string>();
+
+  let leases: TrunkLeaseLeaf[];
+  try {
+    leases = deps.readLeases();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease leaf scan threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    leases = [];
+  }
+  let fencingToken = leases.reduce(
+    (max, lease) => Math.max(max, lease.fencing_token),
+    0,
+  );
+  for (const lease of leases) {
+    if (!lease.active) continue;
+    const residueKey = `${lease.repo_root}\0${lease.fencing_token}`;
+    try {
+      const residue = deps.probeResidue(lease);
+      handledResidue.add(residueKey);
+      if (residue !== null) {
+        if (!residueState.has(residueKey)) {
+          deps.recordResidue(lease, residue);
+          residueState.set(residueKey, true);
+          result.residues += 1;
+        }
+      } else {
+        residueState.delete(residueKey);
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease residue probe threw for ${lease.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let live = true;
+    try {
+      live = deps.probeClaimantLive(
+        lease.claimant_pid,
+        lease.claimant_start_time,
+      );
+    } catch {
+      live = true;
+    }
+    if (live) continue;
+    if (deps.publishLease({ ...lease, active: false, expires_at: now })) {
+      result.dead += 1;
+      residueState.delete(residueKey);
+    }
+  }
+
+  let requests: SpooledTrunkLeaseRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease spool read threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    requests = [];
+  }
+  for (const entry of requests) {
+    const request = entry.request;
+    try {
+      const current = deps.readLease(request.repo_root);
+      if (request.action === "release") {
+        if (
+          current === null ||
+          !current.active ||
+          current.epic_id !== request.epic_id ||
+          current.claimant_session_id !== request.claimant_session_id ||
+          current.fencing_token !== request.fencing_token
+        ) {
+          result.stale += 1;
+          deps.removeRequest(entry.path);
+          continue;
+        }
+        const residueKey = `${current.repo_root}\0${current.fencing_token}`;
+        if (!handledResidue.has(residueKey)) {
+          try {
+            const residue = deps.probeResidue(current);
+            if (residue !== null) {
+              if (!residueState.has(residueKey)) {
+                deps.recordResidue(current, residue);
+                residueState.set(residueKey, true);
+                result.residues += 1;
+              }
+            } else {
+              residueState.delete(residueKey);
+            }
+          } catch (err) {
+            note(
+              `# warn: trunk-lease release residue probe threw for ${current.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        if (deps.publishLease({ ...current, active: false, expires_at: now })) {
+          result.released += 1;
+          residueState.delete(residueKey);
+          deps.removeRequest(entry.path);
+        }
+        continue;
+      }
+
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.epic_id,
+      );
+      if (claimant === null || !claimant.live) {
+        result.stale += 1;
+        deps.removeRequest(entry.path);
+        continue;
+      }
+      if (current?.active) {
+        const sameHolder =
+          current.epic_id === request.epic_id &&
+          current.claimant_session_id === request.claimant_session_id &&
+          current.claimant_pid === claimant.pid &&
+          current.claimant_start_time === claimant.startTime;
+        let holderLive = true;
+        try {
+          holderLive = deps.probeClaimantLive(
+            current.claimant_pid,
+            current.claimant_start_time,
+          );
+        } catch {
+          holderLive = true;
+        }
+        if (holderLive && !sameHolder) {
+          result.deferred += 1;
+          continue;
+        }
+      }
+      const observation = deps.observeRepo(request);
+      if (observation === null || observation.repoRoot !== request.repo_root) {
+        result.deferred += 1;
+        continue;
+      }
+      const token = Math.max(fencingToken, current?.fencing_token ?? 0) + 1;
+      fencingToken = token;
+      const leaf: TrunkLeaseLeaf = {
+        schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+        active: true,
+        epic_id: request.epic_id,
+        claimant_session_id: request.claimant_session_id,
+        claimant_pid: claimant.pid,
+        claimant_start_time: claimant.startTime,
+        acquisition_id: request.request_id,
+        repo_root: observation.repoRoot,
+        writable_root: observation.repoRoot,
+        source_branch: request.source_branch,
+        default_branch: observation.defaultBranch,
+        observed_default_tip: observation.defaultTip,
+        expires_at: now + ttlMs,
+        fencing_token: token,
+      };
+      if (deps.publishLease(leaf)) {
+        result.acquired += 1;
+        deps.removeRequest(entry.path);
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease request for ${request.repo_root} threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // fn-1240 — work-verb fan-in resolver + deconflict inputs (tier-2 stages 1–2)
 // ---------------------------------------------------------------------------
 //
@@ -4521,6 +5448,7 @@ export function selectPendingWorkResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'work'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -5165,16 +6093,22 @@ export const SERVE_LAG_P99_THRESHOLD_MS = 1_000;
 /**
  * Consecutive breaching intervals before a busy-wedge escalates. Requiring N in a
  * row (not one spike) keeps a transient GC pause or a heavy-but-finite fold from
- * tripping a false restart.
+ * tripping a false restart. Sized to outlast a finite retention/backfill grind
+ * burst on a multi-GB event store (several minutes of elevated p99) while still
+ * catching a permanently busy-spinning main; a restart is costlier than the lag
+ * it would clear — the successor boot re-walks the same store cold and the
+ * recycle orphans live workers.
  */
-export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 3;
+export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 6;
 /**
  * Boot grace: the watchdog never escalates within this window of arming. The serve
  * workers may still be binding and no probe has landed yet, so the arm-time baseline
- * would otherwise read as instantly stale. Generous — a healthy boot binds both
- * sockets and answers the first probes well inside it.
+ * would otherwise read as instantly stale. Sized to cover a cold boot's catchup on
+ * a multi-GB event store — fold backlog and retention walks keep MAIN legitimately
+ * hot for minutes after the sockets bind, and escalating inside that window kills a
+ * healthy recovering boot and hands the next one an even larger backlog.
  */
-export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
+export const SERVE_WATCHDOG_BOOT_GRACE_MS = 300_000;
 /**
  * Consecutive FAILED real-read attempts (per socket) before accept-stall escalates.
  * Attempt-counting replaces the old wall-clock age so a laptop suspend/resume gap
@@ -5301,6 +6235,48 @@ export const SERVE_WATCHDOG_INITIAL_STATE: ServeWatchdogTriggerState = {
   reportBaselineMonoMs: null,
   lastTickMonoMs: null,
 };
+
+export const SERVE_LAG_ATTRIBUTION_LOG_STREAK = 3;
+
+export interface ServeLagAttributionLogState {
+  emittedForCurrentStreak: boolean;
+}
+
+export const SERVE_LAG_ATTRIBUTION_INITIAL_STATE: ServeLagAttributionLogState =
+  {
+    emittedForCurrentStreak: false,
+  };
+
+function boundedActiveWorkLabel(activeWork: string | null): string {
+  const raw = activeWork ?? "none";
+  const safe = raw.replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 80);
+  return safe.length > 0 ? safe : "unknown";
+}
+
+export function decideServeLagAttributionLog(inputs: {
+  state: ServeLagAttributionLogState;
+  lagBreachStreak: number;
+  lagP99Ms: number;
+  activeWork: string | null;
+}): { state: ServeLagAttributionLogState; line: string | null } {
+  if (inputs.lagBreachStreak < SERVE_LAG_ATTRIBUTION_LOG_STREAK) {
+    return {
+      state: { emittedForCurrentStreak: false },
+      line: null,
+    };
+  }
+  if (inputs.state.emittedForCurrentStreak) {
+    return { state: inputs.state, line: null };
+  }
+  return {
+    state: { emittedForCurrentStreak: true },
+    line:
+      "[keeperd] serve-liveness watchdog: busy-lag breach " +
+      `streak=${inputs.lagBreachStreak} ` +
+      `active_work=${boundedActiveWorkLabel(inputs.activeWork)} ` +
+      `lag_p99_ms=${Math.round(inputs.lagP99Ms)}`,
+  };
+}
 
 /** A probe streak advances on a dead read and resets on a live/unarmed one. */
 function nextProbeFailStreak(prev: number, outcome: ProbeTickOutcome): number {
@@ -5756,6 +6732,21 @@ export {
   scanCrashReports,
 } from "./crash-report-scan";
 export type {
+  OsMemoryKillEvidence,
+  OsMemoryKillWindow,
+} from "./os-memory-scan";
+export {
+  findOsMemoryKillEvidence,
+  OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
+} from "./os-memory-scan";
+export type {
+  ExitAttributionKind,
+  ExitAttributionRecord,
+  ExitAttributionRecorder,
+  ExitAttributionSignal,
+  ExitVerdict,
+  ExitVerdictKind,
+  OperatorReloadAttribution,
   RestartBoot,
   RestartBootIdentity,
   RestartBootLine,
@@ -5764,24 +6755,32 @@ export type {
   RestartLedgerSnapshot,
   RestartNativeCrashFields,
   RestartProvenance,
+  ServeHealthHistory,
+  ServeHealthReportSample,
 } from "./restart-ledger";
 // Restart-ledger parsing and persistence live in a dependency-free leaf shared
 // with daemon-control readers. Re-export the pure contract for compatibility.
 export {
   appendDurableRestartBoot,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   boundRestartReason,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   CRASH_LOOP_YOUNG_RUNTIME_MS,
+  classifyExitVerdict,
   classifyRestartProvenance,
   collapseRestartLedger,
   compactRestartLedger,
+  createExitAttributionRecorder,
   decideCrashLoop,
+  decideExitAttribution,
   decideRepeatedNativeCrash,
   foldBootIntoRestartLedger,
+  HARD_KILL_EXIT_ATTRIBUTION_REASON,
   isNativeCrashAttributed,
   KEEPERD_LAUNCHD_LABEL,
+  matchOperatorReloadAttribution,
   parseRestartLedger,
   parseRestartLedgerLine,
   planNativeCrashEnrichLines,
@@ -5790,10 +6789,21 @@ export {
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_NATIVE_FIELD_MAX_LEN,
   RESTART_LEDGER_REASON_MAX_LEN,
+  readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
   readRestartLedgerSnapshot,
+  readServeHealthHistory,
+  removeExitAttribution,
+  resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
+  resolveServeHealthHistoryPath,
+  SERVE_HEALTH_HISTORY_MAX_REPORTS,
   serializeRestartLedgerLine,
+  shouldEnrichPriorExitAttribution,
+  writeExitAttribution,
   writeRestartLedger,
+  writeServeHealthHistory,
 } from "./restart-ledger";
 
 /**
@@ -6719,6 +7729,105 @@ export function scanEventsLogDir(
       }
     }
   }
+}
+
+export interface EventsLogBacklog {
+  files: number;
+  bytes: number;
+  readable: boolean;
+}
+
+export interface EventsIngestStallState {
+  backlogSinceMs: number | null;
+}
+
+export type EventsIngestStallAction =
+  | { kind: "none" }
+  | { kind: "mint"; reason: string; tsSec: number }
+  | { kind: "clear" };
+
+export function probeEventsLogBacklog(
+  db: Database,
+  dir: string,
+): EventsLogBacklog {
+  if (!existsSync(dir)) {
+    return { files: 0, bytes: 0, readable: true };
+  }
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { files: 0, bytes: 0, readable: false };
+  }
+  const readOffsetStmt = db.prepare(
+    "SELECT offset FROM event_ingest_offsets WHERE path = ? AND inode = ?",
+  );
+  let files = 0;
+  let bytes = 0;
+  let readable = true;
+  for (const name of names) {
+    if (!name.endsWith(".ndjson")) continue;
+    const full = join(dir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch {
+      readable = false;
+      continue;
+    }
+    if (!st.isFile()) continue;
+    const offRow = readOffsetStmt.get(full, st.ino) as {
+      offset: number;
+    } | null;
+    const offset = offRow ? offRow.offset : 0;
+    const startOffset = st.size < offset ? 0 : offset;
+    if (st.size <= startOffset) continue;
+    files += 1;
+    bytes = Math.min(Number.MAX_SAFE_INTEGER, bytes + (st.size - startOffset));
+  }
+  return { files, bytes, readable };
+}
+
+function boundedEventsIngestStallReason(
+  backlog: EventsLogBacklog,
+  ageMs: number,
+): string {
+  const ageSec = Math.max(0, Math.floor(ageMs / 1000));
+  const files = Math.min(backlog.files, 9999);
+  const bytes = Math.min(backlog.bytes, 9_999_999_999);
+  return `${EVENTS_INGEST_STALL_DISTRESS_REASON}: unread events-log backlog files=${files} bytes=${bytes} age=${ageSec}s`;
+}
+
+export function decideEventsIngestStallDistress(inputs: {
+  state: EventsIngestStallState;
+  backlog: EventsLogBacklog;
+  nowMs: number;
+  thresholdMs: number;
+  distressOpen: boolean;
+}): { state: EventsIngestStallState; action: EventsIngestStallAction } {
+  if (!inputs.backlog.readable) {
+    return { state: inputs.state, action: { kind: "none" } };
+  }
+  const hasBacklog = inputs.backlog.files > 0 && inputs.backlog.bytes > 0;
+  if (!hasBacklog) {
+    return {
+      state: { backlogSinceMs: null },
+      action: inputs.distressOpen ? { kind: "clear" } : { kind: "none" },
+    };
+  }
+  const backlogSinceMs = inputs.state.backlogSinceMs ?? inputs.nowMs;
+  const ageMs = Math.max(0, inputs.nowMs - backlogSinceMs);
+  if (ageMs >= inputs.thresholdMs && !inputs.distressOpen) {
+    return {
+      state: { backlogSinceMs },
+      action: {
+        kind: "mint",
+        reason: boundedEventsIngestStallReason(inputs.backlog, ageMs),
+        tsSec: inputs.nowMs / 1000,
+      },
+    };
+  }
+  return { state: { backlogSinceMs }, action: { kind: "none" } };
 }
 
 /**
@@ -8235,7 +9344,6 @@ export type WorkerName =
   | "exit"
   | "git"
   | "statusline"
-  | "builds"
   | "accountObserver"
   | "deadLetter"
   | "eventsIngest"
@@ -8334,7 +9442,6 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "exit",
   "git",
   "statusline",
-  "builds",
   "accountObserver",
   "deadLetter",
   "eventsIngest",
@@ -8665,7 +9772,7 @@ let singleInstanceLock: FileLock | null = null;
  * name the lock path and recovery command, and neither failed boot opens the DB
  * or mints a ledger entry.
  */
-function acquireSingleInstanceLock(): void {
+function acquireSingleInstanceLock(onExit: () => void): void {
   if (singleInstanceLock !== null) {
     // Already held in this process — a re-acquire would self-conflict on our own
     // flock. Idempotent so a second in-process boot never blocks on itself.
@@ -8683,6 +9790,7 @@ function acquireSingleInstanceLock(): void {
   );
   if (action.action === "exit") {
     console.error(action.message);
+    onExit();
     process.exit(action.code);
   }
   singleInstanceLock = action.lock;
@@ -8723,7 +9831,50 @@ export function publishFableFocusProjection(
   return { schema_version: 1, policy: projected.policy };
 }
 
+export interface NonFableFocusProjectionPublishDeps {
+  publish?: (path: string, policy: NonFableFocusLeaf["policy"]) => void;
+  read?: (path: string) => NonFableFocusDelivery;
+}
+
+/** Verification fences acknowledgement without coupling sibling delivery. */
+export function publishNonFableFocusProjection(
+  db: Database,
+  routingRoot: string,
+  deps: NonFableFocusProjectionPublishDeps = {},
+): NonFableFocusLeaf {
+  const row = db
+    .query("SELECT non_fable_focus FROM autopilot_state WHERE id = 1")
+    .get() as { non_fable_focus: string | null } | null;
+  const projected = projectNonFableFocus(
+    row === null ? [] : [row as Record<string, unknown>],
+  );
+  if (!projected.valid) {
+    throw new Error("authoritative Non-Fable-focus Projection is invalid");
+  }
+  const path = nonFableFocusPolicyPath(routingRoot);
+  (deps.publish ?? publishNonFableFocusLeaf)(path, projected.policy);
+  const delivered = (deps.read ?? readNonFableFocusLeaf)(path);
+  if (
+    !delivered.available ||
+    JSON.stringify(delivered.policy) !== JSON.stringify(projected.policy)
+  ) {
+    throw new Error(
+      "Non-Fable-focus launch leaf does not match the Projection",
+    );
+  }
+  return { schema_version: 1, policy: projected.policy };
+}
+
 const NATIVE_CRASH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * `log show` window trailer past a boot's recorded death — a jetsam kill line
+ * can land a second or two after the pid is actually gone.
+ */
+const OS_MEMORY_KILL_PROBE_TRAILING_MS = 3_000;
+/** Hard budget for the last-resort `log show` subprocess; a wedged probe is killed, never hung. */
+const OS_MEMORY_KILL_PROBE_TIMEOUT_MS = 2_000;
+const OS_MEMORY_KILL_PROBE_PREDICATE =
+  'eventMessage contains "jetsam" OR eventMessage contains "memorystatus_kill" OR eventMessage contains "SIGKILL" OR eventMessage contains "low swap"';
 
 type NativeCrashAttributionProbeOutcome = {
   scanned: number;
@@ -8816,7 +9967,23 @@ export function runNativeCrashAttributionProbe(deps: {
  * restart).
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
+  const restartLedgerPath = resolveRestartLedgerPath();
+  return startDaemonWithExitAttribution(
+    opts,
+    createExitAttributionRecorder({
+      bootId: crypto.randomUUID(),
+      path: resolveExitAttributionPath(restartLedgerPath),
+    }),
+  );
+}
+
+function startDaemonWithExitAttribution(
+  opts: DaemonOptions,
+  exitAttribution: ExitAttributionRecorder,
+): DaemonHandle {
   process.title = "keeperd";
+  const restartLedgerBootId = exitAttribution.bootId;
+  const restartLedgerPath = resolveRestartLedgerPath();
   // Single-instance gate (docs/adr/0030): take a kernel flock on a dedicated
   // keeperd.lock BEFORE openDb/migrate/any worker spawn, so a second concurrent
   // daemon can never open — let alone migrate — the DB. A live incumbent or an
@@ -8825,25 +9992,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // by the in-process test opt (a same-process second boot shares the flock's
   // open-file-description and would self-conflict).
   if (!opts.disableSingleInstanceLock) {
-    acquireSingleInstanceLock();
+    acquireSingleInstanceLock(() =>
+      exitAttribution.record({
+        kind: "fatal_exit",
+        reason: "single-instance admission refused",
+      }),
+    );
   }
   // Persist the recycle-safe identity immediately after admission. No DB path,
   // worker, Drain sample, or readiness surface is touched unless this syncs.
-  const restartLedgerBootId = crypto.randomUUID();
   const restartBootProvenance = classifyRestartProvenance(
     process.env.XPC_SERVICE_NAME,
   );
   const restartBootPid = process.pid;
   const restartBootStartTime = readOsStartTime(restartBootPid);
   if (restartBootStartTime === null) {
-    console.error(
-      "[keeperd] FATAL: restart-ledger boot identity unavailable: process start_time probe failed",
-    );
+    const reason =
+      "restart-ledger boot identity unavailable: process start_time probe failed";
+    console.error(`[keeperd] FATAL: ${reason}`);
+    exitAttribution.record({ kind: "fatal_exit", reason });
     process.exit(1);
   }
   try {
     appendDurableRestartBoot({
-      path: resolveRestartLedgerPath(),
+      path: restartLedgerPath,
       bootId: restartLedgerBootId,
       pid: restartBootPid,
       startTime: restartBootStartTime,
@@ -8851,11 +10023,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       nowMs: Date.now(),
     });
   } catch (error) {
-    console.error(
-      `[keeperd] FATAL: restart-ledger boot append failed: ${boundRestartReason(
-        error instanceof Error ? error.message : String(error),
-      )}`,
-    );
+    const reason = `restart-ledger boot append failed: ${boundRestartReason(
+      error instanceof Error ? error.message : String(error),
+    )}`;
+    console.error(`[keeperd] FATAL: ${reason}`);
+    exitAttribution.record({ kind: "fatal_exit", reason });
     process.exit(1);
   }
   const restartBootIdentity = {
@@ -8953,7 +10125,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     counters: mainBackstopCounters,
     backstopLogPath,
   };
-
   const eventsLogDir = resolveEventsLogDir();
   // The events-ingest worker subscribes ONCE at spawn and goes inert with NO
   // retry if the dir is absent. `mkdir` it HERE — before the boot scan AND the
@@ -9132,6 +10303,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let serveWatchdogState: ServeWatchdogTriggerState = {
     ...SERVE_WATCHDOG_INITIAL_STATE,
   };
+  let serveLagAttributionLogState: ServeLagAttributionLogState = {
+    ...SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
+  };
   // Freshest serve-health report from the server worker, stamped with MAIN's OWN
   // monotonic arrival clock (never the worker's timestamps — a starved worker's
   // own stamps are late by construction). `null` until the first report lands.
@@ -9146,6 +10320,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let prevWatchdogCpuUsage: ReturnType<typeof process.cpuUsage> | null = null;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
+  // Bounded ring buffer of MAIN's own RSS, persisted each watchdog tick (never
+  // only at exit — a hard kill gives zero warning) so a memory-growth death
+  // leaves a visible ramp for the NEXT boot's enrich pass to read.
+  const serveHealthHistoryPath =
+    resolveServeHealthHistoryPath(restartLedgerPath);
+  let serveHealthHistory: ServeHealthHistory = {
+    boot_id: restartLedgerBootId,
+    reports: [],
+  };
   // Includes a successfully inserted event that has not folded yet. The fixed key
   // plus this latch suppresses event churn while a bus-only degradation persists.
   let serveBusDistressPending = false;
@@ -9171,6 +10354,68 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `pumpWakes` captures this via closure to `kick` the server after a drain; the
   // `?.` tolerates the null window (and a server-less boot).
   let serverWorker: Worker | null = null;
+  let activeMainWork: string | null = null;
+  let activeWorkThisLagWindow: string | null = null;
+
+  async function withActiveMainWork<T>(
+    label: string,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    const previous = activeMainWork;
+    activeMainWork = label;
+    activeWorkThisLagWindow = label;
+    try {
+      return await body();
+    } finally {
+      activeMainWork = previous;
+    }
+  }
+
+  let eventsIngestStallState: EventsIngestStallState = {
+    backlogSinceMs: null,
+  };
+
+  function runEventsIngestStallDistressStep(): void {
+    const backlog = probeEventsLogBacklog(db, eventsLogDir);
+    const row = db
+      .query(
+        "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+      )
+      .get(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        EVENTS_INGEST_STALL_DISTRESS_ID,
+      ) as { instance_event_id: number | null } | null;
+    const decision = decideEventsIngestStallDistress({
+      state: eventsIngestStallState,
+      backlog,
+      nowMs: Date.now(),
+      thresholdMs: EVENTS_INGEST_STALL_THRESHOLD_MS,
+      distressOpen: row !== null,
+    });
+    eventsIngestStallState = decision.state;
+    if (decision.action.kind === "mint") {
+      mintDaemonDistress(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        EVENTS_INGEST_STALL_DISTRESS_ID,
+        decision.action.reason,
+        decision.action.tsSec,
+      );
+    } else if (decision.action.kind === "clear") {
+      if (
+        mintDispatchClearedEvent(
+          EVENTS_INGEST_STALL_DISTRESS_VERB,
+          EVENTS_INGEST_STALL_DISTRESS_ID,
+          {
+            expected_attempt_id: null,
+            expected_instance_event_id: row?.instance_event_id ?? null,
+          },
+        )
+      ) {
+        wakePending = true;
+        pumpWakes();
+      }
+    }
+  }
 
   /**
    * Process the wake signal. The re-entrancy guard (`draining`) ensures we never
@@ -9985,8 +11230,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // it (the shared checkout safety invariant lives at the consumption
           // seams via `effectivePerRootCap`, which is strictly stronger — a stale
           // > 1 row can no longer over-dispatch).
+          const eventTs = Date.now() / 1000;
+          const nonFableFocus = msg.patch.non_fable_focus;
+          if (
+            nonFableFocus !== undefined &&
+            nonFableFocus !== null &&
+            nonFableFocus.lifetime.kind === "absolute" &&
+            Date.parse(nonFableFocus.lifetime.deadline_at) <= eventTs * 1_000
+          ) {
+            throw new Error("Non-Fable focus deadline has elapsed");
+          }
           stmts.insertEvent.run({
-            $ts: Date.now() / 1000,
+            $ts: eventTs,
             $session_id: "autopilot",
             $pid: null,
             $hook_event: "AutopilotConfigSet",
@@ -10025,6 +11280,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // the owner-only launch leaf verifies the exact same policy identity.
           if ("fable_focus" in msg.patch) {
             publishFableFocusProjection(db, accountRoutingRoot);
+          }
+          if ("non_fable_focus" in msg.patch) {
+            publishNonFableFocusProjection(db, accountRoutingRoot);
           }
           // `pumpWakes` drains synchronously, so the `AutopilotConfigSet` event is
           // now folded — this read reflects the worktree mode AS OF the applied
@@ -10566,6 +11824,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       `[keeperd] Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+  try {
+    publishNonFableFocusProjection(db, accountRoutingRoot);
+  } catch (error) {
+    console.error(
+      `[keeperd] Non-Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   scheduleProviderLegDeathNoticeSweep();
   scheduleProviderLegCascadeSweep();
 
@@ -10586,6 +11851,138 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  let priorBootId: string | null = null;
+  let priorExitAttribution: ReturnType<typeof readExitAttribution> = null;
+
+  // Last-resort OS-level evidence for a boot no leaf/operator-reload/native-crash
+  // explains: scan the unified log's own window for a jetsam/memory-pressure kill
+  // naming the dead pid. `log show` is a real subprocess, so this stays ASYNC
+  // (never `spawnSync`/`execFileSync` here — that would block the main loop) and
+  // bounded by a hard timeout that kills a wedged probe rather than hanging it.
+  function formatLogShowTimestamp(ms: number): string {
+    const d = new Date(ms);
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    return (
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    );
+  }
+  async function probeOsMemoryKillEvidence(window: {
+    pid: number;
+    startedAtMs: number;
+    diedAtMs: number;
+  }): Promise<OsMemoryKillEvidence | null> {
+    if (process.platform !== "darwin") return null;
+    try {
+      const proc = Bun.spawn(
+        [
+          "/usr/bin/log",
+          "show",
+          "--start",
+          formatLogShowTimestamp(window.startedAtMs),
+          "--end",
+          formatLogShowTimestamp(
+            window.diedAtMs + OS_MEMORY_KILL_PROBE_TRAILING_MS,
+          ),
+          "--predicate",
+          OS_MEMORY_KILL_PROBE_PREDICATE,
+          "--info",
+        ],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      const killTimer = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+      }, OS_MEMORY_KILL_PROBE_TIMEOUT_MS);
+      try {
+        const [, text] = await Promise.all([
+          proc.exited,
+          new Response(proc.stdout).text(),
+        ]);
+        return findOsMemoryKillEvidence(text, {
+          pid: window.pid,
+          startedAtMs: window.startedAtMs,
+          diedAtMs: window.diedAtMs,
+        });
+      } finally {
+        clearTimeout(killTimer);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const enrichPriorExitAttribution = async (): Promise<void> => {
+    if (priorBootId === null) return;
+    try {
+      const priorBoot = collapseRestartLedger(
+        readRestartLedger(restartLedgerPath),
+      ).find((boot) => boot.boot_id === priorBootId);
+      if (priorBoot === undefined) return;
+      const alreadyAttributed =
+        priorBoot.reason !== undefined || isNativeCrashAttributed(priorBoot);
+      if (alreadyAttributed) {
+        if (priorExitAttribution !== null) {
+          removeExitAttribution(resolveExitAttributionPath(restartLedgerPath));
+        }
+        return;
+      }
+      const operatorReload = matchOperatorReloadAttribution(
+        readOperatorReloadAttribution(
+          resolveOperatorReloadAttributionPath(restartLedgerPath),
+        ),
+        { startedAtMs: priorBoot.ts, diedAtMs: Date.now() },
+      );
+      const osMemoryKill =
+        priorExitAttribution === null &&
+        operatorReload === null &&
+        priorBoot.pid !== null
+          ? await probeOsMemoryKillEvidence({
+              pid: priorBoot.pid,
+              startedAtMs: priorBoot.ts,
+              diedAtMs: Date.now(),
+            })
+          : null;
+      appendRestartLedgerLine(
+        restartLedgerPath,
+        decideExitAttribution({
+          bootId: priorBootId,
+          ts: Date.now(),
+          exitAttribution: priorExitAttribution,
+          nativeCrash: priorBoot,
+          operatorReload,
+          osMemoryKill,
+        }),
+      );
+      removeExitAttribution(resolveExitAttributionPath(restartLedgerPath));
+      try {
+        const priorHistory = readServeHealthHistory(
+          resolveServeHealthHistoryPath(restartLedgerPath),
+        );
+        if (
+          priorHistory !== null &&
+          priorHistory.boot_id === priorBootId &&
+          priorHistory.reports.length > 0
+        ) {
+          const reports = priorHistory.reports;
+          const firstMb = Math.round(reports[0].rss_bytes / 1e6);
+          const lastMb = Math.round(
+            reports[reports.length - 1].rss_bytes / 1e6,
+          );
+          console.error(
+            `[keeperd] prior boot RSS history: ${reports.length} report(s), ` +
+              `${firstMb}MB -> ${lastMb}MB`,
+          );
+        }
+      } catch {
+        // RSS history is forensic-only; never blocks enrich on a read failure.
+      }
+    } catch {
+      // The attribution leaf remains for a future boot if its ledger enrichment fails.
+    }
+  };
+
   // Crash-loop retention is a read-side projection. The already-synced boot row
   // and all forensic history remain byte-for-byte append-only on normal boot.
   {
@@ -10598,10 +11995,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         cap: RESTART_LEDGER_CAP,
       },
     );
+    const boots = collapseRestartLedger(ledgerLines);
+    const currentBootIndex = boots.findIndex(
+      (boot) => boot.boot_id === restartLedgerBootId,
+    );
+    const priorBoot = currentBootIndex > 0 ? boots[currentBootIndex - 1] : null;
+    if (
+      priorBoot !== null &&
+      priorBoot.reason === undefined &&
+      !isNativeCrashAttributed(priorBoot)
+    ) {
+      priorBootId = priorBoot.boot_id;
+      const leaf = readExitAttribution(
+        resolveExitAttributionPath(restartLedgerPath),
+      );
+      if (leaf?.boot_id === priorBootId) {
+        priorExitAttribution = leaf;
+      }
+    }
     const verdict = decideCrashLoop({
       nowMs,
       bootTimestamps: qualifyCrashLoopBootTimestamps(
-        collapseRestartLedger(ledgerLines),
+        boots,
         CRASH_LOOP_YOUNG_RUNTIME_MS,
       ),
       threshold: CRASH_LOOP_THRESHOLD,
@@ -10724,12 +12139,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         nativeCrashReprobeTimer = null;
         if (shuttingDown) return;
         reprobesRemaining -= 1;
-        runNativeCrashProbe(reprobesRemaining === 0);
+        const exhausted = reprobesRemaining === 0;
+        runNativeCrashProbe(exhausted);
+        void enrichPriorExitAttribution();
         if (reprobesRemaining > 0) scheduleReprobe();
       }, 30_000);
     };
     runNativeCrashProbe(false);
+    void enrichPriorExitAttribution();
     scheduleReprobe();
+  } else {
+    void enrichPriorExitAttribution();
   }
 
   // fn-1311: durably record THIS boot's catch-up window (start/end wall-clock +
@@ -11604,103 +13024,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (statuslineWorker)`
 
-  // Spawn the builds worker — keeperd's FIRST outbound-HTTP producer (not a
-  // file-watcher; NOT in WATCHER_WORKERS, so it never dlopens @parcel/watcher).
-  // It polls the local buildbot master's REST API on a fixed cadence and posts
-  // `{kind: "build-snapshot" | "build-deleted", ...}` messages — main turns each
-  // into a synthetic `BuildSnapshot`/`BuildDeleted` events row on its writable
-  // connection. Gated on the selector AND a configured `buildbot_url` (the
-  // config key has no default — an unconfigured
-  // buildbot leaves the worker un-spawned and the daemon boots normally).
-  const buildbotUrl = resolveBuildbotUrl();
-  const buildsWorker =
-    want("builds") && buildbotUrl !== null
-      ? new Worker(new URL("./builds-worker.ts", import.meta.url).href, {
-          workerData: {
-            dbPath,
-            buildbotUrl,
-          } satisfies BuildsWorkerData,
-        } as WorkerOptions & { workerData: unknown })
-      : null;
-
-  if (buildsWorker) {
-    const bw = buildsWorker;
-    // Main stays the SOLE writer: a `build-snapshot`/`build-deleted` message
-    // becomes a synthetic events row on the WRITABLE connection, then a wake
-    // pump folds it. The builder NAME rides in `session_id`; the flattened
-    // snapshot in `data` (empty for tombstones). Everything else is NULL.
-    bw.onmessage = (ev: MessageEvent<BuildsMessage | undefined>): void => {
-      const msg = ev.data;
-      if (!msg) return;
-      let hookEvent: string;
-      let data: string;
-      if (msg.kind === "build-snapshot") {
-        hookEvent = "BuildSnapshot";
-        // Pre-flattened payload — the reducer never re-reads the buildbot API.
-        // Forwarded via the exported `serializeBuildSnapshot` so the wire shape
-        // is pinned by the task-1 round-trip test.
-        data = serializeBuildSnapshot(msg);
-      } else if (msg.kind === "build-deleted") {
-        // Tombstone: the reducer DELETEs the `builds` row whose pk is the
-        // builder name. No payload beyond the pk in `session_id` — matches the
-        // UsageDeleted / EpicDeleted shape so re-fold reproduces the deletion.
-        hookEvent = "BuildDeleted";
-        data = "";
-      } else {
-        return;
-      }
-      // Tolerant mint: a transient writer-lock miss is logged-and-dropped
-      // (recoverable via change-gated re-emit on the next poll) instead of
-      // crashing the daemon; real corruption still throws through to fatalExit.
-      const minted = mintRecoverableSnapshotEvent({
-        $ts: Date.now() / 1000,
-        $session_id: msg.project, // the entity pk: builder name
-        $pid: null,
-        $hook_event: hookEvent,
-        $event_type: "build_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      if (minted) {
-        wakePending = true;
-        pumpWakes();
-      }
-    };
-
-    bw.onerror = (err: ErrorEvent): void => {
-      console.error("[keeperd] builds worker error:", err.message ?? err);
-      if (!shuttingDown) fatalExit();
-    };
-
-    bw.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  } // end `if (buildsWorker)`
-
   // Spawn the account-observation PRODUCER worker — the bounded
   // `cswap list --json` probe. It validates the payload and atomically publishes
   // ONE PII-free observation sidecar under the routing root; every Claude launch
@@ -11862,6 +13185,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           }`,
         );
       }
+      // Stall distress is minted only by the absence of ingest, which by
+      // definition never fires this handler — so the stall probe runs solely
+      // on `eventsIngestFallbackTimer` below, not on this hot path.
     };
 
     // Same crash policy as the other workers: any thread failure → fatalExit.
@@ -12824,11 +14150,96 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  function incidentOwnerFailureForAdmission(
+    verb: string,
+    id: string,
+  ): IncidentOwnerFailureFacts | null {
+    const row = db
+      .query(
+        `SELECT verb, id, reason, dir, claim_session_id,
+                resolver_dispatched_at, merge_escalated_at, human_notified_at
+           FROM dispatch_failures
+          WHERE verb = ? AND id = ?`,
+      )
+      .get(verb, id) as {
+      verb: string;
+      id: string;
+      reason: string;
+      dir: string | null;
+      claim_session_id: string | null;
+      resolver_dispatched_at: number | null;
+      merge_escalated_at: number | null;
+      human_notified_at: number | null;
+    } | null;
+    if (row == null) return null;
+    return {
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    };
+  }
+
+  /** Append one owner-attachment marker inside the admission transaction. */
+  function insertIncidentOwnerAttachmentMarker(
+    row: IncidentOwnerFailureFacts,
+    marker: "resolver" | "merge",
+    ts: number,
+  ): void {
+    const verb = row.verb === "work" ? "work" : "close";
+    stmts.insertEvent.run({
+      $ts: ts,
+      $session_id: row.id,
+      $pid: null,
+      $hook_event:
+        marker === "resolver"
+          ? "ResolverDispatchAttempted"
+          : "MergeEscalationAttempted",
+      $event_type: "dispatch_failures",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({
+        id: row.id,
+        outcome: "dispatched",
+        ...(verb === "close" ? {} : { verb }),
+      }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+    });
+  }
+
   /**
    * Admit one `Dispatched` attempt through the durable mint gate. Both the
    * reconciler bridge and the blocked-owner attachment path call this before
    * launch, so every `work::<task>` side effect carries an exact Event-derived
-   * attempt fence and a crash leaves a bounded `pending_dispatches` lease.
+   * attempt fence and a crash leaves a bounded `pending_dispatches` lease. A
+   * routed merge incident consumes its next attachment marker in the SAME
+   * transaction, so a restart cannot launch an uncounted owner.
    */
   function admitDispatched(payload: DispatchedPayload): DispatchedAck {
     const dispatchKey = `${payload.verb}::${payload.id}`;
@@ -12849,6 +14260,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         expected_attempt_id: currentClaim?.attempt_id ?? null,
       });
       const nowMs = Date.now();
+      const incident = incidentOwnerFailureForAdmission(
+        payload.verb,
+        payload.id,
+      );
+      const incidentMarker =
+        incident == null ? null : nextIncidentOwnerAttachmentMarker(incident);
+      if (
+        incident != null &&
+        isOwnerRoutableIncident(incident) &&
+        incidentMarker == null
+      ) {
+        return { ok: false, suppressed: true };
+      }
       // The gate read + the conditional insert run atomically in ONE
       // `BEGIN IMMEDIATE`. `onFreshMint` runs only on the mint branch (gate empty
       // or window elapsed); a re-mint inside the window suppresses without
@@ -12906,6 +14330,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // derives the same value from the marker in `data`; the ack carries it
           // into the launch metadata envelope before any backend execution.
           attemptId = insertedId;
+          if (incident != null && incidentMarker != null) {
+            insertIncidentOwnerAttachmentMarker(
+              incident,
+              incidentMarker,
+              nowMs / 1000,
+            );
+          }
           ok = true;
         },
       ));
@@ -13427,6 +14858,151 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
+  }
+
+  /**
+   * Mint one synthetic `IncidentClaimed` event onto the writable connection
+   * — the ONLY write path into the `dispatch_failures` claim columns. The
+   * producer has already validated the claimant is live and verifiable; the fold
+   * records the claim WITHOUT re-probing. The row `(verb, id)` rides the entity-key
+   * overload on `session_id` so a re-fold correlates it WITHOUT re-parsing `data`;
+   * the full payload rides `data` for the strict fold parser. NON-FATAL on insert
+   * failure — the next sweep re-attempts (the request stays spooled until minted).
+   */
+  function mintIncidentClaimedEvent(p: IncidentClaimMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentClaimed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+          ts: p.ts,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    // The event is durable now. A drain failure must NOT report mint failure —
+    // leaving the request spooled would insert a duplicate on every retry.
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Mint one synthetic `IncidentReleased` event onto the writable connection
+   * — clears the claim on a self-release OR positive dead-claimant
+   * evidence (the producer's expiry pass). Sibling of {@link
+   * mintIncidentClaimedEvent}; the fold's claimant-fence no-ops a stale release.
+   * NON-FATAL on insert failure — the next expiry sweep re-attempts.
+   */
+  function mintIncidentReleasedEvent(p: IncidentReleaseMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentReleased",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
   }
 
   /**
@@ -14198,7 +15774,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // re-sweepable. All wall-clock + spawn lives HERE in the producer; the spawn lives only
   // here, so a re-fold never re-fires a launch. Rides the SAME 60s heartbeat as the block
   // tick. `void` + `.catch`: the async launch must not block the heartbeat.
-  async function runMergeEscalationSweepTick(): Promise<void> {
+  async function _runMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a paused
     // board never auto-dispatches a NEW escalation session, mirroring the resolver-
@@ -14233,20 +15809,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
-  // launcher is reachable (a server-only boot never dispatches). Rides the same 60s
-  // heartbeat as the resolver-dispatch sweep.
-  const mergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  // Owner-mediated incidents never launch a top-level deconflict session. Keep
+  // the legacy sweep callable for bounded compatibility tests, but do not arm it.
+  const mergeEscalationSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   // The stage-3 board-state gate for the deconflict notify: is the epic's sticky
   // `close::<epic>` merge-conflict row still present? A successful deconflict clears it
@@ -14297,7 +15862,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires. Same pause + autopilot-role gating as the
   // dispatch sweep.
-  async function runDeconflictHumanNotifySweepTick(): Promise<void> {
+  async function _runDeconflictHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runDeconflictHumanNotifySweep({
@@ -14332,17 +15897,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const deconflictHumanNotifySweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runDeconflictHumanNotifySweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const deconflictHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // The sticky work row's `instance_event_id` — the block-instance anchor the work-verb
   // resolver-outcome probe (stage 2) and the work human-notify (stage 3) scope their jobs
@@ -14447,7 +16003,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires; `retry_dispatch` also re-arms the whole chain
   // for a genuine re-conflict. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeHumanNotifySweepTick(): Promise<void> {
+  async function _runWorkMergeHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runWorkMergeHumanNotifySweep({
@@ -14484,11 +16040,75 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeHumanNotifySweepTimer = want("autopilot")
+  const workMergeHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
+
+  function incidentOwnerActive(row: PendingIncidentOwnerPage): boolean {
+    try {
+      if (
+        db
+          .query(
+            "SELECT 1 FROM pending_dispatches WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(row.verb, row.id) != null ||
+        db
+          .query(
+            "SELECT 1 FROM dispatch_claims WHERE verb = ? AND id = ? AND state != 'released' LIMIT 1",
+          )
+          .get(row.verb, row.id) != null
+      ) {
+        return true;
+      }
+      const jobs = db
+        .query("SELECT * FROM jobs WHERE plan_verb = ? AND plan_ref = ?")
+        .all(row.verb, row.id) as unknown as Job[];
+      const activities = ownerActivities(jobs);
+      return jobs.some(
+        (job) =>
+          (activities.get(job.job_id) ?? deriveHarnessActivity({ parent: job }))
+            .status !== "quiescent",
+      );
+    } catch {
+      // An inconclusive ownership read must never page over a potentially-live owner.
+      return true;
+    }
+  }
+
+  async function runIncidentOwnerPageSweepTick(): Promise<void> {
+    if (shuttingDown || autopilotPaused) return;
+    await runIncidentOwnerPageSweep({
+      selectPending: () => selectPendingIncidentOwnerPages(db),
+      stillPending: (row) => {
+        try {
+          return (
+            db
+              .query(
+                `SELECT 1 FROM dispatch_failures
+                  WHERE verb = ? AND id = ? AND instance_event_id IS ?
+                    AND claim_session_id IS NULL
+                    AND resolver_dispatched_at IS NOT NULL
+                    AND merge_escalated_at IS NOT NULL
+                    AND human_notified_at IS NULL
+                  LIMIT 1`,
+              )
+              .get(row.verb, row.id, row.instanceEventId) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      ownerActive: (row) => incidentOwnerActive(row),
+      notifyHuman: (row) => notifyHuman(buildIncidentOwnerPageBody(row)),
+      mintNotified: (row, outcome) =>
+        mintMergeHumanNotifiedEvent(row.id, outcome, row.verb),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const incidentOwnerPageSweepTimer = want("autopilot")
     ? setInterval(() => {
-        void runWorkMergeHumanNotifySweepTick().catch((err) => {
+        void runIncidentOwnerPageSweepTick().catch((err) => {
           console.error(
-            `[keeperd] work fan-in human-notify sweep tick threw (non-fatal): ${
+            `[keeperd] incident-owner page sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -14520,7 +16140,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows whose resolver reached a TERMINAL verdict (leased so a crashed resolver never
   // deadlocks) and dispatches ONE `deconflict::<taskId>` session, stamping `merge_escalated_at`
   // on a terminal `dispatched`. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeEscalationSweepTick(): Promise<void> {
+  async function _runWorkMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runMergeEscalationSweep({
@@ -14552,17 +16172,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workMergeEscalationSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // Launch ONE autonomous `resolve::<taskId>` merge-resolver worker for a stuck work
   // fan-in conflict (fn-1240 tier-2 stage 1), the work-verb twin of `dispatchResolver`.
@@ -14631,7 +16242,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows with a NULL resolver latch and launches ONE `resolve::<taskId>` worker, stamping
   // `resolver_dispatched_at` on a terminal `dispatched`. Same pause + autopilot-role gating
   // as the sibling sweeps: a paused board defers the launch (the human is in control).
-  async function runWorkResolverDispatchSweepTick(): Promise<void> {
+  async function _runWorkResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runResolverDispatchSweep({
@@ -14641,7 +16252,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -14655,17 +16266,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workResolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workResolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   function readWorkerProvider(): WorkerProvider | null {
     try {
@@ -15185,6 +16787,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // every newest-tip leaf read this daemon does. Matches the tip producer's + worker's +
   // CLI's `currentToolchain()`, so all compose the identical key for one (repo, tip).
   const baselineToolchain = currentToolchain();
+  const repairGrantsDir = join(keeperStateDir(), "grants");
 
   // Read a repo's current default-branch tip off the `git_status` projection (the
   // git-worker's feed) — the sha half of the newest-tip baseline key. Null when no seeded
@@ -15390,30 +16993,145 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
-  // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
-  // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
-  // is `/plan:repair <token>`, run at the escalation model/effort via the shared
-  // `dispatchEscalationSession` (so the global cap + per-key occupancy guard apply).
-  async function dispatchRepair(
+  function canonicalRepairDir(path: string): string | null {
+    try {
+      return realpathSync(path);
+    } catch {
+      return null;
+    }
+  }
+
+  function selectRepairGrantOwner(
     group: RepairGroup,
-  ): Promise<EscalationDispatchOutcome> {
-    return dispatchEscalationSession(liveEscalationDispatchDeps, {
-      verb: "repair",
-      id: group.repo_token,
-      prompt: defaultPlanPrompt("repair", group.repo_token),
-      cwd: group.repo_dir,
+    candidates: readonly RepairCandidate[],
+  ): RepairGrantOwner | null {
+    const shared = canonicalRepairDir(group.repo_dir);
+    if (shared == null) return null;
+    for (const candidate of [...candidates].sort(compareRepairCandidate)) {
+      if (
+        candidate.epic_id === "" ||
+        candidate.task_id.startsWith("baseline-tip::")
+      ) {
+        continue;
+      }
+      let jobs: Job[];
+      try {
+        jobs = db
+          .query(
+            "SELECT * FROM jobs WHERE plan_verb = 'work' AND plan_ref = ? ORDER BY last_event_id DESC",
+          )
+          .all(candidate.task_id) as unknown as Job[];
+      } catch {
+        return null;
+      }
+      for (const job of jobs) {
+        if (job.state !== "working") continue;
+        if (job.cwd == null || canonicalRepairDir(job.cwd) !== shared) continue;
+        if (job.pid == null || job.start_time == null || !pidAlive(job.pid)) {
+          continue;
+        }
+        const startTime = probeChildStartTime(job.pid);
+        if (startTime == null || startTime !== job.start_time) continue;
+        return {
+          epic_id: candidate.epic_id,
+          task_id: candidate.task_id,
+          parent_job_id: job.job_id,
+        };
+      }
+    }
+    return null;
+  }
+
+  function repairGrantHolderLiveness(
+    grant: GrantLeaf,
+  ): RepairGrantHolderLiveness {
+    try {
+      const row = db
+        .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+        .get(grant.parent_job_id) as {
+        pid: number | null;
+        start_time: string | null;
+      } | null;
+      if (row == null || row.pid == null || row.start_time == null) {
+        return "inconclusive";
+      }
+      if (!pidAlive(row.pid)) return "dead";
+      const startTime = probeChildStartTime(row.pid);
+      if (startTime == null) return "inconclusive";
+      return startTime === row.start_time ? "live" : "dead";
+    } catch {
+      return "inconclusive";
+    }
+  }
+
+  function repairGrantOwnerOutcome(grant: GrantLeaf): ResolverOutcome {
+    try {
+      const row = db
+        .query("SELECT state FROM jobs WHERE job_id = ?")
+        .get(grant.parent_job_id) as { state: Job["state"] } | null;
+      if (row?.state === "killed" || row?.state === "ended") {
+        return { terminal: true, verdict: "died" };
+      }
+      if (row?.state === "stopped") {
+        return { terminal: true, verdict: "declined" };
+      }
+    } catch {
+      return { terminal: false };
+    }
+    return repairGrantHolderLiveness(grant) === "dead"
+      ? { terminal: true, verdict: "died" }
+      : { terminal: false };
+  }
+
+  function publishRepairGrant(grant: GrantLeaf): boolean {
+    const active = listGrantLeaves(repairGrantsDir).some(
+      (leaf) =>
+        leaf.role === "repair" &&
+        leaf.writable_root === grant.writable_root &&
+        Date.now() < leaf.expires_at,
+    );
+    return !active && writeGrantLeaf(repairGrantsDir, grant);
+  }
+
+  function expireRepairGrant(grant: GrantLeaf, nowMs: number): void {
+    writeGrantLeaf(repairGrantsDir, {
+      ...grant,
+      expires_at: Math.min(grant.expires_at, nowMs),
     });
   }
 
-  // Send the ONE agentbot page about a declined/dead `repair::<token>` session. Sibling of
-  // `notifyHumanOfBlock`: ASYNC spawn, array form so the body rides as a literal argv
-  // element. A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal,
-  // so the marker stays NULL and the row re-sweeps: the page is never lost, and the sticky
-  // repair row stays operator-visible on the board throughout.
+  async function unblockRepairedTask(
+    candidate: RepairCandidate,
+  ): Promise<boolean> {
+    try {
+      const proc = Bun.spawn(
+        [
+          ...launcherArgvPrefix.slice(0, -1),
+          "plan",
+          "unblock",
+          candidate.task_id,
+        ],
+        {
+          cwd: candidate.repo_dir,
+          stdout: "ignore",
+          stderr: "ignore",
+        },
+      );
+      return (await proc.exited) === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // Send the ONE agentbot page about a declined/dead granted owner, or a failed
+  // maintenance-task mint. Sibling of `notifyHumanOfBlock`: ASYNC spawn, array form
+  // so the body rides as a literal argv element. A non-zero exit OR a missing
+  // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and
+  // the row re-sweeps: the page is never lost, and the sticky repair row stays
+  // operator-visible on the board throughout.
   async function notifyHumanOfRepair(
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ): Promise<RepairHumanNotifiedOutcome> {
     const body = buildRepairHumanNotifyBody({
       repoToken: row.id,
@@ -15423,70 +17141,76 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return notifyHuman(body);
   }
 
-  // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
-  // read failure returns TRUE so an old dispatch marker can never false-decline a healthy
-  // repair merely because its job row was temporarily unreadable.
-  function repairSessionWorking(token: string): boolean {
+  // The daemon-side maintenance-task idempotence probe: an OPEN (non-`done`) epic
+  // in this repo already carrying the deterministic (repo, fingerprint) title —
+  // re-run before every mint attempt so a still-open mint from an earlier tick is
+  // never duplicated. A read failure defers (treated as "cannot confirm absent"):
+  // the next tick re-probes rather than risking a double mint on a DB hiccup.
+  function hasOpenMaintenanceTask(group: RepairGroup): boolean {
     try {
-      const instance = stickyRepairInstanceFor(token);
-      const jobs =
-        instance == null
-          ? (db
-              .query(
-                "SELECT state FROM jobs WHERE plan_verb = 'repair' AND plan_ref = ?",
-              )
-              .all(token) as Array<Pick<Job, "state">>)
-          : (db
-              .query(
-                `SELECT state FROM jobs
-                   WHERE plan_verb = 'repair' AND plan_ref = ?
-                     AND (escalation_instance = ? OR
-                       (escalation_instance IS NULL AND last_event_id >= ?))`,
-              )
-              .all(token, instance, instance) as Array<Pick<Job, "state">>);
-      return jobs.some((job) => job.state === "working");
+      const row = db
+        .query(
+          `SELECT 1 FROM epics WHERE project_dir = ? AND title = ? AND status IS NOT 'done' LIMIT 1`,
+        )
+        .get(group.repo_dir, maintenanceEpicTitle(group));
+      return row != null;
     } catch {
       return true;
     }
   }
 
-  // The stage-3 board-state gate for the repair notify: is the sticky
-  // `repair::<token>` row still present? A successful repair clears it (the sweep's
-  // positive-evidence `DispatchCleared`) before the notify fires, so a surviving row
-  // means the breakage is unresolved — the incident {@link classifyEscalationOutcome}
-  // may page on. A read miss degrades to `false` (incident treated closed → the
-  // notify WAITS, never a premature page on a transient error), mirroring
-  // {@link deconflictIncidentOpen}.
-  function repairIncidentOpen(token: string): boolean {
+  // Mint the maintenance plan task for a trunk-red group with no live blocked
+  // consumer: a bounded `keeper plan scaffold --file -` subprocess piped the YAML
+  // on stdin, then `keeper plan validate --epic` arms it so autopilot's readiness
+  // gate can dispatch it as ordinary work. The plan CLI writes the plan; this
+  // producer only spawns it (sole-writer discipline holds). Fail-open — any spawn
+  // error, non-zero exit, unparseable envelope, or arm failure maps to
+  // `mint_failed`, never a throw.
+  async function mintMaintenanceTask(
+    group: RepairGroup,
+  ): Promise<MaintenanceMintOutcome> {
     try {
-      return (
-        db
-          .query(
-            "SELECT 1 FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
-          )
-          .get(token) != null
+      const scaffoldProc = Bun.spawn(
+        [...launcherArgvPrefix.slice(0, -1), "plan", "scaffold", "--file", "-"],
+        {
+          cwd: group.repo_dir,
+          stdin: Buffer.from(buildMaintenanceScaffoldYaml(group)),
+          stdout: "pipe",
+          stderr: "ignore",
+        },
       );
+      const [exitCode, stdout] = await Promise.all([
+        scaffoldProc.exited,
+        new Response(scaffoldProc.stdout).text(),
+      ]);
+      if (exitCode !== 0) return "mint_failed";
+      let epicId: string | null = null;
+      try {
+        const parsed = JSON.parse(stdout) as {
+          success?: unknown;
+          epic_id?: unknown;
+        };
+        epicId =
+          parsed.success === true && typeof parsed.epic_id === "string"
+            ? parsed.epic_id
+            : null;
+      } catch {
+        epicId = null;
+      }
+      if (epicId == null || epicId === "") return "mint_failed";
+      const armProc = Bun.spawn(
+        [
+          ...launcherArgvPrefix.slice(0, -1),
+          "plan",
+          "validate",
+          "--epic",
+          epicId,
+        ],
+        { cwd: group.repo_dir, stdout: "ignore", stderr: "ignore" },
+      );
+      return (await armProc.exited) === 0 ? "minted" : "mint_failed";
     } catch {
-      return false;
-    }
-  }
-
-  // The sticky repair row's `instance_event_id` — the incident anchor the repair
-  // human-notify probe scopes its jobs read on, so a stale `repair::<token>` session
-  // row from a resolved (cleared) prior breakage never suppresses or prematurely
-  // fires the notify for a re-minted one. A read miss or absent row degrades to NULL
-  // (the unscoped verb+ref fallback), never a thrown error — mirrors
-  // {@link stickyCloseInstanceFor}.
-  function stickyRepairInstanceFor(token: string): number | null {
-    try {
-      const row = db
-        .query(
-          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
-        )
-        .get(token) as { instance_event_id: number | null } | null;
-      return row?.instance_event_id ?? null;
-    } catch {
-      return null;
+      return "mint_failed";
     }
   }
 
@@ -15571,34 +17295,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     await runRepairEscalationSweep({
       selectCandidates: () => candidatesAll,
       selectRepairRows: () => selectRepairRows(),
-      // DEFER gate — checkout cleanliness (dirty / unseeded → defer the write-capable
-      // launch), DISTINCT from the suite-green clear gate below.
+      selectGrants: () => listGrantLeaves(repairGrantsDir),
+      selectOwner: (group, affected) => selectRepairGrantOwner(group, affected),
+      grantHolderLiveness: (grant) => repairGrantHolderLiveness(grant),
+      grantOwnerOutcome: (grant) => repairGrantOwnerOutcome(grant),
       isDirtyCheckout: (repoDir) =>
         repairCheckoutDirty(repoDirtyCount(repoDir)),
-      // CLEAR gate — the newest-tip baseline LEAF reads SUITE-GREEN. A clean checkout does
-      // NOT prove the suite passes, so the clear gate consults the tested result, never
-      // checkout cleanliness — the green ambiguity the gap analysis named.
       isBaseGreen: (repoDir) =>
         repairTipBaselineGreen(readNewestTipLeaf(repoDir)),
-      // Name the active dirt distress row in the defer diagnostic (once one is open) so
-      // the greppable defer trace and the operator-visible needs-human row correlate.
       activeDirtyDistressId: (repoDir) => openDirtyById.get(repoDir) ?? null,
-      dispatchRepair: (group) => dispatchRepair(group),
-      repairOutcome: (token) =>
-        classifyEscalationOutcome(
-          resolveEscalationJobsFor(
-            db,
-            "repair",
-            token,
-            stickyRepairInstanceFor(token),
-          ),
-          "repair",
-          token,
-          repairIncidentOpen(token),
-        ),
-      repairSessionWorking: (token) => repairSessionWorking(token),
-      nowSec: () => Date.now() / 1000,
-      terminalGraceSec: REPAIR_TERMINAL_GRACE_SEC,
+      nowMs: () => Date.now(),
+      publishGrant: (grant) => publishRepairGrant(grant),
+      expireGrant: (grant, nowMs) => expireRepairGrant(grant, nowMs),
+      unblockTask: (candidate) => unblockRepairedTask(candidate),
       notifyHuman: (row, verdict) => notifyHumanOfRepair(row, verdict),
       mintRow: (group) =>
         mintRepairRowEvent(
@@ -15616,6 +17325,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           expected_attempt_id: row.attempt_id,
           expected_instance_event_id: row.instance_event_id,
         }),
+      hasOpenMaintenanceTask: (group) => hasOpenMaintenanceTask(group),
+      mintMaintenanceTask: (group) => mintMaintenanceTask(group),
       noteLine: note,
     });
 
@@ -15752,7 +17463,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return result.ok ? "dispatched" : "dispatch_failed";
   }
 
-  async function runResolverDispatchSweepTick(): Promise<void> {
+  async function _runResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a
     // paused board never auto-dispatches a NEW resolver, mirroring the reconciler's own
@@ -15768,7 +17479,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -15784,20 +17495,291 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a worker, so it runs only where
-  // the launcher is reachable (a server-only boot never dispatches). Rides the same
-  // 60s heartbeat as the merge-escalation sweep.
-  const resolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
+  // Merge incidents reattach their ordinary owner; no top-level resolver is armed.
+  const resolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
+
+  // Incident-claim producer. Validates a session's spooled claim/release
+  // against the live incident row + claimant liveness and mints the synthetic
+  // `IncidentClaimed` / `IncidentReleased` event; also expires a dead claimant's
+  // claim on positive evidence. It never launches a worker (unlike the resolver /
+  // deconflict sweeps), so it is NOT pause-gated — a live session must be able to
+  // claim, and a dead claimant's lock must be able to expire, regardless of the
+  // autopilot pause banner. The probe (`pidAlive` + `probeChildStartTime`) lives
+  // ONLY here in the producer, never in a fold.
+  function verifyIncidentClaimant(
+    sessionId: string,
+    verb: string,
+    id: string,
+  ): ClaimantLiveness | null {
+    const row = db
+      .query(
+        "SELECT pid, start_time, plan_verb, plan_ref FROM jobs WHERE job_id = ?",
+      )
+      .get(sessionId) as {
+      pid: number | null;
+      start_time: string | null;
+      plan_verb: string | null;
+      plan_ref: string | null;
+    } | null;
+    if (
+      row == null ||
+      row.plan_verb !== verb ||
+      row.plan_ref !== id ||
+      row.pid == null ||
+      row.start_time == null
+    ) {
+      // The session must be the incident's exact owning verb/ref and carry a
+      // recorded process generation; every mismatch is unverifiable authority.
+      return null;
+    }
+    if (!pidAlive(row.pid)) {
+      return { pid: row.pid, startTime: row.start_time, live: false };
+    }
+    const probed = probeChildStartTime(row.pid);
+    if (probed == null) {
+      // A live pid without a readable generation could be recycled. Refuse.
+      return null;
+    }
+    return {
+      pid: row.pid,
+      startTime: row.start_time,
+      live: probed === row.start_time,
+    };
+  }
+  function probeIncidentClaimantLive(
+    pid: number,
+    startTime: string | null,
+  ): boolean {
+    if (!pidAlive(pid)) return false;
+    if (startTime != null) {
+      const probed = probeChildStartTime(pid);
+      if (probed != null && probed !== startTime) return false;
+    }
+    return true;
+  }
+  function runIncidentClaimSweepTick(): void {
+    if (shuttingDown) return;
+    runIncidentClaimSweep({
+      readRequests: () => readIncidentClaimSpool(),
+      removeRequest: (path) => removeIncidentClaimRequest(path),
+      lookupIncident: (verb, id) => {
+        const row = db
+          .query(
+            `SELECT reason, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures WHERE verb = ? AND id = ?`,
+          )
+          .get(verb, id) as {
+          reason: string;
+          instance_event_id: number | null;
+          claim_session_id: string | null;
+          claim_pid: number | null;
+          claim_start_time: string | null;
+        } | null;
+        if (row == null || !isMergeEscalationReason(row.reason)) return null;
+        return {
+          instanceEventId: row.instance_event_id,
+          claimSessionId: row.claim_session_id,
+          claimPid: row.claim_pid,
+          claimStartTime: row.claim_start_time,
+        };
+      },
+      verifyClaimant: (sessionId, verb, id) =>
+        verifyIncidentClaimant(sessionId, verb, id),
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      mintClaimed: (p) => mintIncidentClaimedEvent(p),
+      mintReleased: (p) => mintIncidentReleasedEvent(p),
+      selectClaimed: () => {
+        const rows = db
+          .query(
+            `SELECT verb, id, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures
+              WHERE claim_session_id IS NOT NULL AND claim_pid IS NOT NULL
+                AND instance_event_id IS NOT NULL`,
+          )
+          .all() as Array<{
+          verb: string;
+          id: string;
+          instance_event_id: number;
+          claim_session_id: string;
+          claim_pid: number;
+          claim_start_time: string | null;
+        }>;
+        return rows.map((r) => ({
+          verb: r.verb,
+          id: r.id,
+          instanceEventId: r.instance_event_id,
+          claimSessionId: r.claim_session_id,
+          claimPid: r.claim_pid,
+          claimStartTime: r.claim_start_time,
+        }));
+      },
+      now: () => Date.now() / 1000,
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  // Main owns this spool producer regardless of the optional worker selector:
+  // claim/release is a daemon data surface, not an autopilot-worker actuation.
+  // This also lets a server-only diagnostic boot expire a provably-dead owner.
+  const incidentClaimSweepTimer = setInterval(() => {
+    try {
+      runIncidentClaimSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] incident-claim sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
+
+  const trunkLeaseStateDir = keeperStateDir();
+  const runTrunkLeaseGit = (
+    args: string[],
+    cwd: string,
+  ): { code: number; stdout: string; stderr: string } => {
+    try {
+      const proc = Bun.spawnSync(["git", ...args], { cwd });
+      return {
+        code: proc.exitCode,
+        stdout: proc.stdout.toString(),
+        stderr: proc.stderr.toString(),
+      };
+    } catch (err) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+  const observeTrunkLeaseRepo = (
+    request: SpooledTrunkLeaseRequest["request"],
+  ): TrunkLeaseRepoObservation | null => {
+    let repoRoot: string;
+    try {
+      repoRoot = realpathSync(request.repo_root);
+    } catch {
+      return null;
+    }
+    if (repoRoot !== request.repo_root) return null;
+    const source = runTrunkLeaseGit(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${request.source_branch}^{commit}`,
+      ],
+      repoRoot,
+    );
+    if (source.code !== 0) return null;
+    const symbolic = runTrunkLeaseGit(
+      ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      repoRoot,
+    );
+    let defaultBranch =
+      symbolic.code === 0
+        ? symbolic.stdout.trim().replace(/^origin\//, "")
+        : "";
+    if (defaultBranch === "") {
+      for (const candidate of ["main", "master", "trunk"]) {
+        if (
+          runTrunkLeaseGit(
+            ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+            repoRoot,
+          ).code === 0
+        ) {
+          defaultBranch = candidate;
+          break;
+        }
+      }
+    }
+    if (defaultBranch === "") return null;
+    const tip = runTrunkLeaseGit(
+      ["rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`],
+      repoRoot,
+    );
+    const defaultTip = tip.stdout.trim();
+    if (tip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(defaultTip)) return null;
+    return { repoRoot, defaultBranch, defaultTip };
+  };
+  // Persists across sweep ticks (module-scoped closure, one instance for the
+  // process lifetime) so `runTrunkLeaseSweep` mints a residue DispatchFailed
+  // only when MERGE_HEAD newly appears, never once per 3s tick it persists.
+  const trunkLeaseResidueState = new Map<string, true>();
+  function runTrunkLeaseSweepTick(): void {
+    if (shuttingDown) return;
+    runTrunkLeaseSweep({
+      residueState: trunkLeaseResidueState,
+      readRequests: () => readTrunkLeaseRequests(trunkLeaseStateDir),
+      removeRequest: (path) => removeTrunkLeaseRequest(path),
+      readLeases: () => listTrunkLeaseLeaves(trunkLeaseStateDir),
+      readLease: (repoRoot) => readTrunkLeaseLeaf(trunkLeaseStateDir, repoRoot),
+      verifyClaimant: (sessionId, epicId) => {
+        const claimant = verifyIncidentClaimant(sessionId, "close", epicId);
+        return claimant === null
+          ? null
+          : {
+              pid: claimant.pid,
+              startTime: claimant.startTime,
+              live: claimant.live,
+            };
+      },
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      observeRepo: (request) => observeTrunkLeaseRepo(request),
+      publishLease: (leaf) => writeTrunkLeaseLeaf(trunkLeaseStateDir, leaf),
+      probeResidue: (leaf) => {
+        const mergeHead = runTrunkLeaseGit(
+          ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+          leaf.repo_root,
+        );
+        if (mergeHead.code !== 0) return null;
+        const oid = mergeHead.stdout.trim();
+        return oid === "" ? null : `MERGE_HEAD=${oid}`;
+      },
+      recordResidue: (leaf, detail) => {
+        const conflicts = runTrunkLeaseGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          leaf.repo_root,
+        );
+        handleDispatchFailedMint({
+          verb: "close",
+          id: leaf.epic_id,
+          reason:
+            `worktree-merge-conflict: merging ${leaf.source_branch} into ` +
+            `${leaf.default_branch} — trunk-integration owner ` +
+            `${leaf.claimant_session_id} left residue in ${leaf.repo_root} ` +
+            `(token=${leaf.fencing_token}, ${detail})`,
+          dir: leaf.repo_root,
+          conflictedFiles:
+            conflicts.code === 0
+              ? conflicts.stdout
+                  .split("\n")
+                  .map((path) => path.trim())
+                  .filter(Boolean)
+              : null,
+          ts: Date.now() / 1000,
         });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+      },
+      now: () => Date.now(),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const trunkLeaseSweepTimer = setInterval(() => {
+    try {
+      runTrunkLeaseSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] trunk-lease sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
 
   // Pi resume-target repair producer. Heals a live pi job whose recorded
   // resume target names no on-disk artifact by disk-anchoring a same-cwd session
@@ -15863,6 +17845,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
+    try {
+      runEventsIngestStallDistressStep();
+    } catch (err) {
+      console.error(
+        `[keeperd] events-log stall probe threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     // fn-1103: the births tree rides the SAME fallback tick (own guard so a
     // birth-scan throw never skips the wake). The watcher hint is the fast path;
     // this poll guarantees every record lands within one interval even if the
@@ -15907,47 +17898,72 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // step-latch below emits the pool size ONLY on a fresh 100MB step crossing — an
   // unconditional per-pass line would grow the very server.stderr this epic bounds.
   let lastLoggedReclaimStep = 0;
-  function runRetentionPass(): void {
-    if (shuttingDown) return;
+  let retentionShedProgressBatches = 0;
+  let lastLoggedRetentionShedProgressStep = 0;
+  let retentionRunning = false;
+  async function runRetentionPass(): Promise<void> {
+    if (shuttingDown || retentionRunning) return;
+    retentionRunning = true;
+    await withActiveMainWork("maintenance:retention", () =>
+      runRetentionPassUnlocked(),
+    ).finally(() => {
+      retentionRunning = false;
+    });
+  }
+
+  async function runRetentionPassUnlocked(): Promise<void> {
     let shed = 0;
     let deleted = 0;
     try {
-      const result = retainColdPayloads(db);
-      shed = result.shed;
+      const budget = createMaintenanceTimeBudget();
+      const eventRetention = await runYieldingRetentionPass(db, {
+        budget,
+        shouldContinue: () => !shuttingDown,
+      });
+      if (!eventRetention) return;
+
+      const { bodies, noopSnapshots, tmuxFocus, budgetExhausted } =
+        eventRetention;
+      shed = bodies.shed;
+      deleted = noopSnapshots.deleted + tmuxFocus.deleted;
       if (shed > 0) {
         console.error(
-          `[keeperd] retention: shed ${shed} cold body/bodies in ${result.batches} batch(es), reclaimed ${result.reclaimedPages} page(s) (watermark id<=${result.coldWatermark}, cursor<${result.cursor}${result.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: shed ${shed} cold body/bodies in ${bodies.batches} batch(es), reclaimed ${bodies.reclaimedPages} page(s) (watermark id<=${bodies.coldWatermark}, cursor<${bodies.cursor}${bodies.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Row-growth bound (fn-934.5): physically DELETE cold rows of the no-op-arm
-      // snapshot classes — the body-NULL pass above reclaims body bytes but never
-      // the per-row overhead. PROVEN re-fold-safe for these three classes ONLY
-      // (their fold arms are no-ops and they carry no producer-scanned column);
-      // the predicate is pinned to that set by a guarding test so it can't widen.
-      // Same writable-connection / paced / cursor-gated discipline as the NULL
-      // pass — and it runs in keeper's OWN writer process (a separate process + a
-      // long reader would pin the WAL during the delete).
-      const del = deleteNoopSnapshotRows(db);
-      deleted = del.deleted;
-      if (deleted > 0) {
+      if (bodies.batches > 0) {
+        retentionShedProgressBatches += bodies.batches;
+        if (bodies.moreLikely) {
+          const { shouldLog, step } = retentionShedProgressLogStep(
+            retentionShedProgressBatches,
+            lastLoggedRetentionShedProgressStep,
+          );
+          if (shouldLog) {
+            console.error(
+              formatRetentionShedProgressLogLine(
+                bodies,
+                retentionShedProgressBatches,
+              ),
+            );
+          }
+          lastLoggedRetentionShedProgressStep = step;
+        } else {
+          retentionShedProgressBatches = 0;
+          lastLoggedRetentionShedProgressStep = 0;
+        }
+      }
+      if (noopSnapshots.deleted > 0) {
         console.error(
-          `[keeperd] retention: deleted ${deleted} cold no-op-snapshot row(s) in ${del.batches} batch(es), reclaimed ${del.reclaimedPages} page(s) (watermark id<=${del.coldWatermark}, cursor<${del.cursor}${del.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: deleted ${noopSnapshots.deleted} cold no-op-snapshot row(s) in ${noopSnapshots.batches} batch(es), reclaimed ${noopSnapshots.reclaimedPages} page(s) (watermark id<=${noopSnapshots.coldWatermark}, cursor<${noopSnapshots.cursor}${noopSnapshots.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Row-growth bound for the epic fn-952 `TmuxClientFocusSnapshot` tail —
-      // active window/session navigation logs a slow trickle of focus snapshots.
-      // Re-fold-safe for an INDEPENDENT reason from the no-op classes: the focus
-      // fold writes ONLY the `tmux_client_focus` LIVE-ONLY singleton and the rows
-      // carry no producer-scanned column, so deleting a cold one leaves every
-      // deterministic projection byte-identical (its own SAFE+NECESSARY pair pins
-      // this). A SEPARATELY-NAMED predicate, never folded into the no-op set.
-      const focusDel = deleteColdTmuxFocusRows(db);
-      deleted += focusDel.deleted;
-      if (focusDel.deleted > 0) {
+      if (tmuxFocus.deleted > 0) {
         console.error(
-          `[keeperd] retention: deleted ${focusDel.deleted} cold tmux-focus row(s) in ${focusDel.batches} batch(es), reclaimed ${focusDel.reclaimedPages} page(s) (watermark id<=${focusDel.coldWatermark}, cursor<${focusDel.cursor}${focusDel.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: deleted ${tmuxFocus.deleted} cold tmux-focus row(s) in ${tmuxFocus.batches} batch(es), reclaimed ${tmuxFocus.reclaimedPages} page(s) (watermark id<=${tmuxFocus.coldWatermark}, cursor<${tmuxFocus.cursor}${tmuxFocus.moreLikely ? ", more remain" : ""})`,
         );
       }
+      if (budgetExhausted || budget.exhausted()) return;
+
       // Dead-letter retention (resurrection-safe): prune fully-recovered aged
       // sealed files (unlink-FIRST, rows second) + row-only terminal tails. Its
       // own try so a prune failure is non-fatal AND leaves the
@@ -16040,9 +18056,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Schedule the retention pass on its own slack heartbeat. Stored so shutdown
-  // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn.
+  // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn;
+  // each transaction yields a turn before the next one.
   const retentionTimer = setInterval(() => {
-    runRetentionPass();
+    void runRetentionPass();
   }, RETENTION_INTERVAL_MS);
 
   // Producer-side historical `mutation_path` backfill pass (fn-836.3). Fills the
@@ -16060,22 +18077,41 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // off the body). Once complete the pass self-disables (one-shot historical
   // fill); steady-state rows arrive already-stamped via the forward path.
   let backfillDone = false;
-  function runMutationPathBackfillPass(): void {
-    if (shuttingDown || backfillDone) return;
+  let backfillRunning = false;
+  async function runMutationPathBackfillPass(): Promise<void> {
+    if (shuttingDown || backfillDone || backfillRunning) return;
+    backfillRunning = true;
+    await withActiveMainWork("maintenance:mutation_path_backfill", () =>
+      runMutationPathBackfillPassUnlocked(),
+    ).finally(() => {
+      backfillRunning = false;
+    });
+  }
+
+  async function runMutationPathBackfillPassUnlocked(): Promise<void> {
     let scanned = 0;
     try {
-      const result = backfillMutationPath(db);
+      const budget = createMaintenanceTimeBudget();
+      const result = await runYieldingMutationPathBackfill(db, {
+        budget,
+        shouldContinue: () => !shuttingDown,
+      });
+      if (!result) return;
       scanned = result.scanned;
+      const batches = result.batches;
       if (scanned > 0) {
         console.error(
-          `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${result.batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Self-disable once the historical tail is provably exhausted — the
-      // completion gate counts ONLY rows whose body still yields an unstamped
-      // file_path, so a legitimately-NULL row (malformed / no file_path) never
-      // keeps it running. After this the forward path keeps new rows stamped.
-      if (isMutationPathBackfillComplete(db)) {
+      if (result.budgetExhausted || budget.exhausted()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (shuttingDown || budget.exhausted()) return;
+      // Self-disable once a bounded pass reaches the historical tail and the
+      // completion gate proves no inline body still yields an unstamped path.
+      // A full final batch defers this probe to the next heartbeat rather than
+      // placing a whole-history scan directly after the last transaction.
+      if (!result.moreLikely && isMutationPathBackfillComplete(db)) {
         backfillDone = true;
         clearInterval(mutationPathBackfillTimer);
         if (scanned > 0) {
@@ -16113,9 +18149,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Schedule the backfill on its own slack heartbeat. Stored so shutdown can
   // `clearInterval` it (and so the self-disable on completion can clear it).
-  // Fires on the MAIN THREAD against the writable connection.
+  // Fires on the MAIN THREAD against the writable connection, yielding between
+  // transactions and before the completion scan.
   const mutationPathBackfillTimer = setInterval(() => {
-    runMutationPathBackfillPass();
+    void runMutationPathBackfillPass();
   }, MUTATION_PATH_BACKFILL_INTERVAL_MS);
 
   // Steady-state WAL checkpoint cadence, independent of retention (whose PASSIVE
@@ -16620,35 +18657,25 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  /**
-   * Crash exit. Reserved for unrecoverable errors so launchd restarts us.
-   * `reason` is optional and backward-compatible — every existing bare
-   * `fatalExit()` call site stays valid and records no reason. When given, the
-   * reason is appended as ONE `enrich` line MATCHED on this boot's
-   * `restartLedgerBootId` to the append-only NDJSON ledger — a single bounded
-   * {@link appendRestartLedgerLine}, never a read-modify-write, so it lands
-   * durably BEFORE `process.exit` without blocking or corrupting the ledger on
-   * the crash path. The whole append is wrapped so ledger trouble can never
-   * throw out of the exit path.
-   */
-  function fatalExit(reason?: string): void {
-    if (reason !== undefined) {
-      try {
-        appendRestartLedgerLine(resolveRestartLedgerPath(), {
-          kind: "enrich",
-          boot_id: restartLedgerBootId,
-          ts: Date.now(),
-          reason: boundRestartReason(reason),
-        });
-      } catch {
-        // best-effort; never block the crash exit on ledger trouble
-      }
-    }
+  function fatalExit(
+    reason = "fatalExit (unspecified)",
+    kind:
+      | "fatal_exit"
+      | "uncaught_exception"
+      | "unhandled_rejection" = "fatal_exit",
+  ): void {
+    exitAttribution.record({ kind, reason });
+    try {
+      appendRestartLedgerLine(restartLedgerPath, {
+        kind: "enrich",
+        boot_id: restartLedgerBootId,
+        ts: Date.now(),
+        reason: boundRestartReason(reason),
+      });
+    } catch {}
     try {
       db.close();
-    } catch {
-      // best-effort; we're crashing either way
-    }
+    } catch {}
     process.exit(1);
   }
 
@@ -16797,6 +18824,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       prevWatchdogCpuUsage = cpuNow;
 
+      // Main-thread RSS ramp: sampled every tick, persisted (never only at exit —
+      // a hard/jetsam kill gives zero chance to write anything at death time) so a
+      // memory-growth death leaves a visible ramp for the next boot's enrich pass.
+      serveHealthHistory = appendServeHealthReportSample(serveHealthHistory, {
+        ts: Date.now(),
+        rss_bytes: process.memoryUsage().rss,
+      });
+      try {
+        writeServeHealthHistory(serveHealthHistoryPath, serveHealthHistory);
+      } catch {
+        // Best-effort; RSS history is forensic-only and never blocks the tick.
+      }
+
       const arming = resolveProbeArming({
         serverServed: serverWorker != null,
         busServed: busWorker != null,
@@ -16874,6 +18914,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
       });
       serveWatchdogState = state;
+      const lagAttribution = decideServeLagAttributionLog({
+        state: serveLagAttributionLogState,
+        lagBreachStreak: state.lagBreachStreak,
+        lagP99Ms,
+        activeWork: activeMainWork ?? activeWorkThisLagWindow,
+      });
+      serveLagAttributionLogState = lagAttribution.state;
+      activeWorkThisLagWindow = null;
+      if (lagAttribution.line !== null) {
+        console.error(lagAttribution.line);
+      }
 
       // The bus-only degradation is a producer-owned level trigger. Read-before-
       // mint plus the pending latch makes a persistent outage one row, while a
@@ -16982,28 +19033,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Unrecoverable async errors that escape every guard also take the single
-  // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
-  // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
-  // poll) from clobbering the clean `exit(0)` — both fire AFTER `shuttingDown` is
-  // set. Mirrors every worker `onerror` / `close` handler above.
-  process.on("unhandledRejection", (reason) => {
-    if (shuttingDown) return;
-    console.error("[keeperd] unhandled rejection:", reason);
-    fatalExit(
-      `unhandledRejection: ${
-        reason instanceof Error ? reason.message : String(reason)
-      }`,
-    );
-  });
-  process.on("uncaughtException", (err) => {
-    if (shuttingDown) return;
-    console.error("[keeperd] uncaught exception:", err);
-    fatalExit(
-      `uncaughtException: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
-
   // Step 5 — clean teardown. TEARDOWN LOGIC ONLY: set the shutdown flag FIRST (so
   // the `!shuttingDown` guards keep teardown noise from tripping `fatalExit`),
   // post `{type:"shutdown"}` to every worker, race their `close` against the
@@ -17054,6 +19083,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (workMergeHumanNotifySweepTimer !== null) {
       clearInterval(workMergeHumanNotifySweepTimer);
     }
+    if (incidentOwnerPageSweepTimer !== null) {
+      clearInterval(incidentOwnerPageSweepTimer);
+    }
     if (workMergeEscalationSweepTimer !== null) {
       clearInterval(workMergeEscalationSweepTimer);
     }
@@ -17063,6 +19095,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
     }
+    if (incidentClaimSweepTimer !== null) {
+      clearInterval(incidentClaimSweepTimer);
+    }
+    clearInterval(trunkLeaseSweepTimer);
     if (piResumeRepairSweepTimer !== null) {
       clearInterval(piResumeRepairSweepTimer);
     }
@@ -17093,7 +19129,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       exitWorker,
       gitWorker,
       statuslineWorker,
-      buildsWorker,
       accountObserverWorker,
       codexAccountObserverWorker,
       deadLetterWorker,
@@ -17163,22 +19198,82 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
 /**
  * Production daemon entry point. Boots via {@link startDaemon} (no opts) and
- * installs the SIGTERM/SIGINT → clean-exit-0 handlers. The ONLY path that calls
+ * installs the TERM/INT/HUP → clean-exit-0 handlers. The ONLY path that calls
  * `process.exit(0)`: under launchd `KeepAlive.SuccessfulExit=false` a clean exit
  * tells launchd NOT to restart, while a crash takes `fatalExit` → exit 1 →
  * restart.
  */
 function runDaemon(): void {
-  const { stop } = startDaemon();
-  // The ONLY path that exits 0. `stop()` runs the full teardown (idempotent); we
-  // exit 0 once it resolves so launchd does NOT restart a clean stop.
-  const shutdown = (): void => {
-    void stop().then(() => {
-      process.exit(0);
-    });
+  const restartLedgerPath = resolveRestartLedgerPath();
+  const exitAttribution = createExitAttributionRecorder({
+    bootId: crypto.randomUUID(),
+    path: resolveExitAttributionPath(restartLedgerPath),
+  });
+  let stop: (() => Promise<void>) | null = null;
+  let shutdownRequested = false;
+
+  const fatalProcess = (
+    kind: "uncaught_exception" | "unhandled_rejection",
+    reason: string,
+  ): void => {
+    exitAttribution.record({ kind, reason });
+    process.exit(1);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  const shutdown = (signal: "SIGTERM" | "SIGINT" | "SIGHUP"): void => {
+    exitAttribution.record({ kind: "signal", signal });
+    if (shutdownRequested) return;
+    shutdownRequested = true;
+    if (stop === null) {
+      process.exit(0);
+      return;
+    }
+    void stop()
+      .then(() => process.exit(0))
+      .catch((error) =>
+        fatalProcess(
+          "uncaught_exception",
+          `shutdown: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+  };
+
+  process.once("exit", () => {
+    exitAttribution.record({ kind: "clean_shutdown" });
+  });
+  process.on("unhandledRejection", (reason) => {
+    if (shutdownRequested) return;
+    console.error("[keeperd] unhandled rejection:", reason);
+    fatalProcess(
+      "unhandled_rejection",
+      `unhandledRejection: ${
+        reason instanceof Error ? reason.message : String(reason)
+      }`,
+    );
+  });
+  process.on("uncaughtException", (error) => {
+    if (shutdownRequested) return;
+    console.error("[keeperd] uncaught exception:", error);
+    fatalProcess(
+      "uncaught_exception",
+      `uncaughtException: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGHUP", () => shutdown("SIGHUP"));
+
+  try {
+    stop = startDaemonWithExitAttribution({}, exitAttribution).stop;
+  } catch (error) {
+    fatalProcess(
+      "uncaught_exception",
+      `uncaughtException: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 // Only boot the daemon when this file is the process entry point — a plain

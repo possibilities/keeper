@@ -572,7 +572,10 @@ export function resolvePiCodexPoolExtension(
       typeof peers?.["@earendil-works/pi-coding-agent"] === "string" &&
       source.includes("openAICodexResponsesApi") &&
       source.includes("KEEPER_PI_CODEX_POOL_MODE") &&
-      source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS");
+      source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS") &&
+      source.includes("KEEPER_PI_CODEX_POOL_INITIAL_SCOPE") &&
+      source.includes("KEEPER_PI_CODEX_POOL_ALIAS_POLICY") &&
+      source.includes("KEEPER_PI_CODEX_POOL_POLICY_BINDING");
     if (!compatible) {
       return {
         args: [],

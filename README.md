@@ -13,14 +13,19 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
   Resource holds remain independently observable and recoverable
-- **Account routing** — Claude launches use process-bound claude-swap Account routes;
-  Keeper-launched Pi sessions load a separate Codex companion for root/child session
-  routing, with native fallback and proof-gated activation. `keeper agent accounts check
-  --json` reports both without reading credentials; see the
-  [routing operations guide](./docs/install.md#pi-codex-account-pool)
-- **Fable focus** — a durable, PII-free Account route preference for Fable work,
-  inspectable through account checks, `keeper status`, and `keeper board`; see the
-  [routing operations guide](./docs/install.md#claude-account-routing-and-fable-focus)
+- **Account routing** — Claude launches use process-bound claude-swap Account routes from
+  a fresh Capacity observation. claude-swap owns `usageStatus`, raw quota values, and
+  bounded account-capacity metadata; `keeper usage` shows available categories, explicit
+  multipliers, and producer-marked last-good meters without making stale data routeable.
+  Keeper-launched Pi sessions use an isolated Codex companion with its own visible native
+  fallback and proof-gated activation. `keeper agent accounts check --json` reports both
+  without reading credentials; see the [routing operations guide](./docs/install.md#pi-codex-account-pool)
+- **Account focuses** — independent, PII-free stable-route preferences: Fable focus matches
+  proven Fable work and Non-Fable focus matches proven non-Fable work. Explicit `--x-account`
+  wins, then the matching eligible focus, Fable soft avoidance, and normal route selection.
+  Focus fallback is visible and delivery health is independent; each scope rolls back with its
+  own `clear`. Inspect both through account checks, `keeper status`, and `keeper board`. See the
+  [routing operations guide](./docs/install.md#claude-account-routing-and-account-focuses)
 - **History forensics** — `keeper history list|show|search|files|index` is the
   canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
   foreground continuation path; `keeper transcript` stays for explicit

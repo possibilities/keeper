@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 318,
+        "files_changed": 2,
+        "insertions": 612
+      },
+      "done_summary": "Reworked integrateRepoUnderLease to merge the epic base in a private scratch worktree (ADR 0102): retired the any-dirt TRUNK_INTEGRATION_DIRTY/off-branch/residue refusals, fast-forward the shared checkout only when clean+on-branch else advance the ref and defer only the ff, run an injectable merge-suite gate against the merged tree, and reap the worktree+branch on every exit. Origin push + authoritative gating stay daemon-owned.",
+      "input_hash": "ad13661553ae98e65b88ea21fa62599b01ad0407fc1a9bcd835133ccee55712c",
+      "model": "opus",
+      "spec_chars": 3272,
+      "spec_md": "## Description\n\nRework integrateRepoUnderLease (plugins/plan/src/verbs/close_finalize.ts:747)\nso trunk integration happens in a private scratch worktree instead of the\nshared checkout, per ADR 0102 (docs/adr/0102-private-worktree-trunk-integration.md):\n\n- Cut a temporary worktree + temp branch from the local default tip under the\n  existing trunk lease; merge the epic base (sourceOid) there; run the\n  merge-suite gate against the merged tree in that worktree.\n- Publish via a bounded fetch\u2013merge\u2013push retry of the temp branch onto the\n  default branch (a racing origin is expected; a genuine origin-ahead non-ff\n  after retries keeps the existing worktree-finalize-non-fast-forward sticky).\n- The shared checkout is only ever fast-forwarded, and only when it is clean\n  AND on the default branch (close_finalize.ts:787-797 branch check). A dirty\n  or off-branch shared checkout DEFERS ONLY THE FF: integration itself\n  completes, the epic lands, and the trailing shared checkout is left to the\n  existing trailing-tip producers (shared-checkout-desync). Remove the\n  any-dirt TRUNK_INTEGRATION_DIRTY refusal at close_finalize.ts:812-825; if a\n  typed outcome is still needed for the deferred-ff case, mint a new visible,\n  self-clearing code rather than reusing the refusal.\n- Content conflicts in the scratch worktree keep the existing conflict\n  outcome (the worktree-merge-conflict sticky path downstream); the temp\n  worktree and branch are removed on EVERY exit path (success, conflict,\n  gate-red, push-fail), never leaking worktrees.\n- No MERGE_HEAD is ever visible in the shared checkout.\n- Preserve lease acquisition/release semantics and all other typed outcomes\n  of integrateRepoUnderLease/integrateEpicBases (close_finalize.ts:972).\n\nKeep correctness tests deterministic and in-process per docs/testing.md:\ndrive the git-boundary decisions through the existing pure seams used by\nplugins/plan/test/saga-close-finalize.test.ts; real-git coverage belongs to\nthe real-git suite's own gate if needed.\n\nFiles: plugins/plan/src/verbs/close_finalize.ts,\nplugins/plan/test/saga-close-finalize.test.ts.\n\n## Acceptance\n\n- [ ] Integration completes with unrelated tracked and untracked dirt present\n      in the shared checkout (test), landing the epic and deferring only the ff.\n- [ ] A clean, on-branch shared checkout is fast-forwarded exactly as before.\n- [ ] The any-dirt TRUNK_INTEGRATION_DIRTY refusal is gone; the deferred-ff\n      path emits its typed, self-clearing signal.\n- [ ] Temp worktree + branch are removed on success, conflict, gate-red, and\n      push-fail paths (tests cover each exit).\n- [ ] Conflict and non-ff outcomes preserve their existing typed codes.\n- [ ] Suite gate runs against the MERGED tree in the scratch worktree.\n- [ ] Existing saga-close-finalize tests stay green.\n\n## Done summary\nReworked integrateRepoUnderLease to merge the epic base in a private scratch worktree (ADR 0102): retired the any-dirt TRUNK_INTEGRATION_DIRTY/off-branch/residue refusals, fast-forward the shared checkout only when clean+on-branch else advance the ref and defer only the ff, run an injectable merge-suite gate against the merged tree, and reap the worktree+branch on every exit. Origin push + authoritative gating stay daemon-owned.\n## Evidence\n",
+      "task_id": "fn-1392-integrate-trunk-merges-in-a-private.1",
+      "tier": "xhigh",
+      "title": "Move trunk integration into a scratch worktree"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 11,
+        "files_changed": 4,
+        "insertions": 61
+      },
+      "done_summary": "Split the deferred-ff dirt test into dirty-tracked-only and untracked-only cases, clarified the racing-origin CAS-retry test, documented the TRUNK_* problem codes, and corrected the close skill's stale clean-checkout prose.",
+      "input_hash": "ad13661553ae98e65b88ea21fa62599b01ad0407fc1a9bcd835133ccee55712c",
+      "model": "sonnet",
+      "spec_chars": 1471,
+      "spec_md": "## Description\n\nExtend coverage and docs for the private-worktree integration landed by task 1:\n\n- Test matrix over the deferred-ff and edge paths: dirty-tracked-only,\n  untracked-only, off-default-branch shared checkout, racing origin (push\n  retry), conflict inside the scratch worktree, gate-red inside the scratch\n  worktree \u2014 via the pure seams in plugins/plan/test/saga-close-finalize.test.ts.\n- Update docs/problem-codes.md for the retired any-dirt\n  TRUNK_INTEGRATION_DIRTY semantics and the new deferred-ff code; sweep the\n  close skill prose (plugins/plan/skills/close/) for statements that the\n  shared checkout must be clean to land; align CONTEXT.md's trunk-lease\n  vocabulary if fn-1386 introduced an entry.\n- Cross-link ADR 0102 from the touched doc sections where rationale is named.\n\nFiles: plugins/plan/test/saga-close-finalize.test.ts, docs/problem-codes.md,\nplugins/plan/skills/close/, CONTEXT.md.\n\n## Acceptance\n\n- [ ] Each listed edge path has a deterministic in-process test.\n- [ ] docs/problem-codes.md reflects the new outcome semantics.\n- [ ] Close-skill prose no longer requires a clean shared checkout for landing.\n- [ ] Docs state current behavior only (no history narration outside ADR).\n\n## Done summary\nSplit the deferred-ff dirt test into dirty-tracked-only and untracked-only cases, clarified the racing-origin CAS-retry test, documented the TRUNK_* problem codes, and corrected the close skill's stale clean-checkout prose.\n## Evidence\n",
+      "task_id": "fn-1392-integrate-trunk-merges-in-a-private.2",
+      "tier": "high",
+      "title": "Cover deferred-ff paths and update finalize docs"
+    }
+  ],
+  "created_at": "2026-07-21T08:57:49.429000Z",
+  "epic_id": "fn-1392-integrate-trunk-merges-in-a-private",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "ad13661553ae98e65b88ea21fa62599b01ad0407fc1a9bcd835133ccee55712c",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

@@ -1355,27 +1355,6 @@ export function decideReconcileTransitions(
 }
 
 /**
- * Derive a missed-wake rescue's TRUE change-to-rescue latency (`now − oldest
- * committed_at_ms`) from the commit times the rescue discharged — the honest
- * freshness signal, vs the idle-inflating `now − last_fast_path_at`.
- *
- * - Anchor on the OLDEST commit (worst case — it bounds the longest any change
- *   waited unobserved).
- * - Empty array → `null`: a dirty-tree-only rescue has no commit to measure
- *   against. The caller pushes only POSITIVE `committed_at_ms`.
- * - Returns the raw signed difference; the negative-latency (clock-skew) clamp
- *   lives in {@link buildMissedWakeRecord}.
- */
-export function deriveChangeToRescueMs(
-  dischargedCommitAtMs: number[],
-  now: number,
-): number | null {
-  if (dischargedCommitAtMs.length === 0) return null;
-  const oldest = Math.min(...dischargedCommitAtMs);
-  return now - oldest;
-}
-
-/**
  * The presence verdict for a `git_status` project_dir, from a stat probe (never
  * bare `existsSync`): `present` (stat succeeded — exactly `existsSync === true`),
  * `vanished` (ENOENT/ENOTDIR — the dir is PROVABLY gone), or `error` (any other
@@ -2176,14 +2155,6 @@ function startWorker(): void {
   // uniform `missed-wake` record. Every early-return / divergence-suppress /
   // semantic-dedupe coalesce path returns `false`.
   //
-  // fn-771: the optional `dischargedCommitAtMs` collector lets the heartbeat
-  // backstop derive the true change-to-rescue latency. When provided, every
-  // commit this call discharges in the HEAD-oid delta pushes its `committed_at_ms`
-  // (positive only — a 0/unparseable commit time is NOT a usable anchor). The
-  // heartbeat then takes the worst-case (oldest) anchor across all rescued roots
-  // for `now − committed_at_ms`. The fast-path callers (scheduler emit, initial
-  // subscribe) pass nothing — only the slow backstop needs the latency.
-  //
   // fn-921: `force` bypasses the per-root semantic dedupe so a quiet repo with
   // `seed_required` set re-emits an UNCHANGED snapshot — the boot-seed may have
   // captured a floor ABOVE this root's last live snapshot, leaving the surface
@@ -2191,11 +2162,7 @@ function startWorker(): void {
   // snapshot main folds to clear `seed_required`. Used ONLY by the seed-required
   // backstop; every other caller leaves it false so the dedupe still suppresses
   // no-op churn.
-  function emitSnapshot(
-    root: string,
-    dischargedCommitAtMs?: number[],
-    force = false,
-  ): boolean {
+  function emitSnapshot(root: string, force = false): boolean {
     if (shuttingDown) return false;
     // Capture BEFORE reading Git. The eventual synthetic event id is not an
     // observation fence: a hook event can land after readStatus but before main
@@ -2282,14 +2249,6 @@ function startWorker(): void {
               plan_target: c.plan_target,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
-            // fn-771: collect this discharged commit's time so the heartbeat
-            // backstop can derive the true change-to-rescue latency. Only a
-            // POSITIVE committed_at_ms is a usable anchor — enumerateCommitsInDelta
-            // clamps an unparseable/non-positive commit time to 0, which would
-            // otherwise read as a ~epoch-sized false latency.
-            if (dischargedCommitAtMs !== undefined && c.committed_at_ms > 0) {
-              dischargedCommitAtMs.push(c.committed_at_ms);
-            }
             // Epic fn-681: authoritative commit-driven plan ingest.
             // Filter the commit's enumerated file list to plan-shaped
             // paths (epics / tasks / state-tasks) and post one
@@ -2445,7 +2404,7 @@ function startWorker(): void {
     );
     let emitted = 0;
     for (const root of toEmit) {
-      if (emitSnapshot(root, undefined, /* force */ true)) emitted++;
+      if (emitSnapshot(root, /* force */ true)) emitted++;
     }
     return emitted;
   }
@@ -2906,24 +2865,14 @@ function startWorker(): void {
     // fn-720: OR the per-root emitted-booleans into one `rescued` flag. A `true`
     // means the heartbeat re-delivered a snapshot the poll fast path missed.
     let rescued = false;
-    // fn-771: collect every discharged commit's time across the rescued roots so
-    // the record carries the TRUE change-to-rescue latency.
-    const dischargedCommitAtMs: number[] = [];
     for (const root of subscriptions.keys()) {
-      if (emitSnapshot(root, dischargedCommitAtMs)) {
+      if (emitSnapshot(root)) {
         rescued = true;
       }
     }
     backstopCounters.bump("git-heartbeat", "missed-wake", rescued);
     if (rescued) {
       const now = Date.now();
-      // Worst-case (oldest) commit anchor across all roots rescued this tick →
-      // `now − oldest`. No commit anchor (dirty-tree-only rescue) → null. A
-      // negative latency (clock skew) is clamped to null by buildMissedWakeRecord.
-      const changeToRescueMs = deriveChangeToRescueMs(
-        dischargedCommitAtMs,
-        now,
-      );
       port.postMessage({
         kind: "backstop",
         record: buildMissedWakeRecord({
@@ -2936,7 +2885,6 @@ function startWorker(): void {
           rescued: true,
           now,
           lastFastPathAt,
-          changeToRescueMs,
         }),
       } satisfies BackstopMessage);
     }

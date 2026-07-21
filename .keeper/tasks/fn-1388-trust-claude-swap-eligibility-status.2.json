@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-20T15:23:33.055000Z",
+  "depends_on": [
+    "fn-1388-trust-claude-swap-eligibility-status.1"
+  ],
+  "epic": "fn-1388-trust-claude-swap-eligibility-status",
+  "id": "fn-1388-trust-claude-swap-eligibility-status.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Align focus and usage diagnostics",
+  "updated_at": "2026-07-20T17:54:45.804000Z",
+  "worker_done_at": "2026-07-20T17:54:45.804000Z"
+}

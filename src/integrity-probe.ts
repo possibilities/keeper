@@ -47,8 +47,8 @@
  * mints no synthetic event, and touches no reducer state — so re-fold
  * determinism, the cursor+projection single-transaction, and the sole-writer
  * rules are all untouched. Its only side effect is an out-of-band page
- * (agentbot Telegram, the "Keeper" topic — the same sink the sitter dead-man
- * uses). Mirrors the never-throw posture of the compaction / checkpoint timers:
+ * (agentbot Telegram, the "Keeper" topic). Mirrors the never-throw posture of
+ * the compaction / checkpoint timers:
  * a probe hiccup (file gone mid-open, transient lock) logs and the next
  * heartbeat retries; it never wedges the daemon.
  */
@@ -73,7 +73,7 @@ import { isAbsolute, join } from "node:path";
  */
 export const INTEGRITY_PROBE_INTERVAL_MS = 900_000;
 
-/** The Telegram topic every keeper page routes to (matches the sitter). */
+/** The Telegram topic every keeper page routes to. */
 export const KEEPER_TOPIC = "Keeper";
 
 /** Config key for the absolute local paging transport binary. */

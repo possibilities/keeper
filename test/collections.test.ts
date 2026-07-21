@@ -17,11 +17,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectDrainedRunningJobs } from "../cli/await";
-import { projectFableFocus } from "../src/autopilot-projection";
+import {
+  projectFableFocus,
+  projectNonFableFocus,
+} from "../src/autopilot-projection";
 import { drainedState } from "../src/await-conditions";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
-  BUILDS_DESCRIPTOR,
   type CollectionDescriptor,
   countAndToken,
   DEAD_LETTERS_DESCRIPTOR,
@@ -179,9 +181,10 @@ test("getCollection resolves the git status collection", () => {
   expect(GIT_DESCRIPTOR.jsonColumns.has("jobs")).toBe(true);
 });
 
-test("usage and profiles are retired (fn-1239 task .6) — no collection resolves either name", () => {
+test("retired projections do not resolve as collections", () => {
   expect(getCollection("usage")).toBeUndefined();
   expect(getCollection("profiles")).toBeUndefined();
+  expect(getCollection("builds")).toBeUndefined();
 });
 
 test("JOBS_DESCRIPTOR serves profile_name for the recent-sessions log (v36)", () => {
@@ -564,49 +567,6 @@ test("loadReadinessInputs: a stopped parent with a closed subagent child derives
   db.close();
 });
 
-test("getCollection resolves the builds collection (schema v64, fn-781)", () => {
-  // Schema v64 (epic fn-781 task .1): the `keeper builds` buildbot dashboard
-  // surface. One row per registered builder keyed by builder NAME (`project`),
-  // produced by synthetic `BuildSnapshot` / `BuildDeleted` events.
-  expect(getCollection("builds")).toBe(BUILDS_DESCRIPTOR);
-  expect(BUILDS_DESCRIPTOR.table).toBe("builds");
-  expect(BUILDS_DESCRIPTOR.pk).toBe("project");
-  expect(BUILDS_DESCRIPTOR.version).toBe("last_event_id");
-  // Filter: pk only — the per-builder read narrows on the builder name.
-  expect(BUILDS_DESCRIPTOR.filters.project).toBe("project");
-  // Default sort is stable by pk so the dashboard renders alphabetically.
-  expect(BUILDS_DESCRIPTOR.defaultSort).toEqual({
-    column: "project",
-    dir: "asc",
-  });
-  // No JSON-decoded columns — every persisted field is a scalar.
-  expect(BUILDS_DESCRIPTOR.jsonColumns.size).toBe(0);
-  // Columns include every persisted field byte-for-byte against CREATE_BUILDS.
-  for (const col of [
-    "project",
-    "builder_id",
-    "build_number",
-    "complete",
-    "results",
-    "state_string",
-    "started_at",
-    "complete_at",
-    "last_event_id",
-    "updated_at",
-  ]) {
-    expect(BUILDS_DESCRIPTOR.columns).toContain(col);
-  }
-  // Sortable allowlist covers the human-relevant columns.
-  expect(BUILDS_DESCRIPTOR.sortable.has("project")).toBe(true);
-  expect(BUILDS_DESCRIPTOR.sortable.has("build_number")).toBe(true);
-  expect(BUILDS_DESCRIPTOR.sortable.has("results")).toBe(true);
-  expect(BUILDS_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
-  expect(BUILDS_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
-  // No defaultFilter / defaultClause — every builder row is interesting.
-  expect(BUILDS_DESCRIPTOR.defaultFilter).toBeUndefined();
-  expect(BUILDS_DESCRIPTOR.defaultClause).toBeUndefined();
-});
-
 test("runQuery pages an empty pending_dispatches collection on a fresh DB (schema v50, fn-678)", () => {
   // Zero-event projection: a fresh DB has zero pending_dispatches rows
   // (the table populates exclusively from the reducer's `Dispatched` fold
@@ -648,11 +608,15 @@ test("runQuery pages a seeded pending_dispatches row with the served columns (sc
   db.close();
 });
 
-test("jobs and autopilot descriptors serve Fable lineage and atomic focus policy", () => {
+test("jobs and autopilot descriptors serve Fable lineage and independent focus policies", () => {
   expect(JOBS_DESCRIPTOR.columns).toContain("fable_intent");
   expect(JOBS_DESCRIPTOR.jsonColumns.has("fable_intent")).toBe(false);
   expect(AUTOPILOT_STATE_DESCRIPTOR.columns).toContain("fable_focus");
   expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("fable_focus")).toBe(true);
+  expect(AUTOPILOT_STATE_DESCRIPTOR.columns).toContain("non_fable_focus");
+  expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("non_fable_focus")).toBe(
+    true,
+  );
 });
 
 test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", () => {
@@ -663,8 +627,8 @@ test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", (
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   db.query(
     `INSERT INTO autopilot_state
-       (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode, max_concurrent_per_root, worktree_mode, fable_focus)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode, max_concurrent_per_root, worktree_mode, fable_focus, non_fable_focus)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     0,
     7,
@@ -675,6 +639,7 @@ test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", (
     2,
     1,
     '{"schema_version":1,"policy_id":"event:7","target_route":"claude-swap:2","fable_intent":true,"set_at":"2026-07-18T12:00:00.000Z","lifetime":{"kind":"permanent"}}',
+    '{"schema_version":1,"policy_id":"event:8","target_route":"claude-swap:3","fable_intent":false,"set_at":"2026-07-18T12:01:00.000Z","lifetime":{"kind":"permanent"}}',
   );
   const res = asResult(
     runQuery(db, 7, { type: "query", collection: "autopilot_state" }),
@@ -696,6 +661,19 @@ test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", (
   expect(projectFableFocus([row])).toEqual({
     valid: true,
     policy: expectedFocus,
+  });
+  const expectedNonFableFocus = {
+    schema_version: 1 as const,
+    policy_id: "event:8",
+    target_route: "claude-swap:3" as const,
+    fable_intent: false as const,
+    set_at: "2026-07-18T12:01:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  expect(row.non_fable_focus).toEqual(expectedNonFableFocus);
+  expect(projectNonFableFocus([row])).toEqual({
+    valid: true,
+    policy: expectedNonFableFocus,
   });
   // worktree_mode stays out of jsonColumns (it is a scalar INTEGER).
   expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("worktree_mode")).toBe(

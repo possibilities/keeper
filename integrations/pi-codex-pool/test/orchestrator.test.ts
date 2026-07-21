@@ -3,9 +3,17 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../../../src/codex-quota-scope.ts";
 import { writePrivateJsonAtomic } from "../src/auth.ts";
-import { classifyLiveProof } from "../src/proof.ts";
-import { PoolRouteState } from "../src/state.ts";
+import { classifyLiveProof, reportQuotaScope } from "../src/proof.ts";
+import {
+  PoolRouteState,
+  poolAliasPolicyBinding,
+  poolAliasPolicyFromEnvironment,
+} from "../src/state.ts";
 
 const MODEL = {
   id: "gpt-proof-test",
@@ -25,6 +33,27 @@ const CONTEXT = {
 };
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
 const ALIASES = ["keeper-codex-a", "keeper-codex-b"];
+
+function jwt(accountId: string, suffix: string): string {
+  const encode = (value: unknown) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })}.${suffix}`;
+}
+const GENERIC_ALIAS_POLICY = JSON.stringify({
+  [CODEX_GENERIC_QUOTA_SCOPE]: ALIASES,
+  [CODEX_SPARK_QUOTA_SCOPE]: [],
+});
+const SPARK_ALIAS_POLICY = JSON.stringify({
+  [CODEX_GENERIC_QUOTA_SCOPE]: [],
+  [CODEX_SPARK_QUOTA_SCOPE]: ALIASES,
+});
+const SPARK_MODEL = {
+  ...MODEL,
+  id: "openai-codex/gpt-5.3-codex-spark",
+  name: "GPT-5.3 Codex Spark",
+} as const;
 
 function message(stopReason: "stop" | "error" = "stop") {
   return {
@@ -79,16 +108,48 @@ function credentials(now: number) {
   return {
     "keeper-codex-a": {
       type: "oauth" as const,
-      access: "initial-access-a",
+      access: jwt("account-private-a", "initial-a"),
       refresh: "initial-refresh-a",
       expires: now + 3_600_000,
     },
     "keeper-codex-b": {
       type: "oauth" as const,
-      access: "initial-access-b",
+      access: jwt("account-private-b", "initial-b"),
       refresh: "initial-refresh-b",
       expires: now + 3_600_000,
     },
+  };
+}
+
+function scopedUsage() {
+  const resetAt = Math.floor((Date.now() + 900_000) / 1000);
+  return {
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      primary_window: {
+        used_percent: 20,
+        reset_at: resetAt,
+        limit_window_seconds: 18_000,
+      },
+      secondary_window: {
+        used_percent: 10,
+        reset_at: resetAt,
+        limit_window_seconds: 604_800,
+      },
+    },
+    additional_rate_limits: [
+      {
+        limit_name: "GPT-5.3-Codex-Spark",
+        rate_limit: {
+          primary_window: {
+            used_percent: 10,
+            reset_at: resetAt,
+            limit_window_seconds: 18_000,
+          },
+        },
+      },
+    ],
   };
 }
 
@@ -99,7 +160,12 @@ const TEST_OAUTH = {
     refreshSequence += 1;
     return {
       ...credential,
-      access: `rotated-access-${refreshSequence}`,
+      access: jwt(
+        credential.refresh.endsWith("-a")
+          ? "account-private-a"
+          : "account-private-b",
+        `rotated-${refreshSequence}`,
+      ),
       refresh: `rotated-refresh-${refreshSequence}`,
       expires: Date.now() + 3_600_000,
     };
@@ -119,6 +185,9 @@ const ENV_KEYS = [
   "KEEPER_PI_CODEX_POOL_ALIASES",
   "KEEPER_PI_CODEX_POOL_MODE",
   "KEEPER_PI_CODEX_POOL_CONFIG_BINDING",
+  "KEEPER_PI_CODEX_POOL_INITIAL_SCOPE",
+  "KEEPER_PI_CODEX_POOL_ALIAS_POLICY",
+  "KEEPER_PI_CODEX_POOL_POLICY_BINDING",
   "KEEPER_PI_CODEX_POOL_PROOF_WINDOW",
   "KEEPER_PI_CODEX_POOL_REVISION",
   "KEEPER_PI_CODEX_POOL_CONFIG_ROOT",
@@ -136,17 +205,29 @@ interface InstalledProof {
   reportPath: string;
 }
 
-async function installProof(remainingMs = 900_000): Promise<InstalledProof> {
+async function installProof(
+  remainingMs = 900_000,
+  model: typeof MODEL | typeof SPARK_MODEL = MODEL,
+): Promise<InstalledProof> {
   const { installCodexPool } = await import("../src/index.ts");
   const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-orchestrator-"));
   const now = Date.now();
   const armedAt = now - (900_000 - remainingMs);
   const binding = new PoolRouteState(ALIASES, null, () => now).binding;
+  const sparkProof = model.id === SPARK_MODEL.id;
   process.env.KEEPER_JOB_ID = "keeper-proof-job";
   process.env.PI_CODING_AGENT_DIR = sandbox;
   process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = sandbox;
   process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
   process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(ALIASES);
+  const aliasPolicy = sparkProof ? SPARK_ALIAS_POLICY : GENERIC_ALIAS_POLICY;
+  const parsedPolicy = poolAliasPolicyFromEnvironment(aliasPolicy, ALIASES);
+  if (parsedPolicy === null) throw new Error("policy fixture invalid");
+  process.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY = aliasPolicy;
+  process.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING = poolAliasPolicyBinding(
+    ALIASES,
+    parsedPolicy,
+  );
   process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = binding;
   process.env.KEEPER_PI_CODEX_POOL_REVISION = REVISION;
   process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
@@ -157,6 +238,37 @@ async function installProof(remainingMs = 900_000): Promise<InstalledProof> {
     seams: { forced_refresh: true, fault_injection: true },
   });
   writePrivateJsonAtomic(join(sandbox, "auth.json"), credentials(now));
+  if (sparkProof) {
+    writePrivateJsonAtomic(join(sandbox, "keeper-codex-pool-state.json"), {
+      schema_version: 2,
+      config_binding: binding,
+      accounts: ALIASES.map((alias) => ({
+        alias,
+        quota_scopes: [
+          {
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            used_percent: 50,
+            usage_expires_at_ms: 0,
+            cooldown_until_ms: 0,
+            observed_at_ms: now,
+            exhausted: false,
+          },
+          {
+            quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+            used_percent: 10,
+            usage_expires_at_ms: now + 60_000,
+            cooldown_until_ms: 0,
+            observed_at_ms: now,
+            exhausted: false,
+          },
+        ],
+        pressure: 0,
+        pressure_expires_at_ms: 0,
+        cooldown_until_ms: 0,
+        last_selected_at_ms: 0,
+      })),
+    });
+  }
 
   let openaiStream: any;
   let tool: any;
@@ -174,14 +286,18 @@ async function installProof(remainingMs = 900_000): Promise<InstalledProof> {
         tool = definition;
       },
     } as never,
-    { nativeDelegate: nativeStream as never, oauth: TEST_OAUTH as never },
+    {
+      nativeDelegate: nativeStream as never,
+      oauth: TEST_OAUTH as never,
+      requestUsage: async () => scopedUsage(),
+    },
   );
   sessionStart(
     { reason: "startup" },
     { sessionManager: { getSessionId: () => "root-proof-session" } },
   );
   await consume(
-    openaiStream(MODEL, CONTEXT, { sessionId: "root-proof-session" }),
+    openaiStream(model, CONTEXT, { sessionId: "root-proof-session" }),
   );
 
   const { aliasRoleBinding } = await import("../src/proof.ts");
@@ -227,6 +343,14 @@ describe("atomic Codex pool proof tool", () => {
         interrupted: false,
       });
       const report = JSON.parse(readFileSync(installed.reportPath, "utf8"));
+      expect(report.schema_version).toBe(2);
+      expect(report.quota_scope).toBe(CODEX_GENERIC_QUOTA_SCOPE);
+      expect(reportQuotaScope(report)).toBe(CODEX_GENERIC_QUOTA_SCOPE);
+      expect(
+        report.routes.every(
+          (route: any) => route.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
+        ),
+      ).toBe(true);
       expect(report.verdict).toBe("proven");
       expect(report.transcript).toHaveLength(13);
       expect(
@@ -252,6 +376,45 @@ describe("atomic Codex pool proof tool", () => {
             route.attempts === 1 &&
             route.failure_class === "rate" &&
             route.substantive_output,
+        ),
+      ).toBe(true);
+      expect(
+        classifyLiveProof(report, {
+          revision: REVISION,
+          config_binding: installed.binding,
+          alias_binding: installed.aliasBinding,
+          now_ms: report.completed_at_ms,
+        }),
+      ).toEqual({ verdict: "proven", reasons: [] });
+    } finally {
+      console.warn = originalWarn;
+      rmSync(installed.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("writes Spark proof reports under the Spark quota scope", async () => {
+    const installed = await installProof(900_000, SPARK_MODEL);
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const result = await installed.tool.execute(
+        "proof-call-spark",
+        {},
+        undefined,
+      );
+      expect(result.details).toEqual({
+        schema_version: 1,
+        status: "written",
+        verdict: "proven",
+        interrupted: false,
+      });
+      const report = JSON.parse(readFileSync(installed.reportPath, "utf8"));
+      expect(report.schema_version).toBe(2);
+      expect(report.quota_scope).toBe(CODEX_SPARK_QUOTA_SCOPE);
+      expect(reportQuotaScope(report)).toBe(CODEX_SPARK_QUOTA_SCOPE);
+      expect(
+        report.routes.every(
+          (route: any) => route.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
         ),
       ).toBe(true);
       expect(

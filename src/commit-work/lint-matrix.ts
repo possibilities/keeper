@@ -21,8 +21,10 @@
  * | `Dockerfile*` / `Containerfile*` | `hadolint` |
  * | `.{js,jsx,ts,tsx,mjs,cjs}` | `npm run lint` per nearest package.json |
  *
- * **Project-wide checks** (only when any `.py` is staged):
- *  - `uvx ty check` — typecheck is inherently cross-file.
+ * **Python project checks** (only when any `.py` is staged):
+ *  - `uvx ty check` for repositories that explicitly configure or depend on
+ *    ty; otherwise `uvx ty check <staged.py...>` keeps an untyped repository's
+ *    unrelated baseline from masking errors in the edited files.
  *  - `./scripts/lint-cli-boundaries.py` — fast regardless of repo size.
  *
  * **Staged-path-conditional drift gates** (fire on a staged-PATH match, independent
@@ -51,7 +53,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import {
   isAdrPath,
   isContextDocPath,
@@ -190,6 +192,119 @@ function readPkgScripts(pkgPath: string): Record<string, unknown> | null {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requirementNamesTy(value: string): boolean {
+  return /^ty(?:\[[^\]]*\])?(?=$|\s|[<>=!~@;(])/iu.test(value.trim());
+}
+
+function requirementListNamesTy(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      (entry) => typeof entry === "string" && requirementNamesTy(entry),
+    )
+  );
+}
+
+function dependencyMapNamesTy(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return Object.keys(value).some(
+    (name) => name.split("[", 1)[0]?.toLowerCase() === "ty",
+  );
+}
+
+function groupedRequirementListsNameTy(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.values(value).some((entries) => requirementListNamesTy(entries))
+  );
+}
+
+function recordValuesAreArrays(value: unknown): boolean {
+  return isRecord(value) && Object.values(value).every(Array.isArray);
+}
+
+function poetryGroupsHaveValidShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return Object.values(value).every(
+    (group) =>
+      isRecord(group) &&
+      (!Object.hasOwn(group, "dependencies") || isRecord(group.dependencies)),
+  );
+}
+
+function poetryGroupsNameTy(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return Object.values(value).some((group) => {
+    if (!isRecord(group)) return false;
+    return dependencyMapNamesTy(group.dependencies);
+  });
+}
+
+/**
+ * Whether this repository requires project-wide ty checking. An explicit
+ * `[tool.ty]` table or ty dependency opts in; repositories without either get
+ * staged-path checking so unrelated untyped baselines cannot suppress errors
+ * in the files being committed. An unreadable or malformed manifest chooses
+ * project-wide scope conservatively instead of weakening a possible contract.
+ */
+export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
+  try {
+    const parsed = Bun.TOML.parse(
+      readFileSync(pyprojectPath, "utf8"),
+    ) as Record<string, unknown>;
+    if (Object.hasOwn(parsed, "tool") && !isRecord(parsed.tool)) return true;
+    if (Object.hasOwn(parsed, "project") && !isRecord(parsed.project)) {
+      return true;
+    }
+    const tool = isRecord(parsed.tool) ? parsed.tool : {};
+    if (Object.hasOwn(tool, "ty")) return true;
+
+    const project = isRecord(parsed.project) ? parsed.project : {};
+    for (const owner of ["poetry", "pdm", "uv"]) {
+      if (Object.hasOwn(tool, owner) && !isRecord(tool[owner])) return true;
+    }
+    const poetry = isRecord(tool.poetry) ? tool.poetry : {};
+    const pdm = isRecord(tool.pdm) ? tool.pdm : {};
+    const uv = isRecord(tool.uv) ? tool.uv : {};
+    if (
+      (Object.hasOwn(project, "dependencies") &&
+        !Array.isArray(project.dependencies)) ||
+      (Object.hasOwn(project, "optional-dependencies") &&
+        !recordValuesAreArrays(project["optional-dependencies"])) ||
+      (Object.hasOwn(parsed, "dependency-groups") &&
+        !recordValuesAreArrays(parsed["dependency-groups"])) ||
+      (Object.hasOwn(poetry, "dependencies") &&
+        !isRecord(poetry.dependencies)) ||
+      (Object.hasOwn(poetry, "dev-dependencies") &&
+        !isRecord(poetry["dev-dependencies"])) ||
+      (Object.hasOwn(poetry, "group") &&
+        !poetryGroupsHaveValidShape(poetry.group)) ||
+      (Object.hasOwn(pdm, "dev-dependencies") &&
+        !recordValuesAreArrays(pdm["dev-dependencies"])) ||
+      (Object.hasOwn(uv, "dev-dependencies") &&
+        !Array.isArray(uv["dev-dependencies"]))
+    ) {
+      return true;
+    }
+    return (
+      requirementListNamesTy(project.dependencies) ||
+      groupedRequirementListsNameTy(project["optional-dependencies"]) ||
+      groupedRequirementListsNameTy(parsed["dependency-groups"]) ||
+      dependencyMapNamesTy(poetry.dependencies) ||
+      dependencyMapNamesTy(poetry["dev-dependencies"]) ||
+      poetryGroupsNameTy(poetry.group) ||
+      groupedRequirementListsNameTy(pdm["dev-dependencies"]) ||
+      requirementListNamesTy(uv["dev-dependencies"])
+    );
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Group JS/TS files by the nearest lint-capable package dir. Files with no
  * lint-capable ancestor are dropped (they still commit, just unlinted by npm).
@@ -262,7 +377,10 @@ export async function runScopedLint(
     JS_TS_SUFFIXES.has(suffixLower(f)),
   );
 
-  const hasPyproject = existsSync(join(cwd, "pyproject.toml"));
+  const pyprojectPath = join(cwd, "pyproject.toml");
+  const hasPyproject = existsSync(pyprojectPath);
+  const projectWideTy =
+    hasPyproject && pyprojectRequiresProjectWideTy(pyprojectPath);
   const cliBoundariesScript = join(cwd, "scripts", "lint-cli-boundaries.py");
   const tsconfigPath = join(cwd, "tsconfig.json");
   const vendorCorpusScript = join(cwd, "scripts", "vendor-corpus.ts");
@@ -319,12 +437,15 @@ export async function runScopedLint(
     });
   }
 
-  // 2 --- ty (project-wide; only when any .py is staged) ---
+  // 2 --- ty (repo-owned project scope, staged-path scope otherwise) ---
   if (hasPyproject && pyFiles.length > 0) {
     tasks.push({
       order: 2,
       run: async () => {
-        const r = await runTool(["uvx", "ty", "check"], cwd);
+        const r = await runTool(
+          ["uvx", "ty", "check", ...(projectWideTy ? [] : ["--", ...pyFiles])],
+          cwd,
+        );
         return r.code !== 0
           ? { linter: "ty", files: pyFiles, stderr: failureStderr("ty", r) }
           : null;
@@ -459,13 +580,21 @@ export async function runScopedLint(
         // timeout, so matrix duration is bounded by one tool window rather than
         // package-count × timeout when --max-files disables cardinality refusal.
         const results = await Promise.all(
-          sortedDirs.map(async (pkgDir) => ({
-            pkgDir,
-            result: await runTool(
-              ["npm", "run", "lint", "--", ...(pkgGroups.get(pkgDir) ?? [])],
+          sortedDirs.map(async (pkgDir) => {
+            const packageFiles = pkgGroups.get(pkgDir) ?? [];
+            const relPaths = packageFiles.map((fileRel) => {
+              const absPath = resolve(cwd, fileRel);
+              const relPath = relative(pkgDir, absPath);
+              return relPath.replace(/\\/g, "/");
+            });
+            return {
               pkgDir,
-            ),
-          })),
+              result: await runTool(
+                ["npm", "run", "lint", "--", ...relPaths],
+                pkgDir,
+              ),
+            };
+          }),
         );
         const npmStderrs = results
           .filter(({ result }) => result.code !== 0)

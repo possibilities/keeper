@@ -60,103 +60,165 @@ use the normal status/query surfaces to verify the same identifiers against the 
 treat moving live counts as an acceptance threshold.
 Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidence-diagnostics).
 
-### Claude account routing and Fable focus
+### Claude account routing and Account focuses
 
-Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). Every installer run executes
-`uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal to Keeper's
-non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
-registered.
+Claude launches require the `feat/json-account-capacity-metadata` branch of the
+[`possibilities/claude-swap`](https://github.com/possibilities/claude-swap) fork. The installer keeps its
+checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, rebases the
+clean integration branch onto `upstream/main`, attempts to republish it with force-with-lease, then installs
+that exact checkout through `uv`. A wrong branch, dirty checkout, fetch/rebase conflict, or clone failure skips
+installation and sends a best-effort `notifyctl` alert rather than installing unrebased source. Missing
+`uv`, a failed sync, or a failed installation is nonfatal to Keeper's non-Claude surfaces, but Claude
+remains unavailable until `cswap` works and at least one account is registered.
 
-The daemon publishes one private, freshness-bounded Capacity observation from `cswap list --json`. A
-route must have fresh `usageStatus: ok` data plus remaining session and weekly quota; Fable work also
-requires remaining Fable quota. Unknown, stale, malformed, signed-out, exhausted, or otherwise unusable
-routes are excluded rather than treated as spare capacity. A successful managed launch always runs through
-`cswap run <slot> --share-history -- <claude arguments...>`; missing or stale inventory and zero eligible
-routes fail before Claude starts.
+The daemon samples `cswap list --json` no faster than the provider-safe three-minute floor, adds jitter after
+each completed cycle, and publishes one private Capacity observation from each completed response; only a
+fresh observation supplies routing or
+focus-setup advice. Concurrent surfaces share claude-swap's persisted request claims and poll plans, so
+repainting inventory cannot bypass provider backoff. claude-swap owns each row's `usageStatus`,
+raw quota values, bounded provider account category, and explicit capacity multiplier, including its
+last-good and backoff policy. Keeper admits only `usageStatus: ok`
+routes with valid provenance, required session and weekly windows, and remaining raw quota; Fable work
+also requires remaining Fable quota. Per-account Measurement age is diagnostic provenance shown by
+`keeper usage`, never a second eligibility gate. A fresh non-`ok` row removes the route immediately, while
+unknown, malformed, signed-out, exhausted, or otherwise unusable routes remain excluded. Every managed
+launch runs through `cswap run <slot> --share-history -- <claude arguments...>`; stale Capacity inventory
+and zero eligible routes fail before Claude starts.
 
 #### Routing model
 
 An **Account route** is the PII-free stable identity `claude-swap:<slot>`. Persist and operate on that
-route, not on a display ordinal: `cN` is only the current zero-based inventory label shown by Claude and
-can name a different Account route after inventory changes. An explicit per-launch `--x-account` request
-uses that display label and takes precedence for that one process; it never changes Fable focus.
+route, not a display ordinal. `cN` is only Claude's current zero-based inventory label and can name a
+different route after inventory changes: `c1` is the second displayed account, while `claude-swap:2` is
+stable durable intent. An explicit `keeper agent claude --x-account cN` request uses the current display
+label for that launch only; it never changes either focus and refuses rather than selecting another route
+when its requested account is unavailable.
 
-Every fresh, resumed, restored, or forked Claude process is selected independently from current eligible
-routes. Without an effective Fable focus, normal balancing selects the route from current quota pressure,
-Fable availability, recency, and short-lived Launch reservations. Launch attribution records the selected
-Account route for that process only; it never creates account affinity for later work.
+An **Account focus** is a durable preference over one stable Account route. The two focuses are independent:
 
-**Fable focus** is one optional durable preference for a stable Account route. For Fable work, an eligible
-focus target wins after normal eligibility filtering. If that target cannot serve the launch, Keeper reports
-`fallback` and uses normal eligible-route balancing; focus never makes an ineligible route viable. For
-non-Fable Claude work, the target is soft-avoided whenever another route is eligible, but remains eligible
-as the sole route. This preserves availability while reserving the target's Fable capacity when possible.
+- **Fable focus** matches only proven Fable intent. It supports `permanent`, `absolute`, `current-reset`,
+  and `cycle-end` lifetimes.
+- **Non-Fable focus** matches only proven non-Fable intent. It supports `permanent` and `absolute`
+  lifetimes.
 
-**Fable intent** is process-lineage routing metadata, not Launch attribution. An explicit effective model
-sets or overrides it; a continuation, resume, restore, or fork inherits it when no explicit override is
-present. An interactive model change cannot move an already-running process to another Account route.
+An absolute lifetime is active only while `now < deadline`; `permanent` lasts until replaced or cleared.
+Fresh launches and passthrough commands establish explicit intent. Continuation, resume, restore, and fork
+inherit process-lineage Fable intent unless an explicit model overrides it. Unknown intent matches neither
+focus. Launch attribution records the route used by one process; it is not intent or Account affinity.
 
-A focus lifetime is one of:
+Selection uses one eligible-route set and this complete precedence:
 
-- `permanent`, effective until replacement or clear;
-- `absolute`, effective strictly before its timezone-bearing UTC deadline;
-- `current-reset`, which snapshots the selected route's fresh `model:Fable` reset boundary as an absolute
-  deadline; or
-- `cycle-end`, which completes when that same reset boundary passes or a fresh target observation proves
-  full Fable utilization.
+1. an explicit per-launch `--x-account` request;
+2. the eligible focus matching proven Fable or proven non-Fable intent;
+3. for non-Fable work with no matching target, soft avoidance of the active Fable target while another
+   eligible route exists; then
+4. normal Account-route scoring, reservation pressure, least-recently-used order, and stable tie-breaking.
+
+A matching eligible target wins even under reservation pressure. A Fable focus soft-avoids its target only
+for non-Fable work; a Non-Fable focus neither affects Fable work nor changes that scope's Fable policy. An
+inactive, expired, unavailable, absent, or ineligible matching target visibly falls through the remaining
+precedence. This **focus fallback** is visible Account-route fallback, not model fallback or Pi/Codex
+native fallback; it never makes an ineligible route viable or bypasses mandatory claude-swap routing.
+
+Each focus has its own durable policy and launch-delivery health. A malformed or unavailable Non-Fable
+delivery cannot disable a valid Fable focus, and vice versa. Inspection reports each scope's configured state,
+target, lifetime, eligibility, outcome, reason, and delivery diagnostic independently.
 
 #### Inspect routing state
 
 Use the read-only account check for Capacity observation health, candidate Account routes, and the
 ordinary route choice; it records no Launch reservation. Use the focus view for durable policy, effective
-state, target, lifetime, fallback, and delivery diagnostic. Both are PII-free.
+state, target, lifetime, fallback, and delivery diagnostic. `keeper usage` renders provider meters: only
+cswap's decision-trusted `usage` can supply an Account route, while separately marked last-good data remains
+visible under `[unavailable]` with its `measured` age and cannot authorize a launch. The source age is
+whole-snapshot Capacity freshness. Account headers also show a bounded provider account category and, only
+when the producer reports one explicitly, a capacity multiplier such as `Claude 1 · Max 20×`. Unknown values
+are omitted, never guessed. These surfaces are PII-free.
 
 ```sh
 keeper agent accounts check --json
 keeper agent accounts fable-focus show --json
+keeper usage
+keeper agent accounts non-fable-focus show --json
 keeper status --json
 keeper board
 ```
 
-`keeper status --json` includes `data.fable_focus`. `keeper board` presents the same effective Fable focus
-state in its semantic header, including the target, lifetime, and focused or fallback outcome; its snapshot
-and copied diagnostics retain that header.
+`accounts check --json` reports `claude_launch_routing.fable_focus` and
+`claude_launch_routing.non_fable_focus`, alongside current capacity and the route it would choose without
+creating a reservation. `keeper status --json` exposes the same views as `data.fable_focus` and
+`data.non_fable_focus`. `keeper board` renders full `Fable focus` and `Non-Fable focus` sections in its
+live, snapshot, frame, sidecar, and copied output. Off focuses collapse to one line; configured sections
+show target, lifetime, current eligibility, and effective routing state, while unavailable sections preserve
+the effective state and delivery diagnostic.
 
-#### Activate, verify, and clear Fable focus
+#### Operate Account focuses
 
-Use a stable Account route from a fresh inspection. For a guarded current-reset activation, set the
-expected value to the fresh target `model:Fable` reset boundary in timezone-bearing UTC; the placeholders
-below are values to substitute, not account identities or a rollout schedule.
+Use a stable route from fresh inspection. Ordinary changes are scope-specific: setting or clearing one
+focus leaves the other focus intact.
 
 ```sh
 route='claude-swap:<stable-slot>'
+deadline='<fixed-timezone-bearing-UTC-deadline>'
 expected_reset='<fresh-model-Fable-reset-in-UTC>'
+
+keeper agent accounts fable-focus set "$route" permanent --json
+keeper agent accounts fable-focus set "$route" absolute "$deadline" --json
 keeper agent accounts fable-focus set "$route" current-reset \
   --expect-reset "$expected_reset" --json
-keeper agent accounts fable-focus show --json
+keeper agent accounts non-fable-focus set "$route" permanent --json
 ```
 
-The command atomically snapshots the observed boundary before setting policy. An expected-boundary
-mismatch, stale or missing reset evidence, or an already elapsed boundary is a refusal: it leaves the
-existing policy unchanged and never advances the focus into a later reset cycle. Re-read `show` after any
-refusal or uncertain acknowledgement before choosing another action.
+`current-reset` snapshots the fresh Fable reset boundary and refuses a stale, missing, elapsed, or
+mismatched boundary rather than rolling into a later cycle. `cycle-end` is the Fable-only companion to
+that snapshot. Use an absolute deadline for a fixed Non-Fable window.
 
-Other durable lifetimes use the same stable route form:
+##### Guarded Non-Fable activation
+
+Use this runbook only while the fixed deadline is still authoritative. It does not create a relative window.
+Inspect the policy and capacity first; confirm that `$route` appears in the current candidates and is eligible,
+and independently establish `now < $deadline`. Then issue the guarded absolute update and verify every
+read surface:
 
 ```sh
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' permanent --json
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' absolute '<timezone-bearing-UTC-deadline>' --json
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' cycle-end --json
+route='claude-swap:<stable-slot>'
+deadline='<fixed-timezone-bearing-UTC-deadline>'
+
+keeper agent accounts non-fable-focus show --json
+keeper agent accounts fable-focus show --json
+keeper agent accounts check --json
+# Require: $route is present and eligible, and now < $deadline.
+keeper agent accounts non-fable-focus set "$route" absolute "$deadline" \
+  --require-eligible --json
+keeper agent accounts non-fable-focus show --json
+keeper agent accounts check --json
+keeper status --json
+keeper board
 ```
 
-Clear is the rollback and is idempotent when the policy is already off. It also repairs an unavailable
-delivery view by publishing the durable clear; if its acknowledgement is uncertain, inspect before
-repeating it.
+`--require-eligible` requires fresh global capacity evidence and an eligible target. An elapsed deadline,
+missing or ineligible target, stale capacity, or refusal makes no policy update. Do not turn a missed
+deadline into a new relative window, and do not clear, replace, or retry either focus merely to recover from
+a missed or refused activation: inspect first so a concurrent human policy remains intact. If the mutation
+acknowledgement is uncertain, re-read the affected `show --json` view before deciding whether a deliberate
+retry is needed.
+
+##### Roll back one scope
+
+Clear is the rollback and is idempotent when that scope is already off. It also repairs an unavailable
+launch-delivery view by publishing the durable clear. Inspect first after an uncertain acknowledgement; do
+not repeat a mutation blindly.
 
 ```sh
 keeper agent accounts fable-focus clear --json
 keeper agent accounts fable-focus show --json
+keeper agent accounts non-fable-focus clear --json
+keeper agent accounts non-fable-focus show --json
 ```
+
+Account focuses affect only Keeper-launched Claude routing. Pi and Codex session routing are isolated:
+Non-Codex Pi providers keep their native path, and the Pi Codex pool has its own visible native
+`openai-codex` fallback and proof-gated activation.
 
 Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
 absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.
@@ -206,20 +268,22 @@ environment can produce a fresh routing observation. A durable `KEEPER_PI_CODEX_
 skips the link and is used verbatim instead.
 
 The companion affects only `openai-codex`. Non-Codex providers keep Pi's native path. Root and inherited
-pi-subagents child requests share the Provider wrapper but select independently by session id. A session
-keeps its healthy opaque alias. One logical Provider call may move to one different alias only after a
-classified quota, rate, authentication, or transport failure **before** Substantive output. Text,
-thinking, tool calls, and unknown stream events close that retry window.
+pi-subagents child requests share the Provider wrapper but select independently by `(session, scope)`. The
+requested model derives the scope: `openai-codex/gpt-5.3-codex-spark` (or basename
+`gpt-5.3-codex-spark`) uses `model:gpt-5.3-codex-spark`; every other Codex request uses `generic`. A
+session keeps its healthy opaque alias only for the same scope. One logical Provider call may move to one
+different alias only after a classified quota, rate, authentication, or transport failure **before**
+Substantive output. Text, thinking, tool calls, and unknown stream events close that retry window.
 
-Activation is intentionally pending until the separate live two-account proof is complete. Pending,
-missing, incompatible, stale, interrupted, or unhealthy machinery uses Pi's native `openai-codex`
-credential and emits the fixed warning
+Activation is intentionally pending until a separate live proof activates the requested scope. Pending,
+missing, incompatible, stale, interrupted, missing Spark-scope evidence, missing scoped authorization, or
+unhealthy machinery uses Pi's native `openai-codex` credential and emits the fixed warning
 `[keeper-codex-pool] pool-unavailable; using native openai-codex`; it never claims a balanced route.
-The launch environment carries only a bounded mode and proof-window state, opaque aliases, an optional
-opaque initial route candidate for Codex work, revision and configuration bindings, and a bounded reason
-code. OAuth credentials remain in Pi's private `auth.json`; account ids, provider
-headers, raw errors, tokens, plan labels, and account PII do not enter Keeper diagnostics, proof reports,
-launch environments, the daemon database, or a Projection.
+The launch environment carries only a bounded mode and proof-window state, opaque aliases, a scope-keyed
+alias policy plus binding, an optional opaque initial route candidate tagged with its scope, revision and
+configuration bindings, and a bounded reason code. OAuth credentials remain in Pi's private `auth.json`;
+account ids, provider headers, raw errors, tokens, plan labels, and account PII do not enter Keeper
+diagnostics, proof reports, launch environments, the daemon database, or a Projection.
 
 Inspect Claude launch-routing and Codex session-routing together. This read does not create a Claude
 Launch reservation or Codex pressure:
@@ -247,19 +311,29 @@ keeper agent accounts codex-pool enroll keeper-codex-b
 Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
 Codex on those surfaces to remain unavailable until activation.
 
-Arm one proof window and run the managed Pi proof probe. The run wrapper accepts this exact Pi-only
-launcher flag and forwards it to the managed launch. The probe directs Pi to invoke the `codex_pool_proof`
-tool exactly once; the tool runs the bounded proof and atomically writes its private report to
-`~/.config/keeper/codex-pool/live-proof.json` before the window closes:
+Arm one proof window and run the managed Pi proof probe for the scope you are activating. The run wrapper
+accepts this exact Pi-only launcher flag and forwards it to the managed launch. The requested model chosen
+by that managed Pi call determines the proof scope; use the actual Spark launch id
+`openai-codex/gpt-5.3-codex-spark` when proving Spark, and ordinary Codex model syntax for `generic`. The
+probe directs Pi to invoke the `codex_pool_proof` tool exactly once; the tool runs the bounded proof and
+atomically writes its private report to `~/.config/keeper/codex-pool/live-proof.json` before the window
+closes:
 
 ```sh
+# Generic Codex
 keeper agent run pi --x-codex-pool-proof-window=arm \
+  'Call the codex_pool_proof tool exactly once and return its JSON result.'
+
+# Spark
+keeper agent run pi --model openai-codex/gpt-5.3-codex-spark \
+  --x-codex-pool-proof-window=arm \
   'Call the codex_pool_proof tool exactly once and return its JSON result.'
 ```
 
-Stage and classify that exact report, then activate promptly. Unknown fields, sanitation findings, stale
-revision/configuration/alias bindings, interruption, incomplete root/child routes, or incomplete restoration
-cannot pass:
+Stage and classify that exact report, then activate promptly. The report must carry one exact top-level
+scope and the same scope on every route; mixed scopes, display labels, old schemas, unknown fields,
+sanitation findings, stale revision/configuration/alias bindings, interruption, incomplete root/child
+routes, or incomplete restoration cannot pass:
 
 ```sh
 keeper agent accounts codex-pool proof capture \
@@ -271,10 +345,14 @@ keeper agent accounts codex-pool verify --json
 
 Activation uses a host-local advisory lock and a private transaction marker. The marker makes native mode
 authoritative throughout reload and verification; the active state publishes atomically only after the
-fresh report still matches the current code revision, configuration, alias roles, companion contract, and
-healthy Capacity observation. A concurrent activation is refused. Reload or immediate verification
-failure returns `rollback-complete`; an interrupted or unwritable rollback leaves `recovery-required`,
-which also forces native mode.
+fresh report still matches the current code revision, configuration, alias roles, proved scope, companion
+contract, scoped alias policy, and healthy Capacity observation. A full proof authorizes all enrolled
+aliases for its scope; a scoped or degraded activation preserves other-scope policy only when the stored
+activation is valid and still binding-matched. Status is `active` when generic is fully pooled,
+`active-scoped` when Spark policy is in force (including a Spark single-alias authorization), and
+`active-degraded` for the compatible explicit generic single-alias pin.
+A concurrent activation is refused. Reload or immediate verification failure returns `rollback-complete`;
+an interrupted or unwritable rollback leaves `recovery-required`, which also forces native mode.
 
 Rollback and recovery are idempotent and require no credential edits:
 
@@ -301,9 +379,9 @@ degraded.
 
 Enroll the **surviving** account as the primary alias (the first entry in `KEEPER_PI_CODEX_POOL_ALIASES`,
 `keeper-codex-a` by default) and the quota-dead account as the alternate; degraded activation pins routing
-to the primary and immediate verification refuses any other pin. Degraded activation is never implicit — it
-requires the explicit flag naming the degraded verdict, and without it a degraded report is refused with
-`proof-degraded-unauthorized`:
+for the proved scope to the primary and immediate verification refuses any other pin. Degraded activation is
+never implicit — it requires the explicit flag naming the degraded verdict, and without it a degraded report
+is refused with `proof-degraded-unauthorized`:
 
 ```sh
 keeper agent accounts codex-pool proof verdict --json   # proven-degraded-single-alias
@@ -313,13 +391,15 @@ keeper agent accounts codex-pool status --json          # state=active-degraded
 keeper agent accounts check                             # activation=active-degraded, DEGRADED single-alias
 ```
 
-The active pool routes only through the pinned healthy alias and surfaces `active-degraded` loudly in
-`status` and `accounts check`; it never presents balanced operation. When the quota recovers, run a fresh
-**full** proof and activate normally — a genuine `proven` report upgrades the pool to full `active` and
-clears the degraded marker. A partial or still-degraded report never upgrades.
+A generic-only degraded pool routes only through the pinned healthy alias and surfaces `active-degraded`
+loudly in `status` and `accounts check`; a degraded Spark proof produces an `active-scoped` policy naming
+only its proved alias. Neither presents balanced operation. When the quota recovers, run
+a fresh **full** proof for that scope and activate normally — a genuine `proven` report upgrades that
+scope's authorization and clears the degraded marker when every effective scope is fully authorized. A
+partial or still-degraded report never upgrades.
 
 ```sh
-keeper agent accounts codex-pool activate --json        # full proven → active, degraded marker cleared
+keeper agent accounts codex-pool activate --json        # full proven → active/active-scoped, degraded marker cleared
 ```
 
 ### Reload trigger
@@ -549,11 +629,6 @@ active to archived history. Sending hands the body to the selected harness throu
 so process visibility and that harness's transcript policy apply beyond the mode-0600 local store.
 `keeper note --help` carries the interaction and failure semantics.
 
-## Sitter scanners (optional)
-
-One manual step has no code home: the read-only sitter set lives in its own repo at `~/code/sitter`;
-install and uninstall it per that repo's `README.md`.
-
 ## Uninstall
 
 ```sh
@@ -570,7 +645,6 @@ rm -f ~/.config/fish/completions/keeper.fish
 rm -f ~/.local/share/bash-completion/completions/keeper
 rm -f ~/.local/share/zsh/site-functions/_keeper
 rm -f "$(brew --prefix 2>/dev/null)/share/zsh/site-functions/_keeper"
-# Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```
 

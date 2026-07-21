@@ -13,7 +13,6 @@ import {
   ledgerPath,
   OBSERVATION_SCHEMA_VERSION,
   observationSidecarPath,
-  ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
 } from "../src/account-routing-config";
 
 const NOW = Date.parse("2026-07-18T00:00:00Z");
@@ -156,34 +155,35 @@ describe("mandatory managed account selection", () => {
     expect(!result.ok && result.error).not.toContain("private@example.test");
   });
 
-  test("revalidates route measurement freshness at the launch boundary", () => {
+  test("measurement age and future skew do not veto shared route admission", () => {
     const dir = root();
-    const boundary = {
+    const oldMeasurement = {
       ...route(3, 0.2),
-      measuredAtMs: NOW - ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
+      measuredAtMs: Date.parse("2001-01-01T00:00:00Z"),
     };
-    publish(dir, observation([boundary]));
-    expect(selectRoute({ stateDir: dir, nowMs: NOW }).ok).toBe(true);
+    const futureMeasurement = {
+      ...route(4, 0.4),
+      measuredAtMs: Date.parse("2099-01-01T00:00:00Z"),
+    };
+    publish(dir, observation([oldMeasurement, futureMeasurement]));
 
-    const expired = { ...boundary, measuredAtMs: boundary.measuredAtMs - 1 };
-    publish(dir, observation([expired]));
-    const automatic = selectRoute({ stateDir: dir, nowMs: NOW });
-    expect(automatic.ok).toBe(false);
-    expect(!automatic.ok && automatic.error).toContain(
-      "c0: quota measurement is stale",
-    );
-    const explicit = selectRouteByAccountOrdinal(0, {
-      stateDir: dir,
-      nowMs: NOW,
+    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:3" },
     });
-    expect(explicit.ok).toBe(false);
-    expect(!explicit.ok && explicit.error).toContain(
-      "Requested account c0 cannot serve this Claude launch.\n  c0: quota measurement is stale.",
-    );
+    expect(
+      selectRouteByAccountOrdinal(1, { stateDir: dir, nowMs: NOW }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:4", reason: "requested-account" },
+    });
     expect(inspectRouting({ stateDir: dir, nowMs: NOW })).toMatchObject({
-      enabled: false,
-      would_choose: null,
-      error: expect.stringContaining("c0: quota measurement is stale"),
+      enabled: true,
+      would_choose: { id: "claude-swap:3" },
+      candidates: [
+        { id: "claude-swap:3", worst_utilization: 0.25 },
+        { id: "claude-swap:4", worst_utilization: 0.45 },
+      ],
     });
   });
 
@@ -202,13 +202,19 @@ describe("mandatory managed account selection", () => {
     });
   });
 
-  test("Fable uses the account with the most Fable quota left", () => {
+  test("Fable uses raw Fable quota after a reported reset time", () => {
     const dir = root();
+    const elapsedReset = routeWithFable(2, 0.1, 0.8);
+    elapsedReset.windows = elapsedReset.windows.map((window) =>
+      window.key === "model:Fable"
+        ? { ...window, resetsAt: "2026-07-17T23:00:00Z" }
+        : window,
+    );
     publish(
       dir,
       observation([
         routeWithFable(1, 0.8, 0.1),
-        routeWithFable(2, 0.1, 0.8),
+        elapsedReset,
         routeWithFable(3, 0.05, null),
       ]),
     );
@@ -285,7 +291,7 @@ describe("mandatory managed account selection", () => {
       dir,
       observation([routeWithFable(1, 0.2, 1)], {
         count: 2,
-        accountIssues: { "claude-swap:21": "measurement-stale" },
+        accountIssues: { "claude-swap:21": "token-expired" },
       }),
     );
     expect(selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" })).toEqual({
@@ -293,41 +299,24 @@ describe("mandatory managed account selection", () => {
       error: [
         "Claude cannot start with Fable.",
         "  c0: Fable quota is exhausted.",
-        "  c1: quota measurement is stale.",
+        "  c1: has an expired token.",
         "Next: run `cswap list --json` to refresh status or repair the listed account.",
       ].join("\n"),
     });
   });
 
-  test("Fable requires live session, week, and Fable quota", () => {
-    const missingSession = routeWithFable(1, 0.1, 0.1);
-    missingSession.windows = missingSession.windows.filter(
-      (window) => window.key !== "session",
-    );
+  test("Fable requires non-exhausted week and Fable quota", () => {
     const exhaustedWeek = routeWithFable(2, 0.1, 0.1);
     exhaustedWeek.windows = exhaustedWeek.windows.map((window) =>
       window.key === "week" ? { ...window, utilization: 1 } : window,
     );
     const exhaustedFable = routeWithFable(3, 0.1, 1);
     const missingFable = routeWithFable(4, 0.1, null);
-    const ambiguousFable = routeWithFable(5, 0.1, 0.1);
-    ambiguousFable.windows.push({
-      key: "model:Fable",
-      utilization: 1,
-      resetsAt: null,
-    });
     const valid = routeWithFable(6, 0.9, 0.9);
     const dir = root();
     publish(
       dir,
-      observation([
-        missingSession,
-        exhaustedWeek,
-        exhaustedFable,
-        missingFable,
-        ambiguousFable,
-        valid,
-      ]),
+      observation([exhaustedWeek, exhaustedFable, missingFable, valid]),
     );
     const selected = selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" });
     expect(selected.ok && selected.selection.id).toBe("claude-swap:6");
@@ -348,18 +337,33 @@ describe("mandatory managed account selection", () => {
     ]);
   });
 
-  test("past reset windows receive rollover grace", () => {
+  test("raw exhaustion remains authoritative after a reported reset time", () => {
     const dir = root();
-    const reset: Route = {
+    const exhausted: Route = {
       ...route(1, 1),
       windows: [
         { key: "session", utilization: 0.1, resetsAt: null },
         { key: "week", utilization: 1, resetsAt: "2026-07-17T23:00:00Z" },
       ],
     };
-    publish(dir, observation([reset, route(2, 0.2)]));
-    const selected = selectRoute({ stateDir: dir, nowMs: NOW });
-    expect(selected.ok && selected.selection.id).toBe("claude-swap:1");
+    publish(dir, observation([exhausted, route(2, 0.2)]));
+    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2" },
+    });
+    const explicit = selectRouteByAccountOrdinal(0, {
+      stateDir: dir,
+      nowMs: NOW,
+    });
+    expect(explicit.ok).toBe(false);
+    expect(!explicit.ok && explicit.error).toContain(
+      "weekly quota is exhausted; resets 2026-07-17T23:00:00.000Z",
+    );
+    expect(inspectRouting({ stateDir: dir, nowMs: NOW })).toMatchObject({
+      enabled: true,
+      would_choose: { id: "claude-swap:2" },
+      candidates: [{ id: "claude-swap:2", worst_utilization: 0.25 }],
+    });
   });
 });
 
@@ -373,12 +377,13 @@ describe("durable Fable focus", () => {
     lifetime: { kind: "permanent" as const },
   };
 
-  test("eligible target serves every Fable launch despite reservation pressure", () => {
+  test("eligible target serves every Fable launch despite age and reservation pressure", () => {
     const dir = root();
-    publish(
-      dir,
-      observation([routeWithFable(1, 0.01, 0.01), routeWithFable(2, 0.9, 0.9)]),
-    );
+    const target = {
+      ...routeWithFable(2, 0.9, 0.9),
+      measuredAtMs: Date.parse("2001-01-01T00:00:00Z"),
+    };
+    publish(dir, observation([routeWithFable(1, 0.01, 0.01), target]));
     const deps = {
       stateDir: dir,
       nowMs: NOW,
@@ -510,6 +515,225 @@ describe("durable Fable focus", () => {
   });
 });
 
+describe("independent scoped Account focus", () => {
+  const fablePolicy = {
+    schema_version: 1 as const,
+    policy_id: "event:20",
+    target_route: "claude-swap:1" as const,
+    fable_intent: true as const,
+    set_at: "2026-07-17T00:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  const nonFablePolicy = {
+    schema_version: 1 as const,
+    policy_id: "event:21",
+    target_route: "claude-swap:2" as const,
+    fable_intent: false as const,
+    set_at: "2026-07-17T00:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  const deliveries = {
+    focusDelivery: { available: true as const, policy: fablePolicy },
+    nonFableFocusDelivery: {
+      available: true as const,
+      policy: nonFablePolicy,
+    },
+  };
+
+  test("proven Non-Fable focus wins before Fable avoidance and reservation pressure", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([
+        routeWithFable(1, 0.01, 0.9),
+        routeWithFable(2, 0.95, 0.1),
+        routeWithFable(3, 0.02, null),
+      ]),
+    );
+    const first = selectRoute({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    });
+    const second = selectRoute({
+      stateDir: dir,
+      nowMs: NOW + 1,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "non-fable-focus" },
+    });
+    expect(second).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "non-fable-focus" },
+    });
+  });
+
+  test("proven Fable ignores Non-Fable focus and unknown intent matches neither", () => {
+    const fableDir = root();
+    publish(
+      fableDir,
+      observation([routeWithFable(1, 0.8, 0.8), routeWithFable(2, 0.01, 0.01)]),
+    );
+    expect(
+      selectRoute({
+        stateDir: fableDir,
+        nowMs: NOW,
+        model: "fable",
+        fableIntent: true,
+        ...deliveries,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "fable-focus" },
+    });
+
+    const unknownDir = root();
+    publish(
+      unknownDir,
+      observation([routeWithFable(1, 0.2, 0.9), routeWithFable(2, 0.2, 0.1)]),
+    );
+    expect(
+      selectRoute({
+        stateDir: unknownDir,
+        nowMs: NOW,
+        model: null,
+        fableIntent: null,
+        ...deliveries,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "selected" },
+    });
+  });
+
+  test("ineligible Non-Fable target visibly falls through Fable avoidance", () => {
+    const dir = root();
+    const ineligible = routeWithFable(2, 0.1, 0.1);
+    ineligible.windows = ineligible.windows.map((window) =>
+      window.key === "week" ? { ...window, utilization: 1 } : window,
+    );
+    publish(
+      dir,
+      observation([
+        routeWithFable(1, 0.1, 0.9),
+        ineligible,
+        routeWithFable(3, 0.9, 0.2),
+      ]),
+    );
+    const deps = {
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    };
+    expect(selectRoute(deps)).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:3", reason: "fable-focus-avoided" },
+    });
+    expect(inspectRouting(deps).non_fable_focus).toEqual({
+      configured: true,
+      state: "active",
+      target_route: "claude-swap:2",
+      lifetime: { kind: "permanent" },
+      target_eligible: false,
+      outcome: "fallback",
+      reason: "target-ineligible",
+      diagnostic: "none",
+    });
+  });
+
+  test("same target reports two independent focused outcomes", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.1, 0.1), routeWithFable(2, 0.9, 0.9)]),
+    );
+    const sameTargetFable = {
+      ...fablePolicy,
+      target_route: "claude-swap:2" as const,
+    };
+    const inspection = inspectRouting({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      focusDelivery: { available: true, policy: sameTargetFable },
+      nonFableFocusDelivery: {
+        available: true,
+        policy: nonFablePolicy,
+      },
+    });
+    expect(inspection.fable_focus).toMatchObject({
+      target_route: "claude-swap:2",
+      outcome: "focused",
+      reason: "target-focused",
+    });
+    expect(inspection.non_fable_focus).toMatchObject({
+      target_route: "claude-swap:2",
+      outcome: "focused",
+      reason: "target-focused",
+    });
+    expect(inspection.would_choose).toMatchObject({
+      id: "claude-swap:2",
+      reason: "non-fable-focus",
+    });
+  });
+
+  test("expired and unavailable Non-Fable policy state stays isolated", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.2, 0.2), routeWithFable(2, 0.8, 0.8)]),
+    );
+    const expired = {
+      ...nonFablePolicy,
+      lifetime: {
+        kind: "absolute" as const,
+        deadline_at: "2026-07-18T00:00:00.000Z",
+      },
+    };
+    expect(
+      inspectRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        model: "opus",
+        fableIntent: false,
+        focusDelivery: deliveries.focusDelivery,
+        nonFableFocusDelivery: { available: true, policy: expired },
+      }).non_fable_focus,
+    ).toMatchObject({
+      state: "expired",
+      outcome: "fallback",
+      reason: "policy-inactive",
+    });
+    const unavailable = inspectRouting({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
+      fableIntent: true,
+      focusDelivery: deliveries.focusDelivery,
+      nonFableFocusDelivery: {
+        available: false,
+        diagnostic: "delivery-malformed",
+      },
+    });
+    expect(unavailable.fable_focus.outcome).toBe("focused");
+    expect(unavailable.non_fable_focus).toMatchObject({
+      state: "unavailable",
+      outcome: "fallback",
+      reason: "policy-unavailable",
+      diagnostic: "delivery-malformed",
+    });
+  });
+});
+
 describe("explicit account resolution", () => {
   test("the active account is an ordinary managed route", () => {
     const dir = root();
@@ -554,7 +778,7 @@ describe("explicit account resolution", () => {
       dir,
       observation([route(9, 0.1)], {
         count: 2,
-        accountIssues: { "claude-swap:21": "account-unavailable" },
+        accountIssues: { "claude-swap:21": "usage-unavailable" },
       }),
     );
     const unavailable = selectRouteByAccountOrdinal(1, {
@@ -563,7 +787,7 @@ describe("explicit account resolution", () => {
     });
     expect(unavailable.ok).toBe(false);
     expect(!unavailable.ok && unavailable.error).toContain(
-      "Requested account c1 cannot serve this Claude launch.\n  c1: is unavailable according to claude-swap.",
+      "Requested account c1 cannot serve this Claude launch.\n  c1: has unavailable usage according to claude-swap.",
     );
     expect(
       selectRouteByAccountOrdinal(2, { stateDir: dir, nowMs: NOW }),

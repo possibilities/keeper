@@ -19,7 +19,6 @@ import {
   MAX_OUTPUT_BYTES,
   observationRefreshLockPath,
   observationSidecarPath,
-  ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
   SUBPROCESS_TIMEOUT_MS,
 } from "./account-routing-config";
 import { FileLock } from "./file-lock";
@@ -30,7 +29,6 @@ export interface ObserveDeps {
   runner: ExactArgvRunner;
   nowMs: () => number;
   cswapArgv?: string[];
-  freshnessCeilingMs?: number;
 }
 
 export async function observeOnce(deps: ObserveDeps): Promise<Observation> {
@@ -38,11 +36,7 @@ export async function observeOnce(deps: ObserveDeps): Promise<Observation> {
   const observedAtMs = deps.nowMs();
   return buildObservation({
     observedAtMs,
-    cswap: parseCswapList(
-      outcome,
-      observedAtMs,
-      deps.freshnessCeilingMs ?? ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
-    ),
+    cswap: parseCswapList(outcome, observedAtMs),
   });
 }
 

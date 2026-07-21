@@ -107,7 +107,7 @@ test("default --view is board; a bare invocation dispatches to the board entry",
   expect(h.calls[0]?.view).toBe("board");
 });
 
-test("the dispatch table reaches all five views by name", async () => {
+test("the dispatch table reaches all four views by name", async () => {
   for (const view of FRAMES_VIEWS) {
     const h = makeHarness();
     await run(h, ["--view", view, "--max-frames", "1"]);

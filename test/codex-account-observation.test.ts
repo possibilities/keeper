@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,12 +15,17 @@ import {
 } from "../src/account-routing-config";
 import {
   CODEX_PROVIDER,
+  codexScopedAliasCapacityView,
   isCodexObservationFresh,
   parseCodexObserverOutcome,
   readCodexObservationSidecar,
   validateCodexObservation,
   writeCodexObservationSidecar,
 } from "../src/codex-account-observation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
 
 const NOW = Date.parse("2026-07-18T12:00:00Z");
 const BINDING = "a".repeat(64);
@@ -34,18 +46,21 @@ function envelope(overrides: Record<string, unknown> = {}): unknown {
       {
         alias: "keeper-codex-a",
         usage: {
-          schema_version: 1,
+          schema_version: 2,
           alias: "keeper-codex-a",
           status: "healthy",
+          account_category: "pro",
           observed_at_ms: NOW,
           expires_at_ms: NOW + 60_000,
           windows: [
             {
               role: "primary",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
               key: "week",
               label: "weekly",
               window_seconds: 604_800,
               used_percent: 12.3,
+              exhausted: false,
               reset_at_ms: NOW + 30_000,
               private_plan: "enterprise-secret",
             },
@@ -80,15 +95,18 @@ describe("Codex observer envelope", () => {
         {
           alias: "keeper-codex-a",
           status: "healthy",
+          account_category: "pro",
           observed_at_ms: NOW,
           expires_at_ms: NOW + 60_000,
           windows: [
             {
               role: "primary",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
               key: "week",
               label: "weekly",
               window_seconds: 604_800,
               used_percent: 12.3,
+              exhausted: false,
               reset_at_ms: NOW + 30_000,
             },
           ],
@@ -116,6 +134,12 @@ describe("Codex observer envelope", () => {
     ).toBeNull();
     expect(parseCodexObserverOutcome({ code: 0, stdout: "{" })).toBeNull();
     expect(parse(envelope({ schema_version: 2 }))).toBeNull();
+    const oldUsage = envelope() as Record<string, unknown>;
+    const oldUsageAliases = oldUsage.aliases as Array<{
+      usage: Record<string, unknown>;
+    }>;
+    if (oldUsageAliases[0]) oldUsageAliases[0].usage.schema_version = 1;
+    expect(parse(oldUsage)).toBeNull();
     expect(parse(envelope({ truncated: true }))).toBeNull();
     const duplicate = envelope() as Record<string, unknown>;
     duplicate.aliases = [
@@ -131,29 +155,49 @@ describe("Codex observer envelope", () => {
     ).toBeNull();
   });
 
-  test("accepts only fixed status classes, opaque aliases, and bounded windows", () => {
+  test("accepts only fixed status classes, categories, opaque aliases, and bounded windows", () => {
     const invalidAlias = envelope() as Record<string, unknown>;
     invalidAlias.aliases = [
       {
         alias: "owner@example.test",
         usage: {
-          schema_version: 1,
+          schema_version: 2,
           alias: "owner@example.test",
           status: "healthy",
           observed_at_ms: NOW,
           expires_at_ms: NOW + 1,
-          windows: [{ role: "primary", used_percent: 10, reset_at_ms: null }],
+          windows: [
+            {
+              role: "primary",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+              key: "session",
+              label: "session",
+              window_seconds: 18_000,
+              used_percent: 10,
+              exhausted: false,
+              reset_at_ms: null,
+            },
+          ],
         },
       },
     ];
     expect(parse(invalidAlias)).toBeNull();
+
+    const invalidCategory = envelope() as Record<string, unknown>;
+    const categoryAliases = invalidCategory.aliases as Array<{
+      usage: Record<string, unknown>;
+    }>;
+    if (categoryAliases[0]) {
+      categoryAliases[0].usage.account_category = "private-enterprise-plan";
+    }
+    expect(parse(invalidCategory)).toBeNull();
 
     const unavailable = envelope() as Record<string, unknown>;
     unavailable.aliases = [
       {
         alias: "keeper-codex-a",
         usage: {
-          schema_version: 1,
+          schema_version: 2,
           alias: "keeper-codex-a",
           status: "unavailable",
           failure_class: "auth",
@@ -169,6 +213,104 @@ describe("Codex observer envelope", () => {
     (raw[0]?.usage as Record<string, unknown>).failure_class =
       "private provider error";
     expect(parse(unavailable)).toBeNull();
+  });
+});
+
+describe("Codex scoped capacity view", () => {
+  test("keeps generic and Spark exhaustion independent with reset-effective windows", () => {
+    const observation = parse();
+    if (observation === null) throw new Error("fixture did not parse");
+    const alias = {
+      ...observation.aliases[0]!,
+      status: "exhausted" as const,
+      windows: [
+        {
+          role: "primary" as const,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          key: "week",
+          label: "weekly",
+          window_seconds: 604_800,
+          used_percent: 100,
+          exhausted: true,
+          reset_at_ms: NOW,
+        },
+        {
+          role: "additional" as const,
+          quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          key: "meter:spark:primary",
+          label: "GPT-5.3-Codex-Spark",
+          window_seconds: null,
+          used_percent: 0,
+          exhausted: false,
+          reset_at_ms: NOW + 30_000,
+        },
+      ],
+    };
+
+    expect(
+      codexScopedAliasCapacityView(alias, CODEX_GENERIC_QUOTA_SCOPE, NOW),
+    ).toMatchObject({
+      quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+      status: "healthy",
+      windows: [{ quota_scope: CODEX_GENERIC_QUOTA_SCOPE }],
+      used_percent: 0,
+      cooldown_until_ms: 0,
+    });
+    expect(
+      codexScopedAliasCapacityView(alias, CODEX_SPARK_QUOTA_SCOPE, NOW),
+    ).toMatchObject({
+      quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+      status: "healthy",
+      windows: [{ quota_scope: CODEX_SPARK_QUOTA_SCOPE }],
+      used_percent: 0,
+      cooldown_until_ms: 0,
+    });
+  });
+
+  test("Spark exhaustion does not hide generic and missing Spark is unavailable", () => {
+    const observation = parse();
+    if (observation === null) throw new Error("fixture did not parse");
+    const alias = {
+      ...observation.aliases[0]!,
+      windows: [
+        {
+          ...observation.aliases[0]!.windows[0]!,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          used_percent: 10,
+          exhausted: false,
+        },
+        {
+          role: "additional" as const,
+          quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          key: "meter:spark:primary",
+          label: "GPT-5.3-Codex-Spark",
+          window_seconds: null,
+          used_percent: 0,
+          exhausted: true,
+          reset_at_ms: NOW + 30_000,
+        },
+      ],
+    };
+
+    expect(
+      codexScopedAliasCapacityView(alias, CODEX_GENERIC_QUOTA_SCOPE, NOW)
+        .status,
+    ).toBe("healthy");
+    expect(
+      codexScopedAliasCapacityView(alias, CODEX_SPARK_QUOTA_SCOPE, NOW),
+    ).toMatchObject({ status: "exhausted", cooldown_until_ms: NOW + 30_000 });
+    expect(
+      codexScopedAliasCapacityView(
+        { ...alias, windows: alias.windows.slice(0, 1) },
+        CODEX_SPARK_QUOTA_SCOPE,
+        NOW,
+      ),
+    ).toMatchObject({
+      status: "unavailable",
+      used_percent: 100,
+      windows: [],
+      cooldown_until_ms: 0,
+    });
   });
 });
 
@@ -202,6 +344,20 @@ describe("Codex capacity sidecar", () => {
     expect(
       validateCodexObservation({ ...second, provider: "claude" }),
     ).toBeNull();
+    expect(
+      validateCodexObservation({
+        ...second,
+        schema_version: CODEX_OBSERVATION_SCHEMA_VERSION - 1,
+      }),
+    ).toBeNull();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        ...second,
+        schema_version: CODEX_OBSERVATION_SCHEMA_VERSION - 1,
+      }),
+    );
+    expect(readCodexObservationSidecar(path)).toBeNull();
 
     chmodSync(path, 0o644);
     writeCodexObservationSidecar(path, second);

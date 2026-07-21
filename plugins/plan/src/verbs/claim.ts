@@ -21,6 +21,7 @@ import { assembleBrief, writeBrief } from "../brief.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
+import { resolveIncident } from "../incident.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentFor } from "../models.ts";
 import {
@@ -405,6 +406,12 @@ export function runClaim(args: ClaimArgs): void {
   // Mark this session as actively working the task (success path only, fail-open).
   writeWorkMarker(taskId);
 
+  // Surface any unresolved merge incident on THIS task's `work::<taskId>` sticky
+  // row so the worker can record ownership via `keeper incident claim` — sourced
+  // read-only from the incident read surface, never a plan-plugin DB read. Null
+  // on the ordinary no-incident claim.
+  const incident = resolveIncident(`work::${taskId}`);
+
   const pc = buildPlanInvocationReadonly("claim", ctx.projectPath, taskId);
   emitReadonly(
     {
@@ -419,6 +426,7 @@ export function runClaim(args: ClaimArgs): void {
       task_state: taskState,
       epic_state: epicState,
       brief_ref: briefRef,
+      incident,
     },
     pc,
   );

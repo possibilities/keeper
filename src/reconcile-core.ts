@@ -31,6 +31,7 @@ import {
 import { computeEligibleEpics } from "./armed-closure";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
+  routeDispatchFailure,
   SLOT_OCCUPIED_REASON_PREFIX,
   SLOT_RECLAIMED_REASON_PREFIX,
   WORKTREE_RECOVER_KEY_PREFIX,
@@ -134,6 +135,73 @@ export type Verb = "work" | "close";
  * baked into the worker argv (also the tmux window name).
  */
 export type DispatchKey = string;
+
+/** Maximum owning-session attachments before an unresolved merge incident pages. */
+export const INCIDENT_OWNER_ATTACHMENT_LIMIT = 2;
+
+/** Durable facts used to classify and count one owner-routable merge incident. */
+export interface IncidentOwnerFailureFacts {
+  verb: string;
+  id: string;
+  reason: string;
+  dir?: string | null;
+  claimSessionId: string | null;
+  resolverDispatchedAt: number | null;
+  mergeEscalatedAt: number | null;
+  humanNotifiedAt: number | null;
+}
+
+/**
+ * True only for the two natural-key merge-incident routes. The typed failure
+ * router owns this boundary so a similarly worded suppression row can never
+ * bypass sticky-failure suppression.
+ */
+export function isOwnerRoutableIncident(
+  row: Pick<IncidentOwnerFailureFacts, "verb" | "id" | "reason" | "dir">,
+): boolean {
+  const route = routeDispatchFailure({
+    verb: row.verb,
+    id: row.id,
+    reason: row.reason,
+    dir: row.dir ?? "",
+  });
+  return (
+    route.kind === "work-merge-conflict" || route.kind === "merge-escalation"
+  );
+}
+
+/** Number of durable owner attachments already consumed by this incident. */
+export function incidentOwnerAttachmentCount(
+  row: Pick<
+    IncidentOwnerFailureFacts,
+    "resolverDispatchedAt" | "mergeEscalatedAt"
+  >,
+): number {
+  return (
+    Number(row.resolverDispatchedAt != null) +
+    Number(row.mergeEscalatedAt != null)
+  );
+}
+
+/**
+ * The next durable marker an ordinary owner admission consumes. The two legacy
+ * once-markers form a bounded two-slot attachment lease until escalation state is
+ * collapsed; claimed, paged, exhausted, and non-incident rows consume no slot.
+ */
+export function nextIncidentOwnerAttachmentMarker(
+  row: IncidentOwnerFailureFacts,
+): "resolver" | "merge" | null {
+  if (
+    !isOwnerRoutableIncident(row) ||
+    row.claimSessionId != null ||
+    row.humanNotifiedAt != null
+  ) {
+    return null;
+  }
+  if (row.resolverDispatchedAt == null) return "resolver";
+  if (row.mergeEscalatedAt == null) return "merge";
+  return null;
+}
 
 /**
  * Stable machine codes explaining why a ready reconciler row did not dispatch.
@@ -704,6 +772,14 @@ export interface ReconcileSnapshot {
    * are sticky until a human `retry_dispatch` mints a `DispatchCleared`.
    */
   failedKeys: Set<DispatchKey>;
+  /**
+   * Open, unclaimed merge incidents with a durable attachment slot remaining.
+   * These exact keys alone may bypass `failedKeys`; every other sticky remains
+   * suppressing. Producer-classified through {@link isOwnerRoutableIncident}.
+   */
+  incidentOwnerKeys?: Set<DispatchKey>;
+  /** Open merge incidents currently protected by a live incident claim. */
+  claimedIncidentKeys?: Set<DispatchKey>;
   /**
    * The `id`s of every OPEN `close::<id>` dispatch-failure row minted by the
    * worktree RECOVER pass (its `reason` carries the {@link
@@ -2433,7 +2509,9 @@ export function reconcile(
     for (const task of epic.tasks) {
       const taskId = task.task_id;
       const verdict = readiness.perTask.get(taskId);
-      const verb = verbForVerdict("task", verdict);
+      const ownerKey = dispatchKey("work", taskId);
+      const routesIncident = snapshot.incidentOwnerKeys?.has(ownerKey) === true;
+      const verb = routesIncident ? "work" : verbForVerdict("task", verdict);
       if (verb === null) {
         continue;
       }
@@ -2471,7 +2549,7 @@ export function reconcile(
         withholds.set(taskId, withhold("dispatch-in-flight"));
         continue;
       }
-      if (snapshot.failedKeys.has(key)) {
+      if (snapshot.failedKeys.has(key) && !routesIncident) {
         withholds.set(taskId, withhold("failed-key"));
         continue;
       }
@@ -2681,7 +2759,12 @@ export function reconcile(
     // Close row.
     const epicId = epic.epic_id;
     const closeVerdict = readiness.perCloseRow.get(epicId);
-    const closeVerb = verbForVerdict("close", closeVerdict);
+    const ownerCloseKey = dispatchKey("close", epicId);
+    const routesCloseIncident =
+      snapshot.incidentOwnerKeys?.has(ownerCloseKey) === true;
+    const closeVerb = routesCloseIncident
+      ? "close"
+      : verbForVerdict("close", closeVerdict);
     if (closeVerb !== null) {
       const closeKey = dispatchKey(closeVerb, epicId);
       // Evaluate the close arms in the original conjunction order. The first
@@ -2692,7 +2775,7 @@ export function reconcile(
         closeWithhold = withhold("autopilot-paused");
       } else if (state.inFlight.has(closeKey)) {
         closeWithhold = withhold("dispatch-in-flight");
-      } else if (snapshot.failedKeys.has(closeKey)) {
+      } else if (snapshot.failedKeys.has(closeKey) && !routesCloseIncident) {
         closeWithhold = withhold("failed-key");
       } else {
         const ownershipCode = dispatchTargetWithholdCode(
@@ -2841,8 +2924,10 @@ export function reconcile(
             );
       if (closeIsActive) continue;
       if (
-        completedRowIds.has(epicId) ||
-        closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds)
+        snapshot.incidentOwnerKeys?.has(dispatchKey("close", epicId)) !==
+          true &&
+        (completedRowIds.has(epicId) ||
+          closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds))
       ) {
         finalizeEpicIds.add(epicId);
       }

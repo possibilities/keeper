@@ -50,6 +50,11 @@
 
 import type { Database } from "bun:sqlite";
 import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
+import {
+  createMaintenanceTimeBudget,
+  type MaintenanceTimeBudget,
+  runBudgetedMaintenanceLoop,
+} from "./maintenance-budget";
 
 /** `meta` key for the crash-safe resume watermark (highest processed id). */
 export const BACKFILL_WATERMARK_KEY = "mutation_path_backfill_watermark";
@@ -91,12 +96,33 @@ export interface BackfillResult {
   moreLikely: boolean;
 }
 
+export interface YieldingBackfillOptions extends BackfillOptions {
+  budget?: MaintenanceTimeBudget;
+  yieldTurn?: () => Promise<void>;
+  shouldContinue?: () => boolean;
+}
+
+export interface YieldingBackfillResult extends BackfillResult {
+  budgetExhausted: boolean;
+}
+
 /**
  * The mutation-tool predicate shared by every query here, ARM A/B, the forward
  * deriver, AND compaction's shed guard — the one dep-free
  * {@link MUTATION_TOOL_SQL_PREDICATE} in `src/derivers.ts`.
  */
 const MUTATION_TOOL_PREDICATE = MUTATION_TOOL_SQL_PREDICATE;
+
+/**
+ * Forward-seeking batch selector. `NOT INDEXED` prevents SQLite from expanding
+ * the hook/tool OR through secondary indexes and sorting cold history for LIMIT.
+ */
+export const BACKFILL_SELECT_BATCH_SQL = `SELECT id FROM events NOT INDEXED
+  WHERE id > ?
+    AND ${MUTATION_TOOL_PREDICATE}
+    AND mutation_path IS NULL
+  ORDER BY id ASC
+  LIMIT ?`;
 
 /**
  * The guarded extract over `events.data` (post-shed there is no side table to
@@ -145,19 +171,15 @@ export function backfillMutationPath(
   let watermark = readBackfillWatermark(db);
 
   // Select the next batch of mutation-row ids strictly above the watermark.
+  // `NOT INDEXED` keeps this as one forward primary-key seek: the hook/tool OR
+  // predicate's secondary indexes would otherwise materialize and sort the
+  // entire historical match set before LIMIT, starving MAIN on a cold tail.
   // `mutation_path IS NULL` skips the forward-path rows task .2 already filled
   // (so a re-deployed daemon doesn't re-touch them), while the watermark skips
   // the done-null tail (malformed / no-file_path rows whose column legitimately
   // stays NULL). Reads only `events` (the body extract below also reads only the
   // inline `events.data` — post-shed there is no side table).
-  const selectBatch = db.prepare(
-    `SELECT id FROM events
-      WHERE id > ?
-        AND ${MUTATION_TOOL_PREDICATE}
-        AND mutation_path IS NULL
-      ORDER BY id ASC
-      LIMIT ?`,
-  );
+  const selectBatch = db.prepare(BACKFILL_SELECT_BATCH_SQL);
 
   // UPDATE the batch's `mutation_path` from the guarded extract over the inline
   // `events.data` body (post-shed: no `event_blobs` side table to COALESCE). A
@@ -207,6 +229,31 @@ export function backfillMutationPath(
     batches,
     watermark,
     moreLikely: batches === maxBatches && lastBatchFull,
+  };
+}
+
+export async function runYieldingMutationPathBackfill(
+  db: Database,
+  options: YieldingBackfillOptions = {},
+): Promise<YieldingBackfillResult | null> {
+  const {
+    batchSize = DEFAULT_BACKFILL_BATCH_SIZE,
+    maxBatches = DEFAULT_BACKFILL_MAX_BATCHES,
+    budget = createMaintenanceTimeBudget(),
+    yieldTurn,
+    shouldContinue,
+  } = options;
+  const results = await runBudgetedMaintenanceLoop(
+    () => backfillMutationPath(db, { batchSize, maxBatches: 1 }),
+    { maxBatches, budget, yieldTurn, shouldContinue },
+  );
+  const last = results.at(-1);
+  if (!last) return null;
+  return {
+    ...last,
+    scanned: results.reduce((sum, item) => sum + item.scanned, 0),
+    batches: results.reduce((sum, item) => sum + item.batches, 0),
+    budgetExhausted: budget.exhausted(),
   };
 }
 

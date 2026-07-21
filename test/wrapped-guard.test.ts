@@ -765,6 +765,7 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
   });
 
   test("ALLOWS a handoff Write into a /private/tmp keeper-wrapped dir (temp-root reconciliation)", () => {
+    if (process.platform !== "darwin") return;
     const root = mkdtempSync(join("/private/tmp", "keeper-wrapped-privtmp-"));
     try {
       // a wrapped worker's handoff dir may sit under /private/tmp (not the

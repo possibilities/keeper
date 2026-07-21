@@ -909,7 +909,12 @@ test("title-bearing event for a non-existent job is a no-op", () => {
   // TranscriptTitle (NULL pid, daemon-synthesized) rather than a UserPromptSubmit:
   // fn-816's fork-attribution seed mints a row on a PID-BEARING UPS, so a
   // pid-bearing title event would no longer exercise the title-rule-no-op path.
-  const id = transcriptTitleEvent("foo", "ghost");
+  const id = insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "ghost",
+    pid: null,
+    data: JSON.stringify({ session_title: "foo" }),
+  });
   drainAll();
   expect(getJob("ghost")).toBeNull();
   expect(getCursor()).toBe(id);

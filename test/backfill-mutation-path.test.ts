@@ -20,11 +20,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BACKFILL_SELECT_BATCH_SQL,
   BACKFILL_WATERMARK_KEY,
   backfillMutationPath,
   isMutationPathBackfillComplete,
   readBackfillWatermark,
+  runYieldingMutationPathBackfill,
 } from "../src/backfill-mutation-path";
+import {
+  createMaintenanceTimeBudget,
+  MAIN_MAINTENANCE_TICK_BUDGET_MS,
+} from "../src/maintenance-budget";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -101,6 +107,16 @@ test("readBackfillWatermark is 0 before any pass; advances after a pass", () => 
   expect(readBackfillWatermark(db)).toBe(maxId);
 });
 
+test("backfill batch selection seeks the primary key without sorting cold history", () => {
+  const plan = db
+    .query(`EXPLAIN QUERY PLAN ${BACKFILL_SELECT_BATCH_SQL}`)
+    .all(0, 500) as Array<{ detail: string }>;
+  const details = plan.map((row) => row.detail).join("\n");
+
+  expect(details).toContain("USING INTEGER PRIMARY KEY");
+  expect(details).not.toContain("TEMP B-TREE");
+});
+
 test("backfill fills mutation_path from inline events.data; non-mutation rows untouched", () => {
   const a = insertMutation("/repo/a.ts");
   const b = insertMutation("/repo/b.ts", "Edit");
@@ -169,6 +185,50 @@ test("backfill is paced + resumable: a bounded pass stops, a watermark resumes t
   for (let i = 0; i < 7; i++)
     expect(mutationPathOf(ids[i] as number)).toBe(`/repo/f${i}.ts`);
   expect(isMutationPathBackfillComplete(db)).toBe(true);
+});
+
+test("wall-clock budget yields mutation-path backfill and the next tick resumes without repeats", async () => {
+  const ids = Array.from({ length: 5 }, (_, i) =>
+    insertMutation(`/repo/budget-${i}.ts`),
+  );
+  let now = 0;
+
+  const firstTick = await runYieldingMutationPathBackfill(db, {
+    batchSize: 2,
+    maxBatches: 20,
+    budget: createMaintenanceTimeBudget({ now: () => now }),
+    yieldTurn: async () => {
+      now += MAIN_MAINTENANCE_TICK_BUDGET_MS + 1;
+    },
+  });
+
+  expect(firstTick?.scanned).toBe(2);
+  expect(firstTick?.batches).toBe(1);
+  expect(firstTick?.budgetExhausted).toBe(true);
+  expect(readBackfillWatermark(db)).toBe(ids[1]);
+  expect(ids.map(mutationPathOf)).toEqual([
+    "/repo/budget-0.ts",
+    "/repo/budget-1.ts",
+    null,
+    null,
+    null,
+  ]);
+
+  now = 1_000;
+  const secondTick = await runYieldingMutationPathBackfill(db, {
+    batchSize: 2,
+    maxBatches: 20,
+    budget: createMaintenanceTimeBudget({ now: () => now }),
+    yieldTurn: async () => {},
+  });
+
+  expect(secondTick?.scanned).toBe(3);
+  expect(secondTick?.batches).toBe(2);
+  expect(secondTick?.budgetExhausted).toBe(false);
+  expect(readBackfillWatermark(db)).toBe(ids[4]);
+  expect(ids.map(mutationPathOf)).toEqual(
+    ids.map((_, i) => `/repo/budget-${i}.ts`),
+  );
 });
 
 test("crash-safe watermark: a pre-set watermark skips the backfilled prefix", () => {

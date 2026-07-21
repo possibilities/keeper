@@ -12,22 +12,497 @@
 // directory; the reader validates the descriptor it read from (anti-TOCTOU
 // fstat), never a re-stat of the path.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
+  opendirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 export const GRANT_LEAF_SCHEMA_VERSION = 1 as const;
+export const TRUNK_LEASE_SCHEMA_VERSION = 1 as const;
+export const TRUNK_LEASE_REQUEST_SCHEMA_VERSION = 1 as const;
+export const TRUNK_LEASE_TTL_MS = 120_000;
+
+export interface TrunkLeaseRequest {
+  schema_version: number;
+  action: "acquire" | "release";
+  epic_id: string;
+  repo_root: string;
+  source_branch: string;
+  claimant_session_id: string;
+  request_id: string;
+  fencing_token: number | null;
+  requested_at: number;
+}
+
+export interface TrunkLeaseLeaf {
+  schema_version: number;
+  active: boolean;
+  epic_id: string;
+  claimant_session_id: string;
+  claimant_pid: number;
+  claimant_start_time: string;
+  acquisition_id: string;
+  repo_root: string;
+  writable_root: string;
+  source_branch: string;
+  default_branch: string;
+  observed_default_tip: string;
+  expires_at: number;
+  fencing_token: number;
+}
+
+export interface SpooledTrunkLeaseRequest {
+  path: string;
+  request: TrunkLeaseRequest;
+}
+
+const TRUNK_LEASE_DIRNAME = "trunk-leases";
+const TRUNK_LEASE_REQUEST_DIRNAME = "requests";
+const TRUNK_LEASE_LEAF_DIRNAME = "leases";
+const MAX_TRUNK_LEASE_BYTES = 16 * 1024;
+const MAX_TRUNK_LEASE_REQUESTS = 256;
+
+function trunkLeaseRepoDigest(repoRoot: string): string {
+  return createHash("sha256").update(repoRoot).digest("hex").slice(0, 32);
+}
+
+export function trunkLeaseRoot(stateDir: string): string {
+  return join(stateDir, TRUNK_LEASE_DIRNAME);
+}
+
+export function trunkLeaseRequestDir(stateDir: string): string {
+  return join(trunkLeaseRoot(stateDir), TRUNK_LEASE_REQUEST_DIRNAME);
+}
+
+export function trunkLeaseLeafDir(stateDir: string): string {
+  return join(trunkLeaseRoot(stateDir), TRUNK_LEASE_LEAF_DIRNAME);
+}
+
+export function deriveTrunkLeaseLeafPath(
+  stateDir: string,
+  repoRoot: string,
+): string {
+  return join(
+    trunkLeaseLeafDir(stateDir),
+    `lease-${trunkLeaseRepoDigest(repoRoot)}.json`,
+  );
+}
+
+export function newTrunkLeaseRequestPath(stateDir: string): string {
+  return join(trunkLeaseRequestDir(stateDir), `${randomUUID()}.json`);
+}
+
+function validTrunkLeaseIdentity(
+  epicId: string,
+  sourceBranch: string,
+): boolean {
+  return (
+    /^fn-[0-9]+-[0-9a-z][0-9a-z-]*$/.test(epicId) &&
+    sourceBranch === `keeper/epic/${epicId}`
+  );
+}
+
+function parseTrunkLeaseRequest(raw: string): TrunkLeaseRequest | null {
+  if (Buffer.byteLength(raw, "utf8") > MAX_TRUNK_LEASE_BYTES) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const r = value as Record<string, unknown>;
+  if (
+    r.schema_version !== TRUNK_LEASE_REQUEST_SCHEMA_VERSION ||
+    (r.action !== "acquire" && r.action !== "release") ||
+    typeof r.epic_id !== "string" ||
+    typeof r.repo_root !== "string" ||
+    !isAbsolute(r.repo_root) ||
+    typeof r.source_branch !== "string" ||
+    !validTrunkLeaseIdentity(r.epic_id, r.source_branch) ||
+    typeof r.claimant_session_id !== "string" ||
+    r.claimant_session_id.length === 0 ||
+    Buffer.byteLength(r.claimant_session_id, "utf8") > 512 ||
+    typeof r.request_id !== "string" ||
+    !/^[0-9a-f]{32}$/.test(r.request_id) ||
+    typeof r.requested_at !== "number" ||
+    !Number.isFinite(r.requested_at)
+  ) {
+    return null;
+  }
+  const token = r.fencing_token;
+  if (
+    !(
+      (r.action === "acquire" && token === null) ||
+      (r.action === "release" &&
+        typeof token === "number" &&
+        Number.isSafeInteger(token) &&
+        token > 0)
+    )
+  ) {
+    return null;
+  }
+  return {
+    schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+    action: r.action,
+    epic_id: r.epic_id,
+    repo_root: r.repo_root,
+    source_branch: r.source_branch,
+    claimant_session_id: r.claimant_session_id,
+    request_id: r.request_id,
+    fencing_token: token as number | null,
+    requested_at: r.requested_at,
+  };
+}
+
+function parseTrunkLeaseLeaf(raw: string): TrunkLeaseLeaf | null {
+  if (Buffer.byteLength(raw, "utf8") > MAX_TRUNK_LEASE_BYTES) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const l = value as Record<string, unknown>;
+  if (
+    l.schema_version !== TRUNK_LEASE_SCHEMA_VERSION ||
+    typeof l.active !== "boolean" ||
+    typeof l.epic_id !== "string" ||
+    typeof l.source_branch !== "string" ||
+    !validTrunkLeaseIdentity(l.epic_id, l.source_branch) ||
+    typeof l.claimant_session_id !== "string" ||
+    l.claimant_session_id.length === 0 ||
+    typeof l.claimant_pid !== "number" ||
+    !Number.isSafeInteger(l.claimant_pid) ||
+    l.claimant_pid <= 0 ||
+    typeof l.claimant_start_time !== "string" ||
+    l.claimant_start_time.length === 0 ||
+    typeof l.acquisition_id !== "string" ||
+    !/^[0-9a-f]{32}$/.test(l.acquisition_id) ||
+    typeof l.repo_root !== "string" ||
+    !isAbsolute(l.repo_root) ||
+    typeof l.writable_root !== "string" ||
+    !isAbsolute(l.writable_root) ||
+    typeof l.default_branch !== "string" ||
+    l.default_branch.length === 0 ||
+    typeof l.observed_default_tip !== "string" ||
+    !/^[0-9a-f]{7,64}$/.test(l.observed_default_tip) ||
+    typeof l.expires_at !== "number" ||
+    !Number.isFinite(l.expires_at) ||
+    typeof l.fencing_token !== "number" ||
+    !Number.isSafeInteger(l.fencing_token) ||
+    l.fencing_token <= 0
+  ) {
+    return null;
+  }
+  return l as unknown as TrunkLeaseLeaf;
+}
+
+function readBoundedPrivateJson(path: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | O_CLOEXEC);
+    const st = fstatSync(fd);
+    const getuid = process.getuid;
+    if (
+      !st.isFile() ||
+      st.nlink !== 1 ||
+      (st.mode & 0o077) !== 0 ||
+      (getuid !== undefined && st.uid !== getuid.call(process))
+    ) {
+      return null;
+    }
+    const buf = Buffer.allocUnsafe(MAX_TRUNK_LEASE_BYTES + 1);
+    let offset = 0;
+    while (offset < buf.length) {
+      const count = readSync(fd, buf, offset, buf.length - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    return offset <= MAX_TRUNK_LEASE_BYTES
+      ? buf.subarray(0, offset).toString("utf8")
+      : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // unreadable is non-authoritative
+      }
+    }
+  }
+}
+
+function plainPrivateDir(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    const getuid = process.getuid;
+    return (
+      st.isDirectory() &&
+      !st.isSymbolicLink() &&
+      (st.mode & 0o077) === 0 &&
+      (getuid === undefined || st.uid === getuid.call(process))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function ensureTrunkLeaseDir(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  if (!plainPrivateDir(path)) {
+    throw new Error("trunk lease directory is not owner-private");
+  }
+}
+
+function writeAtomicPrivateJson(path: string, value: unknown): boolean {
+  const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  if (bytes.byteLength > MAX_TRUNK_LEASE_BYTES) return false;
+  const dir = dirname(path);
+  const tmp = join(dir, `.${basename(path)}.${randomUUID()}.tmp`);
+  let fd: number | null = null;
+  try {
+    ensureTrunkLeaseDir(dir);
+    fd = openSync(
+      tmp,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW |
+        O_CLOEXEC,
+      0o600,
+    );
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = writeSync(fd, bytes, offset, bytes.byteLength - offset);
+      if (count <= 0) return false;
+      offset += count;
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmp, path);
+    let dirFd: number | null = null;
+    try {
+      dirFd = openSync(dir, constants.O_RDONLY | O_CLOEXEC);
+      fsyncSync(dirFd);
+    } catch {
+      // The published rename remains authoritative on filesystems without dir fsync.
+    } finally {
+      if (dirFd !== null) {
+        try {
+          closeSync(dirFd);
+        } catch {
+          // the rename is already published
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      // preserve the publication verdict
+    }
+  }
+}
+
+export function writeTrunkLeaseRequest(
+  stateDir: string,
+  request: TrunkLeaseRequest,
+): string | null {
+  if (parseTrunkLeaseRequest(JSON.stringify(request)) === null) return null;
+  const path = newTrunkLeaseRequestPath(stateDir);
+  return writeAtomicPrivateJson(path, request) ? path : null;
+}
+
+export function readTrunkLeaseRequests(
+  stateDir: string,
+): SpooledTrunkLeaseRequest[] {
+  const dirPath = trunkLeaseRequestDir(stateDir);
+  if (!plainPrivateDir(dirPath)) return [];
+  const out: SpooledTrunkLeaseRequest[] = [];
+  let dir: ReturnType<typeof opendirSync> | null = null;
+  try {
+    dir = opendirSync(dirPath);
+    for (let n = 0; n < MAX_TRUNK_LEASE_REQUESTS; n += 1) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      if (!entry.name.endsWith(".json")) continue;
+      const path = join(dirPath, entry.name);
+      const raw = readBoundedPrivateJson(path);
+      const request = raw === null ? null : parseTrunkLeaseRequest(raw);
+      if (request === null) {
+        removeTrunkLeaseRequest(path);
+      } else {
+        out.push({ path, request });
+      }
+    }
+  } catch {
+    return out;
+  } finally {
+    try {
+      dir?.closeSync();
+    } catch {
+      // no request semantics depend on closing the directory descriptor
+    }
+  }
+  return out.sort(
+    (a, b) =>
+      a.request.requested_at - b.request.requested_at ||
+      a.path.localeCompare(b.path),
+  );
+}
+
+export function removeTrunkLeaseRequest(path: string): void {
+  try {
+    if (!plainPrivateDir(dirname(path))) return;
+    unlinkSync(path);
+  } catch {
+    // idempotent removal
+  }
+}
+
+export function readTrunkLeaseLeaf(
+  stateDir: string,
+  repoRoot: string,
+): TrunkLeaseLeaf | null {
+  const raw = readBoundedPrivateJson(
+    deriveTrunkLeaseLeafPath(stateDir, repoRoot),
+  );
+  return raw === null ? null : parseTrunkLeaseLeaf(raw);
+}
+
+export function listTrunkLeaseLeaves(stateDir: string): TrunkLeaseLeaf[] {
+  const dirPath = trunkLeaseLeafDir(stateDir);
+  if (!plainPrivateDir(dirPath)) return [];
+  const out: TrunkLeaseLeaf[] = [];
+  let dir: ReturnType<typeof opendirSync> | null = null;
+  try {
+    dir = opendirSync(dirPath);
+    for (let n = 0; n < MAX_TRUNK_LEASE_REQUESTS; n += 1) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      if (!entry.name.startsWith("lease-") || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const raw = readBoundedPrivateJson(join(dirPath, entry.name));
+      const leaf = raw === null ? null : parseTrunkLeaseLeaf(raw);
+      if (leaf !== null) out.push(leaf);
+    }
+  } catch {
+    return out;
+  } finally {
+    try {
+      dir?.closeSync();
+    } catch {
+      // bounded scan is complete
+    }
+  }
+  return out.sort((a, b) => a.repo_root.localeCompare(b.repo_root));
+}
+
+export function writeTrunkLeaseLeaf(
+  stateDir: string,
+  leaf: TrunkLeaseLeaf,
+): boolean {
+  const canonical = realpathNearest(leaf.writable_root);
+  if (canonical === null) return false;
+  const published: TrunkLeaseLeaf = {
+    ...leaf,
+    repo_root: canonical,
+    writable_root: canonical,
+  };
+  if (parseTrunkLeaseLeaf(JSON.stringify(published)) === null) return false;
+  return writeAtomicPrivateJson(
+    deriveTrunkLeaseLeafPath(stateDir, canonical),
+    published,
+  );
+}
+
+export type TrunkIntegrationFenceDecision =
+  | { kind: "already-integrated" }
+  | { kind: "merge" }
+  | {
+      kind: "defer";
+      reason: "lease-invalid" | "ancestry-inconclusive" | "tip-drift";
+    };
+
+export function decideTrunkIntegrationFence(input: {
+  leaseValid: boolean;
+  ancestry: "ancestor" | "not-ancestor" | "inconclusive";
+  observedDefaultTip: string;
+  liveDefaultTip: string | null;
+}): TrunkIntegrationFenceDecision {
+  if (!input.leaseValid) return { kind: "defer", reason: "lease-invalid" };
+  if (input.ancestry === "inconclusive") {
+    return { kind: "defer", reason: "ancestry-inconclusive" };
+  }
+  if (input.ancestry === "ancestor") return { kind: "already-integrated" };
+  if (
+    input.liveDefaultTip === null ||
+    input.liveDefaultTip !== input.observedDefaultTip
+  ) {
+    return { kind: "defer", reason: "tip-drift" };
+  }
+  return { kind: "merge" };
+}
+
+export function trunkLeaseIsValid(
+  leaf: TrunkLeaseLeaf,
+  expected: {
+    epicId: string;
+    repoRoot: string;
+    sourceBranch: string;
+    claimantSessionId: string;
+    fencingToken?: number;
+  },
+  now: number,
+): boolean {
+  return (
+    leaf.active &&
+    now < leaf.expires_at &&
+    leaf.epic_id === expected.epicId &&
+    leaf.repo_root === expected.repoRoot &&
+    leaf.writable_root === expected.repoRoot &&
+    leaf.source_branch === expected.sourceBranch &&
+    leaf.claimant_session_id === expected.claimantSessionId &&
+    (expected.fencingToken === undefined ||
+      leaf.fencing_token === expected.fencingToken)
+  );
+}
 
 /** The four confined escalation roles and their agent types. Role names match the
  *  escalation vocabulary (`unblock`/`resolve`/`deconflict`/`repair`); agent types
@@ -86,6 +561,8 @@ export interface GrantLeaf {
   parent_job_id: string;
   agent_type: EscalationAgentType;
   incident_id: string;
+  /** The blocked task whose work owner may consume a repo-scoped repair grant. */
+  owner_task_id?: string;
   /** Fencing identities per the incident-fenced-clear discipline (ADR 0070). */
   attempt_id: string;
   instance_event_id: number;
@@ -252,6 +729,8 @@ function parseGrant(bytes: string): GrantLeaf | null {
     expectedRole === null ||
     typeof g.incident_id !== "string" ||
     g.incident_id === "" ||
+    (g.owner_task_id !== undefined &&
+      (typeof g.owner_task_id !== "string" || g.owner_task_id === "")) ||
     typeof g.attempt_id !== "string" ||
     g.attempt_id === "" ||
     typeof g.instance_event_id !== "number" ||
@@ -317,6 +796,52 @@ export function readGrantLeaf(
 // ---------------------------------------------------------------------------
 
 const MAX_GRANT_BYTES = 8192;
+
+/** Read a bounded snapshot of valid owner-private grant leaves. Malformed,
+ *  raced, or insecure leaves are omitted; callers still apply incident/expiry
+ *  filters before treating a leaf as authority. */
+export function listGrantLeaves(grantsDir: string): GrantLeaf[] {
+  if (
+    grantsDir === "" ||
+    !isAbsolute(grantsDir) ||
+    !plainPrivateDir(grantsDir)
+  ) {
+    return [];
+  }
+  const leaves: GrantLeaf[] = [];
+  let dir: ReturnType<typeof opendirSync> | null = null;
+  try {
+    dir = opendirSync(grantsDir);
+    for (
+      let inspected = 0;
+      inspected < MAX_TRUNK_LEASE_REQUESTS;
+      inspected += 1
+    ) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      if (!entry.name.startsWith("grant-") || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const read = readOwnerPrivateLeaf(join(grantsDir, entry.name));
+      if ("verdict" in read) continue;
+      const grant = parseGrant(read.bytes);
+      if (grant !== null) leaves.push(grant);
+    }
+  } catch {
+    return leaves;
+  } finally {
+    try {
+      dir?.closeSync();
+    } catch {
+      // A completed bounded read needs no recovery action.
+    }
+  }
+  return leaves.sort(
+    (a, b) =>
+      a.fencing_token - b.fencing_token ||
+      a.parent_job_id.localeCompare(b.parent_job_id),
+  );
+}
 
 /** Publish `grant` under `grantsDir` (created 0o700 if absent). Writes a fresh
  *  O_EXCL|O_NOFOLLOW temp leaf, fsyncs, then atomically renames it onto the
@@ -400,6 +925,10 @@ export interface GrantEnv {
   KEEPER_GRANT_FENCING_TOKEN?: string;
   KEEPER_GRANT_ATTEMPT?: string;
   KEEPER_GRANT_INSTANCE_EVENT?: string;
+  KEEPER_STATE_DIR?: string;
+  KEEPER_JOB_ID?: string;
+  CLAUDE_CODE_SESSION_ID?: string;
+  HOME?: string;
 }
 
 /** Build the launch-anchored expectation for `agentType`, or null when the env
@@ -408,30 +937,64 @@ export function grantExpectationFromEnv(
   env: GrantEnv,
   agentType: string,
 ): GrantExpectation | null {
-  const parentJobId = (env.KEEPER_GRANT_PARENT_JOB ?? "").trim();
+  const explicitParent = (env.KEEPER_GRANT_PARENT_JOB ?? "").trim();
   const incidentId = (env.KEEPER_GRANT_INCIDENT ?? "").trim();
   const tokenRaw = (env.KEEPER_GRANT_FENCING_TOKEN ?? "").trim();
-  if (parentJobId === "" || incidentId === "" || tokenRaw === "") return null;
-  const fencingToken = Number(tokenRaw);
-  if (!Number.isFinite(fencingToken)) return null;
-  const attempt = (env.KEEPER_GRANT_ATTEMPT ?? "").trim();
-  const instanceRaw = (env.KEEPER_GRANT_INSTANCE_EVENT ?? "").trim();
-  const expectation: GrantExpectation = {
+  if (explicitParent !== "" && incidentId !== "" && tokenRaw !== "") {
+    const fencingToken = Number(tokenRaw);
+    if (!Number.isFinite(fencingToken)) return null;
+    const attempt = (env.KEEPER_GRANT_ATTEMPT ?? "").trim();
+    const instanceRaw = (env.KEEPER_GRANT_INSTANCE_EVENT ?? "").trim();
+    const expectation: GrantExpectation = {
+      parentJobId: explicitParent,
+      agentType,
+      incidentId,
+      fencingToken,
+    };
+    if (attempt !== "") expectation.attemptId = attempt;
+    if (instanceRaw !== "") {
+      const n = Number(instanceRaw);
+      if (Number.isFinite(n)) expectation.instanceEventId = n;
+    }
+    return expectation;
+  }
+
+  const parentJobId = (
+    env.KEEPER_JOB_ID ??
+    env.CLAUDE_CODE_SESSION_ID ??
+    ""
+  ).trim();
+  const grantsDir = grantsDirOf(env);
+  if (parentJobId === "" || grantsDir === "") return null;
+  const read = readOwnerPrivateLeaf(
+    deriveGrantLeafPath(grantsDir, parentJobId, agentType),
+  );
+  if ("verdict" in read) return null;
+  const grant = parseGrant(read.bytes);
+  if (
+    grant === null ||
+    grant.parent_job_id !== parentJobId ||
+    grant.agent_type !== agentType
+  ) {
+    return null;
+  }
+  return {
     parentJobId,
     agentType,
-    incidentId,
-    fencingToken,
+    incidentId: grant.incident_id,
+    fencingToken: grant.fencing_token,
+    attemptId: grant.attempt_id,
+    instanceEventId: grant.instance_event_id,
   };
-  if (attempt !== "") expectation.attemptId = attempt;
-  if (instanceRaw !== "") {
-    const n = Number(instanceRaw);
-    if (Number.isFinite(n)) expectation.instanceEventId = n;
-  }
-  return expectation;
 }
 
 export function grantsDirOf(env: GrantEnv): string {
-  return (env.KEEPER_GRANT_DIR ?? "").trim();
+  const explicit = (env.KEEPER_GRANT_DIR ?? "").trim();
+  if (explicit !== "") return explicit;
+  const stateDir = (env.KEEPER_STATE_DIR ?? "").trim();
+  if (stateDir !== "") return join(stateDir, "grants");
+  const home = (env.HOME ?? "").trim() || homedir();
+  return join(home, ".local", "state", "keeper", "grants");
 }
 
 /** The shared grant-override decision: does a valid, unexpired, write-capable

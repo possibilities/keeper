@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.6,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy and under-specified: the F2 reconcile requires choosing between a lease adopt-and-release behavior change vs a SKILL.md amend, and the bulk is delicate saga-test idiom-matching behind a pure git seam across many typed lease-exit paths \u2014 contract-touching (lease-release) work, but no nameable opus reason since daemon reclaim already self-heals the behavior.",
+      "task_id": "fn-1386-harden-trunk-lease-integration.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.58,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified acceptance but correctness-invariant-sensitive: picking a durable/live-derived prior-residue signal that keeps the sweep producer-only and re-fold-safe is delicate keeper event-sourcing idiom where a wrong state-signal choice reintroduces the history-growing-fold hazard, so route to the workhorse rather than GPT-first.",
+      "task_id": "fn-1386-harden-trunk-lease-integration.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T12:54:48.790000Z",
+  "epic_id": "fn-1386-harden-trunk-lease-integration",
+  "input_hash": "235e6d59e9bba3f4407be7504acef372c868c2981ff560bd5205938166212064",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 593390937,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy and under-specified: the F2 reconcile requires choosing between a lease adopt-and-release behavior change vs a SKILL.md amend, and the bulk is delicate saga-test idiom-matching behind a pure git seam across many typed lease-exit paths \u2014 contract-touching (lease-release) work, but no nameable opus reason since daemon reclaim already self-heals the behavior.\",\"confidence\":0.6},{\"task_id\":\"2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Well-specified acceptance but correctness-invariant-sensitive: picking a durable/live-derived prior-residue signal that keeps the sweep producer-only and re-fold-safe is delicate keeper event-sourcing idiom where a wrong state-signal choice reintroduces the history-growing-fold hazard, so route to the workhorse rather than GPT-first.\",\"confidence\":0.58}]}\n"
+}

@@ -39,12 +39,26 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  opendirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { roleJobIds } from "../src/bus-identity";
+import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb, resolveDbPath } from "../src/db";
 import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
 import { isMergeEscalationReason } from "../src/dispatch-failure-key";
+import { escalationRoleFor } from "../src/grant-leaf";
+import { keeperStateDir } from "../src/keeper-state-dir";
 import { repoToken as deriveRepoToken } from "../src/worktree-plan";
 
 /** Envelope schema version for `keeper escalation-brief`. */
@@ -59,6 +73,12 @@ export const MAX_LINEAGE_HOPS = 5;
 const ESCALATION_CATEGORY_RE =
   /\b(SPEC_UNCLEAR|DEPENDENCY_BLOCKED|DESIGN_CONFLICT|SCOPE_EXCEEDED|TOOLING_FAILURE|EXTERNAL_BLOCKED|RESUME_EXHAUSTED|SHARED_BASE_BROKEN)\b/;
 
+/** A grant directory is operator-owned but still a filesystem read surface. Keep
+ *  discovery bounded independently of the parent subprocess timeout. */
+export const MAX_GRANT_CANDIDATES = 128;
+export const MAX_GRANT_LEAF_BYTES = 8 * 1024;
+const O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
+
 const HELP = `keeper escalation-brief <key> [options]
 
 Print the read-only context envelope an autopilot escalation session loads at
@@ -70,6 +90,8 @@ Keys:
   unblock::<task-id>         A blocked plan task (e.g. unblock::fn-12-add-oauth.3)
   deconflict::<epic-id>      A sticky worktree-merge-conflict close (e.g. deconflict::fn-12-add-oauth)
   deconflict::<task-id>      A sticky worktree-merge-conflict work fan-in (e.g. deconflict::fn-12-add-oauth.3)
+  close::<epic-id>           The close-sink merge incident by its own dispatch key (deconflict brief)
+  work::<task-id>            The work fan-in merge incident by its own dispatch key (deconflict brief)
   repair::<repo-token>       A shared-base-broken repo (e.g. repair::keeper-qzvs8i)
 
 The incident block is kind-specific (unblock: blocked reason + CATEGORY + other
@@ -117,7 +139,21 @@ export interface Lineage {
   chain: LineageLink[];
 }
 
-/** The deconflict incident: the parsed merge-conflict + the resolver jobs. */
+/** A live owner's claim on a merge incident, recorded on the sticky row
+ *  by the `IncidentClaimed` fold. Null when the incident is unclaimed. */
+export interface IncidentClaim {
+  session_id: string;
+  pid: number | null;
+  start_time: string | null;
+  claimed_at: number | null;
+}
+
+/** The deconflict incident: the parsed merge-conflict + the resolver jobs. The
+ *  conflict block also carries the incident-fenced clear identities
+ *  (`instance_event_id` / `attempt_id`) and the live owner's claim so a
+ *  session that pulled the incident has everything to claim it and the daemon can
+ *  fence the clear. `grant_ref` is the path to a write grant leaf for the incident
+ *  when one exists (else null). */
 export interface DeconflictIncident {
   conflict: {
     reason: string;
@@ -127,12 +163,19 @@ export interface DeconflictIncident {
     repo_dir: string | null;
     merge_escalated_at: number | null;
     resolver_dispatched_at: number | null;
+    /** The incident-fenced clear identities (ADR 0070). */
+    instance_event_id: number | null;
+    attempt_id: number | null;
+    /** The live owner's claim, or null when the incident is unclaimed. */
+    claim: IncidentClaim | null;
   } | null;
   resolver_jobs: Array<{
     session_id: string;
     state: string | null;
     transcript_path: string | null;
   }>;
+  /** Path to a write grant leaf for this incident when one exists, else null. */
+  grant_ref: string | null;
 }
 
 /** The unblock incident: the blocked task's reason + category + other blocked
@@ -214,9 +257,16 @@ type ParsedKey =
  *  {@link parsePlanRef} at all — it is repo-scoped, not epic/task-scoped, so
  *  its id half is validated against {@link REPO_TOKEN_RE} (the same
  *  repo-token shape `dispatch-command.ts` and `derivers.ts` share) instead.
- *  Returns null for anything not a valid key. */
+ *
+ *  The `work::<taskId>` / `close::<epicId>` forms are the INCIDENT-ID
+ *  keys a live owning session passes to serve the SAME deconflict brief keyed on
+ *  the sticky merge-incident row's OWN `(verb, id)` — so a session that pulled an
+ *  incident (with its fenced identities) keeps one read surface. `work::` requires
+ *  a task-form ref (a work fan-in is always a task); `close::` requires an
+ *  epic-form ref (a close-sink is always an epic). Returns null for anything not a
+ *  valid key. */
 export function parseEscalationKey(key: string): ParsedKey | null {
-  const m = /^(unblock|deconflict|repair)::(.+)$/.exec(key);
+  const m = /^(unblock|deconflict|repair|work|close)::(.+)$/.exec(key);
   if (m == null) {
     return null;
   }
@@ -233,6 +283,20 @@ export function parseEscalationKey(key: string): ParsedKey | null {
     return ref.kind === "epic"
       ? { kind: "deconflict", epic_id: ref.epic_id }
       : { kind: "deconflict", epic_id: ref.epic_id, task_id: ref.task_id };
+  }
+  if (m[1] === "work") {
+    // A work fan-in incident is always a task; its brief is the task-form
+    // deconflict keyed on the `work::<taskId>` sticky row.
+    return ref.kind === "task"
+      ? { kind: "deconflict", epic_id: ref.epic_id, task_id: ref.task_id }
+      : null;
+  }
+  if (m[1] === "close") {
+    // A close-sink incident is always an epic; its brief is the epic-form
+    // deconflict keyed on the `close::<epicId>` sticky row.
+    return ref.kind === "epic"
+      ? { kind: "deconflict", epic_id: ref.epic_id }
+      : null;
   }
   return ref.kind === "task"
     ? { kind: "unblock", epic_id: ref.epic_id, task_id: ref.task_id }
@@ -455,14 +519,19 @@ function parseMergeConflictReason(
 function buildDeconflictIncident(
   db: Database,
   epicId: string,
-  taskId?: string,
+  taskId: string | undefined,
+  grantsDir: string | null,
+  nowMs: number,
+  grantParentJobId: string | null,
 ): IncidentResult<DeconflictIncident> {
   const verb = taskId != null ? "work" : "close";
   const stickyId = taskId ?? epicId;
   const degraded: string[] = [];
   const row = db
     .query(
-      `SELECT reason, dir, merge_escalated_at, resolver_dispatched_at
+      `SELECT reason, dir, merge_escalated_at, resolver_dispatched_at,
+              instance_event_id, attempt_id, claim_session_id, claim_pid,
+              claim_start_time, claimed_at
          FROM dispatch_failures WHERE verb = ? AND id = ?`,
     )
     .get(verb, stickyId) as {
@@ -470,6 +539,12 @@ function buildDeconflictIncident(
     dir: string | null;
     merge_escalated_at: number | null;
     resolver_dispatched_at: number | null;
+    instance_event_id: number | null;
+    attempt_id: number | null;
+    claim_session_id: string | null;
+    claim_pid: number | null;
+    claim_start_time: string | null;
+    claimed_at: number | null;
   } | null;
 
   let conflict: DeconflictIncident["conflict"] = null;
@@ -488,6 +563,17 @@ function buildDeconflictIncident(
       repo_dir: row.dir,
       merge_escalated_at: row.merge_escalated_at,
       resolver_dispatched_at: row.resolver_dispatched_at,
+      instance_event_id: row.instance_event_id,
+      attempt_id: row.attempt_id,
+      claim:
+        row.claim_session_id != null
+          ? {
+              session_id: row.claim_session_id,
+              pid: row.claim_pid,
+              start_time: row.claim_start_time,
+              claimed_at: row.claimed_at,
+            }
+          : null,
     };
   }
 
@@ -509,7 +595,160 @@ function buildDeconflictIncident(
     transcript_path: r.transcript_path,
   }));
 
-  return { data: { conflict, resolver_jobs }, degraded };
+  const grant_ref = findGrantRef(
+    grantsDir,
+    `${verb}::${stickyId}`,
+    row?.instance_event_id ?? null,
+    nowMs,
+    grantParentJobId,
+  );
+
+  return { data: { conflict, resolver_jobs, grant_ref }, degraded };
+}
+
+/** Read one owner-private grant leaf through a no-follow, size-bounded
+ * descriptor. The grant guard independently revalidates the whole tuple at use;
+ * this read only decides whether the brief may advertise the path. */
+function readGrantCandidate(path: string): Record<string, unknown> | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | O_CLOEXEC);
+    const stat = fstatSync(fd);
+    const getuid = process.getuid;
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      (getuid !== undefined && stat.uid !== getuid.call(process))
+    ) {
+      return null;
+    }
+    const bytes = Buffer.allocUnsafe(MAX_GRANT_LEAF_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const n = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (n === 0) break;
+      offset += n;
+    }
+    if (offset > MAX_GRANT_LEAF_BYTES) return null;
+    const parsed = JSON.parse(bytes.subarray(0, offset).toString("utf8"));
+    return parsed != null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // A failed close cannot make an unreadable grant usable.
+      }
+    }
+  }
+}
+
+function isUsableGrantCandidate(
+  leaf: Record<string, unknown>,
+  incidentKey: string,
+  instanceEventId: number,
+  nowMs: number,
+  expectedParentJobId: string | null,
+): boolean {
+  const agentType = leaf.agent_type;
+  const role = leaf.role;
+  const expectedRole =
+    typeof agentType === "string" ? escalationRoleFor(agentType) : null;
+  return (
+    leaf.schema_version === 1 &&
+    typeof leaf.parent_job_id === "string" &&
+    leaf.parent_job_id.length > 0 &&
+    (expectedParentJobId === null ||
+      leaf.parent_job_id === expectedParentJobId) &&
+    expectedRole !== null &&
+    role === expectedRole &&
+    leaf.incident_id === incidentKey &&
+    typeof leaf.attempt_id === "string" &&
+    leaf.attempt_id.length > 0 &&
+    leaf.instance_event_id === instanceEventId &&
+    typeof leaf.writable_root === "string" &&
+    isAbsolute(leaf.writable_root) &&
+    typeof leaf.expires_at === "number" &&
+    Number.isFinite(leaf.expires_at) &&
+    leaf.expires_at > nowMs &&
+    typeof leaf.fencing_token === "number" &&
+    Number.isFinite(leaf.fencing_token)
+  );
+}
+
+/** Scan a bounded owner-private grant directory for the exact live incident
+ * instance and, when known, the current parent session. Missing, unsafe,
+ * expired, malformed, over-budget, or ambiguous leaves yield no ref; the grant
+ * guard still performs authoritative tuple validation at use. */
+export function findGrantRef(
+  grantsDir: string | null,
+  incidentKey: string,
+  instanceEventId: number | null,
+  nowMs: number,
+  expectedParentJobId: string | null = null,
+): string | null {
+  if (grantsDir == null || grantsDir.length === 0 || instanceEventId == null) {
+    return null;
+  }
+  try {
+    const stat = lstatSync(grantsDir);
+    const getuid = process.getuid;
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      (stat.mode & 0o077) !== 0 ||
+      (getuid !== undefined && stat.uid !== getuid.call(process))
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  let dir: ReturnType<typeof opendirSync> | null = null;
+  const matches: string[] = [];
+  let inspected = 0;
+  try {
+    dir = opendirSync(grantsDir);
+    while (inspected < MAX_GRANT_CANDIDATES) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      inspected += 1;
+      if (!entry.name.startsWith("grant-") || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const path = join(grantsDir, entry.name);
+      const leaf = readGrantCandidate(path);
+      if (
+        leaf !== null &&
+        isUsableGrantCandidate(
+          leaf,
+          incidentKey,
+          instanceEventId,
+          nowMs,
+          expectedParentJobId,
+        )
+      ) {
+        matches.push(path);
+      }
+    }
+  } catch {
+    return null;
+  } finally {
+    try {
+      dir?.closeSync();
+    } catch {
+      // A failed close changes no read authority.
+    }
+  }
+  return matches.length === 1 ? (matches[0] as string) : null;
 }
 
 /** Every OTHER blocked task in the same epic — scanned from the gitignored
@@ -838,13 +1077,16 @@ function buildRepairBrief(
 
 // ── Orchestration ──────────────────────────────────────────────────────────
 
-/** Assemble the escalation brief for `key`. PURE over `(db, cwd)` — no clock, no
- *  process env — so a fixture drives every path. `cwd` is the fallback `.keeper`
- *  root when the epic has no `project_dir` in keeper.db. */
+/** Assemble the escalation brief for `key`. `cwd` is the fallback `.keeper`
+ * root when the epic has no `project_dir`; `nowMs` is explicit so grant-expiry
+ * fixtures stay deterministic. */
 export function buildEscalationBrief(
   db: Database,
   key: string,
   cwd: string,
+  grantsDir: string | null = null,
+  nowMs: number = Date.now(),
+  grantParentJobId: string | null = null,
 ): EscalationBriefResult {
   const parsed = parseEscalationKey(key);
   if (parsed == null) {
@@ -898,7 +1140,14 @@ export function buildEscalationBrief(
   const lineage = resolveLineage(db, keeperRoot, epicId);
   const incident =
     parsed.kind === "deconflict"
-      ? buildDeconflictIncident(db, epicId, parsed.task_id)
+      ? buildDeconflictIncident(
+          db,
+          epicId,
+          parsed.task_id,
+          grantsDir,
+          nowMs,
+          grantParentJobId,
+        )
       : buildUnblockIncident(db, keeperRoot, epicId, parsed.task_id);
 
   const degraded = [...lineage.degraded, ...incident.degraded];
@@ -1014,8 +1263,24 @@ export function main(argv: string[]): void {
     return;
   }
 
+  // The grant leaf dir: the launch-injected KEEPER_GRANT_DIR if present, else the
+  // conventional `<keeper-state>/grants`. Resolved in main() (env + default), so
+  // `buildEscalationBrief` stays pure over its explicit params for the fixtures.
+  const grantsDir =
+    process.env.KEEPER_GRANT_DIR != null &&
+    process.env.KEEPER_GRANT_DIR.length > 0
+      ? process.env.KEEPER_GRANT_DIR
+      : join(keeperStateDir(), "grants");
+
   try {
-    const result = buildEscalationBrief(db, key, process.cwd());
+    const result = buildEscalationBrief(
+      db,
+      key,
+      process.cwd(),
+      grantsDir,
+      Date.now(),
+      resolveSessionId(null, process.env),
+    );
     if (result.kind === "error") {
       emitError(
         {

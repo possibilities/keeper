@@ -1,0 +1,31 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Introduces a new bounded retry state-machine into the autopilot finalize/recover reconciler (autopilot-worker.ts + baseline-worker.ts): a per-key load-suspect memo that must be bounded (no infinite retry), reset on green/named-red, and live in producers/workers and NEVER in a deterministic-replayed fold. That is a subtle correctness invariant on keeper's most delicate, contract-shaped operational-state surface where a wrong abstraction (memo placement, key, reset condition) propagates past the task; clears the opus gate. xhigh fits new-pattern introduction touching operational state; not max since the root cause is named and this is not hypothesis-free debugging.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T07:26:04.616000Z",
+  "epic_id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box",
+  "input_hash": "b2303d0d8dc2878f62d22c9ff6026810f1e3491256939fb9ee266446dab2262c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2989505805,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1397-retry-suite-verdicts-once-on-a-quiet-box.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Introduces a new bounded retry state-machine into the autopilot finalize/recover reconciler (autopilot-worker.ts + baseline-worker.ts): a per-key load-suspect memo that must be bounded (no infinite retry), reset on green/named-red, and live in producers/workers and NEVER in a deterministic-replayed fold. That is a subtle correctness invariant on keeper's most delicate, contract-shaped operational-state surface where a wrong abstraction (memo placement, key, reset condition) propagates past the task; clears the opus gate. xhigh fits new-pattern introduction touching operational state; not max since the root cause is named and this is not hypothesis-free debugging.\", \"confidence\": 0.7, \"spark_fit\": false, \"spark_exclusion\": \"subtle-invariant-reasoning\"}]}"
+}

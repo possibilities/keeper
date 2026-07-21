@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T06:19:22.114000Z",
+  "depends_on": [],
+  "epic": "fn-1395-harden-repair-sweep-grant-reaping-and",
+  "id": "fn-1395-harden-repair-sweep-grant-reaping-and.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Reap grant leaves, cap-safe exclusion",
+  "updated_at": "2026-07-21T06:19:22.114000Z"
+}

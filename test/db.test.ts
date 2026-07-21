@@ -19,13 +19,17 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readNonFableFocusLeaf } from "../src/account-focus";
 import {
   AWAITS_DESCRIPTOR,
   DISPATCH_FAILURES_DESCRIPTOR,
   JOBS_DESCRIPTOR,
   selectByIds,
 } from "../src/collections";
-import { publishFableFocusProjection } from "../src/daemon";
+import {
+  publishFableFocusProjection,
+  publishNonFableFocusProjection,
+} from "../src/daemon";
 import {
   AUTOPILOT_STATE_REBUILD_COPY_LISTS,
   computeSchemaFingerprint,
@@ -645,6 +649,31 @@ test("v120: a pre-retirement DB with real usage/profiles rows drops both tables 
   db2.close();
 });
 
+test("v140 retires the builds projection and does not resurrect it on reopen", () => {
+  const pre = new Database(dbPath, { create: true });
+  pre.run("CREATE TABLE builds (project TEXT PRIMARY KEY)");
+  pre.run("INSERT INTO builds (project) VALUES ('keeper')");
+  pre.close();
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { db } = openDb(dbPath);
+    const hasBuilds = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'builds'",
+      )
+      .get();
+    expect(hasBuilds ?? null).toBeNull();
+    expect(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string }
+      ).value,
+    ).toBe(String(SCHEMA_VERSION));
+    db.close();
+  }
+});
+
 test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {
   // The v113→v114 step binds an escalation session to its block instance:
   // `jobs.escalation_instance` (the bound instance id) and
@@ -752,6 +781,56 @@ test("openDb adds nullable Dispatch attempt owners to failures and mint gates", 
   db.close();
 });
 
+test("openDb adds nullable incident claim identity, generation, and freshness columns", () => {
+  const { db } = openDb(":memory:");
+  const columns = db.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  expect(
+    columns.slice(-4).map(({ name, type, notnull, dflt_value }) => ({
+      name,
+      type,
+      notnull,
+      dflt_value,
+    })),
+  ).toEqual([
+    {
+      name: "claim_session_id",
+      type: "TEXT",
+      notnull: 0,
+      dflt_value: null,
+    },
+    { name: "claim_pid", type: "INTEGER", notnull: 0, dflt_value: null },
+    {
+      name: "claim_start_time",
+      type: "TEXT",
+      notnull: 0,
+      dflt_value: null,
+    },
+    { name: "claimed_at", type: "REAL", notnull: 0, dflt_value: null },
+  ]);
+
+  db.prepare(
+    "INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at) VALUES ('close', 'fn-claim-zero', 'r', 1, 1, 1, 1)",
+  ).run();
+  expect(
+    db
+      .prepare(
+        "SELECT claim_session_id, claim_pid, claim_start_time, claimed_at FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-claim-zero'",
+      )
+      .get(),
+  ).toEqual({
+    claim_session_id: null,
+    claim_pid: null,
+    claim_start_time: null,
+    claimed_at: null,
+  });
+  db.close();
+});
+
 test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {
   // The v106->v107 step adds the two multi-harness columns to both surfaces:
   // events via the FIVE-place lockstep (CREATE literal + migration append), jobs
@@ -813,7 +892,7 @@ test("openDb adds nullable adopted to BOTH events and jobs (fn-1131 task .1)", (
   db.close();
 });
 
-test("Fable focus schema defaults are nullable on fresh and upgraded projections", () => {
+test("Account focus schema defaults are nullable and independent", () => {
   const { db } = openDb(":memory:");
   const state = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
     name: string;
@@ -821,6 +900,9 @@ test("Fable focus schema defaults are nullable on fresh and upgraded projections
     dflt_value: string | null;
   }[];
   expect(state.find((column) => column.name === "fable_focus")).toEqual(
+    expect.objectContaining({ type: "TEXT", dflt_value: null }),
+  );
+  expect(state.find((column) => column.name === "non_fable_focus")).toEqual(
     expect.objectContaining({ type: "TEXT", dflt_value: null }),
   );
   const jobs = db.prepare("PRAGMA table_info(jobs)").all() as {
@@ -846,7 +928,7 @@ test("Fable focus schema defaults are nullable on fresh and upgraded projections
   db.close();
 });
 
-test("an openDb boot cycle preserves durable Fable focus and republishes the same absolute policy", () => {
+test("an openDb boot cycle preserves and republishes both independent Account focuses", () => {
   const policyJson =
     '{"schema_version":1,"policy_id":"event:4242","target_route":"claude-swap:7","fable_intent":true,"set_at":"2026-01-02T03:04:05.000Z","lifetime":{"kind":"absolute","deadline_at":"2026-12-31T23:59:59.000Z"}}';
   const expectedPolicy = {
@@ -860,20 +942,33 @@ test("an openDb boot cycle preserves durable Fable focus and republishes the sam
       deadline_at: "2026-12-31T23:59:59.000Z",
     },
   } as const;
+  const nonFablePolicyJson =
+    '{"schema_version":1,"policy_id":"event:4243","target_route":"claude-swap:8","fable_intent":false,"set_at":"2026-01-02T03:05:05.000Z","lifetime":{"kind":"permanent"}}';
+  const expectedNonFablePolicy = {
+    schema_version: 1,
+    policy_id: "event:4243",
+    target_route: "claude-swap:8",
+    fable_intent: false,
+    set_at: "2026-01-02T03:05:05.000Z",
+    lifetime: { kind: "permanent" },
+  } as const;
   const seeded = openDb(dbPath);
   seeded.db.run(
     `INSERT INTO autopilot_state
-       (id, paused, last_event_id, created_at, updated_at, fable_focus)
-     VALUES (1, 1, 4242, 1767323045, 1767323045, ?)`,
-    [policyJson],
+       (id, paused, last_event_id, created_at, updated_at, fable_focus, non_fable_focus)
+     VALUES (1, 1, 4243, 1767323045, 1767323045, ?, ?)`,
+    [policyJson, nonFablePolicyJson],
   );
   seeded.db.close();
 
   const booted = openDb(dbPath);
   const durable = booted.db
-    .prepare("SELECT fable_focus FROM autopilot_state WHERE id = 1")
-    .get() as { fable_focus: string | null };
+    .prepare(
+      "SELECT fable_focus, non_fable_focus FROM autopilot_state WHERE id = 1",
+    )
+    .get() as { fable_focus: string | null; non_fable_focus: string | null };
   expect(durable.fable_focus).toBe(policyJson);
+  expect(durable.non_fable_focus).toBe(nonFablePolicyJson);
 
   const routingRoot = join(tmpDir, "account-routing");
   expect(publishFableFocusProjection(booted.db, routingRoot)).toEqual({
@@ -883,7 +978,40 @@ test("an openDb boot cycle preserves durable Fable focus and republishes the sam
   expect(
     readFableFocusLeaf(join(routingRoot, "fable-focus-policy.json")),
   ).toEqual({ available: true, policy: expectedPolicy });
+  expect(publishNonFableFocusProjection(booted.db, routingRoot)).toEqual({
+    schema_version: 1,
+    policy: expectedNonFablePolicy,
+  });
+  expect(
+    readNonFableFocusLeaf(join(routingRoot, "non-fable-focus-policy.json")),
+  ).toEqual({ available: true, policy: expectedNonFablePolicy });
   booted.db.close();
+});
+
+test("the tail migration adds Non-Fable focus without changing Fable focus", () => {
+  const seeded = openDb(dbPath);
+  const fable =
+    '{"schema_version":1,"policy_id":"event:9","target_route":"claude-swap:2","fable_intent":true,"set_at":"2026-01-01T00:00:00.000Z","lifetime":{"kind":"permanent"}}';
+  seeded.db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, fable_focus)
+     VALUES (1, 1, 9, 1, 1, ?)`,
+    [fable],
+  );
+  seeded.db.run("ALTER TABLE autopilot_state DROP COLUMN non_fable_focus");
+  seeded.db.run("UPDATE meta SET value = ? WHERE key = 'schema_version'", [
+    String(SCHEMA_STEPS[SCHEMA_STEPS.length - 2]?.version),
+  ]);
+  seeded.db.close();
+
+  const upgraded = openDb(dbPath);
+  const row = upgraded.db
+    .query(
+      "SELECT fable_focus, non_fable_focus FROM autopilot_state WHERE id = 1",
+    )
+    .get() as { fable_focus: string; non_fable_focus: string | null };
+  expect(row).toEqual({ fable_focus: fable, non_fable_focus: null });
+  upgraded.db.close();
 });
 
 test("autopilot_state adoption-column drop preserves every surviving value and fresh-schema order", () => {
@@ -907,6 +1035,7 @@ test("autopilot_state adoption-column drop preserves every surviving value and f
     drift_behind_threshold: 23,
     drift_age_threshold_days: 11,
     fable_focus: null,
+    non_fable_focus: null,
   };
   seeded.db
     .prepare(`
@@ -3378,7 +3507,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // pace-free fold-work rate the full-replay projection derives from) — an
   // additive ALTER on that operational singleton, not a touch of the epics
   // SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(137);
+  expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(138);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

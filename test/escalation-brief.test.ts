@@ -15,11 +15,19 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildEscalationBrief,
+  findGrantRef,
+  MAX_GRANT_LEAF_BYTES,
   main,
   parseEscalationKey,
 } from "../cli/escalation-brief";
@@ -95,13 +103,22 @@ function seedMergeConflict(
     dir?: string | null;
     resolver_dispatched_at?: number | null;
     merge_escalated_at?: number | null;
+    instance_event_id?: number | null;
+    attempt_id?: number | null;
+    claim?: {
+      session_id: string;
+      pid: number | null;
+      start_time: string | null;
+      claimed_at: number | null;
+    } | null;
   },
 ): void {
   db.query(
     `INSERT INTO dispatch_failures
        (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-        resolver_dispatched_at, merge_escalated_at)
-     VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
+        resolver_dispatched_at, merge_escalated_at, instance_event_id,
+        attempt_id, claim_session_id, claim_pid, claim_start_time, claimed_at)
+     VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.verb ?? "close",
     opts.id,
@@ -109,6 +126,12 @@ function seedMergeConflict(
     opts.dir ?? null,
     opts.resolver_dispatched_at ?? null,
     opts.merge_escalated_at ?? null,
+    opts.instance_event_id ?? null,
+    opts.attempt_id ?? null,
+    opts.claim?.session_id ?? null,
+    opts.claim?.pid ?? null,
+    opts.claim?.start_time ?? null,
+    opts.claim?.claimed_at ?? null,
   );
 }
 
@@ -161,11 +184,20 @@ test("parseEscalationKey accepts all three key shapes", () => {
   });
 });
 
-test("parseEscalationKey accepts a task-form deconflict ref (the work-verb fan-in escalation)", () => {
+test("parseEscalationKey accepts task deconflicts and direct work/close incident ids", () => {
   expect(parseEscalationKey("deconflict::fn-12-add-oauth.3")).toEqual({
     kind: "deconflict",
     epic_id: "fn-12-add-oauth",
     task_id: "fn-12-add-oauth.3",
+  });
+  expect(parseEscalationKey("work::fn-12-add-oauth.3")).toEqual({
+    kind: "deconflict",
+    epic_id: "fn-12-add-oauth",
+    task_id: "fn-12-add-oauth.3",
+  });
+  expect(parseEscalationKey("close::fn-12-add-oauth")).toEqual({
+    kind: "deconflict",
+    epic_id: "fn-12-add-oauth",
   });
 });
 
@@ -173,6 +205,8 @@ test("parseEscalationKey rejects shape mismatches and garbage", () => {
   // unblock wants a task ref; an epic ref is a mismatch.
   expect(parseEscalationKey("unblock::fn-12-add-oauth")).toBeNull();
   expect(parseEscalationKey("resolve::fn-12-add-oauth")).toBeNull();
+  expect(parseEscalationKey("work::fn-12-add-oauth")).toBeNull();
+  expect(parseEscalationKey("close::fn-12-add-oauth.3")).toBeNull();
   expect(parseEscalationKey("garbage")).toBeNull();
   expect(parseEscalationKey("deconflict::")).toBeNull();
 });
@@ -794,8 +828,12 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         repo_dir: "/repo",
         merge_escalated_at: null,
         resolver_dispatched_at: null,
+        instance_event_id: null,
+        attempt_id: null,
+        claim: null,
       },
       resolver_jobs: [],
+      grant_ref: null,
     },
     lineage: {
       creator: {
@@ -834,6 +872,183 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
     degraded: ["incident_resolver_job_missing"],
   });
   db.close();
+});
+
+test("direct work and close incident ids resolve fenced claim and grant facts read-only", () => {
+  const { db } = freshMemDb();
+  const epicId = "fn-950-incident-brief";
+  const taskId = `${epicId}.1`;
+  seedEpic(db, { epic_id: epicId, project_dir: tmp });
+  writeEpicFile(tmp, epicId, { primary_repo: "/repo" });
+  seedMergeConflict(db, {
+    verb: "work",
+    id: taskId,
+    reason:
+      `worktree-merge-conflict: merging keeper/epic/${epicId}--${taskId} ` +
+      `into keeper/epic/${epicId} — CONFLICT (content): work.ts`,
+    dir: "/repo/lane",
+    instance_event_id: 91,
+    attempt_id: 14,
+    claim: {
+      session_id: "session-owner",
+      pid: 9191,
+      start_time: "proc:9191:1",
+      claimed_at: 1_700_000_001,
+    },
+  });
+  seedMergeConflict(db, {
+    verb: "close",
+    id: epicId,
+    reason:
+      `worktree-merge-conflict: merging keeper/epic/${epicId} into main — ` +
+      `CONFLICT (content): close.ts`,
+    dir: "/repo",
+    instance_event_id: 92,
+    attempt_id: 15,
+  });
+  const grantsDir = join(tmp, "grants");
+  mkdirSync(grantsDir, { recursive: true, mode: 0o700 });
+  const grant = (instanceEventId: number) => ({
+    schema_version: 1,
+    parent_job_id: "session-owner",
+    agent_type: "plan:deconflicter",
+    incident_id: `work::${taskId}`,
+    attempt_id: "attempt-14",
+    instance_event_id: instanceEventId,
+    writable_root: "/repo",
+    role: "deconflict",
+    expires_at: 6_000,
+    fencing_token: 3,
+  });
+  writeFileSync(
+    join(grantsDir, "grant-stale.json"),
+    JSON.stringify(grant(90)),
+    { mode: 0o600 },
+  );
+  const grantPath = join(grantsDir, "grant-work.json");
+  writeFileSync(grantPath, JSON.stringify(grant(91)), { mode: 0o600 });
+
+  const work = buildEscalationBrief(
+    db,
+    `work::${taskId}`,
+    tmp,
+    grantsDir,
+    5_000,
+    "session-owner",
+  );
+  expect(work.kind).toBe("ok");
+  if (work.kind === "ok") {
+    expect(work.brief.kind).toBe("deconflict");
+    expect(work.brief.epic_id).toBe(epicId);
+    expect(work.brief.task_id).toBe(taskId);
+    expect(work.brief.incident).toMatchObject({
+      conflict: {
+        instance_event_id: 91,
+        attempt_id: 14,
+        claim: {
+          session_id: "session-owner",
+          pid: 9191,
+          start_time: "proc:9191:1",
+          claimed_at: 1_700_000_001,
+        },
+      },
+      grant_ref: grantPath,
+    });
+  }
+
+  const close = buildEscalationBrief(
+    db,
+    `close::${epicId}`,
+    tmp,
+    grantsDir,
+    5_000,
+    "session-owner",
+  );
+  expect(close.kind).toBe("ok");
+  if (close.kind === "ok") {
+    expect(close.brief.kind).toBe("deconflict");
+    expect(close.brief.epic_id).toBe(epicId);
+    expect(close.brief.task_id).toBeNull();
+    expect(close.brief.incident).toMatchObject({
+      conflict: {
+        instance_event_id: 92,
+        attempt_id: 15,
+        claim: null,
+      },
+      grant_ref: null,
+    });
+  }
+  db.close();
+});
+
+test("grant discovery rejects expired, oversized, symlinked, and ambiguous leaves", () => {
+  const incidentId = "close::fn-951-grant-bounds";
+  const instanceEventId = 101;
+  const grant = {
+    schema_version: 1,
+    parent_job_id: "session-owner",
+    agent_type: "plan:deconflicter",
+    incident_id: incidentId,
+    attempt_id: "attempt-20",
+    instance_event_id: instanceEventId,
+    writable_root: "/repo",
+    role: "deconflict",
+    expires_at: 6_000,
+    fencing_token: 4,
+  };
+
+  const expiredDir = join(tmp, "expired-grants");
+  mkdirSync(expiredDir, { mode: 0o700 });
+  writeFileSync(
+    join(expiredDir, "grant-expired.json"),
+    JSON.stringify({ ...grant, expires_at: 5_000 }),
+    { mode: 0o600 },
+  );
+  expect(
+    findGrantRef(expiredDir, incidentId, instanceEventId, 5_000),
+  ).toBeNull();
+
+  const oversizedDir = join(tmp, "oversized-grants");
+  mkdirSync(oversizedDir, { mode: 0o700 });
+  writeFileSync(
+    join(oversizedDir, "grant-oversized.json"),
+    JSON.stringify({ ...grant, padding: "x".repeat(MAX_GRANT_LEAF_BYTES) }),
+    { mode: 0o600 },
+  );
+  expect(
+    findGrantRef(oversizedDir, incidentId, instanceEventId, 5_000),
+  ).toBeNull();
+
+  const symlinkDir = join(tmp, "symlink-grants");
+  mkdirSync(symlinkDir, { mode: 0o700 });
+  const target = join(tmp, "grant-target.json");
+  writeFileSync(target, JSON.stringify(grant), { mode: 0o600 });
+  symlinkSync(target, join(symlinkDir, "grant-linked.json"));
+  expect(
+    findGrantRef(symlinkDir, incidentId, instanceEventId, 5_000),
+  ).toBeNull();
+
+  const ambiguousDir = join(tmp, "ambiguous-grants");
+  mkdirSync(ambiguousDir, { mode: 0o700 });
+  const ownerPath = join(ambiguousDir, "grant-owner.json");
+  writeFileSync(ownerPath, JSON.stringify(grant), { mode: 0o600 });
+  writeFileSync(
+    join(ambiguousDir, "grant-other.json"),
+    JSON.stringify({ ...grant, parent_job_id: "session-other" }),
+    { mode: 0o600 },
+  );
+  expect(
+    findGrantRef(ambiguousDir, incidentId, instanceEventId, 5_000),
+  ).toBeNull();
+  expect(
+    findGrantRef(
+      ambiguousDir,
+      incidentId,
+      instanceEventId,
+      5_000,
+      "session-owner",
+    ),
+  ).toBe(ownerPath);
 });
 
 // ── Deconflict: work-verb task-form ref (fn-1246 F1) ───────────────────────

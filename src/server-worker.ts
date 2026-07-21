@@ -46,6 +46,7 @@ import {
 import { dirname } from "node:path";
 import { createHistogram, monitorEventLoopDelay } from "node:perf_hooks";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import type { NormalizedNonFableFocusInput } from "./account-focus";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import {
   type CollectionDescriptor,
@@ -334,6 +335,7 @@ export interface SetAutopilotConfigRequestMessage {
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
     fable_focus?: NormalizedFableFocusInput | null;
+    non_fable_focus?: NormalizedNonFableFocusInput | null;
   };
 }
 
@@ -2279,7 +2281,8 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
  *     pacing is real experienced catch-up latency.
  *   - The FULL-REPLAY projection derives ONLY from the pace-free fold-work
  *     rate (`stats.workMs / events_folded`) scaled by the CURRENT total
- *     `eventCount`: an estimator of a from-scratch rebuild, whose folds run
+ *     `eventCount` (an id-derived upper bound of the retained-row count —
+ *     never an exact table walk): an estimator of a from-scratch rebuild, whose folds run
  *     unpaced. It is `null` unless `workMs` is a positive measurement — a
  *     missing, zero, or negative `workMs` reads as "not measured", NEVER a
  *     zero or the paced-rate extrapolation. It is also `null` when
@@ -2292,16 +2295,32 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
  * projected durations `null`: the shared denominator is undefined. A
  * non-positive `duration_ms` additionally nulls just the catch-up leg.
  */
+export function computeIngestLagSeconds(
+  nowSec: number,
+  newestFoldedEventTs: number | null,
+): number {
+  if (
+    newestFoldedEventTs === null ||
+    !Number.isFinite(nowSec) ||
+    !Number.isFinite(newestFoldedEventTs)
+  ) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(nowSec - newestFoldedEventTs));
+}
+
 export function computeEventStoreStatus(
   stats: BootCatchupStats | null,
   eventCount: number,
   dbBytes: number,
   headEventId: number,
+  ingestLagSeconds = 0,
 ): EventStoreStatus {
   if (stats === null) {
     return {
       event_count: eventCount,
       db_bytes: dbBytes,
+      ingest_lag_seconds: ingestLagSeconds,
       last_boot_catchup: null,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
@@ -2317,6 +2336,7 @@ export function computeEventStoreStatus(
     return {
       event_count: eventCount,
       db_bytes: dbBytes,
+      ingest_lag_seconds: ingestLagSeconds,
       last_boot_catchup: lastBootCatchup,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
@@ -2337,6 +2357,7 @@ export function computeEventStoreStatus(
   return {
     event_count: eventCount,
     db_bytes: dbBytes,
+    ingest_lag_seconds: ingestLagSeconds,
     last_boot_catchup: lastBootCatchup,
     projected_catchup_duration_ms: projectedCatchupMs,
     projected_full_replay_duration_ms: projectedFullReplayMs,
@@ -2353,7 +2374,10 @@ export function computeEventStoreStatus(
  * independently defended so a missing/corrupt piece degrades to the null-honest
  * shape rather than throwing into the no-self-heal serve path.
  */
-export function readEventStoreStatus(db: Database): EventStoreStatus {
+export function readEventStoreStatus(
+  db: Database,
+  nowSec = Date.now() / 1000,
+): EventStoreStatus {
   let head = 0;
   try {
     const h = db.prepare("SELECT MAX(id) AS head FROM events").get() as {
@@ -2363,15 +2387,12 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
   } catch {
     head = 0;
   }
-  let eventCount = 0;
-  try {
-    const c = db.query("SELECT COUNT(*) AS n FROM events").get() as {
-      n: number;
-    } | null;
-    eventCount = c ? c.n : 0;
-  } catch {
-    eventCount = 0;
-  }
+  // `head` doubles as the event-count figure: an id-derived upper bound of the
+  // retained-row count (retention row-deletes leave gaps) that keeps the
+  // full-replay estimator conservative. An exact COUNT(*) walks the whole
+  // multi-GB events b-tree on every status read — a cost this serve path must
+  // never pay.
+  const eventCount = head;
   let dbBytes = 0;
   try {
     const pc = db.query("PRAGMA page_count").get() as {
@@ -2390,7 +2411,27 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
   } catch {
     catchupStats = null;
   }
-  return computeEventStoreStatus(catchupStats, eventCount, dbBytes, head);
+  let newestFoldedEventTs: number | null = null;
+  try {
+    const row = db
+      .query(
+        `SELECT e.ts AS ts
+           FROM reducer_state r
+           JOIN events e ON e.id = r.last_event_id
+          WHERE r.id = 1`,
+      )
+      .get() as { ts: number } | null;
+    newestFoldedEventTs = row?.ts ?? null;
+  } catch {
+    newestFoldedEventTs = null;
+  }
+  return computeEventStoreStatus(
+    catchupStats,
+    eventCount,
+    dbBytes,
+    head,
+    computeIngestLagSeconds(nowSec, newestFoldedEventTs),
+  );
 }
 
 /**
@@ -4125,6 +4166,7 @@ function main(): void {
       drift_behind_threshold?: number | null;
       drift_age_threshold_days?: number | null;
       fable_focus?: NormalizedFableFocusInput | null;
+      non_fable_focus?: NormalizedNonFableFocusInput | null;
     }): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();

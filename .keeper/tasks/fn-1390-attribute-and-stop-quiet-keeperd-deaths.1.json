@@ -1,0 +1,16 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-20T20:24:45.863000Z",
+  "depends_on": [],
+  "epic": "fn-1390-attribute-and-stop-quiet-keeperd-deaths",
+  "id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Log every daemon exit path with flushed attribution",
+  "updated_at": "2026-07-21T00:07:54.225000Z",
+  "worker_done_at": "2026-07-21T00:07:54.225000Z"
+}

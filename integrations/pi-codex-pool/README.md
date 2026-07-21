@@ -1,14 +1,12 @@
 # Keeper Pi Codex pool
 
-Route Keeper-marked Pi Codex requests across opaque subscription aliases while leaving standalone Pi untouched.
+Route Keeper-marked Pi Codex requests across opaque subscription aliases with quota-scoped routing while leaving standalone Pi untouched.
 
-## Activation boundary
+## Routing contract
 
-Pi loads the package as an extension, but it registers nothing unless `KEEPER_JOB_ID` is nonempty. Keeper launch integration supplies that marker. Installing the package alone does not activate account routing for ordinary Pi sessions.
+Pi loads the package as an extension, but it registers nothing unless `KEEPER_JOB_ID` is nonempty. Keeper launch integration supplies that marker and loads the companion only on the tracked Pi launch path; Pi metadata/package commands and standalone Pi use their native paths. The package overrides only `openai-codex` streaming and delegates wire behavior to Pi's built-in Codex implementation.
 
-The default aliases are `keeper-codex-a` and `keeper-codex-b`. Set `KEEPER_PI_CODEX_POOL_ALIASES` to a JSON array of one through eight names matching `keeper-codex-*` before launch to use a different opaque set. Alias names must not contain email addresses, account names, plan names, or other operator identity.
-
-Enroll each alias through Pi's login flow:
+The default aliases are `keeper-codex-a` and `keeper-codex-b`. Set `KEEPER_PI_CODEX_POOL_ALIASES` to a JSON array of one through eight names matching `keeper-codex-*` before launch to use a different opaque set. Alias names must not contain email addresses, account names, plan names, or other operator identity. Enroll each alias through Pi's login flow:
 
 ```text
 /login keeper-codex-a
@@ -17,15 +15,15 @@ Enroll each alias through Pi's login flow:
 
 OAuth credentials stay in Pi's `auth.json`. The companion resolves and refreshes only the selected alias under the credential file's cross-process lock and replaces refreshed JSON atomically with private file permissions. Tokens and token-derived account identity are used only for the delegated request and usage fetch.
 
-## Routing contract
+The requested model chooses the Codex quota scope. `gpt-5.3-codex-spark` requests, including provider-qualified `openai-codex/gpt-5.3-codex-spark`, use `model:gpt-5.3-codex-spark`; every other Codex model uses `generic`. A session route is sticky for exactly `(session, scope)`. Scope-specific authorization, usage/headroom, and quota cooldowns never bleed into the sibling scope; routing pressure and auth/rate/transport cooldowns are account-wide.
 
-The companion overrides only `openai-codex` streaming and delegates wire behavior to Pi's built-in Codex implementation. A session keeps its selected healthy alias. New sessions choose deterministically from fresh worst-window usage, expiring pressure, cooldown, and least-recently-used state.
+The launcher provides a scope-keyed alias policy plus its binding. A missing, malformed, or binding-mismatched policy fails closed to native fallback instead of broadening authorization. A scope-tagged initial alias candidate is consumed only by a matching scoped request.
 
-One logical call can use an initial alias and at most one different alias. The companion disables lower transport retries for pooled attempts. It retries only classified quota, rate, authentication, or transport failures that occur before Substantive output. Text, thinking, tool-call, and unknown events are Substantive; after any such event the attempt and its terminal outcome remain ordered and are never replayed. Abort and the caller's total timeout cover selection, refresh, backoff, and both attempts.
+One logical call can make at most two attempts. The companion disables lower transport retries for pooled attempts. It moves classified quota, rate, authentication, or pre-output transport failures to a different eligible alias; when no distinct eligible alias exists, only a pre-output transport failure retries the same alias once. Context overflow and unclassified failures never replay. Text, thinking, tool-call, and unknown events are Substantive; after any such event the attempt and its terminal outcome remain ordered and are never replayed. Abort and the caller's total timeout cover selection, refresh, backoff, and both attempts.
 
-Caller headers, callbacks, transport preference, cache controls, metadata, environment, reasoning controls, context, model, and logical session identity pass through unchanged. Account stickiness prevents a healthy cached connection from crossing aliases; a route changes only after its prior account attempt fails. Pooled delegates force `maxRetries` to zero so the wrapper remains the only account-retry owner.
+Caller headers, callbacks, transport preference, cache controls, metadata, environment, reasoning controls, context, model, and logical session identity pass through unchanged. Account stickiness prevents a healthy cached connection from crossing aliases within its scope; a route changes only after its prior account attempt fails. Pooled delegates force `maxRetries` to zero so the wrapper remains the only account-retry owner.
 
-Missing configuration, unavailable credentials, or failed pool machinery emits this fixed warning and delegates to native `openai-codex`:
+Missing configuration, missing Spark-scope usage evidence for a Spark request, missing scoped authorization, unavailable credentials, or failed pool machinery emits this fixed warning and delegates to native `openai-codex`:
 
 ```text
 [keeper-codex-pool] pool-unavailable; using native openai-codex
@@ -38,21 +36,22 @@ Run `/codex-pool-observe` inside a marked Pi instance, or invoke the package's `
 - schema and configuration bindings;
 - opaque aliases;
 - bounded observation and expiration timestamps;
-- normalized usage percentages and reset times; and
+- normalized usage percentages, reset times, and exact quota scopes;
+- an optional canonical provider account category from a fixed allowlist; and
 - fixed health or failure classes.
 
-It never contains raw provider responses, headers, errors, credentials, account IDs, plan labels, or free-form account data.
+It never contains raw provider responses, headers, errors, credentials, account IDs, raw plan labels, inferred capacity multipliers, or free-form account data. Credential or usage failures produce immediate sanitized unavailable observations; missing authorization fails closed at selection, and last-good display data never authorizes routing.
 
-`keeper-codex-pool-state.json` stores only opaque aliases, bounded usage, pressure, cooldown, selection timestamps, expirations, and the configuration binding. Session routes remain memory-only. This surface is transient routing state, not a keeperd Projection, RPC mutation, lease, or claim.
+`keeper-codex-pool-state.json` stores only opaque aliases, scope-keyed usage and quota cooldowns, account-wide pressure and failure cooldowns, selection timestamps, expirations, and the configuration binding. Session routes remain memory-only. Persisted state updates read, merge, and atomically write under the package's Node owner-lock so stale observations cannot erase fresher pressure or cooldown data. This surface is transient routing state, not a keeperd Projection, RPC mutation, lease, or claim.
 
 ## Live proof
 
 An armed managed Pi session registers `codex_pool_proof`, a sequential no-argument tool that runs the complete proof once and atomically writes its private report. Models do not assemble proof primitives: the tool drives every required route and records the observed per-clause transcript.
 
+The report carries one top-level `quota_scope`, and every recorded route must carry the same scope. Mixed scopes, display labels, old schemas, unknown fields, or unknown scope strings fail verification structurally. Verification re-derives the verdict from the recorded transcript and the exact revision, configuration, alias, and scope bindings; it also requires root and child routes, completed restoration, and a clean artifact scan. The launcher separately binds the resulting runtime alias policy.
+
 The forced-refresh seam in the credential layer performs a bounded normal OAuth refresh for enrolled aliases even when expiry does not require one. The fault-injection seam at the pooled-stream delegate emits an allowed classified fault before output or after Substantive output, exercising the production classification, retry, cooldown, and fallback path. Both seams are inert outside an armed managed proof window.
 
-The report is an attestation, not a self-reported result. Verification re-derives the verdict from the recorded transcript and the exact revision, configuration, and alias bindings; it also requires root and child routes, completed restoration, and a clean artifact scan. A report that is not derived from an actually recorded run fails verification structurally. The report is evidence only: it does not register providers, change configuration, or activate the pool.
-
-## Pi compatibility seam
+The report is an attestation, not a self-reported result. A report that is not derived from an actually recorded run fails verification structurally. The report is evidence only: it does not register providers, change configuration, or activate the pool.
 
 The extension imports `openAICodexResponsesApi()` from the `@earendil-works/pi-ai` compat root. Pi's extension loader aliases that root correctly, while its alias currently also captures the documented `@earendil-works/pi-ai/api/openai-codex-responses` subpath as though it were below `compat.js`. The upstream fix belongs in `packages/coding-agent/src/core/extensions/loader.ts` and is tracked through <https://github.com/earendil-works/pi-mono/issues>. Production uses the compat-root seam and does not depend on that issue being resolved.

@@ -3,6 +3,11 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+} from "../../../src/codex-quota-scope.ts";
+import {
   type ArtifactSurface,
   aliasRoleBinding,
   classifyLiveProof,
@@ -14,6 +19,7 @@ import {
   type ProofTranscriptEntry,
   QUOTA_WAIVABLE_CLAUSES,
   reportDegradedVerdict,
+  reportQuotaScope,
   scanProofArtifacts,
   writeLiveProofReport,
 } from "../src/proof.ts";
@@ -103,12 +109,40 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
   },
 ];
 
-function passingReport(): LiveProofReport {
+function quotaRoutes(
+  quotaScope: CodexQuotaScope = CODEX_GENERIC_QUOTA_SCOPE,
+): LiveProofReport["routes"] {
+  return [
+    {
+      session_role: "root",
+      quota_scope: quotaScope,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      attempts: 2,
+      failure_class: "quota",
+      substantive_output: false,
+      restored: true,
+    },
+    {
+      session_role: "child",
+      quota_scope: quotaScope,
+      aliases: ["keeper-codex-b"],
+      attempts: 1,
+      failure_class: "none",
+      substantive_output: true,
+      restored: true,
+    },
+  ];
+}
+
+function passingReport(
+  quotaScope: CodexQuotaScope = CODEX_GENERIC_QUOTA_SCOPE,
+): LiveProofReport {
   return collectLiveProof(
     {
       revision: REVISION,
       config_binding: CONFIG_BINDING,
       alias_binding: ALIAS_BINDING,
+      quota_scope: quotaScope,
       started_at_ms: 990_000,
       completed_at_ms: 999_000,
       interrupted: false,
@@ -120,24 +154,7 @@ function passingReport(): LiveProofReport {
       clauses: Object.fromEntries(
         LIVE_PROOF_CLAUSES.map((clause) => [clause, true]),
       ) as LiveProofReport["clauses"],
-      routes: [
-        {
-          session_role: "root",
-          aliases: ["keeper-codex-a", "keeper-codex-b"],
-          attempts: 2,
-          failure_class: "quota",
-          substantive_output: false,
-          restored: true,
-        },
-        {
-          session_role: "child",
-          aliases: ["keeper-codex-b"],
-          attempts: 1,
-          failure_class: "none",
-          substantive_output: true,
-          restored: true,
-        },
-      ],
+      routes: quotaRoutes(quotaScope),
       alias_health: [
         { alias: "keeper-codex-a", status: "healthy" },
         { alias: "keeper-codex-b", status: "healthy" },
@@ -158,35 +175,20 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-const QUOTA_ROUTES: LiveProofReport["routes"] = [
-  {
-    session_role: "root",
-    aliases: ["keeper-codex-a", "keeper-codex-b"],
-    attempts: 2,
-    failure_class: "quota",
-    substantive_output: false,
-    restored: true,
-  },
-  {
-    session_role: "child",
-    aliases: ["keeper-codex-b"],
-    attempts: 1,
-    failure_class: "none",
-    substantive_output: true,
-    restored: true,
-  },
-];
+const QUOTA_ROUTES: LiveProofReport["routes"] = quotaRoutes();
 
 /** A collectLiveProof input with the named clauses dropped and routes overridden. */
 function proofInput(
   dropClauses: readonly LiveProofClause[] = [],
   routes: LiveProofReport["routes"] = QUOTA_ROUTES,
+  quotaScope: CodexQuotaScope = CODEX_GENERIC_QUOTA_SCOPE,
 ): Omit<LiveProofReport, "schema_version" | "verdict" | "degraded"> {
   const drop = new Set(dropClauses);
   return {
     revision: REVISION,
     config_binding: CONFIG_BINDING,
     alias_binding: ALIAS_BINDING,
+    quota_scope: quotaScope,
     started_at_ms: 990_000,
     completed_at_ms: 999_000,
     interrupted: false,
@@ -230,11 +232,73 @@ describe("live proof bindings and classifier", () => {
 
   test("returns proven only for the complete fresh allowlisted report", () => {
     const report = passingReport();
+    expect(report.schema_version).toBe(2);
+    expect(report.quota_scope).toBe(CODEX_GENERIC_QUOTA_SCOPE);
+    expect(
+      report.routes.every((route) => route.quota_scope === report.quota_scope),
+    ).toBe(true);
     expect(report.verdict).toBe("proven");
     expect(classifyLiveProof(report, EXPECTED)).toEqual({
       verdict: "proven",
       reasons: [],
     });
+    expect(reportQuotaScope(report)).toBe(CODEX_GENERIC_QUOTA_SCOPE);
+  });
+
+  test("accepts the shared Spark quota scope, not display labels", () => {
+    const report = passingReport(CODEX_SPARK_QUOTA_SCOPE);
+    expect(report.quota_scope).toBe(CODEX_SPARK_QUOTA_SCOPE);
+    expect(
+      report.routes.every((route) => route.quota_scope === report.quota_scope),
+    ).toBe(true);
+    expect(classifyLiveProof(report, EXPECTED)).toEqual({
+      verdict: "proven",
+      reasons: [],
+    });
+    expect(reportQuotaScope(report)).toBe(CODEX_SPARK_QUOTA_SCOPE);
+
+    const displayLabel = {
+      ...report,
+      quota_scope: "GPT-5.3-Codex-Spark",
+      routes: report.routes.map((route) => ({
+        ...route,
+        quota_scope: "GPT-5.3-Codex-Spark",
+      })),
+    };
+    expect(classifyLiveProof(displayLabel, EXPECTED).verdict).toBe("failed");
+    expect(reportQuotaScope(displayLabel)).toBeNull();
+  });
+
+  test("rejects invalid, mixed-scope, unknown-field, and old-schema scope reports", () => {
+    const invalid = { ...passingReport(), quota_scope: "spark" };
+    expect(classifyLiveProof(invalid, EXPECTED).verdict).toBe("failed");
+    expect(reportQuotaScope(invalid)).toBeNull();
+
+    const mixed = clone(passingReport());
+    const childRoute = mixed.routes[1];
+    if (!childRoute) throw new Error("missing-child-fixture");
+    childRoute.quota_scope = CODEX_SPARK_QUOTA_SCOPE;
+    mixed.interrupted = true;
+    mixed.verdict = "incomplete";
+    expect(classifyLiveProof(mixed, EXPECTED).verdict).toBe("failed");
+    expect(reportQuotaScope(mixed)).toBeNull();
+
+    const unknown = { ...passingReport(), scope_label: "generic" };
+    expect(classifyLiveProof(unknown, EXPECTED).verdict).toBe("failed");
+    expect(reportQuotaScope(unknown)).toBeNull();
+
+    const oldSchema = clone(passingReport()) as Record<string, unknown>;
+    oldSchema.schema_version = 1;
+    delete oldSchema.quota_scope;
+    oldSchema.routes = (oldSchema.routes as Array<Record<string, unknown>>).map(
+      (route) => {
+        const withoutScope = { ...route };
+        delete withoutScope.quota_scope;
+        return withoutScope;
+      },
+    );
+    expect(classifyLiveProof(oldSchema, EXPECTED).verdict).toBe("failed");
+    expect(reportQuotaScope(oldSchema)).toBeNull();
   });
 
   test("makes every missing or false live clause non-passing", () => {
@@ -416,6 +480,7 @@ describe("degraded single-alias verdict", () => {
     const routes: LiveProofReport["routes"] = [
       {
         session_role: "root",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         aliases: ["keeper-codex-a", "keeper-codex-b"],
         attempts: 2,
         failure_class: "quota",
@@ -424,6 +489,7 @@ describe("degraded single-alias verdict", () => {
       },
       {
         session_role: "child",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         aliases: ["keeper-codex-b", "keeper-codex-a"],
         attempts: 2,
         failure_class: "quota",
@@ -431,7 +497,10 @@ describe("degraded single-alias verdict", () => {
         restored: true,
       },
     ];
-    const input = proofInput(["native_fallback", "transport_isolation"], routes);
+    const input = proofInput(
+      ["native_fallback", "transport_isolation"],
+      routes,
+    );
     input.alias_health = [
       { alias: "keeper-codex-a", status: "healthy" },
       { alias: "keeper-codex-b", status: "healthy" },
@@ -474,6 +543,7 @@ describe("degraded single-alias verdict", () => {
         [
           {
             session_role: "root",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
             aliases: ["keeper-codex-a"],
             attempts: 1,
             failure_class: "rate",
@@ -482,6 +552,7 @@ describe("degraded single-alias verdict", () => {
           },
           {
             session_role: "child",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
             aliases: ["keeper-codex-b"],
             attempts: 1,
             failure_class: "none",
@@ -662,6 +733,7 @@ describe("proof artifact sanitation and persistence", () => {
         "config_binding",
         "degraded",
         "interrupted",
+        "quota_scope",
         "restoration",
         "revision",
         "routes",

@@ -1,0 +1,26 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Small fixed-shape one-boundary edit across explicitly named files (db.ts/restart-ledger.ts/install.sh) with a preferred convention already chosen and a deterministic path-resolution/precedence invariant plus test, fitting Spark at a bounded medium band.",
+      "spark_exclusion": null,
+      "spark_fit": true,
+      "task_id": "fn-1396-align-restart-ledger-state-dir-with.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T06:49:12.942000Z",
+  "epic_id": "fn-1396-align-restart-ledger-state-dir-with",
+  "input_hash": "48b8fd4b8a4ad0bcd20a68320910fe26de7c4fa4791842fccd472fd3865887a5",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1220083019,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Small fixed-shape one-boundary edit across explicitly named files (db.ts/restart-ledger.ts/install.sh) with a preferred convention already chosen and a deterministic path-resolution/precedence invariant plus test, fitting Spark at a bounded medium band.\",\"confidence\":0.86,\"spark_fit\":true,\"spark_exclusion\":null}]}\n"
+}

@@ -1,0 +1,75 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 54,
+        "files_changed": 7,
+        "insertions": 390
+      },
+      "done_summary": "Added a shared 250ms wall-clock maintenance-budget seam (src/maintenance-budget.ts) consulted by retention shed, cold-row compaction, and mutation_path backfill; each pass yields between bounded transactions and resumes from its durable watermark on the next tick. Added tests proving oversized-workload yield/resume with no lost or repeated work, re-fold determinism untouched, and a test pinning the budget constant's arithmetic relation to SERVE_LAG_MAX_CONSECUTIVE_BREACHES.",
+      "input_hash": "51e15f7c477f97d6a8125dbfc55d0509eb075d7b72233e147c2bbb4b03dad2ca",
+      "model": "opus",
+      "spec_chars": 1678,
+      "spec_md": "## Description\n\nIntroduce one shared per-tick time budget for the periodic maintenance\npasses that run on MAIN (retention shed, cold-history compaction,\nmutation_path backfill). A pass that exhausts the budget yields and\nresumes on a later tick from its durable watermark instead of running its\nbatch chain to completion. The budget must be enforced by wall-clock\nmeasurement inside the pass loop, not by batch-count heuristics, so a\npathological cold-page batch cannot blow through it.\n\n## Acceptance\n\n- A shared budget seam covers retention shed, cold-history compaction,\n  and mutation_path backfill; each pass checks it between bounded units\n  of work.\n- Deterministic in-process tests prove an oversized workload yields\n  within the budget and resumes correctly from its watermark on the next\n  tick (no lost or repeated work; re-fold determinism untouched \u2014 the\n  budget gates producer-side passes only, never folds).\n- A maintenance-only workload can no longer accumulate a lag-breach\n  streak that reaches SERVE_LAG_MAX_CONSECUTIVE_BREACHES (asserted via\n  the budget constant's relation to the lag threshold and interval, with\n  a test pinning the arithmetic).\n\n## Done summary\nAdded a shared 250ms wall-clock maintenance-budget seam (src/maintenance-budget.ts) consulted by retention shed, cold-row compaction, and mutation_path backfill; each pass yields between bounded transactions and resumes from its durable watermark on the next tick. Added tests proving oversized-workload yield/resume with no lost or repeated work, re-fold determinism untouched, and a test pinning the budget constant's arithmetic relation to SERVE_LAG_MAX_CONSECUTIVE_BREACHES.\n## Evidence\n",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.1",
+      "tier": "xhigh",
+      "title": "Budget main-thread maintenance passes per tick"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 17,
+        "files_changed": 3,
+        "insertions": 267
+      },
+      "done_summary": "Raised the scheduled retention shed ceiling (DEFAULT_RETENTION_MAX_BATCHES 20->200) so cheap batches consume the full 250ms maintenance budget instead of stopping early, added step-latched shed progress logging with scan watermark and remaining-backlog estimates, and added deterministic tests covering representative backlog drain to the cold boundary and interleaved ingest freshness under 5s.",
+      "input_hash": "51e15f7c477f97d6a8125dbfc55d0509eb075d7b72233e147c2bbb4b03dad2ca",
+      "model": "gpt-5.5",
+      "spec_chars": 1407,
+      "spec_md": "## Description\n\n~780K events rows still carry ~1.2GB of shed-class cold bodies because\nthe incremental shed's small batches never catch up to the backlog. Under\nthe task-1 budget, raise the shed's effective throughput (larger bounded\nunits, more frequent resumption, or both) so the backlog drains to the\nretention watermark within days of continuous operation, while ingest\nstays current throughout.\n\n## Acceptance\n\n- The shed watermark reaches the cold-tail boundary on a representative\n  fixture; the remaining un-shed body count matches the retention\n  policy's keep-set exactly (no over-shed \u2014 the keep-set invariants from\n  the existing retention tests continue to pass).\n- Ingest freshness (newest-folded-event age) stays under 5 seconds in a\n  deterministic test that interleaves ingest applies with a saturated\n  shed backlog under the budget.\n- Progress is observable: the shed logs one bounded line per N batches\n  with watermark position and remaining-backlog estimate.\n\n## Done summary\nRaised the scheduled retention shed ceiling (DEFAULT_RETENTION_MAX_BATCHES 20->200) so cheap batches consume the full 250ms maintenance budget instead of stopping early, added step-latched shed progress logging with scan watermark and remaining-backlog estimates, and added deterministic tests covering representative backlog drain to the cold boundary and interleaved ingest freshness under 5s.\n## Evidence\n",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.2",
+      "tier": "high",
+      "title": "Drain the retained cold-body backlog under the budget"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 9,
+        "insertions": 583
+      },
+      "done_summary": "Surfaced ingest lag (keeper status --json), a bounded events-ingest-stalled distress mint/clear, and a one-shot busy-lag breach-streak attribution log naming the active maintenance pass.",
+      "input_hash": "51e15f7c477f97d6a8125dbfc55d0509eb075d7b72233e147c2bbb4b03dad2ca",
+      "model": "gpt-5.5",
+      "spec_chars": 1351,
+      "spec_md": "## Description\n\nOperators currently detect ingest starvation only by hand-querying\nevents-MAX age against wall clock, and a watchdog kill names its detector\nbut never its cause. Surface both: status carries the newest-folded-event\nage; a sustained ingest stall with unread backlog mints a bounded\ndistress signal; and a lag-breach streak at or past 3 logs ONE bounded\nline naming the maintenance pass (or other attributed work) active during\nthe breach window.\n\n## Acceptance\n\n- `keeper status --json` carries an ingest-lag field (newest-folded-event\n  age in seconds) with a test pinning its derivation; the field reads 0\n  or near-0 on a current projection fixture and the true lag on a stale\n  one.\n- A distress signal mints when ingest applies stall past a bounded\n  threshold with unread events-log backlog present, and level-clears when\n  ingest catches up (deterministic tests for mint and clear; no new\n  unbounded projection state).\n- On a lag-breach streak reaching 3, exactly one bounded log line names\n  the active maintenance pass; a test drives the streak with a stubbed\n  active-pass marker and asserts the single line.\n\n## Done summary\nSurfaced ingest lag (keeper status --json), a bounded events-ingest-stalled distress mint/clear, and a one-shot busy-lag breach-streak attribution log naming the active maintenance pass.\n## Evidence\n",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.3",
+      "tier": "high",
+      "title": "Surface ingest lag and breach-time cause"
+    }
+  ],
+  "created_at": "2026-07-20T21:04:55.302000Z",
+  "epic_id": "fn-1389-scale-event-store-maintenance-off-the",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "51e15f7c477f97d6a8125dbfc55d0509eb075d7b72233e147c2bbb4b03dad2ca",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

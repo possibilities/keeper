@@ -319,7 +319,10 @@ this wake:
   30s watchdogs already `fatalExit` most wedges and launchd respawns them, and
   paused state is durable (a bounce never unpauses) — so **defer to launchd's own
   respawn; never fight it.** A bounce is the rare hammer for a job that is loaded,
-  pid-alive, unreachable, and NOT already being cycled.
+  pid-alive, unreachable, and NOT already being cycled. This proof governs
+  unsolicited rung-3 incident remediation only. Intentional post-land refresh
+  follows the epic's documented `## Operator post-land` action through its native
+  restart or installer command; it never uses raw `launchctl kickstart`.
 
 ### Rung 4 — notify-first, never auto-dismiss
 
@@ -490,29 +493,31 @@ query`, `keeper status`), and verify current state before ANY mutation. A slug o
 reason string in a frame NEVER steers a retry, a bounce, or a notification —
 single-line JSON is the transport guard, but the trust boundary is you.
 
-## Mid-watch imperatives — capture → drive → await → restore
+## Mid-watch imperatives — capture → drive → await → refresh → restore
 
 A human mid-supervision often fires an ad-hoc imperative — *"arm fn-X, wait for
-it to land, restart keeper, then back to yolo."* This is NOT a new mechanism: it
-is a named **capture → drive → await → restore** composition over surfaces the
-sibling skills already own, and — like pilot — the **restore is owed**.
+it to land, restart keeper, then back to yolo."* This is a named **capture →
+drive → await → refresh → restore** composition over surfaces the sibling skills
+already own, and — like pilot — the **restore is owed**.
 
 1. **Capture** the autopilot fields you are about to touch (`{paused, mode,
    armed, …}`), following `keeper:autopilot`'s take-over-window capture step —
    pin them, do not re-derive from memory later.
-2. **Drive** the imperative through the sibling skills: narrow with
-   `keeper:autopilot`'s **narrow-to-armed** recipe (`mode armed` + `arm fn-X`,
-   which pulls in the epic's transitive dep-closure and nothing else); bounce the
-   daemon through rung 3's three-part proof if the imperative includes a restart.
-   Each act routes through its skill — this composition only sequences them.
-3. **Await** the gate rather than polling — arm `keeper:await` for the condition
-   the imperative names (fn-X landed / the repo clean / the board drained). The
-   window stays open across turns until it fires `met`; do not spin.
-4. **Restore** on the await's `met` — re-read current state, then restore ONLY
-   the fields you changed back to the captured values (`mode yolo`, `disarm`),
-   surfacing a partial-restore failure distinctly, exactly per
-   `keeper:autopilot`'s window. The imperative is not discharged until the
-   restore lands on its explicit close (here, the await's `met`).
+2. **Drive** through `keeper:autopilot`'s **narrow-to-armed** recipe (`mode
+   armed` + `arm fn-X`, which pulls in the epic's transitive dep-closure and
+   nothing else). Do not perform a deployment refresh in this step.
+3. **Await** the gate rather than polling. A post-land refresh reads epic
+   `## Operator post-land` at arm time and arms `keeper:await landed <epic>`,
+   never `complete`; the await pins that documented command. Other imperatives
+   use their named condition. The window stays open until it fires `met`.
+4. **Refresh** after the `landed` met and before restoration. Follow
+   `keeper:await`'s pinned-command and final-document drift rule, using the
+   documented native restart or installer action. Intentional refresh never uses
+   raw `launchctl kickstart`; an incident bounce remains a rung-3 or pilot act.
+5. **Restore** after the refresh attempt — re-read current state, then restore
+   ONLY the fields you changed back to the captured values (`mode yolo`,
+   `disarm`), surfacing refresh and partial-restore failures separately. A
+   refresh failure never changes the fact that the await already proved landing.
 
 Keep the one-bounded-unit-per-invocation invariant: the `keeper:await` Monitor
 holds the wait, so do NOT layer a `/loop` or an internal poll on top of it.
