@@ -9,7 +9,7 @@
     "fn-1386-harden-trunk-lease-integration"
   ],
   "id": "fn-1352-retire-escalation-sessions",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T14:05:23.945000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T14:05:20.166000Z"
+  "updated_at": "2026-07-21T14:05:23.945000Z"
 }
