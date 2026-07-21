@@ -1347,3 +1347,268 @@ test("decideProviderLegGrantWaitLog: sibling-live names both legs and re-logs on
     "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause sibling-live sibling leg-b",
   ]);
 });
+
+// ---------------------------------------------------------------------------
+// Single-live-leg admission — SYNCHRONOUS reservation at the grant gate. The
+// folded-projection read alone double-mints when two complete births for one
+// attempt land in ONE scan (nothing folds mid-scan). Admission consults THREE
+// sources: folded live ownership, the unfolded ProviderLegBorn event tail above
+// the reducer cursor (the crash-durable reservation), and the same-scan
+// pre-discovered GLOBAL winner. These pin the four locked regressions.
+// ---------------------------------------------------------------------------
+
+/** Insert an UNFOLDED `ProviderLegBorn` event (above the reducer cursor — no fold
+ *  runs), the crash-durable slot reservation the event-tail admission read sees. */
+function insertUnfoldedProviderLegBorn(
+  db: ReturnType<typeof freshMemDb>["db"],
+  opts: { legLaunchId: string; wrapperJobId?: string; attemptId?: number },
+): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (1700000000, 'leg-sess', 'ProviderLegBorn', 'provider_leg_born', ?)`,
+    [
+      JSON.stringify({
+        leg_launch_id: opts.legLaunchId,
+        wrapper_job_id: opts.wrapperJobId ?? "wrapper-status-1",
+        wrapper_dispatch_attempt_id: opts.attemptId ?? 700,
+      }),
+    ],
+  );
+}
+
+/** Count `ProviderLegBorn` events minted for one leg. */
+function bornCount(
+  db: ReturnType<typeof freshMemDb>["db"],
+  legLaunchId: string,
+): number {
+  return (
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE hook_event = 'ProviderLegBorn'
+            AND json_extract(data, '$.leg_launch_id') = ?`,
+      )
+      .get(legLaunchId) as { n: number }
+  ).n;
+}
+
+test("scanBirthDir single-live-leg (a): two fresh complete births on one attempt, ZERO ownership, ONE scan grants only the leg_launch_id-order winner and holds the loser sibling-live (no double-mint)", () => {
+  const { db } = freshMemDb();
+  // A live wrapper attempt with its claim bound; NO ownership rows exist yet, so the
+  // folded read is blind — only the same-scan winner keeps this from double-minting.
+  db.query(
+    `INSERT INTO jobs (job_id, state, created_at, updated_at, last_event_id)
+     VALUES ('wrapper-race-1', 'working', 1, 1, 1)`,
+  ).run();
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, legacy_unfenced,
+        acquired_at, bound_at, last_event_id, updated_at)
+     VALUES ('work', 'fn-race.1', 900, 'bound', 'wrapper-race-1', 0, 1, 2, 1, 2)`,
+  ).run();
+
+  // Two complete births, same attempt, distinct start_time (so distinct maildir file).
+  const shared = {
+    dispatch_attempt_id: null,
+    wrapper_job_id: "wrapper-race-1",
+    wrapper_dispatch_attempt_id: 900,
+    launcher_pid: LIVE_PID,
+  } as const;
+  writeBirthRecord(
+    birthDir,
+    makeBirthRecord({
+      ...shared,
+      session_id: "leg-race-a-session",
+      start_time: "darwin:race-a",
+      leg_launch_id: "leg-race-a",
+      launcher_start_time: "linux:900a",
+    }),
+  );
+  writeBirthRecord(
+    birthDir,
+    makeBirthRecord({
+      ...shared,
+      session_id: "leg-race-b-session",
+      start_time: "darwin:race-b",
+      leg_launch_id: "leg-race-b",
+      launcher_start_time: "linux:900b",
+    }),
+  );
+
+  const memo = new Map<string, string>();
+  const ctx: EventsIngestContext = {
+    counters: new BackstopCounters(),
+    backstopLogPath: join(tmpDir, "backstop.ndjson"),
+    providerLegGrantWaitLog: memo,
+  };
+  const errors: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  };
+  try {
+    scanBirthDir(db, birthDir, ctx);
+  } finally {
+    console.error = origError;
+  }
+
+  // Exactly ONE ProviderLegBorn + SessionStart minted, for the winner leg-race-a.
+  expect(bornCount(db, "leg-race-a")).toBe(1);
+  expect(bornCount(db, "leg-race-b")).toBe(0);
+  expect(sessionStartCount(db, "leg-race-a-session")).toBe(1);
+  expect(sessionStartCount(db, "leg-race-b-session")).toBe(0);
+  // Exactly ONE grant leaf — the winner's; the loser has NONE and its record is kept.
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-race-a",
+      wrapper_job_id: "wrapper-race-1",
+      wrapper_dispatch_attempt_id: 900,
+    }),
+  ).toBe(true);
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-race-b",
+      wrapper_job_id: "wrapper-race-1",
+      wrapper_dispatch_attempt_id: 900,
+    }),
+  ).toBe(false);
+  expect(pendingRecords().length).toBe(1); // only the retained loser remains
+  // The loser is held sibling-live, one bounded line naming the winner as blocker.
+  const waitLines = errors.filter((l) => l.includes("provider-leg grant wait"));
+  expect(waitLines).toEqual([
+    "[keeperd] provider-leg grant wait: leg leg-race-b wrapper wrapper-race-1 attempt 900 cause sibling-live sibling leg-race-a",
+  ]);
+  db.close();
+});
+
+test("providerLegGrantStatus crash-window (b): an unfolded ProviderLegBorn above the reducer cursor withholds a DIFFERENT leg (sibling-live)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // A sibling minted its born, then the daemon crashed before the fold — the cursor
+  // still trails it, exactly the boot-scan-before-boot-drain window.
+  insertUnfoldedProviderLegBorn(db, { legLaunchId: "leg-unfolded-sib" });
+  expect(
+    db.query("SELECT last_event_id AS c FROM reducer_state WHERE id = 1").get(),
+  ).toEqual({ c: 0 });
+  expect(
+    providerLegGrantStatus(db, makeBirthRecord(OWNED_LEG_OVERRIDES)),
+  ).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-unfolded-sib",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus crash-window (b): the requesting leg's OWN unfolded ProviderLegBorn never self-blocks (crash replay re-admits the same leg)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // leg-status-1 minted its own born then crashed before the fold: replay must
+  // re-issue THIS leg's grant, so its own unfolded reservation cannot block it.
+  insertUnfoldedProviderLegBorn(db, { legLaunchId: "leg-status-1" });
+  expect(
+    providerLegGrantStatus(db, makeBirthRecord(OWNED_LEG_OVERRIDES)),
+  ).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("scanBirthDir single-live-leg (c): the winner is the GLOBAL leg_launch_id-order minimum across BOTH buckets, never the first file processed", () => {
+  const { db } = freshMemDb();
+  db.query(
+    `INSERT INTO jobs (job_id, state, created_at, updated_at, last_event_id)
+     VALUES ('wrapper-split-1', 'working', 1, 1, 1)`,
+  ).run();
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, legacy_unfenced,
+        acquired_at, bound_at, last_event_id, updated_at)
+     VALUES ('work', 'fn-split.1', 800, 'bound', 'wrapper-split-1', 0, 1, 2, 1, 2)`,
+  ).run();
+
+  // The LOWER-id winner lands in new/ (processed SECOND). The higher-id loser is a
+  // promoted intent in pending/ (processed FIRST). A first-file-processed rule would
+  // wrongly grant the loser.
+  writeBirthRecord(
+    birthDir,
+    makeBirthRecord({
+      session_id: "leg-split-a-session",
+      start_time: "darwin:split-a",
+      dispatch_attempt_id: null,
+      leg_launch_id: "leg-split-a",
+      wrapper_job_id: "wrapper-split-1",
+      wrapper_dispatch_attempt_id: 800,
+      launcher_pid: LIVE_PID,
+      launcher_start_time: "linux:800a",
+    }),
+  );
+  const loser = makeBirthRecord({
+    session_id: "leg-split-z-session",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-split-z",
+    wrapper_job_id: "wrapper-split-1",
+    wrapper_dispatch_attempt_id: 800,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:800z",
+  });
+  const draft = { ...loser } as Record<string, unknown>;
+  delete draft.pid;
+  delete draft.start_time;
+  const intentPath = writeBirthIntent(
+    birthDir,
+    draft as unknown as Parameters<typeof writeBirthIntent>[1],
+    LIVE_PID,
+  );
+  promoteBirthIntent(intentPath, loser);
+
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+
+  // The new/ winner (lower id, processed second) took the sole slot.
+  expect(sessionStartCount(db, "leg-split-a-session")).toBe(1);
+  expect(sessionStartCount(db, "leg-split-z-session")).toBe(0);
+  expect(bornCount(db, "leg-split-a")).toBe(1);
+  expect(bornCount(db, "leg-split-z")).toBe(0);
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-split-a",
+      wrapper_job_id: "wrapper-split-1",
+      wrapper_dispatch_attempt_id: 800,
+    }),
+  ).toBe(true);
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-split-z",
+      wrapper_job_id: "wrapper-split-1",
+      wrapper_dispatch_attempt_id: 800,
+    }),
+  ).toBe(false);
+  db.close();
+});
+
+test("scanBirthDir single-live-leg (d): a bucket readdir failure leaves the wait-log memo UNPRUNED (a transient FS error never churns the resident memo)", () => {
+  const { db } = freshMemDb();
+  const memo = new Map<string, string>([["leg-ghost", "wrapper-unfolded"]]);
+  const ctx: EventsIngestContext = {
+    counters: new BackstopCounters(),
+    backstopLogPath: join(tmpDir, "backstop.ndjson"),
+    providerLegGrantWaitLog: memo,
+  };
+  // Make `new/` a regular FILE so existsSync passes but readdirSync throws ENOTDIR:
+  // the scan cannot confirm it observed every waiting leg, so it must NOT prune.
+  mkdirSync(birthDir, { recursive: true });
+  writeFileSync(join(birthDir, "new"), "not a directory");
+
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    scanBirthDir(db, birthDir, ctx);
+  } finally {
+    console.error = origError;
+  }
+  // The ghost entry survives — a complete scan would have pruned it.
+  expect(memo.has("leg-ghost")).toBe(true);
+  expect(memo.size).toBe(1);
+  db.close();
+});

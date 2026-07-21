@@ -6991,18 +6991,76 @@ function liveSiblingLegLaunchId(
 }
 
 /**
- * Classify an owned birth's grant readiness AND surface WHY. Probes the claim and
- * the wrapper job separately (the prior single JOIN collapsed every non-grant
- * state into a bare `wait`): the split preserves EVERY grant/wait/deny routing
- * decision but distinguishes the lag causes so the wait branch is no longer silent.
- * The final gate before grant is the single-live-leg admission rail
- * ({@link liveSiblingLegLaunchId}): an otherwise-grantable leg becomes a
- * `sibling-live` WAIT while a different live leg still owns the same attempt.
+ * Source (b) of the single-live-leg admission read: the launch id of a DIFFERENT
+ * leg that has RESERVED `owner`'s exact wrapper attempt via an unfolded
+ * `ProviderLegBorn` event ABOVE the reducer cursor, or null. The inserted event IS
+ * the durable, restart-safe reservation the instant it commits — a crash after the
+ * mint but before its fold leaves the reservation right here, so a fresh boot scan
+ * (which runs BEFORE boot drain) still withholds the slot from a second leg. It
+ * ignores `owner`'s OWN launch id so a crash replay re-admits the SAME leg
+ * (idempotent). Below-cursor legs are already folded — {@link liveSiblingLegLaunchId}
+ * covers those with its liveness filter; splitting on the cursor is what keeps this
+ * from blocking forever on a long-settled sibling. A PURE projection read — never
+ * wall-clock or process liveness.
  */
-export function providerLegGrantStatus(
+function unfoldedSiblingLegLaunchId(
   db: Database,
-  record: BirthRecord,
-): ProviderLegGrantVerdict {
+  owner: BirthOwnerTuple,
+): string | null {
+  const row = db
+    .query(
+      `SELECT json_extract(data, '$.leg_launch_id') AS leg_launch_id
+         FROM events
+        WHERE hook_event = 'ProviderLegBorn'
+          AND id > (SELECT last_event_id FROM reducer_state WHERE id = 1)
+          AND json_valid(data)
+          AND json_extract(data, '$.wrapper_job_id') = ?
+          AND json_extract(data, '$.wrapper_dispatch_attempt_id') = ?
+          AND json_extract(data, '$.leg_launch_id') != ?
+        ORDER BY json_extract(data, '$.leg_launch_id')
+        LIMIT 1`,
+    )
+    .get(
+      owner.wrapper_job_id,
+      owner.wrapper_dispatch_attempt_id,
+      owner.leg_launch_id,
+    ) as { leg_launch_id: string } | null;
+  return row?.leg_launch_id ?? null;
+}
+
+/**
+ * The single stable leg that has RESERVED `owner`'s wrapper attempt across BOTH
+ * durable sources — folded live ownership ({@link liveSiblingLegLaunchId}) and the
+ * unfolded ProviderLegBorn event tail ({@link unfoldedSiblingLegLaunchId}) — or
+ * null when no other leg holds the slot. Returns the deterministic
+ * `leg_launch_id`-order minimum so ONE stable blocker is named. The two sources are
+ * disjoint by the reducer cursor, so this is their union under a single total order.
+ */
+function reservedSiblingLegLaunchId(
+  db: Database,
+  owner: BirthOwnerTuple,
+): string | null {
+  const folded = liveSiblingLegLaunchId(db, owner);
+  const unfolded = unfoldedSiblingLegLaunchId(db, owner);
+  if (folded === null) return unfolded;
+  if (unfolded === null) return folded;
+  return folded < unfolded ? folded : unfolded;
+}
+
+/** The wrapper-attempt slot a leg competes for: exactly ONE live leg is admitted
+ *  per `(wrapper_job_id, wrapper_dispatch_attempt_id)`. */
+function providerLegSlotKey(owner: BirthOwnerTuple): string {
+  return `${owner.wrapper_job_id}\0${owner.wrapper_dispatch_attempt_id}`;
+}
+
+/**
+ * The owner tuple for a COMPLETE owned birth — a full tuple AND the immutable
+ * launch coordinates ({@link providerLegGrantStatus} denies `owner-incomplete`
+ * without them), else null. The single source of truth for both the grant gate and
+ * the same-scan winner candidacy, so the two never disagree on which records
+ * compete for a slot.
+ */
+function completeOwnedBirthTuple(record: BirthRecord): BirthOwnerTuple | null {
   const owner = ownerTupleFromBirthRecord(record);
   if (
     owner === null ||
@@ -7010,6 +7068,30 @@ export function providerLegGrantStatus(
     record.launcher_pid === undefined ||
     record.launcher_start_time === undefined
   ) {
+    return null;
+  }
+  return owner;
+}
+
+/**
+ * Classify an owned birth's grant readiness AND surface WHY. Probes the claim and
+ * the wrapper job separately (the prior single JOIN collapsed every non-grant
+ * state into a bare `wait`): the split preserves EVERY grant/wait/deny routing
+ * decision but distinguishes the lag causes so the wait branch is no longer silent.
+ * The final gate before grant is the single-live-leg admission rail, which admits
+ * exactly ONE leg per wrapper attempt across THREE reservation sources: folded live
+ * ownership + the unfolded ProviderLegBorn event tail ({@link reservedSiblingLegLaunchId}),
+ * and the same-scan pre-discovered GLOBAL winner (`admission.slotWinner`). A durable
+ * reservation wins over the same-scan winner, and each source ignores this leg's OWN
+ * launch id, so an already-granted leg is never revoked and a crash replay re-admits.
+ */
+export function providerLegGrantStatus(
+  db: Database,
+  record: BirthRecord,
+  admission: { slotWinner?: string } = {},
+): ProviderLegGrantVerdict {
+  const owner = completeOwnedBirthTuple(record);
+  if (owner === null) {
     return { decision: "deny", cause: "owner-incomplete" };
   }
   const claim = db
@@ -7057,12 +7139,23 @@ export function providerLegGrantStatus(
   ) {
     return { decision: "deny", cause: "claim-foreign" };
   }
-  // Otherwise-grantable: admit exactly one live leg per attempt. A different live
-  // leg still owning this attempt holds the grant as a recoverable wait, never a
-  // second concurrent editor of the same lane.
-  const sibling = liveSiblingLegLaunchId(db, owner);
-  if (sibling !== null) {
-    return { decision: "wait", cause: "sibling-live", sibling };
+  // Otherwise-grantable: admit exactly ONE live leg per wrapper attempt. A durable
+  // reservation — a folded live sibling or an unfolded ProviderLegBorn event tail
+  // above the reducer cursor — holds the grant as a recoverable wait, never a
+  // second concurrent editor of the same lane. It ignores this leg's OWN launch id
+  // so a crash replay re-issues the same leg's grant, and it wins over the same-scan
+  // winner so an already-granted (even higher-id) leg is never revoked.
+  const durableSibling = reservedSiblingLegLaunchId(db, owner);
+  if (durableSibling !== null) {
+    return { decision: "wait", cause: "sibling-live", sibling: durableSibling };
+  }
+  // No durable reservation yet: the same-scan pre-discovered GLOBAL winner (the
+  // stable leg_launch_id-order minimum across BOTH birth buckets) takes the sole
+  // slot; every other candidate holds as a recoverable sibling-live wait, so the
+  // winner is never the first file processed.
+  const winner = admission.slotWinner;
+  if (winner !== undefined && winner !== owner.leg_launch_id) {
+    return { decision: "wait", cause: "sibling-live", sibling: winner };
   }
   return { decision: "grant" };
 }
@@ -7450,6 +7543,15 @@ export function scanBirthDir(
   // so absence-from-a-completed-scan is the bound that keeps the resident memo
   // from leaking one entry per timed-out leg forever.
   const observedWaitLegs = new Set<string>();
+  // Pre-discovery pass: enumerate BOTH buckets and pick the GLOBAL single-live-leg
+  // winner per wrapper attempt — the stable leg_launch_id-order minimum among this
+  // scan's complete owned births — BEFORE any grant is issued, so the winner is
+  // never the first file processed nor a per-bucket artifact. `completeScan` holds
+  // only when every bucket read succeeded; a transient readdir failure must NOT
+  // churn the resident wait-log memo (its prune below is gated on it).
+  const bucketFiles: { bucket: "pending" | "new"; full: string }[] = [];
+  const slotWinners = new Map<string, string>();
+  let completeScan = true;
   for (const bucket of ["pending", "new"] as const) {
     const bucketDir = join(dir, bucket);
     if (!existsSync(bucketDir)) {
@@ -7464,6 +7566,7 @@ export function scanBirthDir(
           err instanceof Error ? err.message : String(err)
         }`,
       );
+      completeScan = false;
       continue;
     }
     for (const name of names) {
@@ -7471,6 +7574,9 @@ export function scanBirthDir(
         continue;
       }
       const full = join(bucketDir, name);
+      bucketFiles.push({ bucket, full });
+      // Read the record once for winner candidacy; the mint pass re-reads so a file
+      // that vanishes mid-scan is still skipped, never double-minted.
       let body: string;
       try {
         body = readFileSync(full, "utf8");
@@ -7479,127 +7585,155 @@ export function scanBirthDir(
       }
       const record = parseBirthRecord(body);
       if (record === null) {
-        // A valid pending intent is deliberately retained until its launcher
-        // promotes it. It is not a poison birth record.
-        if (bucket === "pending" && parseBirthIntent(body) !== null) {
-          continue;
-        }
-        if (parkPoisonBirth(db, full, body, null, ctx)) {
-          retireBirthFile(full);
-        }
         continue;
       }
+      const candidate = completeOwnedBirthTuple(record);
+      if (candidate === null) {
+        continue;
+      }
+      const slot = providerLegSlotKey(candidate);
+      const prior = slotWinners.get(slot);
+      if (prior === undefined || candidate.leg_launch_id < prior) {
+        slotWinners.set(slot, candidate.leg_launch_id);
+      }
+    }
+  }
+  // Mint pass: process every enumerated record, admitting only the slot's winner.
+  for (const { bucket, full } of bucketFiles) {
+    let body: string;
+    try {
+      body = readFileSync(full, "utf8");
+    } catch {
+      continue;
+    }
+    const record = parseBirthRecord(body);
+    if (record === null) {
+      // A valid pending intent is deliberately retained until its launcher
+      // promotes it. It is not a poison birth record.
+      if (bucket === "pending" && parseBirthIntent(body) !== null) {
+        continue;
+      }
+      if (parkPoisonBirth(db, full, body, null, ctx)) {
+        retireBirthFile(full);
+      }
+      continue;
+    }
 
-      const owner = ownerTupleFromBirthRecord(record);
-      let committed = false;
-      let shouldIssueGrant = false;
-      let verdict: ProviderLegGrantVerdict | null = null;
-      db.run("BEGIN IMMEDIATE");
+    const owner = ownerTupleFromBirthRecord(record);
+    const slotWinner =
+      owner === null ? undefined : slotWinners.get(providerLegSlotKey(owner));
+    let committed = false;
+    let shouldIssueGrant = false;
+    let verdict: ProviderLegGrantVerdict | null = null;
+    db.run("BEGIN IMMEDIATE");
+    try {
+      verdict =
+        owner === null
+          ? null
+          : providerLegGrantStatus(db, record, { slotWinner });
+      if (verdict?.decision === "wait" || verdict?.decision === "deny") {
+        db.run("ROLLBACK");
+      } else {
+        const duplicateOwnedBirth =
+          owner !== null &&
+          providerLegBirthAlreadyMinted(db, owner.leg_launch_id);
+        if (!duplicateOwnedBirth) {
+          insertBirthSessionStart(db, record);
+          insertProviderLegBorn(db, record);
+        }
+        // A crash after the durable mint but before grant publication leaves
+        // the same complete pending record. Re-issue for that one shim while
+        // keeping the synthetic events set-once on leg_launch_id.
+        shouldIssueGrant = owner !== null;
+        db.run("COMMIT");
+        committed = true;
+      }
+    } catch (err) {
       try {
-        verdict = owner === null ? null : providerLegGrantStatus(db, record);
-        if (verdict?.decision === "wait" || verdict?.decision === "deny") {
-          db.run("ROLLBACK");
-        } else {
-          const duplicateOwnedBirth =
-            owner !== null &&
-            providerLegBirthAlreadyMinted(db, owner.leg_launch_id);
-          if (!duplicateOwnedBirth) {
-            insertBirthSessionStart(db, record);
-            insertProviderLegBorn(db, record);
-          }
-          // A crash after the durable mint but before grant publication leaves
-          // the same complete pending record. Re-issue for that one shim while
-          // keeping the synthetic events set-once on leg_launch_id.
-          shouldIssueGrant = owner !== null;
-          db.run("COMMIT");
-          committed = true;
-        }
-      } catch (err) {
-        try {
-          db.run("ROLLBACK");
-        } catch {
-          // best-effort
-        }
-        console.error(
-          `[keeperd] births mint failed for ${full} (leaving for retry): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        db.run("ROLLBACK");
+      } catch {
+        // best-effort
       }
-      if (verdict?.decision === "wait") {
-        // The owner fold may still be catching up, or a sibling leg still owns the
-        // attempt. Surface the DISTINCT lag cause (naming the blocking sibling for
-        // `sibling-live`) once per transition, then keep the promoted identity
-        // visible so a later scan can recheck it without launching paid work.
-        if (owner !== null) {
-          observedWaitLegs.add(owner.leg_launch_id);
-        }
-        if (owner !== null && ctx?.providerLegGrantWaitLog !== undefined) {
-          const line = decideProviderLegGrantWaitLog(
-            ctx.providerLegGrantWaitLog,
-            {
-              legLaunchId: owner.leg_launch_id,
-              wrapperJobId: owner.wrapper_job_id,
-              wrapperAttemptId: owner.wrapper_dispatch_attempt_id,
-            },
-            verdict.cause,
-            verdict.sibling,
-          );
-          if (line !== null) {
-            console.error(line);
-          }
-        }
-        gcStuckBirthRecord(db, full, record, ctx);
-        continue;
-      }
-      if (verdict?.decision === "deny") {
-        // A denied owner can never become grantable, so retire the record under
-        // its classifiable terminal status immediately.
-        if (owner !== null) {
-          clearProviderLegGrantWaitLog(
-            ctx?.providerLegGrantWaitLog,
-            owner.leg_launch_id,
-          );
-        }
-        if (parkStuckBirth(db, full, record, ctx)) {
-          retireBirthFile(full);
-        }
-        continue;
-      }
+      console.error(
+        `[keeperd] births mint failed for ${full} (leaving for retry): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    if (verdict?.decision === "wait") {
+      // The owner fold may still be catching up, or a sibling leg still owns the
+      // attempt. Surface the DISTINCT lag cause (naming the blocking sibling for
+      // `sibling-live`) once per transition, then keep the promoted identity
+      // visible so a later scan can recheck it without launching paid work.
       if (owner !== null) {
-        // The leg settled into a grant this scan: it will never re-enter the wait
-        // branch, so drop its memo entry.
+        observedWaitLegs.add(owner.leg_launch_id);
+      }
+      if (owner !== null && ctx?.providerLegGrantWaitLog !== undefined) {
+        const line = decideProviderLegGrantWaitLog(
+          ctx.providerLegGrantWaitLog,
+          {
+            legLaunchId: owner.leg_launch_id,
+            wrapperJobId: owner.wrapper_job_id,
+            wrapperAttemptId: owner.wrapper_dispatch_attempt_id,
+          },
+          verdict.cause,
+          verdict.sibling,
+        );
+        if (line !== null) {
+          console.error(line);
+        }
+      }
+      gcStuckBirthRecord(db, full, record, ctx);
+      continue;
+    }
+    if (verdict?.decision === "deny") {
+      // A denied owner can never become grantable, so retire the record under
+      // its classifiable terminal status immediately.
+      if (owner !== null) {
         clearProviderLegGrantWaitLog(
           ctx?.providerLegGrantWaitLog,
           owner.leg_launch_id,
         );
       }
-      if (committed && owner !== null && shouldIssueGrant) {
-        try {
-          // The transaction lock made the owner recheck and ownership mint one
-          // serial writer step. Publish only after its durable commit.
-          writeProviderLegGrant(dir, owner);
-        } catch (err) {
-          console.error(
-            `[keeperd] provider-leg grant failed for ${full} (leaving for retry): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-          continue;
-        }
-      }
-      if (committed) {
+      if (parkStuckBirth(db, full, record, ctx)) {
         retireBirthFile(full);
+      }
+      continue;
+    }
+    if (owner !== null) {
+      // The leg settled into a grant this scan: it will never re-enter the wait
+      // branch, so drop its memo entry.
+      clearProviderLegGrantWaitLog(
+        ctx?.providerLegGrantWaitLog,
+        owner.leg_launch_id,
+      );
+    }
+    if (committed && owner !== null && shouldIssueGrant) {
+      try {
+        // The transaction lock made the owner recheck and ownership mint one
+        // serial writer step. Publish only after its durable commit.
+        writeProviderLegGrant(dir, owner);
+      } catch (err) {
+        console.error(
+          `[keeperd] provider-leg grant failed for ${full} (leaving for retry): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
         continue;
       }
-      gcStuckBirthRecord(db, full, record, ctx);
     }
+    if (committed) {
+      retireBirthFile(full);
+      continue;
+    }
+    gcStuckBirthRecord(db, full, record, ctx);
   }
-  // A completed scan saw every still-present waiting leg. Prune any memo entry for
-  // a leg this scan no longer observed (its record vanished with no terminal
-  // settle), so the resident wait-log map stays bounded to legs still waiting.
+  // Prune ONLY after a complete scan (every bucket read): the scan then saw every
+  // still-present waiting leg, so any memo entry for a leg it no longer observed
+  // (its record vanished with no terminal settle) is dropped, keeping the resident
+  // wait-log map bounded. A transient readdir failure leaves the memo untouched.
   const waitLog = ctx?.providerLegGrantWaitLog;
-  if (waitLog !== undefined) {
+  if (completeScan && waitLog !== undefined) {
     for (const legLaunchId of [...waitLog.keys()]) {
       if (!observedWaitLegs.has(legLaunchId)) {
         waitLog.delete(legLaunchId);
