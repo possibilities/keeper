@@ -1886,23 +1886,39 @@ interface FakeTrunkDepsOptions {
   releaseOk?: boolean;
   /** acquireLock() returns null (lock contention) when false. */
   lockOk?: boolean;
+  /** OPTIONAL merge-suite gate probe (ADR 0102). Omitted → the plan CLI skips
+   * the gate (the daemon owns the authoritative one). */
+  runMergeSuite?: TrunkIntegrationDeps["runMergeSuite"];
+}
+
+/** One recorded git call — the (args, cwd) pair, so a test can assert the private
+ * scratch worktree + temp branch were reaped on the exit path it drives. */
+interface GitCall {
+  args: string[];
+  cwd: string;
 }
 
 /** Build a scripted TrunkIntegrationDeps: the caller supplies only the git
  * responder (the thing under test), while lock/lease plumbing defaults to an
  * always-succeeding fake that mirrors whatever lease it last minted back
  * through readLeaseLeaf — the in-fence "is my lease still valid" re-check
- * `integrateRepoUnderLease` performs every attempt. */
+ * `integrateRepoUnderLease` performs every attempt. Every git call is recorded
+ * so the reap assertions can read them off `gitCalls`. */
 function makeFakeTrunkDeps(opts: FakeTrunkDepsOptions): {
   deps: TrunkIntegrationDeps;
   releasedLeases: TrunkLeaseLeaf[];
   requestAttempts: () => number;
+  gitCalls: GitCall[];
 } {
   let attempt = 0;
   let lastLease: TrunkLeaseLeaf | null = null;
   const releasedLeases: TrunkLeaseLeaf[] = [];
+  const gitCalls: GitCall[] = [];
   const deps: TrunkIntegrationDeps = {
-    git: opts.git,
+    git: (args, cwd) => {
+      gitCalls.push({ args, cwd });
+      return opts.git(args, cwd);
+    },
     acquireLock: () => (opts.lockOk === false ? null : { release: () => {} }),
     requestLease: (
       _stateDir,
@@ -1931,50 +1947,163 @@ function makeFakeTrunkDeps(opts: FakeTrunkDepsOptions): {
       return opts.releaseOk ?? true;
     },
     readLeaseLeaf: () => lastLease,
+    runMergeSuite: opts.runMergeSuite,
   };
-  return { deps, releasedLeases, requestAttempts: () => attempt };
+  return { deps, releasedLeases, requestAttempts: () => attempt, gitCalls };
 }
 
-describe("integrateRepoUnderLease saga (pure git seam)", () => {
-  test("merges the source branch into local default and releases the lease", () => {
-    // F1: the merge exit — reprobe finds not-yet-ancestor, live tip matches
-    // the leased observation, merge succeeds, the objective re-probe confirms
-    // containment.
-    let mergeBaseCalls = 0;
-    let mergeAttempted = false;
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitFail(1);
-      }
-      if (args[0] === "status") return gitOk("");
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
-      ) {
-        return gitOk("abc1234");
-      }
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
-      ) {
-        return gitOk("base000");
-      }
-      if (args[0] === "merge-base") {
-        mergeBaseCalls += 1;
-        // Pre-merge reprobe: not yet an ancestor. Post-merge objective check:
-        // now contained.
-        return mergeBaseCalls === 1 ? gitFail(1) : gitOk();
-      }
-      if (args[0] === "merge") {
-        mergeAttempted = true;
-        return gitOk();
-      }
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+/** True when the recorded git calls include a `worktree remove --force <path>`
+ * on some scratch path AND a `branch -D <branch>` — the reap every exit path owes.
+ * The scratch path/branch carry a random suffix, so match on the stable prefixes. */
+function reapedScratch(gitCalls: GitCall[]): boolean {
+  const removed = gitCalls.some(
+    (c) =>
+      c.args[0] === "worktree" &&
+      c.args[1] === "remove" &&
+      c.args.includes("--force") &&
+      (c.args.at(-1) ?? "").includes("keeper-trunk-integrate-"),
+  );
+  const branchDeleted = gitCalls.some(
+    (c) =>
+      c.args[0] === "branch" &&
+      c.args[1] === "-D" &&
+      (c.args[2] ?? "").startsWith("keeper/trunk-integrate/"),
+  );
+  return removed && branchDeleted;
+}
 
-    const result = runTrunkVerb(() =>
+/** The scratch worktree path a `worktree add` was cut at, or null — so a test can
+ * confirm the merge + gate ran INSIDE that private worktree, not the shared checkout. */
+function scratchWorktreePath(gitCalls: GitCall[]): string | null {
+  const add = gitCalls.find(
+    (c) => c.args[0] === "worktree" && c.args[1] === "add",
+  );
+  return add ? (add.args.at(-2) ?? null) : null;
+}
+
+// A scripted git responder for the private-worktree integration flow (ADR 0102).
+// It distinguishes the SHARED checkout (cwd === TRUNK_REPO_ROOT) from the PRIVATE
+// scratch worktree (cwd carries the `keeper-trunk-integrate-` prefix), so a test
+// drives each side independently. Every knob defaults to the happy path: a clean,
+// on-default-branch shared checkout, a not-yet-ancestor source that merges cleanly
+// in the scratch worktree and is objectively contained, and a fast-forwardable
+// shared checkout.
+interface TrunkFlowScript {
+  sourceOid?: string;
+  liveTip?: string;
+  /** Pre-merge reprobe: is source ALREADY an ancestor of default? Default false. */
+  reprobeAncestor?: boolean;
+  mergedCommit?: string;
+  worktreeAddOk?: boolean;
+  /** The scratch `git merge --no-edit` result. Default success. */
+  mergeResult?: TrunkGitResult;
+  /** MERGE_HEAD in the scratch worktree after a failed merge — set to mark a
+   * content conflict, left empty for a residue-free failure. */
+  mergeHeadAfterFail?: string;
+  conflictFiles?: string;
+  /** Objective containment (`merge-base --is-ancestor source HEAD` in scratch).
+   * Default contained. */
+  contained?: boolean;
+  /** Shared checkout HEAD branch. Default the default branch (on-branch). */
+  sharedHead?: string;
+  /** Shared checkout `git status --porcelain` output. Default clean. */
+  sharedStatus?: string;
+  /** Shared checkout `git merge --ff-only` result. Default success. */
+  ffResult?: TrunkGitResult;
+  /** `git update-ref` (deferred-ff advance) result. Default success. */
+  updateRefResult?: TrunkGitResult;
+}
+
+function trunkFlowGit(
+  script: TrunkFlowScript = {},
+): TrunkIntegrationDeps["git"] {
+  const src = script.sourceOid ?? "abc1234";
+  const live = script.liveTip ?? "base000";
+  const merged = script.mergedCommit ?? "merged12345678";
+  return (args, cwd) => {
+    const inScratch = cwd.includes("keeper-trunk-integrate-");
+    // Scratch worktree admin (reap + provision) — always on the shared repo root.
+    if (args[0] === "worktree" && args[1] === "remove") return gitOk();
+    if (args[0] === "worktree" && args[1] === "prune") return gitOk();
+    if (args[0] === "branch" && args[1] === "-D") return gitOk();
+    if (args[0] === "worktree" && args[1] === "add") {
+      return script.worktreeAddOk === false
+        ? gitFail(1, "worktree add failed")
+        : gitOk();
+    }
+    // MERGE_HEAD probe (scratch, only after a failed merge).
+    if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+      return script.mergeHeadAfterFail
+        ? gitOk(script.mergeHeadAfterFail)
+        : gitFail(1);
+    }
+    // Pre-merge source/default tip reads (shared repo root).
+    if (
+      args[0] === "rev-parse" &&
+      args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+    ) {
+      return gitOk(src);
+    }
+    if (
+      args[0] === "rev-parse" &&
+      args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+    ) {
+      return gitOk(live);
+    }
+    // Merged HEAD read (scratch).
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return gitOk(merged);
+    // merge-base --is-ancestor: pre-merge reprobe (shared) vs objective
+    // containment (scratch).
+    if (args[0] === "merge-base") {
+      if (inScratch) return script.contained === false ? gitFail(1) : gitOk();
+      return script.reprobeAncestor ? gitOk() : gitFail(1);
+    }
+    // The epic-base merge (scratch, --no-edit) and the shared-checkout
+    // fast-forward (root, --ff-only).
+    if (args[0] === "merge") {
+      if (inScratch) return script.mergeResult ?? gitOk();
+      return script.ffResult ?? gitOk();
+    }
+    if (args[0] === "diff") return gitOk(script.conflictFiles ?? "");
+    if (args[0] === "symbolic-ref") {
+      return gitOk(script.sharedHead ?? TRUNK_DEFAULT_BRANCH);
+    }
+    if (args[0] === "status") return gitOk(script.sharedStatus ?? "");
+    if (args[0] === "update-ref") return script.updateRefResult ?? gitOk();
+    throw new Error(`unexpected git call: ${cwd} :: ${args.join(" ")}`);
+  };
+}
+
+/** Did a `git merge --no-edit <source>` run INSIDE the private scratch worktree
+ * (never the shared checkout) — the ADR 0102 relocation. */
+function mergedInScratch(gitCalls: GitCall[]): boolean {
+  return gitCalls.some(
+    (c) =>
+      c.args[0] === "merge" &&
+      c.args.includes("--no-edit") &&
+      c.cwd.includes("keeper-trunk-integrate-"),
+  );
+}
+
+/** Did any `git merge` run in the SHARED checkout OTHER than a fast-forward — the
+ * thing that must NEVER happen (no MERGE_HEAD is ever visible in the shared
+ * checkout). */
+function mergedInSharedCheckout(gitCalls: GitCall[]): boolean {
+  return gitCalls.some(
+    (c) =>
+      c.args[0] === "merge" &&
+      !c.args.includes("--ff-only") &&
+      c.cwd === TRUNK_REPO_ROOT,
+  );
+}
+
+function findGitCall(gitCalls: GitCall[], verb: string): GitCall | undefined {
+  return gitCalls.find((c) => c.args[0] === verb);
+}
+
+describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
+  const runIntegrate = (deps: TrunkIntegrationDeps) =>
+    runTrunkVerb(() =>
       integrateRepoUnderLease(
         TRUNK_EPIC_ID,
         TRUNK_REPO_ROOT,
@@ -1985,99 +2114,166 @@ describe("integrateRepoUnderLease saga (pure git seam)", () => {
       ),
     );
 
+  test("clean on-branch shared checkout: merges in a scratch worktree, fast-forwards, reaps, releases", () => {
+    // The happy path: the epic base merges in a PRIVATE worktree cut from the
+    // leased default tip, the clean on-branch shared checkout is fast-forwarded to
+    // the merged commit, the scratch worktree + temp branch are reaped, and the
+    // lease is released.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+    });
+
+    const result = runIntegrate(deps);
+
     expect(result.code).toBeNull();
-    expect(mergeAttempted).toBe(true);
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    // The shared checkout is fast-forwarded to the exact merged commit.
+    const ff = gitCalls.find(
+      (c) => c.args[0] === "merge" && c.args.includes("--ff-only"),
+    );
+    expect(ff?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(ff?.args.at(-1)).toBe("merged12345678");
+    expect(reapedScratch(gitCalls)).toBe(true);
     expect(releasedLeases.length).toBe(1);
   });
 
-  test("ancestor-skip: an in-fence reprobe already ancestor releases without merging", () => {
-    // F1: the already-integrated exit — decideTrunkIntegrationFence grades
-    // "already-integrated" before any merge is attempted.
-    let mergeAttempted = false;
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitFail(1);
-      }
-      if (args[0] === "status") return gitOk("");
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
-      ) {
-        return gitOk("abc1234");
-      }
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
-      ) {
-        return gitOk("base000");
-      }
-      if (args[0] === "merge-base") return gitOk(); // already an ancestor
-      if (args[0] === "merge") {
-        mergeAttempted = true;
-        return gitOk();
-      }
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+  test("dirty-tracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): an unrelated TRACKED modification in the shared
+    // checkout — integration completes (the merge happens in the scratch worktree),
+    // the default ref advances via update-ref (compare-and-swap against the leased
+    // tip), and ONLY the fast-forward defers (the trailing checkout is the daemon's
+    // shared-checkout-desync producer's job). The old any-dirt refusal is gone.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedStatus: " M unrelated.ts\n" }),
+    });
 
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
+    const result = runIntegrate(deps);
 
+    // Success returns normally (no error envelope emitted): code null.
     expect(result.code).toBeNull();
-    expect(mergeAttempted).toBe(false);
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    // The default ref advances via a compare-and-swap update-ref, NOT a working-tree
+    // fast-forward (the dirt is preserved untouched).
+    const advance = findGitCall(gitCalls, "update-ref");
+    expect(advance).toBeDefined();
+    expect(advance?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(advance?.args).toEqual([
+      "update-ref",
+      `refs/heads/${TRUNK_DEFAULT_BRANCH}`,
+      "merged12345678",
+      "base000",
+    ]);
+    // No fast-forward merge ran in the shared checkout.
+    expect(
+      gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
+    ).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
     expect(releasedLeases.length).toBe(1);
   });
 
-  test("conflict-retains-lease: TRUNK_INTEGRATION_CONFLICT exits without releasing", () => {
-    // F1: the conflict exit — MERGE_HEAD appears only AFTER the failed merge
-    // (absent on the pre-merge residue check), and the lease is never released
-    // so a live closer keeps its fenced trunk ownership through resolution.
-    let mergeHeadCalls = 0;
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        mergeHeadCalls += 1;
-        return mergeHeadCalls === 1 ? gitFail(1) : gitOk("deadbeef1234");
-      }
-      if (args[0] === "status") return gitOk("");
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
-      ) {
-        return gitOk("abc1234");
-      }
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
-      ) {
-        return gitOk("base000");
-      }
-      if (args[0] === "merge-base") return gitFail(1); // not yet an ancestor
-      if (args[0] === "merge") return gitFail(1, "CONFLICT (content)");
-      if (args[0] === "diff") return gitOk("path/one.ts\npath/two.ts\n");
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+  test("untracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): a bare UNTRACKED path (no tracked modification at
+    // all) trips the same `--untracked-files=all` "not clean" read as a tracked
+    // edit, so the merge still lands and only the fast-forward defers.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedStatus: "?? scratch.txt\n" }),
+    });
 
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    const advance = findGitCall(gitCalls, "update-ref");
+    expect(advance).toBeDefined();
+    expect(advance?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(
+      gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
+    ).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("off-branch shared checkout lands the epic via update-ref, deferring only the ff", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedHead: "some-operator-branch" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(findGitCall(gitCalls, "update-ref")).toBeDefined();
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("the merge-suite gate runs against the MERGED tree in the scratch worktree", () => {
+    // Acceptance: the injected gate is called with the scratch worktree path AND
+    // the merged commit — proving it gates the merged tree, not the shared checkout.
+    const gateCalls: { worktreePath: string; mergedCommit: string }[] = [];
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: (args) => {
+        gateCalls.push(args);
+        return { kind: "green" };
+      },
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(gateCalls).toHaveLength(1);
+    expect(gateCalls[0].mergedCommit).toBe("merged12345678");
+    expect(gateCalls[0].worktreePath).toBe(scratchWorktreePath(gitCalls));
+    expect(gateCalls[0].worktreePath).toContain("keeper-trunk-integrate-");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("gate-red aborts the land with TRUNK_INTEGRATION_SUITE_RED, reaping the worktree and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: () => ({ kind: "red", detail: "3 tests failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_SUITE_RED");
+    // Nothing landed: no fast-forward, no ref advance.
+    expect(findGitCall(gitCalls, "update-ref")).toBeUndefined();
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("gate cannot-run defers with TRUNK_INTEGRATION_DEFERRED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: () => ({ kind: "cannot-run", detail: "install failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DEFERRED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("conflict in the scratch worktree keeps TRUNK_INTEGRATION_CONFLICT, retains the lease, reaps, and never touches the shared checkout", () => {
+    // The conflict materializes in the scratch worktree, NOT the shared checkout —
+    // the closer retains its fenced lease (no release) for the downstream resolver,
+    // the scratch worktree carrying MERGE_HEAD is reaped, and no MERGE_HEAD is ever
+    // visible in the shared checkout.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({
+        mergeResult: gitFail(1, "CONFLICT (content)"),
+        mergeHeadAfterFail: "deadbeef1234",
+        conflictFiles: "path/one.ts\npath/two.ts\n",
+      }),
+    });
+
+    const result = runIntegrate(deps);
 
     expect(result.code).toBe(1);
     expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_CONFLICT");
@@ -2088,178 +2284,125 @@ describe("integrateRepoUnderLease saga (pure git seam)", () => {
       "path/one.ts",
       "path/two.ts",
     ]);
+    // Lease RETAINED for the downstream deconflicter.
     expect(releasedLeases.length).toBe(0);
+    expect(mergedInSharedCheckout(gitCalls)).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
   });
 
-  test("off-branch: HEAD on the wrong branch exits and releases the lease", () => {
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk("some-other-branch");
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
-
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
-
-    expect(result.code).toBe(1);
-    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_OFF_BRANCH");
-    expect(releasedLeases.length).toBe(1);
-  });
-
-  test("dirty: an unclean checkout exits and releases the lease", () => {
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitFail(1);
-      }
-      if (args[0] === "status") return gitOk(" M some/file.ts\n");
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
-
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
-
-    expect(result.code).toBe(1);
-    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DIRTY");
-    expect(releasedLeases.length).toBe(1);
-  });
-
-  test("residue: a pre-existing MERGE_HEAD exits and releases the lease", () => {
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitOk("existingmergehead");
-      }
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
-
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
-
-    expect(result.code).toBe(1);
-    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_RESIDUE");
-    expect(releasedLeases.length).toBe(1);
-  });
-
-  test("tip-drift: default advancing every fenced attempt exhausts the 3-try loop", () => {
-    // F1: the tip-drift exit — the live default tip never matches the leased
-    // observation, so every attempt defers and the loop exhausts without ever
-    // attempting a merge.
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitFail(1);
-      }
-      if (args[0] === "status") return gitOk("");
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
-      ) {
-        return gitOk("abc1234");
-      }
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
-      ) {
-        return gitOk("drifted-tip");
-      }
-      if (args[0] === "merge-base") return gitFail(1); // not yet an ancestor
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
-    const { deps, releasedLeases, requestAttempts } = makeFakeTrunkDeps({
-      git,
-      leaseFor: (attempt) =>
-        baseLeaseFor({
-          fencing_token: attempt + 1,
-          observed_default_tip: "base000",
-        }),
+  test("a residue-free merge failure exits TRUNK_INTEGRATION_FAILED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({
+        mergeResult: gitFail(128, "fatal: not something we can merge"),
+        mergeHeadAfterFail: "",
+      }),
     });
 
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_FAILED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a merge that does not provably contain the source exits TRUNK_INTEGRATION_UNVERIFIED, reaping and releasing", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ contained: false }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_UNVERIFIED");
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a scratch worktree that could not be provisioned defers with TRUNK_INTEGRATION_DEFERRED", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ worktreeAddOk: false }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DEFERRED");
+    // No merge was attempted, and the failed provision was reaped.
+    expect(mergedInScratch(gitCalls)).toBe(false);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a lost update-ref compare-and-swap reaps + retries on a fresh tip, then lands", () => {
+    // Racing-origin edge path: the deferred-ff publish is a compare-and-swap ref
+    // advance (ADR 0102's "push" — this single-repo model has no separate remote
+    // to push to). The advance loses its CAS on the first attempt (a concurrent
+    // local advance moved the default under the fence); that attempt reaps its
+    // scratch worktree and retries, and the second attempt's CAS wins.
+    let updateRefCalls = 0;
+    const base = trunkFlowGit({ sharedStatus: " M unrelated.ts\n" });
+    const git: TrunkIntegrationDeps["git"] = (args, cwd) => {
+      if (args[0] === "update-ref") {
+        updateRefCalls += 1;
+        return updateRefCalls === 1 ? gitFail(1, "CAS mismatch") : gitOk();
+      }
+      return base(args, cwd);
+    };
+    const { deps, releasedLeases, requestAttempts, gitCalls } =
+      makeFakeTrunkDeps({ git });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(updateRefCalls).toBe(2);
+    expect(requestAttempts()).toBe(2);
+    // Each attempt released its lease (the failed one on the retry, the winner on
+    // success), and the scratch worktree was reaped on both.
+    expect(releasedLeases.length).toBe(2);
+    expect(reapedScratch(gitCalls)).toBe(true);
+  });
+
+  test("ancestor-skip: an in-fence reprobe already ancestor releases without a scratch worktree", () => {
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ reprobeAncestor: true }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(false);
+    expect(findGitCall(gitCalls, "worktree")).toBeUndefined();
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("tip-drift: default advancing every fenced attempt exhausts the 3-try loop before any worktree", () => {
+    const { deps, releasedLeases, requestAttempts, gitCalls } =
+      makeFakeTrunkDeps({
+        git: trunkFlowGit({ liveTip: "drifted-tip" }),
+        leaseFor: (attempt) =>
+          baseLeaseFor({
+            fencing_token: attempt + 1,
+            observed_default_tip: "base000",
+          }),
+      });
+
+    const result = runIntegrate(deps);
 
     expect(result.code).toBe(1);
     expect(trunkErrorCode(result.stdout)).toBe("TRUNK_TIP_DRIFT");
     expect(requestAttempts()).toBe(3);
     expect(releasedLeases.length).toBe(3);
+    // Drift defers BEFORE the merge — no scratch worktree is ever cut.
+    expect(findGitCall(gitCalls, "worktree")).toBeUndefined();
   });
 
-  test("release-fail: a successful merge whose release the daemon never acks exits TRUNK_LEASE_RELEASE_FAILED", () => {
-    let mergeBaseCalls = 0;
-    const git: TrunkIntegrationDeps["git"] = (args) => {
-      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
-      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
-        return gitFail(1);
-      }
-      if (args[0] === "status") return gitOk("");
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
-      ) {
-        return gitOk("abc1234");
-      }
-      if (
-        args[0] === "rev-parse" &&
-        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
-      ) {
-        return gitOk("base000");
-      }
-      if (args[0] === "merge-base") {
-        mergeBaseCalls += 1;
-        return mergeBaseCalls === 1 ? gitFail(1) : gitOk();
-      }
-      if (args[0] === "merge") return gitOk();
-      throw new Error(`unexpected git call: ${args.join(" ")}`);
-    };
+  test("release-fail: a landed merge whose release the daemon never acks exits TRUNK_LEASE_RELEASE_FAILED", () => {
     const { deps, releasedLeases } = makeFakeTrunkDeps({
-      git,
+      git: trunkFlowGit(),
       releaseOk: false,
     });
 
-    const result = runTrunkVerb(() =>
-      integrateRepoUnderLease(
-        TRUNK_EPIC_ID,
-        TRUNK_REPO_ROOT,
-        TRUNK_SOURCE_BRANCH,
-        TRUNK_CLAIMANT,
-        "json",
-        deps,
-      ),
-    );
+    const result = runIntegrate(deps);
 
     expect(result.code).toBe(1);
     expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_RELEASE_FAILED");
