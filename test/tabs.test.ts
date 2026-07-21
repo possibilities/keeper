@@ -449,7 +449,6 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
       // The dumped resume line carries the identity env (candidate.job_id),
       // byte-aligned with what --apply spawns for the same candidate.
       "'--x-tmux-env' 'KEEPER_JOB_ID=j' " +
-      "'--x-tmux-env' 'KEEPER_ESCALATION_ROLE=' " +
       // The three always-present dispatched-cell carriers (ADR 0047), EMPTY on a
       // resume line (byte-aligned with what --apply spawns).
       "'--x-tmux-env' 'KEEPER_PLAN_DISPATCHED_MODEL=' " +

@@ -189,19 +189,14 @@ function epicWith(
 }
 
 // ---------------------------------------------------------------------------
-// Help text documents every dispatchable plan-form verb (the parser accepts
-// work/close/unblock/deconflict — the help must not under-claim work|close).
+// Help text documents the dispatchable plan-form verbs (the parser accepts
+// work/close — the help must not under-claim either).
 // ---------------------------------------------------------------------------
 
-test("--help documents all four plan-form verbs with their id shapes + scope", async () => {
+test("--help documents the plan-form verbs with their id shapes + scope", async () => {
   const r = await runDispatch(["--help"]);
   expect(r.code).toBe(0);
-  for (const key of [
-    "work::fn-N.M",
-    "unblock::fn-N.M",
-    "close::fn-N",
-    "deconflict::fn-N",
-  ]) {
+  for (const key of ["work::fn-N.M", "close::fn-N"]) {
     expect(r.stdout).toContain(key);
   }
   // Scope is named, not just the verbs — a task-id shape vs an epic-id shape.
@@ -209,10 +204,10 @@ test("--help documents all four plan-form verbs with their id shapes + scope", a
   expect(r.stdout).toContain("epic-scoped");
 });
 
-test("--agent-help names all four plan-form verbs and their scope", async () => {
+test("--agent-help names the plan-form verbs and their scope", async () => {
   const r = await runDispatch(["--agent-help"]);
   expect(r.code).toBe(0);
-  expect(r.stdout).toContain("work|close|unblock|deconflict");
+  expect(r.stdout).toContain("work|close");
   expect(r.stdout).toContain("task-scoped");
   expect(r.stdout).toContain("epic-scoped");
 });
@@ -281,79 +276,6 @@ test("plan form with no dispatch.work row falls back to sonnet/max", async () =>
   });
   expect(r.spec?.model).toBe("sonnet");
   expect(r.spec?.effort).toBe("max");
-});
-
-test("plan form unblock:: defaults to the escalation floor (sonnet/high), boots /plan:unblock", async () => {
-  // No presets.yaml → the resolver floors unblock to the ESCALATION_* constants
-  // (sonnet/high). unblock is task-scoped, so it resolves the blocked task's repo.
-  const epicRows: Row[] = [
-    {
-      epic_id: "fn-1-x",
-      project_dir: dir,
-      tasks: [{ task_id: "fn-1-x.1", target_repo: dir }],
-    } as unknown as Row,
-  ];
-  const r = await runDispatch(["unblock::fn-1-x.1", "--force"], {
-    query: async () => epicRows,
-    dirExists: () => true,
-  });
-  expect(r.code).toBeUndefined();
-  expect(r.spec?.model).toBe("sonnet");
-  expect(r.spec?.effort).toBe("high");
-  expect(r.spec?.prompt).toBe("/plan:unblock fn-1-x.1");
-  expect(r.spec?.claudeName).toBe("unblock::fn-1-x.1");
-  // Escalation dispatches are never cell-based — no --plugin-dir.
-  expect(r.spec?.pluginDir).toBeUndefined();
-});
-
-test("plan form escalation verb resolves its own dispatch row, independent of work", async () => {
-  // Both rows present → an escalation verb resolves its OWN dispatch row
-  // (dispatch.unblock), NEVER the dispatch.work one.
-  writePresets(
-    "dispatch:\n  work: claude::opus::low\n  unblock: claude::haiku::max\n",
-  );
-  const epicRows: Row[] = [
-    {
-      epic_id: "fn-1-x",
-      project_dir: dir,
-      tasks: [{ task_id: "fn-1-x.1", target_repo: dir }],
-    } as unknown as Row,
-  ];
-  const r = await runDispatch(["unblock::fn-1-x.1", "--force"], {
-    query: async () => epicRows,
-    dirExists: () => true,
-  });
-  expect(r.spec?.model).toBe("haiku");
-  expect(r.spec?.effort).toBe("max");
-});
-
-test("plan form deconflict:: is epic-scoped — runs in the epic dir, boots /plan:deconflict", async () => {
-  const epicRows: Row[] = [
-    { epic_id: "fn-1-x", project_dir: dir, tasks: [] } as unknown as Row,
-  ];
-  const r = await runDispatch(["deconflict::fn-1-x", "--force"], {
-    query: async () => epicRows,
-    dirExists: () => true,
-    // No lane worktree → falls back to project_dir (a note on stderr), never a
-    // real git probe.
-    resolveLaneDir: async () => null,
-  });
-  expect(r.code).toBeUndefined();
-  expect(r.spec?.prompt).toBe("/plan:deconflict fn-1-x");
-  expect(r.spec?.claudeName).toBe("deconflict::fn-1-x");
-});
-
-test("plan form unblock:: honors the race guard (parity with work/close)", async () => {
-  const r = await runDispatch(["unblock::fn-1-x.1"], {
-    query: makeQuery({
-      epics: epicWith(dir),
-      pending: [{ verb: "unblock", id: "fn-1-x.1" } as unknown as Row],
-    }),
-    dirExists: () => true,
-  });
-  expect(r.code).toBe(1);
-  expect(r.stderr).toContain("already in flight");
-  expect(r.spec).toBeUndefined();
 });
 
 test("a retired harness --preset triple fails loud (exit 2)", async () => {

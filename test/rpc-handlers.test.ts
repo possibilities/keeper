@@ -1538,27 +1538,6 @@ test("retry_dispatch accepts an `approve::id` clear and forwards it to the bridg
   ]);
 });
 
-test("retry_dispatch accepts a `repair::<token>` re-arm and forwards it to the bridge", async () => {
-  // The operator re-arm path for a stranded `repair::<repo-token>` sticky —
-  // `bridge.retryDispatch` mints the `DispatchCleared` event the reducer folds
-  // to DELETE the repair row's latches, letting the repair-escalation sweep
-  // re-dispatch on any persisting candidate.
-  const { bridge, state } = autopilotStubBridge({});
-  const result = await retryDispatchHandler(
-    { id: "repair::keeper-qzvs8i" },
-    bridge,
-  );
-  expect(result).toEqual({
-    ok: true,
-    verb: "repair",
-    id: "keeper-qzvs8i",
-    outcome: "cleared",
-  });
-  expect(state.retryCalls).toEqual([
-    { verb: "repair", id: "keeper-qzvs8i", force: false, caller_session: null },
-  ]);
-});
-
 test("retry_dispatch rejects params with extra keys (no command/param injection)", async () => {
   const { bridge } = autopilotStubBridge({});
   for (const bad of [

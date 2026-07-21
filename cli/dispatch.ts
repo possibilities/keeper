@@ -51,9 +51,9 @@ import {
 } from "../src/db";
 import {
   buildDispatchLaunchArgv,
-  type DispatchableVerb,
   defaultPlanPrompt,
-  parseDispatchableKey,
+  parseDispatchKey,
+  type RetryDispatchVerb,
   validatePromptBytes,
 } from "../src/dispatch-command";
 import { assertNever } from "../src/dispatch-failure-key";
@@ -81,7 +81,6 @@ import {
   type WorkerCellFreshness,
 } from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
-import { repoToken } from "../src/worktree-plan";
 import { queryCollection } from "./control-rpc";
 import { buildParseOptions, DISPATCH_FLAGS } from "./descriptor";
 
@@ -154,23 +153,16 @@ export interface MainDeps {
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
 
 Usage:
-  keeper dispatch <work|close|unblock|deconflict|repair>::<id> [options]  # plan form
+  keeper dispatch <work|close>::<id> [options]      # plan form
   keeper dispatch --prompt "<text>" [options]       # free form
   keeper dispatch --prompt-file <path> [options]    # free form
   keeper dispatch --help
 
 Plan form resolves the /plan:<verb> <id> prompt + cwd from the daemon and bakes
---name <verb>::<id> so the hook binds a board-visible jobs row. The five
-plan-form verbs, by id scope:
+--name <verb>::<id> so the hook binds a board-visible jobs row. The plan-form
+verbs, by id scope:
   work::fn-N.M      task-scoped  fire the worker in the task's repo
-  unblock::fn-N.M   task-scoped  escalation session for a blocked task
   close::fn-N       epic-scoped  close the epic (its lane worktree when present)
-  deconflict::fn-N  epic-scoped  escalation session for an epic merge conflict
-  repair::<token>   repo-scoped  escalation session for a shared-base-broken repo;
-                     <token> is a '<slug>-<hash>' repo token (the SAME convention
-                     worktree lane dirs use), resolved to a repo by hashing every
-                     epic's project_dir/task target_repo — an unresolvable token
-                     is a typed error, never a guess
 Free form launches an arbitrary prompt; --name is OPTIONAL and forwarded
 verbatim to claude (no keeper labeling). When omitted, no --name is passed at all.
 
@@ -202,11 +194,8 @@ Run \`keeper dispatch --agent-help\` for the terse operator runbook.
 const AGENT_HELP = `keeper dispatch — operator runbook (agent-facing)
 
 Fire ONE claude worker by hand. Two forms:
-  Plan form:  keeper dispatch <work|close|unblock|deconflict>::<id>
-              keeper dispatch repair::<repo-token>
-              work::fn-N.M and unblock::fn-N.M are task-scoped; close::fn-N and
-              deconflict::fn-N are epic-scoped; repair::<token> is REPO-scoped
-              (unblock/deconflict/repair boot the escalation session). Resolves
+  Plan form:  keeper dispatch <work|close>::<id>
+              work::fn-N.M is task-scoped; close::fn-N is epic-scoped. Resolves
               the /plan:<verb> <id> prompt + cwd from the daemon and bakes
               --name so the hook binds a jobs row.
   Free form:  keeper dispatch --prompt "<text>" [--name <n>] [--cwd <dir>]
@@ -302,7 +291,7 @@ async function resolveEpicLaneWorktree(
  */
 export async function resolvePlanCwd(
   query: QueryFn,
-  verb: DispatchableVerb,
+  verb: RetryDispatchVerb,
   id: string,
   dirExists: (dir: string) => boolean = existsSync,
   resolveLaneDir: (
@@ -322,65 +311,10 @@ export async function resolvePlanCwd(
     }
   | { ok: false; error: string }
 > {
-  // repair::<repo-token> is REPO-scoped, not epic/task-scoped — id is a repo
-  // token, never an fn-shaped ref, so it can't join the `epics` filter below by
-  // epic_id. Resolve it by scanning every epic for a project_dir or task
-  // target_repo that hashes to the token (the SAME `repoToken` derivation
-  // worktree lane paths use), landing the session in that repo's SHARED
-  // checkout — never a lane-or-project resolution. An unresolvable token is a
-  // typed error, never a guess.
-  if (verb === "repair") {
-    let allRows: EpicRow[];
-    try {
-      allRows = (await query("epics")) as EpicRow[];
-    } catch (err) {
-      return {
-        ok: false,
-        error: `cannot reach daemon to resolve cwd (${(err as Error).message})`,
-      };
-    }
-    const seen = new Set<string>();
-    for (const epic of allRows) {
-      const candidates: string[] = [];
-      if (typeof epic.project_dir === "string" && epic.project_dir !== "") {
-        candidates.push(epic.project_dir);
-      }
-      for (const t of epic.tasks ?? []) {
-        if (typeof t.target_repo === "string" && t.target_repo !== "") {
-          candidates.push(t.target_repo);
-        }
-      }
-      for (const dir of candidates) {
-        if (seen.has(dir)) {
-          continue;
-        }
-        seen.add(dir);
-        if (repoToken(dir) === id) {
-          if (!dirExists(dir)) {
-            return { ok: false, error: `cwd-missing: ${dir}` };
-          }
-          return { ok: true, cwd: dir };
-        }
-      }
-    }
-    return {
-      ok: false,
-      error:
-        `unknown repo token '${id}': no epic's project_dir or task target_repo ` +
-        "hashes to it (see `keeper query epics`)",
-    };
-  }
-
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
-  // prefix. close: id IS the epic id. The epic filter resolves both. The two
-  // epic/task-scoped escalation verbs mirror those shapes exactly —
-  // `unblock::<task>` is task-scoped like work, `deconflict::<epic>` is
-  // epic-scoped like close — so each resolves its cwd through the same branch
-  // (the unblock session runs in the blocked task's repo; the deconflict
-  // session runs in the epic lane where the merge conflict lives, exactly
-  // like the resolver).
-  const taskScoped = verb === "work" || verb === "unblock";
-  const epicScoped = verb === "close" || verb === "deconflict";
+  // prefix. close: id IS the epic id. The epic filter resolves both.
+  const taskScoped = verb === "work";
+  const epicScoped = verb === "close";
   const epicId = taskScoped ? id.replace(/\.\d+$/, "") : id;
   let rows: EpicRow[];
   try {
@@ -425,7 +359,8 @@ export async function resolvePlanCwd(
       warning: `no epic lane worktree for '${epicId}'; launching close in ${projectDir}`,
     };
   }
-  // work / unblock: walk the parent epic's tasks for the matching task id.
+  // work (and the fallthrough `approve` case): walk the parent epic's tasks
+  // for the matching task id.
   const task = (epic.tasks ?? []).find((t) => t.task_id === id);
   if (task === undefined) {
     return {
@@ -460,16 +395,12 @@ export async function resolvePlanCwd(
 /**
  * Plan-form race guard. Best-effort scan: refuses (naming the tripped condition
  * and the right-path recovery) when a `pending_dispatches` row for the key
- * exists, autopilot is unpaused and still eligible to dispatch the key, or a
- * `working`/`stopped` job carries the plan key (client-side scan — `jobs` has no
- * `plan_verb`/`plan_ref` filter). An `unblock::` key with an attempted terminal
- * block latch bypasses only the generic unpaused refusal: whether its parsed
- * category class has re-armed is producer-owned state the CLI cannot infer from
- * the latch, while pending and live collisions still refuse. Each refusal names the
- * recovery BEFORE `--force` (the caller appends the `--force` suffix, keeping it
- * last): a stopped-but-live worker warm-resumes over the bus, a dead one is
- * reclaimed. Returns the tripped-condition string, or `null` when clear.
- * Skipped by the caller under `--force`.
+ * exists, autopilot is unpaused, or a `working`/`stopped` job carries the plan
+ * key (client-side scan — `jobs` has no `plan_verb`/`plan_ref` filter). Each
+ * refusal names the recovery BEFORE `--force` (the caller appends the
+ * `--force` suffix, keeping it last): a stopped-but-live worker warm-resumes
+ * over the bus, a dead one is reclaimed. Returns the tripped-condition string,
+ * or `null` when clear. Skipped by the caller under `--force`.
  *
  * A daemon-unreachable read here is treated as "clear" — the launch surface
  * itself will fail loudly if the daemon is truly gone, and a manual hatch must
@@ -477,7 +408,7 @@ export async function resolvePlanCwd(
  */
 export async function checkRaceGuard(
   query: QueryFn,
-  verb: DispatchableVerb,
+  verb: RetryDispatchVerb,
   id: string,
 ): Promise<string | null> {
   const key = `${verb}::${id}`;
@@ -489,14 +420,7 @@ export async function checkRaceGuard(
     const state = await query("autopilot_state", { id: 1 });
     const paused = state[0]?.paused;
     if (paused === 0 || paused === false) {
-      let terminalBlockLatch = false;
-      if (verb === "unblock") {
-        const latches = await query("block_escalations", { task_id: id });
-        terminalBlockLatch = latches.some((row) => row.status === "attempted");
-      }
-      if (!terminalBlockLatch) {
-        return "autopilot is unpaused — it may dispatch this key itself; pause it first";
-      }
+      return "autopilot is unpaused — it may dispatch this key itself; pause it first";
     }
     // jobs has no plan_verb/plan_ref filter — scan the live set client-side.
     const jobs = await query("jobs");
@@ -627,14 +551,13 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     );
   }
 
-  // Parse the plan-form key up-front (the WIDER dispatchable set, so the two
-  // escalation verbs are accepted) — the model/effort default below selects the
-  // escalation vs worker launch config by verb, and the plan-form block reuses
-  // the parsed pair. A malformed verb::id key is CLI misuse — exit 2.
-  let planVerb: DispatchableVerb | undefined;
+  // Parse the plan-form key up-front — the model/effort default below resolves
+  // the verb's dispatch-table row, and the plan-form block reuses the parsed
+  // pair. A malformed verb::id key is CLI misuse — exit 2.
+  let planVerb: RetryDispatchVerb | undefined;
   let planId: string | undefined;
   if (hasPlanKey) {
-    const keyResult = parseDispatchableKey(positional);
+    const keyResult = parseDispatchKey(positional);
     if (!keyResult.ok) {
       argFault(keyResult.error);
     }
@@ -647,13 +570,13 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   // dispatch[verb] triple (plan form only) > floor. Dispatch widens to claude
   // alone for now — LaunchSpec carries only claude model/effort (codex/pi dispatch
   // is a follow-up). The plan default resolves the verb's `dispatch:` row (ADR
-  // 0040), floored to the same WORKER_*/ESCALATION_* constants the daemon path
-  // uses — so a manual `keeper dispatch <verb>::<id>` launches byte-identically to
-  // the autopilot's launch for that verb.
+  // 0040), floored to the same WORKER_* constants the daemon path uses — so a
+  // manual `keeper dispatch <verb>::<id>` launches byte-identically to the
+  // autopilot's launch for that verb.
   let baseModel: string | undefined;
   let baseEffort: string | undefined;
   if (hasPlanKey) {
-    const base = resolveDispatchLaunchConfig(planVerb as DispatchableVerb);
+    const base = resolveDispatchLaunchConfig(planVerb as RetryDispatchVerb);
     baseModel = base.model;
     baseEffort = base.effort;
   }
@@ -730,7 +653,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   if (hasPlanKey) {
     // ---- plan form ----
     // Parsed up-front (see the model/effort block) — reuse the pair here.
-    const verb = planVerb as DispatchableVerb;
+    const verb = planVerb as RetryDispatchVerb;
     const id = planId as string;
     const query: QueryFn =
       deps.query ??

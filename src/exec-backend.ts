@@ -159,15 +159,6 @@ export interface LaunchSpec {
    */
   readonly worktreeBranch?: string;
   /**
-   * Escalation-session role (`unblock`/`resolve`/`deconflict`/`repair`). Set ONLY
-   * for an escalation dispatch; empty/absent for every other launch. The launch
-   * ALWAYS emits `--x-tmux-env KEEPER_ESCALATION_ROLE=<role-or-empty>` (the
-   * KEEPER_PLAN_WORKTREE_BRANCH always-emit pattern) so a reused tmux session can
-   * never inherit a stale role marker; the escalation-guard hook reads it from
-   * process env to key its command-family allowlist, an empty value being inert.
-   */
-  readonly escalationRole?: string;
-  /**
    * The DISPATCHED worker cell + the constraint that forced it (ADR 0047), set
    * ONLY when the `worker_provider` pin translated the task's assigned cell into
    * the other family. The launch ALWAYS emits the three `KEEPER_PLAN_DISPATCHED_MODEL`
@@ -1245,16 +1236,6 @@ export interface KeeperAgentLaunchOpts {
    */
   readonly worktreeBranch?: string;
   /**
-   * Escalation-session role carrier. ALWAYS emitted as a FOURTH repeated
-   * `--x-tmux-env KEEPER_ESCALATION_ROLE=<role-or-empty>` right after the branch
-   * env (`?? ""`), mirroring the {@link worktreeBranch} always-emit discipline:
-   * a serial / non-escalation launch reusing a tmux session OVERWRITES any stale
-   * role a prior escalation launch left, and an empty value is inert at the
-   * escalation-guard hook. The dispatch path sets the verb for escalation
-   * launches only.
-   */
-  readonly escalationRole?: string;
-  /**
    * The dispatched worker cell + the pin that forced it (ADR 0047). ALWAYS emitted
    * as the three trailing repeated `--x-tmux-env KEEPER_PLAN_DISPATCHED_MODEL` /
    * `KEEPER_PLAN_DISPATCHED_TIER` / `KEEPER_PLAN_DISPATCH_CONSTRAINT` carriers
@@ -1423,15 +1404,7 @@ export function buildKeeperAgentLaunchArgv(
     // fresh prompted launch can never inherit and fold onto someone else's row.
     "--x-tmux-env",
     `KEEPER_JOB_ID=${isResume ? (opts.jobId ?? "") : ""}`,
-    // Escalation-role carrier — ALWAYS a FIFTH repeated `--x-tmux-env` (keeper
-    // agent last-wins per dup key): the escalation verb on an escalation launch,
-    // EMPTY otherwise. Always present so the `-e` OVERWRITES any stale role a prior
-    // escalation launch left in a reused tmux session env (the same reason the
-    // worktree carriers above are unconditional); an empty value is inert at the
-    // escalation-guard hook (no marker → fail open).
-    "--x-tmux-env",
-    `KEEPER_ESCALATION_ROLE=${opts.escalationRole ?? ""}`,
-    // Dispatched-cell carriers (ADR 0047) — the SIXTH/SEVENTH/EIGHTH repeated
+    // Dispatched-cell carriers (ADR 0047) — the FIFTH/SIXTH/SEVENTH repeated
     // `--x-tmux-env` (keeper agent last-wins per dup key): the model/tier the
     // `worker_provider` pin translated the assigned cell TO, plus the pin that
     // forced it, EMPTY when the assigned cell ran unconstrained. ALWAYS present so
@@ -1687,9 +1660,6 @@ export async function keeperAgentLaunch(
         : {}),
       ...(deps.spec.worktreeBranch !== undefined
         ? { worktreeBranch: deps.spec.worktreeBranch }
-        : {}),
-      ...(deps.spec.escalationRole !== undefined
-        ? { escalationRole: deps.spec.escalationRole }
         : {}),
       ...(deps.spec.dispatchedModel !== undefined
         ? { dispatchedModel: deps.spec.dispatchedModel }

@@ -164,7 +164,6 @@ import {
   type DispatchKey,
   dispatchKey,
   type EpicRecoverVerdict,
-  epicHasActiveResolver,
   epicHasOccupyingJob,
   epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
@@ -371,7 +370,6 @@ export {
   closerJobFinished,
   computeSlotOccupancy,
   dispatchKey,
-  epicHasActiveResolver,
   epicHasOccupyingJob,
   epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
@@ -11708,18 +11706,9 @@ function main(): void {
               (epicId) => epicRecoverVerdictById(db, epicId),
               (epicId) => epicPresentAndNotDone(db, epicId),
               // Per-epic integration exclusion from the SAME snapshot: recovery
-              // skips a live legacy resolver or any active work/close incident
-              // claim. Pure projection data plus read-time liveness, never a fold.
+              // skips any active work/close incident claim. Pure projection data,
+              // never a fold.
               (epicId) => {
-                if (
-                  epicHasActiveResolver(
-                    snapshot.jobs,
-                    epicId,
-                    snapshot.livePaneIds,
-                  )
-                ) {
-                  return true;
-                }
                 for (const key of snapshot.claimedIncidentKeys ?? []) {
                   if (
                     key === dispatchKey("close", epicId) ||
