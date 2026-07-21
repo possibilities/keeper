@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Collapse latches into incident projection",
-  "updated_at": "2026-07-21T14:03:47.232000Z"
+  "updated_at": "2026-07-21T14:38:23.966000Z",
+  "worker_done_at": null
 }
