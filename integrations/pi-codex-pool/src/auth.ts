@@ -328,7 +328,7 @@ function readAuthObject(authPath: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-export function writePrivateJsonAtomic(path: string, value: unknown): void {
+export function writePrivateFileAtomic(path: string, content: string): void {
   const parent = dirname(path);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   chmodSync(parent, 0o700);
@@ -343,19 +343,27 @@ export function writePrivateJsonAtomic(path: string, value: unknown): void {
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
       0o600,
     );
-    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    writeFileSync(fd, content, "utf8");
     closeSync(fd);
     fd = undefined;
     chmodSync(temporary, 0o600);
     renameSync(temporary, path);
     chmodSync(path, 0o600);
-  } catch {
+  } catch (error) {
     if (fd !== undefined) closeSync(fd);
     try {
       rmSync(temporary, { force: true });
     } catch {
       // The original file remains authoritative.
     }
+    throw error;
+  }
+}
+
+export function writePrivateJsonAtomic(path: string, value: unknown): void {
+  try {
+    writePrivateFileAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+  } catch {
     throw new PoolCredentialError("credential-storage-failed");
   }
 }

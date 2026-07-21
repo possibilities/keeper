@@ -47,6 +47,7 @@ import type {
 import {
   initialQuotaScopeFromEnvironment,
   type PoolAliasPolicy,
+  PoolFailureLog,
   PoolRouteState,
   PoolStateStore,
   poolAliasPolicyBinding,
@@ -793,6 +794,7 @@ export function installCodexPool(
     initialScope,
     aliasPolicy ?? undefined,
   );
+  const failureLog = new PoolFailureLog();
   const policyBinding = poolAliasPolicyBinding(aliases, aliasPolicy);
   const active =
     process.env[CONFIG_BINDING_ENV] === routes.binding &&
@@ -873,6 +875,7 @@ export function installCodexPool(
           delegate: nativeDelegate,
           nativeDelegate,
           warn: () => warn(),
+          failureLog,
           ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
         },
         model,
@@ -968,6 +971,7 @@ export function installCodexPool(
         delegate: instrumentedDelegate,
         nativeDelegate: instrumentedNativeDelegate,
         warn: () => warn(),
+        failureLog,
         ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
       },
       model,
