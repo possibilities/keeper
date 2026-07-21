@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T06:15:18.234000Z",
+  "depends_on": [
+    "fn-1394-probe-close-claim-holder-liveness-and.1"
+  ],
+  "epic": "fn-1394-probe-close-claim-holder-liveness-and",
+  "id": "fn-1394-probe-close-claim-holder-liveness-and.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Clear plan session markers on kill paths",
+  "updated_at": "2026-07-21T06:15:18.234000Z"
+}
