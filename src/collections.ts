@@ -653,8 +653,7 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
     "last_event_id",
     "created_at",
     "updated_at",
-    "merge_escalated_at",
-    "resolver_dispatched_at",
+    "owner_redispatch_attempts",
     "human_notified_at",
     "instance_event_id",
     "attempt_id",
@@ -854,34 +853,38 @@ export const PROVIDER_LEG_OWNERSHIP_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `block_escalations` descriptor (fn-941) — the daemon block-escalation
- * producer's escalate-once LATCH, one row per blocked plan task keyed by
- * `(epic_id, task_id)`. A reducer projection (re-fold rebuilds it
- * byte-identically). `task_id` carries the wire identity; `epic_id` rides in
- * `columns` / `filters`. Registering it here is what makes the latch
- * subscribable over the UDS socket so the board renders an escalated-blocked
- * task distinctly and `keeper await` reads the escalation-in-flight signal.
+ * The `block_escalations` descriptor — the daemon block-escalation producer's
+ * escalate-once incident, one row per blocked plan task. Collapsed onto the
+ * `dispatch_failures` incident projection as the `verb='block'` subset (the retired
+ * standalone `block_escalations` table): the wire identity `id` carries the task id,
+ * `block_status` / `block_outcome` the latch stage, and `human_notified_at` the
+ * page-once marker. A reducer projection (re-fold rebuilds it byte-identically).
+ * Registering it (a sibling descriptor over `dispatch_failures`, like
+ * `poison_dead_letters` over `dead_letters`) keeps the block-incident subset
+ * subscribable over the UDS socket so the board renders a blocked task distinctly
+ * and `keeper await` reads the escalation-in-flight signal; `readiness-client`
+ * projects these rows back into the `BlockEscalation` snapshot shape.
  */
 export const BLOCK_ESCALATIONS_DESCRIPTOR: CollectionDescriptor = {
   name: "block_escalations",
-  table: "block_escalations",
+  table: "dispatch_failures",
   columns: [
-    "task_id",
-    "epic_id",
+    "id",
     "blocked_since",
-    "status",
-    "outcome",
+    "block_status",
+    "block_outcome",
+    "owner_redispatch_attempts",
     "last_event_id",
     "human_notified_at",
   ],
-  pk: "task_id",
+  pk: "id",
   version: "last_event_id",
-  sortable: new Set(["task_id", "epic_id", "blocked_since", "last_event_id"]),
+  defaultFilter: { verb: "block" },
+  sortable: new Set(["id", "blocked_since", "last_event_id"]),
   defaultSort: { column: "blocked_since", dir: "desc" },
   filters: {
-    task_id: "task_id",
-    epic_id: "epic_id",
-    status: "status",
+    id: "id",
+    status: "block_status",
   },
   jsonColumns: new Set(),
 };

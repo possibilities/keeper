@@ -1577,13 +1577,16 @@ function taskSnapshotEvent(
   });
 }
 
-/** Stable JSON snapshot of `block_escalations`, sorted by pk — the byte-compare unit. */
+/** Stable JSON snapshot of the block incidents (the `dispatch_failures`
+ *  `verb='block'` subset), sorted by pk — the byte-compare unit. */
 function snapshotBlockEscalations(): string {
   const rows = db
     .query(
-      `SELECT epic_id, task_id, blocked_since, status, outcome, last_event_id
-         FROM block_escalations
-        ORDER BY epic_id, task_id`,
+      `SELECT id AS task_id, blocked_since, block_status AS status,
+              block_outcome AS outcome, last_event_id
+         FROM dispatch_failures
+        WHERE verb = 'block'
+        ORDER BY id`,
     )
     .all();
   return JSON.stringify(rows);
@@ -1598,9 +1601,9 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   drainAll();
   let row = db
     .query(
-      "SELECT blocked_since, status, outcome, last_event_id FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT blocked_since, block_status AS status, block_outcome AS outcome, last_event_id FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as {
+    .get(TASK) as {
     blocked_since: number;
     status: string;
     outcome: string | null;
@@ -1617,9 +1620,9 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   drainAll();
   row = db
     .query(
-      "SELECT blocked_since, status, outcome, last_event_id FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT blocked_since, block_status AS status, block_outcome AS outcome, last_event_id FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as typeof row;
+    .get(TASK) as typeof row;
   expect(row?.status).toBe("pending");
   expect(row?.blocked_since).toBe(blockId);
 
@@ -1634,9 +1637,9 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
     (
       db
         .query(
-          "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+          "SELECT block_status AS status FROM dispatch_failures WHERE verb = 'block' AND id = ?",
         )
-        .get(EPIC, TASK) as { status: string }
+        .get(TASK) as { status: string }
     ).status,
   ).toBe("requested");
 
@@ -1649,9 +1652,9 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   drainAll();
   row = db
     .query(
-      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT block_status AS status, block_outcome AS outcome FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as typeof row;
+    .get(TASK) as typeof row;
   expect(row?.status).toBe("attempted");
   expect(row?.outcome).toBe("sent");
 
@@ -1660,10 +1663,8 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   drainAll();
   expect(
     db
-      .query(
-        "SELECT 1 FROM block_escalations WHERE epic_id = ? AND task_id = ?",
-      )
-      .get(EPIC, TASK),
+      .query("SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ?")
+      .get(TASK),
   ).toBeNull();
 
   // 5. Re-block → latch RE-ARMS fresh at pending (the escalate-once-per-instance
@@ -1672,9 +1673,9 @@ test("block_escalations: latch arms on entering blocked, advances on escalation 
   drainAll();
   row = db
     .query(
-      "SELECT blocked_since, status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT blocked_since, block_status AS status, block_outcome AS outcome FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as typeof row;
+    .get(TASK) as typeof row;
   expect(row?.status).toBe("pending");
   expect(row?.blocked_since).toBe(reblockId);
   expect(row?.outcome).toBeNull();
@@ -1702,9 +1703,9 @@ test("block_escalations: a send_failed Attempted leaves the latch re-swept (pend
     (
       db
         .query(
-          "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+          "SELECT block_status AS status FROM dispatch_failures WHERE verb = 'block' AND id = ?",
         )
-        .get(EPIC, TASK) as { status: string }
+        .get(TASK) as { status: string }
     ).status,
   ).toBe("requested");
 
@@ -1722,9 +1723,9 @@ test("block_escalations: a send_failed Attempted leaves the latch re-swept (pend
   drainAll();
   let row = db
     .query(
-      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT block_status AS status, block_outcome AS outcome FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as { status: string; outcome: string | null };
+    .get(TASK) as { status: string; outcome: string | null };
   expect(row.status).toBe("pending");
   expect(row.outcome).toBe("send_failed");
 
@@ -1743,9 +1744,9 @@ test("block_escalations: a send_failed Attempted leaves the latch re-swept (pend
   drainAll();
   row = db
     .query(
-      "SELECT status, outcome FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      "SELECT block_status AS status, block_outcome AS outcome FROM dispatch_failures WHERE verb = 'block' AND id = ?",
     )
-    .get(EPIC, TASK) as { status: string; outcome: string | null };
+    .get(TASK) as { status: string; outcome: string | null };
   expect(row.status).toBe("attempted");
   expect(row.outcome).toBe("sent");
 });
@@ -1785,7 +1786,7 @@ test("block_escalations: a send_failed lifecycle re-folds byte-identically (fn-9
 
   const live = snapshotBlockEscalations();
   rewindAndWipeProjections();
-  db.run("DELETE FROM block_escalations");
+  db.run("DELETE FROM dispatch_failures WHERE verb = 'block'");
   drainAll();
   expect(snapshotBlockEscalations()).toBe(live);
 });
@@ -1803,9 +1804,9 @@ test("block_escalations: a TOOLING_FAILURE-style block is folded latch-AGNOSTIC 
   expect(
     db
       .query(
-        "SELECT status FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+        "SELECT block_status AS status FROM dispatch_failures WHERE verb = 'block' AND id = ?",
       )
-      .get(EPIC, TASK),
+      .get(TASK),
   ).toEqual({ status: "pending" });
 });
 
@@ -1849,7 +1850,7 @@ test("block_escalations re-folds byte-identically from a from-scratch replay (es
   // (the production rewinding-migration shape — block_escalations rides the
   // canonical DELETE list), then re-drain from id 0.
   rewindAndWipeProjections();
-  db.run("DELETE FROM block_escalations");
+  db.run("DELETE FROM dispatch_failures WHERE verb = 'block'");
   drainAll();
 
   const refolded = snapshotBlockEscalations();
@@ -1927,9 +1928,10 @@ test("dispatch_failures.merge_escalated_at: a {DispatchFailed(close), MergeEscal
     .all() as Array<Record<string, unknown>>;
   const stamped = live.find((r) => r.id === "fn-1009-mc");
   const unstamped = live.find((r) => r.id === "fn-1009-mc-sf");
-  // Terminal stamp survives the later re-failure UPSERT; non-terminal stays NULL.
-  expect(stamped?.merge_escalated_at).toBe(1750);
-  expect(unstamped?.merge_escalated_at).toBeNull();
+  // Terminal outcome consumed one attachment slot; it survives the later re-failure
+  // UPSERT. The non-terminal outcome consumed no slot (count stays 0).
+  expect(stamped?.owner_redispatch_attempts).toBe(1);
+  expect(unstamped?.owner_redispatch_attempts).toBe(0);
 
   // Full from-scratch re-fold: rewind + wipe (dispatch_failures rides the
   // canonical DELETE list but rewindAndWipeProjections omits it, mirroring the
@@ -2018,11 +2020,11 @@ test("dispatch_failures.resolver_dispatched_at: a {DispatchFailed(close), MergeE
     .all() as Array<Record<string, unknown>>;
   const dispatched = live.find((r) => r.id === "fn-1088-rd");
   const failed = live.find((r) => r.id === "fn-1088-rd-df");
-  // Terminal dispatch stamp survives the later re-failure UPSERT; the failed one
-  // stays NULL. The human-escalation marker coexists independently on the dispatched row.
-  expect(dispatched?.resolver_dispatched_at).toBe(1755);
-  expect(dispatched?.merge_escalated_at).toBe(1750);
-  expect(failed?.resolver_dispatched_at).toBeNull();
+  // The dispatched row consumed BOTH attachment slots (merge + resolver terminal) →
+  // count saturates at the lease limit (2), surviving the later re-failure UPSERT.
+  // The failed one consumed no slot (count stays 0).
+  expect(dispatched?.owner_redispatch_attempts).toBe(2);
+  expect(failed?.owner_redispatch_attempts).toBe(0);
 
   // Full from-scratch re-fold: rewind + wipe, then re-drain from id 0.
   rewindAndWipeProjections();

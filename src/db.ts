@@ -4589,6 +4589,77 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    // fn-1352.2 — collapse the retired `block_escalations` latch AND the two
+    // merge-incident once-markers (`resolver_dispatched_at` / `merge_escalated_at`)
+    // INTO the per-key `dispatch_failures` incident projection (the v141 columns).
+    // Provisional tail version; fan-in renumbers this singleton. Re-pin
+    // SCHEMA_FINGERPRINT.
+    //
+    // This step is the IN-PLACE upgrade path: it seeds the current LIVE latch state
+    // so no migrated row can re-page. A from-scratch re-fold reproduces the same rows
+    // through the collapsed folds (block: the `TaskSnapshot` arm + `BlockEscalation*`;
+    // merge: `Merge`/`ResolverDispatchAttempted` → `owner_redispatch_attempts`), so
+    // the carry-forward is EVENT-DERIVABLE, not fold-invented — an in-place upgrade
+    // and a later re-fold converge byte-identically.
+    //
+    //   1. Seed a `('block', task_id)` incident row from every live `block_escalations`
+    //      latch. `human_notified_at` (page-once), `blocked_since`, `block_status`,
+    //      `block_outcome`, and `owner_redispatch_attempts` carry forward verbatim. The
+    //      NOT-NULL `ts` / `created_at` are the ARMING event's ts (the event whose id is
+    //      `blocked_since`) and `updated_at` the LAST-touching event's ts (`last_event_id`)
+    //      — exactly what the arm + `BlockEscalation*` folds write, so the seed equals a
+    //      re-fold. The `reason` literal MUST equal `BLOCK_INCIDENT_REASON`
+    //      (`dispatch-failure-key.ts`; this leaf cannot import it).
+    //   2. Fold the two merge once-markers into `owner_redispatch_attempts` on every
+    //      surviving merge row: the bounded two-slot lease becomes the durable count.
+    //   3. DROP the once-marker columns and the `block_escalations` table.
+    //
+    // Steps 1+2 are VERSION-GUARDED (they read the pre-collapse shape, so re-running
+    // them after the DROP would error); the idempotent DROPs (step 3) run every boot.
+    version: 142,
+    kind: "drop",
+    apply: (ctx) => {
+      if (ctx.preMigrateStoredVersion < 142) {
+        // 1. Block incidents. `INSERT OR IGNORE` is defensive — a `('block', task_id)`
+        //    row cannot pre-exist (the `block` verb is new to `dispatch_failures`).
+        ctx.db.run(
+          `INSERT OR IGNORE INTO dispatch_failures (
+             verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+             instance_event_id, blocked_since, block_status, block_outcome,
+             owner_redispatch_attempts, human_notified_at
+           )
+           SELECT 'block', be.task_id, 'block-incident', NULL,
+                  COALESCE(arm.ts, 0), be.last_event_id,
+                  COALESCE(arm.ts, 0), COALESCE(upd.ts, arm.ts, 0),
+                  be.blocked_since, be.blocked_since, be.status, be.outcome,
+                  be.owner_redispatch_attempts, be.human_notified_at
+             FROM block_escalations be
+             LEFT JOIN events arm ON arm.id = be.blocked_since
+             LEFT JOIN events upd ON upd.id = be.last_event_id`,
+        );
+        // 2. Merge attachment lease → durable count (0/1/2), matching the collapsed
+        //    fold's `owner_redispatch_attempts` for the same event history.
+        ctx.db.run(
+          `UPDATE dispatch_failures
+              SET owner_redispatch_attempts =
+                    (CASE WHEN resolver_dispatched_at IS NOT NULL THEN 1 ELSE 0 END)
+                  + (CASE WHEN merge_escalated_at IS NOT NULL THEN 1 ELSE 0 END)
+            WHERE verb != 'block'
+              AND (resolver_dispatched_at IS NOT NULL
+                   OR merge_escalated_at IS NOT NULL)`,
+        );
+      }
+      // 3. Retire the collapsed shape (idempotent — no version guard).
+      dropColumnIfPresent(
+        ctx.db,
+        "dispatch_failures",
+        "resolver_dispatched_at",
+      );
+      dropColumnIfPresent(ctx.db, "dispatch_failures", "merge_escalated_at");
+      ctx.db.run("DROP TABLE IF EXISTS block_escalations");
+    },
+  },
 ];
 
 /**
@@ -4609,7 +4680,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v141:24d4ac10db9503d56e02c38f6b0bb52c4b9cf8d587294423ab405cf70e6481fb";
+  "v142:2b5a836efa13d94de2c5d008700cf50f6c99e3eb46a9514a3f3ce658e20db615";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

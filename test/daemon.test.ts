@@ -7483,16 +7483,18 @@ function seedEpicWithTasks(
 
 function seedBlockLatch(
   db: ReturnType<typeof openDb>["db"],
-  epicId: string,
+  _epicId: string,
   taskId: string,
   status = "pending",
   outcome: string | null = null,
   ownerRedispatchAttempts = 0,
 ): void {
+  // A block incident is the `dispatch_failures` `verb='block'` subset, keyed on the
+  // task id (`id`); the epic id is derived from its prefix by the reader.
   db.run(
-    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, owner_redispatch_attempts)
-       VALUES (?, ?, 1, ?, ?, 1, ?)`,
-    [epicId, taskId, status, outcome, ownerRedispatchAttempts],
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, blocked_since, block_status, block_outcome, owner_redispatch_attempts)
+       VALUES ('block', ?, 'block-incident', 1, 1, 1, 1, 1, ?, ?, ?)`,
+    [taskId, status, outcome, ownerRedispatchAttempts],
   );
 }
 
@@ -10273,19 +10275,20 @@ test("buildBlockHumanNotifyBody: a died verdict names the death", () => {
 
 // ---- selectPendingBlockHumanNotifications (the stage-3 working-set read) ------
 
-/** Seed one `block_escalations` latch row with the full stage-3 column set. */
+/** Seed one block incident (the `dispatch_failures` `verb='block'` subset) with the
+ *  full stage-3 column set. */
 function seedFullBlockLatch(
   db: ReturnType<typeof openDb>["db"],
-  epicId: string,
+  _epicId: string,
   taskId: string,
   status: string,
   outcome: string | null,
   humanNotifiedAt: number | null,
 ): void {
   db.run(
-    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at)
-       VALUES (?, ?, 1, ?, ?, 1, ?)`,
-    [epicId, taskId, status, outcome, humanNotifiedAt],
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, blocked_since, block_status, block_outcome, human_notified_at)
+       VALUES ('block', ?, 'block-incident', 1, 1, 1, 1, 1, ?, ?, ?)`,
+    [taskId, status, outcome, humanNotifiedAt],
   );
 }
 
@@ -10493,21 +10496,21 @@ function seedMergeFailureRow(
     id: string;
     reason: string;
     dir?: string | null;
-    mergeEscalatedAt?: number | null;
-    resolverDispatchedAt?: number | null;
+    /** The collapsed owner-attachment count (0/1/2) — the retired two once-marker
+     *  slots. */
+    ownerRedispatchAttempts?: number;
   },
 ): void {
   db.run(
     `INSERT INTO dispatch_failures
-       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
-       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, owner_redispatch_attempts)
+       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?)`,
     [
       args.verb,
       args.id,
       args.reason,
       args.dir ?? null,
-      args.mergeEscalatedAt ?? null,
-      args.resolverDispatchedAt ?? null,
+      args.ownerRedispatchAttempts ?? 0,
     ],
   );
 }
@@ -10525,8 +10528,7 @@ function ownerIncidentPage(
     dir: "/repo/lane",
     claimSessionId: null,
     instanceEventId: 50,
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
     humanNotifiedAt: null,
     ...overrides,
   };
@@ -10630,17 +10632,15 @@ function routerState(paused = false): ReconcileState {
 }
 
 test("owner incident attachment slots are classified by typed row route and bounded durably", () => {
-  const first = ownerIncidentPage({
-    resolverDispatchedAt: null,
-    mergeEscalatedAt: null,
-  });
+  const first = ownerIncidentPage({ ownerRedispatchAttempts: 0 });
   expect(nextIncidentOwnerAttachmentMarker(first)).toBe("resolver");
   expect(
     nextIncidentOwnerAttachmentMarker({
       ...first,
-      resolverDispatchedAt: 10,
+      ownerRedispatchAttempts: 1,
     }),
   ).toBe("merge");
+  // The default page (2 attachments) is exhausted → no further slot.
   expect(nextIncidentOwnerAttachmentMarker(ownerIncidentPage())).toBeNull();
   expect(
     nextIncidentOwnerAttachmentMarker({
@@ -10735,26 +10735,27 @@ test("exhausted incident attachments page once after the owner yields and never 
 
 test("incident owner page selector excludes claims, non-incidents, and unexhausted attachments", () => {
   const { db } = freshMemDb();
+  // Exhausted (both slots consumed → count at the limit), unclaimed incident.
   seedMergeFailureRow(db, {
     verb: "work",
     id: "fn-1350-owner.1",
     reason: ownerIncidentPage().reason,
     dir: "/repo/lane",
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
   });
+  // Unexhausted (one slot) — excluded from the page selector.
   seedMergeFailureRow(db, {
     verb: "close",
     id: "fn-1350-owner",
     reason: ownerIncidentPage({ verb: "close" }).reason,
-    resolverDispatchedAt: 10,
+    ownerRedispatchAttempts: 1,
   });
+  // Exhausted count but NOT an incident reason — excluded.
   seedMergeFailureRow(db, {
     verb: "work",
     id: "fn-1350-other.1",
     reason: "launch_failed: not an incident",
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
   });
   db.run(
     "UPDATE dispatch_failures SET claim_session_id = 'owner' WHERE verb = 'work' AND id = 'fn-1350-owner.1'",

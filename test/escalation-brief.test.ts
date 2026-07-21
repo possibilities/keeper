@@ -101,8 +101,9 @@ function seedMergeConflict(
     verb?: "close" | "work";
     reason: string;
     dir?: string | null;
-    resolver_dispatched_at?: number | null;
-    merge_escalated_at?: number | null;
+    /** The collapsed owner-attachment count (0/1/2) — the retired two once-marker
+     *  slots. */
+    owner_redispatch_attempts?: number;
     instance_event_id?: number | null;
     attempt_id?: number | null;
     claim?: {
@@ -116,16 +117,15 @@ function seedMergeConflict(
   db.query(
     `INSERT INTO dispatch_failures
        (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-        resolver_dispatched_at, merge_escalated_at, instance_event_id,
+        owner_redispatch_attempts, instance_event_id,
         attempt_id, claim_session_id, claim_pid, claim_start_time, claimed_at)
-     VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.verb ?? "close",
     opts.id,
     opts.reason,
     opts.dir ?? null,
-    opts.resolver_dispatched_at ?? null,
-    opts.merge_escalated_at ?? null,
+    opts.owner_redispatch_attempts ?? 0,
     opts.instance_event_id ?? null,
     opts.attempt_id ?? null,
     opts.claim?.session_id ?? null,
@@ -282,7 +282,7 @@ test("a closer creator resolves through created_by_close_of to the original crea
     reason:
       "worktree-merge-conflict: merging keeper/epic/fn-100-child into main — CONFLICT (content): foo.ts",
     dir: "/repo",
-    resolver_dispatched_at: 123,
+    owner_redispatch_attempts: 1,
   });
   seedJob(db, {
     job_id: "resolve-sess",
@@ -323,7 +323,7 @@ test("a closer creator resolves through created_by_close_of to the original crea
       base_branch: string | null;
       stderr: string | null;
       repo_dir: string | null;
-      resolver_dispatched_at: number | null;
+      owner_redispatch_attempts: number;
     } | null;
     resolver_jobs: Array<{
       session_id: string;
@@ -335,7 +335,7 @@ test("a closer creator resolves through created_by_close_of to the original crea
   expect(inc.conflict?.base_branch).toBe("main");
   expect(inc.conflict?.stderr).toBe("CONFLICT (content): foo.ts");
   expect(inc.conflict?.repo_dir).toBe("/repo");
-  expect(inc.conflict?.resolver_dispatched_at).toBe(123);
+  expect(inc.conflict?.owner_redispatch_attempts).toBe(1);
   expect(inc.resolver_jobs).toEqual([
     {
       session_id: "resolve-sess",
@@ -826,8 +826,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         base_branch: "main",
         stderr: "CONFLICT (content): foo.ts",
         repo_dir: "/repo",
-        merge_escalated_at: null,
-        resolver_dispatched_at: null,
+        owner_redispatch_attempts: 0,
         instance_event_id: null,
         attempt_id: null,
         claim: null,
@@ -1072,7 +1071,7 @@ test("a task-form deconflict ref resolves the work-verb sticky row, keying the s
     reason:
       "worktree-merge-conflict: merging keeper/epic/fn-900-work--fn-900-work.2 into keeper/epic/fn-900-work — CONFLICT (content): bar.ts",
     dir: "/repo/lanes/fn-900-work.2",
-    resolver_dispatched_at: 42,
+    owner_redispatch_attempts: 1,
   });
   seedJob(db, {
     job_id: "resolve-work-sess",
@@ -1231,7 +1230,7 @@ test("main() drives the daemon-dispatched deconflict::<taskId> handoff end-to-en
     reason:
       "worktree-merge-conflict: merging keeper/epic/fn-901-work--fn-901-work.1 into keeper/epic/fn-901-work — CONFLICT (content): baz.ts",
     dir: "/repo/lanes/fn-901-work.1",
-    resolver_dispatched_at: 7,
+    owner_redispatch_attempts: 1,
   });
   db.close();
   writeEpicFile(tmp, "fn-901-work", { primary_repo: "/repo" });

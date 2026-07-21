@@ -1620,13 +1620,14 @@ export function selectPendingBlockEscalations(
 ): PendingBlockEscalation[] {
   const latches = db
     .query(
-      `SELECT epic_id, task_id, status, outcome, owner_redispatch_attempts
-         FROM block_escalations
-        WHERE status = 'pending'
-           OR (status = 'attempted' AND outcome = 'skipped_category')`,
+      `SELECT id AS task_id, block_status AS status, block_outcome AS outcome,
+              owner_redispatch_attempts
+         FROM dispatch_failures
+        WHERE verb = 'block'
+          AND (block_status = 'pending'
+               OR (block_status = 'attempted' AND block_outcome = 'skipped_category'))`,
     )
     .all() as {
-    epic_id: string;
     task_id: string;
     status: string;
     outcome: string | null;
@@ -1635,9 +1636,12 @@ export function selectPendingBlockEscalations(
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
   for (const latch of latches) {
+    // The block incident stores only the task id (`id`); its epic id is the id's
+    // prefix (a `block` row never carries a separate `epic_id` column).
+    const epicId = parsePlanRef(latch.task_id)?.epic_id ?? "";
     const epicRow = db
       .query(`SELECT project_dir, tasks FROM epics WHERE epic_id = ?`)
-      .get(latch.epic_id) as
+      .get(epicId) as
       | { project_dir: string | null; tasks: string }
       | null
       | undefined;
@@ -1671,7 +1675,7 @@ export function selectPendingBlockEscalations(
       }
     }
     out.push({
-      epic_id: latch.epic_id,
+      epic_id: epicId,
       task_id: latch.task_id,
       status: latch.status,
       outcome: latch.outcome,
@@ -2282,9 +2286,9 @@ export async function runBlockEscalationSweep(
 // the leave-blocked `TaskSnapshot` fold, so this sweep never sees a resolved block.
 
 /**
- * A dispatched-but-not-yet-notified `block_escalations` latch row — the stage-3
- * working set (keyed `(epic_id, task_id)`). Bounded by the number of concurrently
- * dispatched-and-declined unblock escalations, never a history scan.
+ * A dispatched-but-not-yet-notified block incident — the stage-3 working set.
+ * Bounded by the number of concurrently dispatched-and-declined unblock
+ * escalations, never a history scan.
  */
 export interface PendingBlockHumanNotify {
   epic_id: string;
@@ -2292,24 +2296,32 @@ export interface PendingBlockHumanNotify {
 }
 
 /**
- * Select every `block_escalations` latch whose `unblock::<task>` session was
- * DISPATCHED (`status='attempted'`, `outcome='dispatched'`) but whose human has NOT
- * yet been notified (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
- * `outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
+ * Select every block incident (the `dispatch_failures` `verb='block'` subset) whose
+ * `unblock::<task>` session was DISPATCHED (`block_status='attempted'`,
+ * `block_outcome='dispatched'`) but whose human has NOT yet been notified
+ * (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
+ * `block_outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
  * them), and a stamped `human_notified_at` (the terminal `notified` fold) drops the
  * row — the notify-once guarantee. The leave-blocked DELETE re-arms the whole chain.
+ * The `epic_id` is derived from the incident id (a `block` row carries only the task
+ * id) for the `BlockHumanNotified` mint's payload.
  */
 export function selectPendingBlockHumanNotifications(
   db: Database,
 ): PendingBlockHumanNotify[] {
-  return db
+  const rows = db
     .query(
-      `SELECT epic_id, task_id FROM block_escalations
-         WHERE status = 'attempted'
-           AND outcome = 'dispatched'
+      `SELECT id FROM dispatch_failures
+         WHERE verb = 'block'
+           AND block_status = 'attempted'
+           AND block_outcome = 'dispatched'
            AND human_notified_at IS NULL`,
     )
-    .all() as PendingBlockHumanNotify[];
+    .all() as { id: string }[];
+  return rows.map((r) => ({
+    task_id: r.id,
+    epic_id: parsePlanRef(r.id)?.epic_id ?? "",
+  }));
 }
 
 /** The outcome the unblock human-notify sweep records on the `BlockHumanNotified`
@@ -3857,23 +3869,21 @@ export function selectPendingIncidentOwnerPages(
   const rows = db
     .query(
       `SELECT verb, id, reason, dir, claim_session_id, instance_event_id,
-              resolver_dispatched_at, merge_escalated_at, human_notified_at
+              owner_redispatch_attempts, human_notified_at
          FROM dispatch_failures
         WHERE verb IN ('work', 'close')
           AND claim_session_id IS NULL
-          AND resolver_dispatched_at IS NOT NULL
-          AND merge_escalated_at IS NOT NULL
+          AND owner_redispatch_attempts >= ?
           AND human_notified_at IS NULL`,
     )
-    .all() as Array<{
+    .all(INCIDENT_OWNER_ATTACHMENT_LIMIT) as Array<{
     verb: "work" | "close";
     id: string;
     reason: string;
     dir: string | null;
     claim_session_id: string | null;
     instance_event_id: number | null;
-    resolver_dispatched_at: number | null;
-    merge_escalated_at: number | null;
+    owner_redispatch_attempts: number;
     human_notified_at: number | null;
   }>;
   return rows
@@ -3884,8 +3894,7 @@ export function selectPendingIncidentOwnerPages(
       dir: row.dir,
       claimSessionId: row.claim_session_id,
       instanceEventId: row.instance_event_id,
-      resolverDispatchedAt: row.resolver_dispatched_at,
-      mergeEscalatedAt: row.merge_escalated_at,
+      ownerRedispatchAttempts: row.owner_redispatch_attempts,
       humanNotifiedAt: row.human_notified_at,
     }))
     .filter(
@@ -12600,7 +12609,7 @@ function startDaemonWithExitAttribution(
     const row = db
       .query(
         `SELECT verb, id, reason, dir, claim_session_id,
-                resolver_dispatched_at, merge_escalated_at, human_notified_at
+                owner_redispatch_attempts, human_notified_at
            FROM dispatch_failures
           WHERE verb = ? AND id = ?`,
       )
@@ -12610,8 +12619,7 @@ function startDaemonWithExitAttribution(
       reason: string;
       dir: string | null;
       claim_session_id: string | null;
-      resolver_dispatched_at: number | null;
-      merge_escalated_at: number | null;
+      owner_redispatch_attempts: number;
       human_notified_at: number | null;
     } | null;
     if (row == null) return null;
@@ -12621,8 +12629,7 @@ function startDaemonWithExitAttribution(
       reason: row.reason,
       dir: row.dir,
       claimSessionId: row.claim_session_id,
-      resolverDispatchedAt: row.resolver_dispatched_at,
-      mergeEscalatedAt: row.merge_escalated_at,
+      ownerRedispatchAttempts: row.owner_redispatch_attempts,
       humanNotifiedAt: row.human_notified_at,
     };
   }
@@ -13951,12 +13958,16 @@ function startDaemonWithExitAttribution(
                 `SELECT 1 FROM dispatch_failures
                   WHERE verb = ? AND id = ? AND instance_event_id IS ?
                     AND claim_session_id IS NULL
-                    AND resolver_dispatched_at IS NOT NULL
-                    AND merge_escalated_at IS NOT NULL
+                    AND owner_redispatch_attempts >= ?
                     AND human_notified_at IS NULL
                   LIMIT 1`,
               )
-              .get(row.verb, row.id, row.instanceEventId) != null
+              .get(
+                row.verb,
+                row.id,
+                row.instanceEventId,
+                INCIDENT_OWNER_ATTACHMENT_LIMIT,
+              ) != null
           );
         } catch {
           return false;
@@ -14345,19 +14356,17 @@ function startDaemonWithExitAttribution(
     : null;
 
   // The stage-3 board-state gate for the unblock notify: is the task's block still OPEN
-  // under an `attempted` latch? The `block_escalations` latch is DELETED the moment the
-  // task leaves `blocked`, so a surviving `status='attempted'` row means the escalation
-  // was dispatched AND the task is still blocked — the incident {@link
+  // under an `attempted` incident? The `('block', task_id)` incident is DELETED the moment
+  // the task leaves `blocked`, so a surviving `block_status='attempted'` row means the
+  // escalation was dispatched AND the task is still blocked — the incident {@link
   // classifyEscalationOutcome} may page on. A read miss degrades to `false` (incident
   // treated closed → the notify WAITS, never a premature page on a transient error).
-  // `task_id` is globally unique (`<epic>.<ordinal>`), so it keys the (epic_id, task_id)
-  // latch alone.
   function unblockIncidentOpen(taskId: string): boolean {
     try {
       return (
         db
           .query(
-            "SELECT 1 FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+            "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' LIMIT 1",
           )
           .get(taskId) != null
       );
@@ -14366,16 +14375,16 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // The block latch's `blocked_since` — the block-instance anchor stage-3 scopes
+  // The block incident's `blocked_since` — the block-instance anchor stage-3 scopes
   // {@link resolveEscalationJobsFor} on so a stale row from a resolved (unblocked) prior
   // instance never suppresses or prematurely pages a re-blocked task's fresh escalation.
-  // A read miss or absent latch degrades to NULL (the unscoped verb+ref fallback), never
-  // a thrown error. `task_id` is globally unique, keying the latch alone.
+  // A read miss or absent incident degrades to NULL (the unscoped verb+ref fallback),
+  // never a thrown error.
   function unblockInstanceFor(taskId: string): number | null {
     try {
       const row = db
         .query(
-          "SELECT blocked_since FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+          "SELECT blocked_since FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' LIMIT 1",
         )
         .get(taskId) as { blocked_since: number } | null;
       return row?.blocked_since ?? null;
@@ -14397,14 +14406,14 @@ function startDaemonWithExitAttribution(
     if (autopilotPaused) return;
     await runBlockHumanNotifySweep({
       selectPending: () => selectPendingBlockHumanNotifications(db),
-      stillPending: (epicId, taskId) => {
+      stillPending: (_epicId, taskId) => {
         try {
           return (
             db
               .query(
-                "SELECT 1 FROM block_escalations WHERE epic_id = ? AND task_id = ? AND status = 'attempted' AND outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
               )
-              .get(epicId, taskId) != null
+              .get(taskId) != null
           );
         } catch {
           return false;

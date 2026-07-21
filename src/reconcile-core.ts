@@ -146,8 +146,10 @@ export interface IncidentOwnerFailureFacts {
   reason: string;
   dir?: string | null;
   claimSessionId: string | null;
-  resolverDispatchedAt: number | null;
-  mergeEscalatedAt: number | null;
+  /** Durable owner-attachment count consumed by this incident (the collapsed home
+   *  of the retired `resolver_dispatched_at` / `merge_escalated_at` two-slot lease),
+   *  bounded by {@link INCIDENT_OWNER_ATTACHMENT_LIMIT}. */
+  ownerRedispatchAttempts: number;
   humanNotifiedAt: number | null;
 }
 
@@ -170,23 +172,21 @@ export function isOwnerRoutableIncident(
   );
 }
 
-/** Number of durable owner attachments already consumed by this incident. */
+/** Number of durable owner attachments already consumed by this incident — the
+ *  collapsed `owner_redispatch_attempts` count, saturated at
+ *  {@link INCIDENT_OWNER_ATTACHMENT_LIMIT}. */
 export function incidentOwnerAttachmentCount(
-  row: Pick<
-    IncidentOwnerFailureFacts,
-    "resolverDispatchedAt" | "mergeEscalatedAt"
-  >,
+  row: Pick<IncidentOwnerFailureFacts, "ownerRedispatchAttempts">,
 ): number {
-  return (
-    Number(row.resolverDispatchedAt != null) +
-    Number(row.mergeEscalatedAt != null)
-  );
+  return Math.min(row.ownerRedispatchAttempts, INCIDENT_OWNER_ATTACHMENT_LIMIT);
 }
 
 /**
- * The next durable marker an ordinary owner admission consumes. The two legacy
- * once-markers form a bounded two-slot attachment lease until escalation state is
- * collapsed; claimed, paged, exhausted, and non-incident rows consume no slot.
+ * The next attachment slot an ordinary owner admission consumes. The collapsed
+ * `owner_redispatch_attempts` count forms the bounded attachment lease: the two
+ * event names (`resolver` for the first slot, `merge` for the second) are retained
+ * so the producer's mint stays a distinct-event two-step, but both fold onto the one
+ * count. Claimed, paged, exhausted, and non-incident rows consume no slot.
  */
 export function nextIncidentOwnerAttachmentMarker(
   row: IncidentOwnerFailureFacts,
@@ -198,8 +198,10 @@ export function nextIncidentOwnerAttachmentMarker(
   ) {
     return null;
   }
-  if (row.resolverDispatchedAt == null) return "resolver";
-  if (row.mergeEscalatedAt == null) return "merge";
+  if (row.ownerRedispatchAttempts <= 0) return "resolver";
+  if (row.ownerRedispatchAttempts < INCIDENT_OWNER_ATTACHMENT_LIMIT) {
+    return "merge";
+  }
   return null;
 }
 

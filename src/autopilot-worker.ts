@@ -10401,11 +10401,9 @@ export async function loadReconcileSnapshot(
         })
       ) {
         const claimSessionId = incidentClaimByKey.get(key) ?? null;
-        const resolverDispatchedAt = (
-          row as { resolver_dispatched_at?: unknown }
-        ).resolver_dispatched_at;
-        const mergeEscalatedAt = (row as { merge_escalated_at?: unknown })
-          .merge_escalated_at;
+        const ownerRedispatchAttempts = (
+          row as { owner_redispatch_attempts?: unknown }
+        ).owner_redispatch_attempts;
         const humanNotifiedAt = (row as { human_notified_at?: unknown })
           .human_notified_at;
         const facts = {
@@ -10417,12 +10415,10 @@ export async function loadReconcileSnapshot(
               ? (row as { dir: string }).dir
               : null,
           claimSessionId,
-          resolverDispatchedAt:
-            typeof resolverDispatchedAt === "number"
-              ? resolverDispatchedAt
-              : null,
-          mergeEscalatedAt:
-            typeof mergeEscalatedAt === "number" ? mergeEscalatedAt : null,
+          ownerRedispatchAttempts:
+            typeof ownerRedispatchAttempts === "number"
+              ? ownerRedispatchAttempts
+              : 0,
           humanNotifiedAt:
             typeof humanNotifiedAt === "number" ? humanNotifiedAt : null,
         };

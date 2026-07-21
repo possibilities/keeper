@@ -217,10 +217,11 @@ const durableAwaitCases: Array<{
   {
     kind: "block-escalation",
     seedMet: (db) =>
+      // A block incident is the `dispatch_failures` `verb='block'` subset.
       db.run(
-        `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        ["fn-1-demo", "fn-1-demo.1", 1, "open", null, 1],
+        `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, blocked_since, block_status)
+           VALUES ('block', ?, 'block-incident', 1, 1, 1, 1, ?, ?)`,
+        ["fn-1-demo.1", 1, "pending"],
       ),
     met: { condition: "block-escalation" },
     waiting: { condition: "block-escalation" },

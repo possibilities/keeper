@@ -16176,26 +16176,26 @@ test("loadReconcileSnapshot routes only unclaimed incident rows with an attachme
     const insert = (
       id: string,
       claim: string | null,
-      resolverAt: number | null,
-      mergeAt: number | null,
+      attachments: number,
     ): void => {
       db.run(
         `INSERT INTO dispatch_failures
            (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-            claim_session_id, resolver_dispatched_at, merge_escalated_at)
-         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?, ?)`,
+            claim_session_id, owner_redispatch_attempts)
+         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?)`,
         [
           id,
           "worktree-merge-conflict: merging source into base — pending owner integration",
           claim,
-          resolverAt,
-          mergeAt,
+          attachments,
         ],
       );
     };
-    insert("fn-1-open.1", null, null, null);
-    insert("fn-2-claimed.1", "live-owner", null, null);
-    insert("fn-3-exhausted.1", null, 10, 20);
+    // Open (0 attachments, has a slot), claimed (owned), exhausted (both slots
+    // consumed → count at the lease limit).
+    insert("fn-1-open.1", null, 0);
+    insert("fn-2-claimed.1", "live-owner", 0);
+    insert("fn-3-exhausted.1", null, 2);
 
     const snapshot = await loadReconcileSnapshot(db);
     expect([...(snapshot.incidentOwnerKeys ?? [])]).toEqual([

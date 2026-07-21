@@ -536,6 +536,136 @@ test("every autopilot_state rebuild copy list covers every current column", () =
   }
 });
 
+test("v142 collapse migration: carries block_escalations + merge once-markers into dispatch_failures, page-once preserved, old shape dropped (fn-1352.2)", () => {
+  const { db } = freshMemDb();
+  // Re-materialize the PRE-collapse shape on the migrated DB: the retired
+  // `block_escalations` table + the two merge once-marker columns, so the v142
+  // apply runs as a genuine in-place upgrade over live pre-collapse state.
+  db.run(`CREATE TABLE block_escalations (
+    epic_id TEXT NOT NULL, task_id TEXT NOT NULL, blocked_since INTEGER NOT NULL,
+    status TEXT NOT NULL, outcome TEXT, last_event_id INTEGER NOT NULL,
+    human_notified_at REAL, owner_redispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (epic_id, task_id))`);
+  db.run("ALTER TABLE dispatch_failures ADD COLUMN merge_escalated_at REAL");
+  db.run(
+    "ALTER TABLE dispatch_failures ADD COLUMN resolver_dispatched_at REAL",
+  );
+
+  const insertEvt = (ts: number): number =>
+    Number(
+      db.run(
+        "INSERT INTO events (ts, session_id, hook_event, event_type) VALUES (?, 's', 'X', 'x')",
+        [ts],
+      ).lastInsertRowid,
+    );
+  // Arming (blocked_since) + last-touching (last_event_id) events — the ts JOIN source.
+  const armPaged = insertEvt(1700);
+  const lastPaged = insertEvt(1750);
+  const armUnpaged = insertEvt(1800);
+
+  // A PAGED block latch (human_notified_at set) and an UNPAGED one (NULL).
+  db.run(
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at, owner_redispatch_attempts)
+       VALUES ('fn-e', 'fn-e.1', ?, 'attempted', 'dispatched', ?, 1720000000.5, 3)`,
+    [armPaged, lastPaged],
+  );
+  db.run(
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at, owner_redispatch_attempts)
+       VALUES ('fn-e', 'fn-e.2', ?, 'pending', NULL, ?, NULL, 0)`,
+    [armUnpaged, armUnpaged],
+  );
+
+  // A merge incident with BOTH once-markers set (a full 2-slot lease) and one with
+  // only the resolver slot set (1 attachment).
+  db.run(
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
+       VALUES ('close', 'fn-e', 'worktree-merge-conflict', 1700, 10, 1700, 1700, 1750, 1755)`,
+  );
+  db.run(
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, resolver_dispatched_at)
+       VALUES ('work', 'fn-e.9', 'worktree-merge-conflict: x', 1700, 11, 1700, 1700, 1755)`,
+  );
+
+  // Run the collapse step as an in-place upgrade from v141.
+  const step = SCHEMA_STEPS.find((s) => s.version === 142);
+  expect(step).toBeDefined();
+  // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
+  step!.apply({ db, preMigrateStoredVersion: 141, needsEventsRebuild: false });
+
+  // Block incidents carried forward onto ('block', task_id) rows. The paged row's
+  // page-once `human_notified_at` survives (no re-page); ts/created_at come from the
+  // arm event, updated_at from the last-touching event.
+  expect(
+    db
+      .query(
+        `SELECT blocked_since, block_status, block_outcome, owner_redispatch_attempts,
+                human_notified_at, ts, created_at, updated_at, reason
+           FROM dispatch_failures WHERE verb = 'block' AND id = 'fn-e.1'`,
+      )
+      .get(),
+  ).toEqual({
+    blocked_since: armPaged,
+    block_status: "attempted",
+    block_outcome: "dispatched",
+    owner_redispatch_attempts: 3,
+    human_notified_at: 1720000000.5,
+    ts: 1700,
+    created_at: 1700,
+    updated_at: 1750,
+    reason: "block-incident",
+  });
+  // The UNPAGED row keeps exactly one future page (human_notified_at NULL).
+  expect(
+    db
+      .query(
+        "SELECT block_status, human_notified_at, owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'block' AND id = 'fn-e.2'",
+      )
+      .get(),
+  ).toEqual({
+    block_status: "pending",
+    human_notified_at: null,
+    owner_redispatch_attempts: 0,
+  });
+
+  // The merge once-markers collapsed into the owner-attachment count (2 slots → 2, 1 → 1).
+  expect(
+    (
+      db
+        .query(
+          "SELECT owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-e'",
+        )
+        .get() as { owner_redispatch_attempts: number }
+    ).owner_redispatch_attempts,
+  ).toBe(2);
+  expect(
+    (
+      db
+        .query(
+          "SELECT owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'work' AND id = 'fn-e.9'",
+        )
+        .get() as { owner_redispatch_attempts: number }
+    ).owner_redispatch_attempts,
+  ).toBe(1);
+
+  // The old shape is gone: no `block_escalations` table, no once-marker columns.
+  expect(
+    db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'block_escalations'",
+      )
+      .all(),
+  ).toEqual([]);
+  const cols = (
+    db.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(cols).not.toContain("merge_escalated_at");
+  expect(cols).not.toContain("resolver_dispatched_at");
+
+  db.close();
+});
+
 test("SCHEMA_STEPS versions are unique — a duplicate version is a structural error", () => {
   const versions = SCHEMA_STEPS.map((s) => s.version);
   const uniq = new Set(versions);
