@@ -37,5 +37,5 @@ Files: `plugins/plan/src/verbs/close_finalize.ts`,
 - [ ] Named plan gate green (bun run test:gate).
 
 ## Done summary
-
+Added saga-level tests over integrateRepoUnderLease/integrateEpicBases behind a pure TrunkIntegrationDeps git+lease seam (merge, ancestor-skip, conflict-retains-lease, off-branch, dirty, residue, tip-drift, release-fail), and fixed the ancestor re-grade path to adopt-and-release a lingering active trunk lease per the SKILL.md recovery contract.
 ## Evidence
