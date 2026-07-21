@@ -3,14 +3,16 @@
 ## Status
 
 Accepted (number PROVISIONAL until landed; fan-in renumber per ADR 0020/0022). Partially
-supersedes [ADR 0017](0017-trunk-repair-escalation-and-role-keyed-guard.md): its
+supersedes [ADR 0017](superseded/0017-trunk-repair-escalation-and-role-keyed-guard.md): its
 `repair::<repo>` escalation ended at a single human page on decline, leaving the sticky
 `dispatch_failures` row stranded until a manual DB edit — this decision makes that row
-operator-recoverable over the `retry_dispatch` wire. The rest of ADR 0017 stands. Builds on
+operator-recoverable over the `retry_dispatch` wire. Builds on
 [ADR 0011](0011-gated-dispatch-failures-snapshot-fold.md) (the operator-jam class the
 needs-human surfaces alarm on) and [ADR 0016](0016-stale-aware-shared-checkout-catchup.md)
 (the board-visible shared-checkout-desync signal this promotes). The fan-in re-arm precedent
-is [ADR 0039](0039-work-verb-merge-conflict-escalation.md).
+is [ADR 0039](superseded/0039-work-verb-merge-conflict-escalation.md). The retry-recoverability
+contract this record adds stands under [ADR 0089](0089-in-session-escalation-subagents.md)'s
+daemon-elected repair grant, which replaced ADR 0017's dispatched `repair::<repo>` session.
 
 ## Context
 

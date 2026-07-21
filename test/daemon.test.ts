@@ -27,7 +27,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
-import { checkRaceGuard, type QueryFn } from "../cli/dispatch";
 import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
 import {
   materializeNonFableFocusPolicy,
@@ -76,17 +75,13 @@ import {
   blockOwnerEscalationDecision,
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
-  buildDeconflictHumanNotifyBody,
   buildDispatchClearedData,
   buildIncidentOwnerPageBody,
   buildMaintenanceScaffoldYaml,
   buildPendingDispatchSweepRecords,
-  buildResolverBrief,
   buildRetryDispatchResultMessage,
   buildSharedCheckoutPageBody,
   buildSharedDirtyObservation,
-  buildWorkMergeHumanNotifyBody,
-  buildWorkResolverBrief,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   CRASH_LOOP_YOUNG_RUNTIME_MS,
@@ -95,13 +90,10 @@ import {
   classifyEscalationOutcome,
   classifyExitVerdict,
   classifyRestartProvenance,
-  classifyWorkResolverOutcome,
   collapseRestartLedger,
   compactRestartLedger,
-  countLiveEscalationSessions,
   createExitAttributionRecorder,
   DEAD_LETTER_RETENTION_MS,
-  type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
@@ -114,15 +106,10 @@ import {
   decideServeLagAttributionLog,
   decideServeLivenessWatchdog,
   dispatchClearFencesAtAppend,
-  dispatchEscalationSession,
   drainToCompletion,
-  type EscalationDispatchDeps,
   type EscalationDispatchOutcome,
   type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
-  epicHasLiveUnblock,
-  escalationCheckoutOccupiedBy,
-  escalationSessionLiveFor,
   findOsMemoryKillEvidence,
   foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
@@ -136,27 +123,19 @@ import {
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
   MAINTENANCE_TASK_TITLE_PREFIX,
-  MAX_LIVE_ESCALATION_SESSIONS,
   type MaintenanceMintOutcome,
   MERGE_ESCALATION_REASON_TOKEN,
-  type MergeEscalationOutcome,
-  type MergeEscalationSweepDeps,
-  type MergeHumanNotifiedOutcome,
   MUTATION_PATH_BACKFILL_INTERVAL_MS,
   maintenanceEpicTitle,
   matchCrashReportToBoot,
   matchOperatorReloadAttribution,
-  mergeConflictBaseCheckout,
   OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingBlockHumanNotify,
   type PendingIncidentOwnerPage,
-  type PendingMergeEscalation,
   type PendingRepairRow,
-  type PendingResolverDispatch,
-  type PendingWorkMergeConflict,
   PROBE_LIFE_ADMISSION_CODES,
   PROBE_SETTLE_INITIAL,
   type ProbeSettleEvent,
@@ -185,9 +164,6 @@ import {
   type RepairEscalationSweepDeps,
   type RepairHumanNotifiedOutcome,
   type RepairNotifyVerdict,
-  type ResolverDispatchOutcome,
-  type ResolverDispatchResult,
-  type ResolverDispatchSweepDeps,
   type RestartBoot,
   type RestartBootLine,
   type RestartLedgerLine,
@@ -212,16 +188,12 @@ import {
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
-  runDeconflictHumanNotifySweep,
   runIncidentClaimSweep,
   runIncidentOwnerPageSweep,
-  runMergeEscalationSweep,
   runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
-  runResolverDispatchSweep,
   runSharedCheckoutPageSweep,
   runTrunkLeaseSweep,
-  runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_HEALTH_HISTORY_MAX_REPORTS,
   SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
@@ -245,26 +217,16 @@ import {
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
   selectPendingBlockHumanNotifications,
-  selectPendingHumanNotifications,
   selectPendingIncidentOwnerPages,
-  selectPendingMergeEscalations,
-  selectPendingResolverDispatches,
-  selectPendingWorkMergeEscalations,
-  selectPendingWorkMergeNotifications,
-  selectPendingWorkResolverDispatches,
   selectRepairCandidates,
   selectWorkerNames,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
   shouldEnrichPriorExitAttribution,
   shouldEscalateBlockedCategory,
-  shouldEscalateMergeConflict,
   type TrunkLeaseSweepDeps,
   WAL_AUTOCHECKPOINT_PAGES,
-  WORK_RESOLVER_LEASE_SEC,
-  type WorkMergeHumanNotifySweepDeps,
   withBootDrainCheckpointTuning,
-  workLaneBusyForResolver,
   writeRestartLedger,
   writeServeHealthHistory,
 } from "../src/daemon";
@@ -322,14 +284,13 @@ import {
   sendAgentbotPage,
 } from "../src/integrity-probe";
 import { MAIN_MAINTENANCE_TICK_BUDGET_MS } from "../src/maintenance-budget";
-import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
+import { MAX_LINE_LENGTH } from "../src/protocol";
 import type {
   ReconcileSnapshot,
   ReconcileState,
   ResolverOutcome,
 } from "../src/reconcile-core";
 import {
-  classifyResolverOutcome,
   INCIDENT_OWNER_ATTACHMENT_LIMIT,
   nextIncidentOwnerAttachmentMarker,
   reconcile,
@@ -354,7 +315,7 @@ import {
   sliceFanout,
 } from "../src/server-worker";
 import type { Epic, Event, Job, Task } from "../src/types";
-import { repoToken, worktreePathFor } from "../src/worktree-plan";
+import { repoToken } from "../src/worktree-plan";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
@@ -7553,16 +7514,18 @@ function seedEpicWithTasks(
 
 function seedBlockLatch(
   db: ReturnType<typeof openDb>["db"],
-  epicId: string,
+  _epicId: string,
   taskId: string,
   status = "pending",
   outcome: string | null = null,
   ownerRedispatchAttempts = 0,
 ): void {
+  // A block incident is the `dispatch_failures` `verb='block'` subset, keyed on the
+  // task id (`id`); the epic id is derived from its prefix by the reader.
   db.run(
-    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, owner_redispatch_attempts)
-       VALUES (?, ?, 1, ?, ?, 1, ?)`,
-    [epicId, taskId, status, outcome, ownerRedispatchAttempts],
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, blocked_since, block_status, block_outcome, owner_redispatch_attempts)
+       VALUES ('block', ?, 'block-incident', 1, 1, 1, 1, 1, ?, ?, ?)`,
+    [taskId, status, outcome, ownerRedispatchAttempts],
   );
 }
 
@@ -7677,74 +7640,6 @@ test("selectPendingBlockEscalations: empty table returns []", () => {
   db.close();
 });
 
-// ---- dispatch unblock collision guard --------------------------------------
-
-function unblockRaceQuery(rows: {
-  latch?: Row[];
-  pending?: Row[];
-  jobs?: Row[];
-}): QueryFn {
-  return async (collection) => {
-    if (collection === "pending_dispatches") return rows.pending ?? [];
-    if (collection === "autopilot_state") return [{ id: 1, paused: 0 }];
-    if (collection === "block_escalations") return rows.latch ?? [];
-    if (collection === "jobs") return rows.jobs ?? [];
-    return [];
-  };
-}
-
-test("checkRaceGuard: an unpaused terminal unblock latch bypasses only the falsified autopilot premise", async () => {
-  const taskId = "fn-1-rearm.1";
-
-  const absent = await checkRaceGuard(unblockRaceQuery({}), "unblock", taskId);
-  expect(absent).toContain("autopilot is unpaused");
-
-  const pending = await checkRaceGuard(
-    unblockRaceQuery({
-      latch: [{ status: "pending", outcome: null }],
-    }),
-    "unblock",
-    taskId,
-  );
-  expect(pending).toContain("autopilot is unpaused");
-
-  const terminal = await checkRaceGuard(
-    unblockRaceQuery({
-      latch: [{ status: "attempted", outcome: "skipped_category" }],
-    }),
-    "unblock",
-    taskId,
-  );
-  expect(terminal).toBeNull();
-});
-
-test("checkRaceGuard: pending and live collisions still win over a terminal unblock latch", async () => {
-  const taskId = "fn-1-rearm.1";
-  const latch: Row[] = [{ status: "attempted", outcome: "skipped_category" }];
-
-  const pending = await checkRaceGuard(
-    unblockRaceQuery({
-      latch,
-      pending: [{ verb: "unblock", id: taskId }],
-    }),
-    "unblock",
-    taskId,
-  );
-  expect(pending).toContain("pending_dispatches");
-  expect(pending).not.toContain("autopilot is unpaused");
-
-  const live = await checkRaceGuard(
-    unblockRaceQuery({
-      latch,
-      jobs: [{ plan_verb: "unblock", plan_ref: taskId, state: "working" }],
-    }),
-    "unblock",
-    taskId,
-  );
-  expect(live).toContain(`a live worker for unblock::${taskId} is running`);
-  expect(live).not.toContain("autopilot is unpaused");
-});
-
 // ---- runBlockEscalationSweep (the dispatch core, injected deps) -------------
 
 interface MintCall {
@@ -7754,7 +7649,8 @@ interface MintCall {
   outcome?: BlockEscalationOutcome;
 }
 
-/** One blocked pending row at the legacy-fallback rung. Owner-ladder tests
+/** One FRESH blocked pending row (zero owner-redispatch attempts consumed) — the
+ * bounded owner-fenced ladder's starting rung. Exhaustion/ladder-progression tests
  * override `owner_redispatch_attempts` explicitly. */
 function blockedRow(
   epicId: string,
@@ -7766,7 +7662,7 @@ function blockedRow(
     task_id: taskId,
     status: "pending",
     outcome: null,
-    owner_redispatch_attempts: BLOCK_OWNER_REDISPATCH_LIMIT,
+    owner_redispatch_attempts: 0,
     project_dir: "/proj",
     runtime_status: "blocked",
     target_repo: null,
@@ -7777,7 +7673,9 @@ function blockedRow(
 }
 
 /** Build injectable deps over a synthetic pending set + a reason map + a dispatch
- *  stub, recording every mint + dispatch call for assertion. */
+ *  stub, recording every mint + dispatch call for assertion. The `dispatches`
+ *  array is retained (always empty) for tests pinning the no-legacy-unblock-arm
+ *  invariant — `runBlockEscalationSweep` only ever calls `dispatchOwner` now. */
 function fakeSweepDeps(opts: {
   pending: PendingBlockEscalation[];
   reasons?: Record<string, string | null>;
@@ -7797,9 +7695,6 @@ function fakeSweepDeps(opts: {
   orchestrator?: Record<string, AuditOrchestratorLiveness>;
   /** Fixed wall-clock (ms) for both owner-death grace comparisons. */
   nowMs?: number;
-  dispatch?: (
-    row: PendingBlockEscalation,
-  ) => Promise<EscalationDispatchOutcome>;
   dispatchOwner?: (
     row: PendingBlockEscalation,
   ) => Promise<EscalationDispatchOutcome>;
@@ -7824,10 +7719,6 @@ function fakeSweepDeps(opts: {
       mints.push({ kind: "requested", epicId, taskId }),
     mintAttempted: (epicId, taskId, outcome) =>
       mints.push({ kind: "attempted", epicId, taskId, outcome }),
-    dispatchUnblock: async (row) => {
-      dispatches.push({ epicId: row.epic_id, taskId: row.task_id });
-      return (await opts.dispatch?.(row)) ?? "dispatched";
-    },
     dispatchOwner: async (row) => {
       ownerDispatches.push({ epicId: row.epic_id, taskId: row.task_id });
       return (await opts.dispatchOwner?.(row)) ?? "dispatched";
@@ -7853,24 +7744,28 @@ function fakeSweepDeps(opts: {
   };
 }
 
-test("runBlockEscalationSweep: an escalatable block DISPATCHES one unblock and mints Requested→Attempted{dispatched} (no planner@ send)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+test("runBlockEscalationSweep: an escalatable block DISPATCHES one owner redispatch and mints Requested→Attempted{owner_redispatched} (no planner@ send)", async () => {
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: ambiguous acceptance" },
   });
   await runBlockEscalationSweep(deps);
 
-  // Exactly one unblock dispatch for the task — and no planner@ bus message (the
-  // deps surface has no notify path at all now).
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
-  // Requested STRICTLY before Attempted; the terminal outcome is `dispatched`.
+  // Exactly one owner-work redispatch for the task (the bounded owner-fenced ladder
+  // is the ONLY escalation path now) — and no planner@ bus message (the deps
+  // surface has no notify path at all now).
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
+  // Requested STRICTLY before Attempted; the terminal outcome is `owner_redispatched`.
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
 });
@@ -8080,15 +7975,17 @@ test("runBlockEscalationSweep: the durable suppression is once-only — skipped 
 });
 
 test("runBlockEscalationSweep: an escalatable block does NOT durably suppress (only surface-and-stop categories do)", async () => {
-  const { deps, suppressions, dispatches } = fakeSweepDeps({
+  const { deps, suppressions, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: ambiguous acceptance" },
   });
   await runBlockEscalationSweep(deps);
 
-  // SPEC_UNCLEAR dispatches an unblock session; the autopilot re-dispatch path stays
-  // open, so NO durable failure is minted.
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  // SPEC_UNCLEAR redispatches the owning work session; the autopilot re-dispatch
+  // path stays open, so NO durable failure is minted.
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
   expect(suppressions).toEqual([]);
 });
 
@@ -8116,7 +8013,7 @@ test("runBlockEscalationSweep: cancellation guard — a task that left blocked i
 });
 
 test("runBlockEscalationSweep: per-epic serialization — two blocked tasks in one epic DISPATCH once, the sibling stays latched", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, ownerDispatches } = fakeSweepDeps({
     pending: [
       blockedRow("fn-1-foo", "fn-1-foo.1"),
       blockedRow("fn-1-foo", "fn-1-foo.2"),
@@ -8128,17 +8025,20 @@ test("runBlockEscalationSweep: per-epic serialization — two blocked tasks in o
   });
   await runBlockEscalationSweep(deps);
 
-  // Exactly ONE unblock dispatch for the epic (the first row wins the claim).
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
-  // The winner mints dispatched; the same-epic sibling mints NOTHING (stays pending,
-  // re-sweeps once the live session goes terminal — no starvation, no collision).
+  // Exactly ONE owner redispatch for the epic (the first row wins the claim).
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
+  // The winner mints owner_redispatched; the same-epic sibling mints NOTHING (stays
+  // pending, re-sweeps once the live session goes terminal — no starvation, no
+  // collision).
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
 });
@@ -8162,7 +8062,7 @@ test("runBlockEscalationSweep: a sibling is NOT dispatched while the epic's unbl
 });
 
 test("runBlockEscalationSweep: once the epic's unblock terminates, a pending sibling dispatches (none starved)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.2")],
     reasons: { "fn-1-foo.2": "SPEC_UNCLEAR: still blocked" },
     // The prior session went terminal → the epic is no longer live.
@@ -8170,20 +8070,22 @@ test("runBlockEscalationSweep: once the epic's unblock terminates, a pending sib
   });
   await runBlockEscalationSweep(deps);
 
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.2" }]);
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.2" },
+  ]);
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.2" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.2",
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
 });
 
 test("runBlockEscalationSweep: two DIFFERENT epics each get their own dispatch (serialization is per-epic)", async () => {
-  const { deps, dispatches } = fakeSweepDeps({
+  const { deps, ownerDispatches } = fakeSweepDeps({
     pending: [
       blockedRow("fn-1-foo", "fn-1-foo.1"),
       blockedRow("fn-2-bar", "fn-2-bar.1", { project_dir: "/proj2" }),
@@ -8195,25 +8097,25 @@ test("runBlockEscalationSweep: two DIFFERENT epics each get their own dispatch (
   });
   await runBlockEscalationSweep(deps);
 
-  expect(dispatches).toEqual([
+  expect(ownerDispatches).toEqual([
     { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     { epicId: "fn-2-bar", taskId: "fn-2-bar.1" },
   ]);
 });
 
 test("runBlockEscalationSweep: an at_cap skip mints NOTHING (row stays pending, re-sweeps)", async () => {
-  const { deps, mints, dispatches, notes } = fakeSweepDeps({
+  const { deps, mints, ownerDispatches, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
-    dispatch: async () => "at_cap",
+    dispatchOwner: async () => "at_cap",
   });
   await runBlockEscalationSweep(deps);
 
   // The dispatcher was consulted, but the cap skip mints no marker — the row re-sweeps.
-  expect(dispatches.length).toBe(1);
+  expect(ownerDispatches.length).toBe(1);
   expect(mints).toEqual([]);
   expect(notes).toEqual([
-    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=at_cap",
+    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=owner_at_cap",
   ]);
 });
 
@@ -8221,41 +8123,41 @@ test("runBlockEscalationSweep: an already_live skip (occupancy guard) mints NOTH
   const { deps, mints, notes } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "SPEC_UNCLEAR: a" },
-    dispatch: async () => "already_live",
+    dispatchOwner: async () => "already_live",
   });
   await runBlockEscalationSweep(deps);
   expect(mints).toEqual([]);
   expect(notes).toEqual([
-    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=already_live",
+    "# block-escalation-skip epic=fn-1-foo task=fn-1-foo.1 class=owner_already_live",
   ]);
 });
 
-test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attempted{dispatch_failed} (re-sweepable)", async () => {
+test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attempted{owner_redispatch_failed} (re-sweepable)", async () => {
   const { deps, mints } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "EXTERNAL_BLOCKED: api down" },
-    dispatch: async () => "dispatch_failed",
+    dispatchOwner: async () => "dispatch_failed",
   });
   await runBlockEscalationSweep(deps);
 
-  // dispatch_failed mints attempted{dispatch_failed} — the fold resets the latch to
-  // pending, so the next sweep retries.
+  // dispatch_failed mints attempted{owner_redispatch_failed} — the fold resets the
+  // latch to pending, so the next sweep retries.
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "dispatch_failed",
+      outcome: "owner_redispatch_failed",
     },
   ]);
 });
 
-test("runBlockEscalationSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
+test("runBlockEscalationSweep: a THROWING dispatcher never aborts the sweep (records owner_redispatch_failed)", async () => {
   const { deps, mints } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": "DESIGN_CONFLICT: clash" },
-    dispatch: async () => {
+    dispatchOwner: async () => {
       throw new Error("boom");
     },
   });
@@ -8265,7 +8167,7 @@ test("runBlockEscalationSweep: a THROWING dispatcher never aborts the sweep (rec
     kind: "attempted",
     epicId: "fn-1-foo",
     taskId: "fn-1-foo.1",
-    outcome: "dispatch_failed",
+    outcome: "owner_redispatch_failed",
   });
 });
 
@@ -8317,7 +8219,7 @@ test("runBlockEscalationSweep: every ordinary escalatable category defers while 
   expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: witnessed owner deaths consume two durable attachment attempts before one legacy fallback", async () => {
+test("runBlockEscalationSweep: witnessed owner deaths consume two durable attachment attempts, then the exhausted lease surfaces silently (no dispatch of any kind)", async () => {
   const taskId = "fn-30-lease.1";
   const row = blockedRow("fn-30-lease", taskId, {
     owner_redispatch_attempts: 0,
@@ -8353,25 +8255,16 @@ test("runBlockEscalationSweep: witnessed owner deaths consume two durable attach
   expect(ownerDispatches).toHaveLength(2);
   expect(dispatches).toEqual([]);
 
+  // The lease is now exhausted: `blockOwnerEscalationDecision` returns
+  // `surface_exhausted`, NOT a fallback dispatch of any kind (the legacy
+  // `unblock::<task>` fallback no longer exists) — the sweep skips the row without
+  // minting, so it surfaces silently on the board pending an operator.
+  const mintsBefore = mints.length;
   row.owner_redispatch_attempts = BLOCK_OWNER_REDISPATCH_LIMIT;
   await runBlockEscalationSweep(deps);
   expect(ownerDispatches).toHaveLength(2);
-  expect(dispatches).toEqual([{ epicId: "fn-30-lease", taskId }]);
-  expect(mints.slice(-2)).toEqual([
-    { kind: "requested", epicId: "fn-30-lease", taskId },
-    {
-      kind: "attempted",
-      epicId: "fn-30-lease",
-      taskId,
-      outcome: "dispatched",
-    },
-  ]);
-
-  // The fallback fold is terminal, so the same block instance cannot dispatch it twice.
-  row.status = "attempted";
-  row.outcome = "dispatched";
-  await runBlockEscalationSweep(deps);
-  expect(dispatches).toHaveLength(1);
+  expect(dispatches).toEqual([]);
+  expect(mints).toHaveLength(mintsBefore);
 });
 
 test("runBlockEscalationSweep: an owner launch failure consumes a bounded attachment attempt", async () => {
@@ -8535,7 +8428,7 @@ test("runBlockEscalationSweep: an AUDIT_READY work resume at cap stays pending",
   expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust the owner bound and page the human", async () => {
+test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust the owner bound and surface silently; a synthetic page still fires on a declined/died unblock incident", async () => {
   const epicId = "fn-1-audit-loop";
   const taskId = `${epicId}.1`;
   const row = blockedRow(epicId, taskId, {
@@ -8574,14 +8467,17 @@ test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust t
     options.nowMs += 1;
   }
 
+  // The lease is now exhausted: `surface_exhausted` skips WITHOUT minting (no
+  // fallback dispatch of any kind — the legacy `unblock::<task>` fallback is gone).
+  const mintsBefore = mints.length;
   await runBlockEscalationSweep(deps);
   expect(ownerDispatches).toHaveLength(BLOCK_OWNER_REDISPATCH_LIMIT);
-  expect(dispatches).toEqual([{ epicId, taskId }]);
-  expect(mints.slice(-2)).toEqual([
-    { kind: "requested", epicId, taskId },
-    { kind: "attempted", epicId, taskId, outcome: "dispatched" },
-  ]);
+  expect(dispatches).toEqual([]);
+  expect(mints).toHaveLength(mintsBefore);
 
+  // The exhausted lease no longer feeds `runBlockHumanNotifySweep` in production
+  // (nothing ever mints a `dispatched` outcome for it to select), but the sweep's
+  // own paging mechanics stay independently correct given a synthetic pending row.
   const pages: { taskId: string; verdict: "declined" | "died" }[] = [];
   const notifyMints: BlockHumanNotifyMintCall[] = [];
   await runBlockHumanNotifySweep({
@@ -8648,7 +8544,7 @@ test("runBlockEscalationSweep: a deferred AUDIT_READY mints nothing across repea
 });
 
 test("runBlockEscalationSweep: AUDIT_SEVERE escalates immediately like any block (orchestrator liveness ignored)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": AUDIT_SEVERE_REASON },
     // A live orchestrator MUST NOT suppress a severe finding — the deny gate
@@ -8658,14 +8554,17 @@ test("runBlockEscalationSweep: AUDIT_SEVERE escalates immediately like any block
   });
   await runBlockEscalationSweep(deps);
 
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
 });
@@ -8818,7 +8717,7 @@ test("probeBlockOwner: only the exact work::<task> orchestrator owns an ordinary
   });
 });
 
-test("blockOwnerEscalationDecision: witnessed death advances attachment attempts then fallback; every uncertain/live state defers", () => {
+test("blockOwnerEscalationDecision: witnessed death advances attachment attempts then surfaces exhausted; every uncertain/live state defers", () => {
   const dead: BlockOwnerLiveness = { state: "dead", diedAtMs: 0 };
   expect(blockOwnerEscalationDecision(dead, 0, BLOCK_OWNER_GRACE_MS)).toBe(
     "redispatch_owner",
@@ -8832,7 +8731,7 @@ test("blockOwnerEscalationDecision: witnessed death advances attachment attempts
       BLOCK_OWNER_REDISPATCH_LIMIT,
       BLOCK_OWNER_GRACE_MS,
     ),
-  ).toBe("dispatch_legacy_unblock");
+  ).toBe("surface_exhausted");
   expect(blockOwnerEscalationDecision(dead, 0, BLOCK_OWNER_GRACE_MS - 1)).toBe(
     "defer",
   );
@@ -10381,32 +10280,6 @@ test("baselineRepairFingerprint: deterministic + stable across sha/flaky noise, 
   ).not.toBe(a);
 });
 
-// ---- epicHasLiveUnblock (per-epic serialization liveness) --------------------
-
-test("epicHasLiveUnblock: true iff a LIVE unblock:: session exists for a task in the epic", () => {
-  const jobs: Job[] = [
-    escJob("unblock", "fn-1-foo.2", "working"), // live, epic fn-1-foo
-    escJob("unblock", "fn-2-bar.1", "ended"), // terminal — not live
-    escJob("deconflict", "fn-1-foo", "working"), // wrong verb (deconflict keys on epic)
-    escJob("work", "fn-1-foo.9", "working"), // a plain worker — not an escalation
-  ];
-  expect(epicHasLiveUnblock(jobs, "fn-1-foo")).toBe(true);
-  // The unblock for fn-2-bar is terminal → not live.
-  expect(epicHasLiveUnblock(jobs, "fn-2-bar")).toBe(false);
-  // No unblock session maps to this epic.
-  expect(epicHasLiveUnblock(jobs, "fn-9-none")).toBe(false);
-  expect(epicHasLiveUnblock([], "fn-1-foo")).toBe(false);
-  // A stopped (finished, idling) unblock session no longer serializes its epic —
-  // turn-active occupancy releases the per-epic slot on turn end, so a sibling re-block
-  // in the same epic can dispatch.
-  expect(
-    epicHasLiveUnblock(
-      [escJob("unblock", "fn-1-foo.5", "stopped")],
-      "fn-1-foo",
-    ),
-  ).toBe(false);
-});
-
 // ---- buildBlockHumanNotifyBody (pure stage-3 notification body) --------------
 
 test("buildBlockHumanNotifyBody: names the task, the epic, the declined verdict, and the unblock command", () => {
@@ -10433,19 +10306,20 @@ test("buildBlockHumanNotifyBody: a died verdict names the death", () => {
 
 // ---- selectPendingBlockHumanNotifications (the stage-3 working-set read) ------
 
-/** Seed one `block_escalations` latch row with the full stage-3 column set. */
+/** Seed one block incident (the `dispatch_failures` `verb='block'` subset) with the
+ *  full stage-3 column set. */
 function seedFullBlockLatch(
   db: ReturnType<typeof openDb>["db"],
-  epicId: string,
+  _epicId: string,
   taskId: string,
   status: string,
   outcome: string | null,
   humanNotifiedAt: number | null,
 ): void {
   db.run(
-    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at)
-       VALUES (?, ?, 1, ?, ?, 1, ?)`,
-    [epicId, taskId, status, outcome, humanNotifiedAt],
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, blocked_since, block_status, block_outcome, human_notified_at)
+       VALUES ('block', ?, 'block-incident', 1, 1, 1, 1, 1, ?, ?, ?)`,
+    [taskId, status, outcome, humanNotifiedAt],
   );
 }
 
@@ -10646,45 +10520,6 @@ test("MERGE_ESCALATION_REASON_TOKEN is the exact worktree-merge-conflict leading
   expect(MERGE_ESCALATION_REASON_TOKEN).toBe("worktree-merge-conflict");
 });
 
-test("shouldEscalateMergeConflict: exact leading-token gate — only worktree-merge-conflict escalates", () => {
-  expect(
-    shouldEscalateMergeConflict(
-      mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
-    ),
-  ).toBe(true);
-  // The excluded siblings — a `worktree-merge` PREFIX must NOT match.
-  expect(
-    shouldEscalateMergeConflict(
-      "worktree-merge-lock-timeout: could not acquire the lock",
-    ),
-  ).toBe(false);
-  expect(
-    shouldEscalateMergeConflict(
-      "worktree-merge-local-timeout: a local git op timed out",
-    ),
-  ).toBe(false);
-  expect(
-    shouldEscalateMergeConflict(
-      "worktree-finalize-non-fast-forward: origin is ahead",
-    ),
-  ).toBe(false);
-  expect(
-    shouldEscalateMergeConflict(
-      "worktree-recover-dirty: lane has uncommitted work",
-    ),
-  ).toBe(false);
-  // A longer token that merely STARTS with the token string is not an exact match.
-  expect(
-    shouldEscalateMergeConflict("worktree-merge-conflict-extra: nope"),
-  ).toBe(false);
-  // No colon / empty / null → false.
-  expect(shouldEscalateMergeConflict("worktree-merge-conflict")).toBe(false);
-  expect(shouldEscalateMergeConflict("")).toBe(false);
-  expect(shouldEscalateMergeConflict(null)).toBe(false);
-});
-
-// ---- selectPendingMergeEscalations (the current-state working-set read) -----
-
 function seedMergeFailureRow(
   db: ReturnType<typeof openDb>["db"],
   args: {
@@ -10692,21 +10527,21 @@ function seedMergeFailureRow(
     id: string;
     reason: string;
     dir?: string | null;
-    mergeEscalatedAt?: number | null;
-    resolverDispatchedAt?: number | null;
+    /** The collapsed owner-attachment count (0/1/2) — the retired two once-marker
+     *  slots. */
+    ownerRedispatchAttempts?: number;
   },
 ): void {
   db.run(
     `INSERT INTO dispatch_failures
-       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
-       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, owner_redispatch_attempts)
+       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?)`,
     [
       args.verb,
       args.id,
       args.reason,
       args.dir ?? null,
-      args.mergeEscalatedAt ?? null,
-      args.resolverDispatchedAt ?? null,
+      args.ownerRedispatchAttempts ?? 0,
     ],
   );
 }
@@ -10724,8 +10559,7 @@ function ownerIncidentPage(
     dir: "/repo/lane",
     claimSessionId: null,
     instanceEventId: 50,
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
     humanNotifiedAt: null,
     ...overrides,
   };
@@ -10829,17 +10663,15 @@ function routerState(paused = false): ReconcileState {
 }
 
 test("owner incident attachment slots are classified by typed row route and bounded durably", () => {
-  const first = ownerIncidentPage({
-    resolverDispatchedAt: null,
-    mergeEscalatedAt: null,
-  });
+  const first = ownerIncidentPage({ ownerRedispatchAttempts: 0 });
   expect(nextIncidentOwnerAttachmentMarker(first)).toBe("resolver");
   expect(
     nextIncidentOwnerAttachmentMarker({
       ...first,
-      resolverDispatchedAt: 10,
+      ownerRedispatchAttempts: 1,
     }),
   ).toBe("merge");
+  // The default page (2 attachments) is exhausted → no further slot.
   expect(nextIncidentOwnerAttachmentMarker(ownerIncidentPage())).toBeNull();
   expect(
     nextIncidentOwnerAttachmentMarker({
@@ -10934,26 +10766,27 @@ test("exhausted incident attachments page once after the owner yields and never 
 
 test("incident owner page selector excludes claims, non-incidents, and unexhausted attachments", () => {
   const { db } = freshMemDb();
+  // Exhausted (both slots consumed → count at the limit), unclaimed incident.
   seedMergeFailureRow(db, {
     verb: "work",
     id: "fn-1350-owner.1",
     reason: ownerIncidentPage().reason,
     dir: "/repo/lane",
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
   });
+  // Unexhausted (one slot) — excluded from the page selector.
   seedMergeFailureRow(db, {
     verb: "close",
     id: "fn-1350-owner",
     reason: ownerIncidentPage({ verb: "close" }).reason,
-    resolverDispatchedAt: 10,
+    ownerRedispatchAttempts: 1,
   });
+  // Exhausted count but NOT an incident reason — excluded.
   seedMergeFailureRow(db, {
     verb: "work",
     id: "fn-1350-other.1",
     reason: "launch_failed: not an incident",
-    resolverDispatchedAt: 10,
-    mergeEscalatedAt: 20,
+    ownerRedispatchAttempts: 2,
   });
   db.run(
     "UPDATE dispatch_failures SET claim_session_id = 'owner' WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
@@ -10983,417 +10816,6 @@ test("incident owner page sweep defers while the final ordinary owner is active"
   expect(notified).toEqual([]);
 });
 
-test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token, a NULL escalate marker, and a dispatched resolver", () => {
-  const { db } = freshMemDb();
-  // Escalatable: a sticky close merge conflict, not yet escalated, whose resolver has
-  // already been dispatched (resolver_dispatched_at set) — the escalation sequences
-  // behind the resolver.
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-1-foo",
-    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-    dir: "/repo/root",
-    resolverDispatchedAt: 555,
-  });
-  // Resolver NOT yet dispatched (a fresh row, or the window after a retry re-armed
-  // both markers) → dropped: the resolver owns the conflict first.
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-8-nores",
-    reason: mergeConflictReason("fn-8-nores.1", "keeper/epic/fn-8-nores"),
-    dir: "/repo/root",
-  });
-  // Already escalated (marker set) → dropped.
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-2-bar",
-    reason: mergeConflictReason("fn-2-bar.1", "keeper/epic/fn-2-bar"),
-    dir: "/repo/root",
-    mergeEscalatedAt: 12345,
-  });
-  // Excluded reasons on a close row — a `worktree-merge` prefix must NOT match.
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-3-lock",
-    reason: "worktree-merge-lock-timeout: could not acquire the lock",
-  });
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-4-local",
-    reason: "worktree-merge-local-timeout: a local git op timed out",
-  });
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-5-nonff",
-    reason: "worktree-finalize-non-fast-forward: origin is ahead",
-  });
-  seedMergeFailureRow(db, {
-    verb: "close",
-    id: "fn-6-recover",
-    reason: "worktree-recover-dirty: lane has uncommitted work",
-  });
-  // A WORK row carrying the same reason token — wrong verb, dropped.
-  seedMergeFailureRow(db, {
-    verb: "work",
-    id: "fn-7-foo.1",
-    reason: mergeConflictReason("fn-7-foo.1", "keeper/epic/fn-7-foo"),
-  });
-
-  const rows = selectPendingMergeEscalations(db);
-  expect(rows).toEqual([
-    {
-      id: "fn-1-foo",
-      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-      dir: "/repo/root",
-    },
-  ]);
-  db.close();
-});
-
-test("selectPendingMergeEscalations: empty table returns []", () => {
-  const { db } = freshMemDb();
-  expect(selectPendingMergeEscalations(db)).toEqual([]);
-  db.close();
-});
-
-// ---- buildDeconflictHumanNotifyBody (pure stage-3 notification body) ----------
-
-test("buildDeconflictHumanNotifyBody: names the epic, the declined verdict, and the unstick command", () => {
-  const body = buildDeconflictHumanNotifyBody({
-    epicId: "fn-9-foo",
-    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
-    verdict: "declined",
-  });
-  expect(body).toContain("deconflict::fn-9-foo");
-  // Names the deconflict session's verdict — both tiers gave up, so the human is the
-  // final fallback.
-  expect(body).toContain("DECLINED");
-  expect(body).toContain("close::fn-9-foo");
-  // The single unstick command the operator runs after resolving by hand.
-  expect(body).toContain("keeper autopilot retry close::fn-9-foo");
-  // The free-text reason rides as a body line.
-  expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
-});
-
-test("buildDeconflictHumanNotifyBody: a died verdict names the death (never throws on an unparseable reason)", () => {
-  const body = buildDeconflictHumanNotifyBody({
-    epicId: "fn-9-foo",
-    reason: "worktree-merge-conflict: something unparseable happened",
-    verdict: "died",
-  });
-  expect(body).toContain("deconflict::fn-9-foo");
-  expect(body).toContain("DIED");
-  expect(body).toContain("keeper autopilot retry close::fn-9-foo");
-});
-
-// ---- runMergeEscalationSweep (deconflict-dispatch core, injected deps) --------
-
-interface MergeMintCall {
-  id: string;
-  outcome: MergeEscalationOutcome;
-}
-
-function fakeMergeSweepDeps(opts: {
-  pending: PendingMergeEscalation[];
-  stillPending?: (id: string) => boolean;
-  resolverOutcome?: (id: string) => ResolverOutcome;
-  dispatch?: (
-    row: PendingMergeEscalation,
-  ) => Promise<EscalationDispatchOutcome>;
-  selectThrows?: boolean;
-}): {
-  deps: MergeEscalationSweepDeps;
-  mints: MergeMintCall[];
-  dispatches: PendingMergeEscalation[];
-} {
-  const mints: MergeMintCall[] = [];
-  const dispatches: PendingMergeEscalation[] = [];
-  const deps: MergeEscalationSweepDeps = {
-    selectPending: () => {
-      if (opts.selectThrows) throw new Error("read boom");
-      return opts.pending;
-    },
-    stillPending: opts.stillPending ?? (() => true),
-    // Default: the resolver already reached a terminal verdict, so the deconflict
-    // dispatch fires (the pre-sequencing behaviour these tests assert). Cases that
-    // exercise the wait override this.
-    resolverOutcome:
-      opts.resolverOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
-    dispatchDeconflict: async (row) => {
-      dispatches.push(row);
-      return (await opts.dispatch?.(row)) ?? "dispatched";
-    },
-    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
-  };
-  return { deps, mints, dispatches };
-}
-
-test("runMergeEscalationSweep: a terminal-resolver close dispatches ONE deconflict and mints attempted{dispatched} (no planner@ send)", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-  });
-  await runMergeEscalationSweep(deps);
-
-  // Exactly one deconflict dispatch for the epic — and no planner@ bus message (the
-  // deps surface has no notify path at all now).
-  expect(dispatches.length).toBe(1);
-  expect(dispatches[0]?.id).toBe("fn-1-foo");
-  // Mints the terminal outcome — and NEVER a DispatchCleared (the sticky row is cleared
-  // only by retry_dispatch).
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
-});
-
-test("runMergeEscalationSweep: a non-token reason in the pending set is NOT dispatched (defense-in-depth gate)", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: "worktree-merge-lock-timeout: could not acquire the lock",
-        dir: "/repo/root",
-      },
-    ],
-  });
-  await runMergeEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a dispatch_failed outcome is recorded and leaves the marker unset (re-sweepable)", async () => {
-  const { deps, mints } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "dispatch_failed",
-  });
-  await runMergeEscalationSweep(deps);
-  // dispatch_failed mints attempted{dispatch_failed} — task .1's fold no-ops on it, so
-  // the marker stays NULL and the next sweep retries.
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
-});
-
-test("runMergeEscalationSweep: an at_cap skip mints NOTHING (row stays pending, re-sweeps)", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "at_cap",
-  });
-  await runMergeEscalationSweep(deps);
-  // The dispatcher was consulted, but the cap skip mints no marker — the row re-sweeps.
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: an already_live skip (occupancy guard) mints NOTHING", async () => {
-  const { deps, mints } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "already_live",
-  });
-  await runMergeEscalationSweep(deps);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a checkout_busy skip mints NOTHING (row re-sweeps once the base checkout frees)", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "checkout_busy",
-  });
-  await runMergeEscalationSweep(deps);
-  // The dispatch was attempted but skipped on occupancy — no once-marker minted, so the
-  // sticky row stays re-sweepable and dispatches once the occupying session terminates.
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
-  const { deps, mints } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => {
-      throw new Error("boom");
-    },
-  });
-  await runMergeEscalationSweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
-});
-
-test("runMergeEscalationSweep: a row cleared mid-sweep (stillPending false) is skipped — no dispatch, no mint", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    stillPending: () => false,
-  });
-  await runMergeEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: an empty pending set is a no-op", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({ pending: [] });
-  await runMergeEscalationSweep(deps);
-  expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [],
-    selectThrows: true,
-  });
-  // MUST resolve (never throw) and do nothing.
-  await runMergeEscalationSweep(deps);
-  expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a live/not-yet-terminal resolver defers the dispatch — no dispatch, no mint", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    // The resolver (tier 1) still owns the conflict (live, or its job has not folded yet).
-    resolverOutcome: () => ({ terminal: false }),
-  });
-  await runMergeEscalationSweep(deps);
-  // The deconflict dispatch waits for the resolver's verdict: nothing dispatched.
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runMergeEscalationSweep: a resolver that DIED is terminal — the deconflict dispatches once", async () => {
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    resolverOutcome: () => ({ terminal: true, verdict: "died" }),
-  });
-  await runMergeEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
-});
-
-// ---- turn-active resolver classifier × deconflict sequencing (end-to-end) -----
-// fn-1171.6 — wire the REAL classifyResolverOutcome into runMergeEscalationSweep, not
-// a mocked outcome, to prove the epic's fix unstarves the deconflict dispatch: a
-// stopped-idle resolver (turn ended) must read terminal so the deconflict follows,
-// while a working (turn-active) resolver must still defer it.
-
-/** Minimal `Job` builder for the classifier tests — mirrors autopilot-worker.test's
- *  `makeJob`, defaulting a resolve session row. */
-function mkResolveJob(overrides: Partial<Job>): Job {
-  return {
-    job_id: "j-res",
-    created_at: 0,
-    cwd: null,
-    pid: null,
-    state: "stopped",
-    last_event_id: 0,
-    updated_at: 0,
-    title: null,
-    title_source: null,
-    transcript_path: null,
-    start_time: null,
-    plan_verb: "resolve",
-    plan_ref: "fn-1-foo",
-    epic_links: [],
-    last_api_error_at: null,
-    last_api_error_kind: null,
-    last_input_request_at: null,
-    last_input_request_kind: null,
-    config_dir: null,
-    git_dirty_count: 0,
-    git_unattributed_to_live_count: 0,
-    git_orphan_count: 0,
-    ...overrides,
-  } as Job;
-}
-
-test("runMergeEscalationSweep + REAL classifyResolverOutcome: a stopped-idle resolver reads terminal and the deconflict dispatches (the epic bug fix, end-to-end)", async () => {
-  // A finished `/plan:resolve` session idling `stopped` in its pane. Under the OLD
-  // pane-liveness rule it counted LIVE and the deconflict NEVER dispatched; turn-active
-  // occupancy reads its yielded turn as terminal so the sequencing proceeds.
-  const jobs = new Map<string, Job>([
-    ["j-res", mkResolveJob({ state: "stopped", backend_exec_pane_id: "%7" })],
-  ]);
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    resolverOutcome: (id) => classifyResolverOutcome(jobs, id),
-  });
-  await runMergeEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
-});
-
-test("runMergeEscalationSweep + REAL classifyResolverOutcome: a working (turn-active) resolver still defers the deconflict (sequencing unchanged)", async () => {
-  const jobs = new Map<string, Job>([
-    ["j-res", mkResolveJob({ state: "working", backend_exec_pane_id: "%1" })],
-  ]);
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    resolverOutcome: (id) => classifyResolverOutcome(jobs, id),
-  });
-  await runMergeEscalationSweep(deps);
-  // The resolver still owns the conflict (its turn is live) → nothing dispatched.
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
 // ---- duplicate-spawn-name pair coexistence (autoclose off) -------------------
 // fn-1171.6 second audit strand — a re-block while an old idle `unblock::<task>`
 // session still lingers (autoclose off) launches a SECOND session with the SAME spawn
@@ -11401,63 +10823,6 @@ test("runMergeEscalationSweep + REAL classifyResolverOutcome: a working (turn-ac
 // escalation_instances (test/reducer-projections.test.ts). This proves the CONSUMERS
 // this task touches — turn-active occupancy guards + instance-scoped stage-3 — stay
 // correct with the pair coexisting: no starvation, no double-count, no cross-adoption.
-
-/** Minimal `Job` builder defaulting an `unblock::<task>` escalation session row. */
-function mkUnblockJob(overrides: Partial<Job>): Job {
-  return mkResolveJob({
-    plan_verb: "unblock",
-    plan_ref: "fn-1-foo.2",
-    ...overrides,
-  });
-}
-
-test("duplicate unblock pair (old idle + fresh dispatch, same task, distinct instances): turn-active guards see exactly ONE live occupant — no starvation, no double-count", () => {
-  // Old instance A finished and idles `stopped`; fresh instance B is turn-active
-  // (`working`). Same spawn name, distinct job_ids + escalation_instances.
-  const oldIdle = mkUnblockJob({
-    job_id: "j-old",
-    state: "stopped",
-    backend_exec_pane_id: "%7",
-    escalation_instance: 100,
-  });
-  const freshLive = mkUnblockJob({
-    job_id: "j-new",
-    state: "working",
-    backend_exec_pane_id: "%8",
-    escalation_instance: 200,
-  });
-  const pair = [oldIdle, freshLive];
-
-  // Global cap denominator: the idle old session freed its slot; only the live one
-  // counts. Pane-liveness would have counted BOTH, double-charging the cap.
-  expect(countLiveEscalationSessions(pair)).toBe(1);
-  // Per-key occupancy guard: exactly one live occupant for the key, so a third
-  // dispatch is correctly suppressed while B runs (never starved by the idle A).
-  expect(escalationSessionLiveFor(pair, "unblock", "fn-1-foo.2")).toBe(true);
-  // Per-epic serialization: one live unblock in the epic.
-  expect(epicHasLiveUnblock(pair, "fn-1-foo")).toBe(true);
-});
-
-test("duplicate unblock pair both finished-idle (autoclose off): every turn-active guard frees the slot so a re-block gets a fresh dispatch", () => {
-  // Both the old and the once-fresh session have ended their turns and idle `stopped`
-  // (autoclose left the panes open). Turn-active occupancy frees the slot entirely.
-  const first = mkUnblockJob({
-    job_id: "j-old",
-    state: "stopped",
-    backend_exec_pane_id: "%7",
-    escalation_instance: 100,
-  });
-  const second = mkUnblockJob({
-    job_id: "j-new",
-    state: "stopped",
-    backend_exec_pane_id: "%8",
-    escalation_instance: 200,
-  });
-  const pair = [first, second];
-  expect(countLiveEscalationSessions(pair)).toBe(0);
-  expect(escalationSessionLiveFor(pair, "unblock", "fn-1-foo.2")).toBe(false);
-  expect(epicHasLiveUnblock(pair, "fn-1-foo")).toBe(false);
-});
 
 test("duplicate unblock pair: instance-scoped stage-3 read classifies each instance INDEPENDENTLY — the stale idle row never speaks for the live one, nor vice versa", () => {
   const { db } = openDb(dbPath);
@@ -11500,432 +10865,6 @@ test("duplicate unblock pair: instance-scoped stage-3 read classifies each insta
   ).toEqual({ terminal: true, verdict: "declined" });
 });
 
-// ---- selectPendingResolverDispatches (the resolver working-set read) ---------
-// fn-1088.1 — the resolver-dispatch sweep's selector, gated on the INDEPENDENT
-// `resolver_dispatched_at IS NULL` latch (sibling of `merge_escalated_at`).
-
-function seedResolverFailureRow(
-  db: ReturnType<typeof openDb>["db"],
-  args: {
-    verb: string;
-    id: string;
-    reason: string;
-    dir?: string | null;
-    mergeEscalatedAt?: number | null;
-    resolverDispatchedAt?: number | null;
-  },
-): void {
-  db.run(
-    `INSERT INTO dispatch_failures
-       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
-       VALUES (?, ?, ?, ?, 1, 1, 1, 1, ?, ?)`,
-    [
-      args.verb,
-      args.id,
-      args.reason,
-      args.dir ?? null,
-      args.mergeEscalatedAt ?? null,
-      args.resolverDispatchedAt ?? null,
-    ],
-  );
-}
-
-test("selectPendingResolverDispatches: picks only close rows with an exact worktree-merge-conflict token and a NULL resolver latch", () => {
-  const { db } = freshMemDb();
-  // Dispatchable: a sticky close merge conflict, no resolver yet.
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-1-foo",
-    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-    dir: "/repo/root",
-  });
-  // Already merge-ESCALATED (human notified) but resolver latch still NULL → STILL
-  // dispatchable: the two latches are independent consumers of the same sticky.
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-2-escalated",
-    reason: mergeConflictReason(
-      "fn-2-escalated.1",
-      "keeper/epic/fn-2-escalated",
-    ),
-    dir: "/repo/root",
-    mergeEscalatedAt: 12345,
-  });
-  // Already resolver-dispatched (latch set) → dropped (dispatch-once).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-3-done",
-    reason: mergeConflictReason("fn-3-done.1", "keeper/epic/fn-3-done"),
-    dir: "/repo/root",
-    resolverDispatchedAt: 999,
-  });
-  // Excluded reasons on a close row — a `worktree-merge` prefix must NOT match.
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-4-lock",
-    reason: "worktree-merge-lock-timeout: could not acquire the lock",
-  });
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-5-nonff",
-    reason: "worktree-finalize-non-fast-forward: origin is ahead",
-  });
-  // A WORK row carrying the token — wrong verb, dropped.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-6-foo.1",
-    reason: mergeConflictReason("fn-6-foo.1", "keeper/epic/fn-6-foo"),
-  });
-
-  const rows = selectPendingResolverDispatches(db);
-  expect(rows).toEqual([
-    {
-      id: "fn-1-foo",
-      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-      dir: "/repo/root",
-    },
-    {
-      id: "fn-2-escalated",
-      reason: mergeConflictReason(
-        "fn-2-escalated.1",
-        "keeper/epic/fn-2-escalated",
-      ),
-      dir: "/repo/root",
-    },
-  ]);
-  db.close();
-});
-
-test("selectPendingResolverDispatches: empty table returns []", () => {
-  const { db } = freshMemDb();
-  expect(selectPendingResolverDispatches(db)).toEqual([]);
-  db.close();
-});
-
-test("fn-1119 recover-origin escalation: a bare close::<epic> row with a recover-shaped worktree-merge-conflict reason (merging keeper/epic/<epic> into <default>) is selected by BOTH daemon sweeps, sequenced resolver-first", () => {
-  const { db } = freshMemDb();
-  const epic = "fn-1119-x";
-  // The EXACT reason recoverWorktrees pass-2 mints on a content conflict: the SOURCE
-  // is the epic BASE branch and the TARGET is the DEFAULT branch (not a rib into a
-  // base), keyed on the BARE epic id. The token gate is id-agnostic + token-exact, so
-  // this recover-origin shape escalates identically to finalize's close-sink conflict.
-  const reason = mergeConflictReason(`keeper/epic/${epic}`, "main");
-  expect(shouldEscalateMergeConflict(reason)).toBe(true);
-  // The resolver-dispatch sweep goes FIRST (fresh row, no resolver latch yet).
-  seedResolverFailureRow(db, { verb: "close", id: epic, reason, dir: "/repo" });
-  expect(selectPendingResolverDispatches(db)).toEqual([
-    { id: epic, reason, dir: "/repo" },
-  ]);
-  // Merge-escalation is SEQUENCED behind the resolver — it selects the same row once
-  // a resolver has been dispatched (resolver_dispatched_at set, escalate marker null).
-  db.run(
-    "UPDATE dispatch_failures SET resolver_dispatched_at = 555 WHERE verb = 'close' AND id = ?",
-    [epic],
-  );
-  expect(selectPendingMergeEscalations(db)).toEqual([
-    { id: epic, reason, dir: "/repo" },
-  ]);
-  db.close();
-});
-
-// ---- buildResolverBrief (the autonomous resolver worker prompt) --------------
-
-test("mergeConflictBaseCheckout: a default-branch base resolves to the repo root (never a nonexistent lane path); a keeper/epic lane base to its worktree", () => {
-  const repoDir = "/Users/me/code/foo";
-  // A lane→default finalize (base = the default branch) is NEVER laned: the cwd is the
-  // repo root itself (the shared default checkout). `worktreePathFor(repoDir, "main")`
-  // would be a lane dir that does not exist, so a launch cd'ing there ENOENTs and the
-  // resolver never dispatches — the regression this pins.
-  expect(mergeConflictBaseCheckout(repoDir, "main")).toBe(repoDir);
-  expect(mergeConflictBaseCheckout(repoDir, "master")).toBe(repoDir);
-  // A rib→lane fan-in (base = the epic lane) resolves to that lane's worktree.
-  const lane = "keeper/epic/fn-9-foo";
-  expect(mergeConflictBaseCheckout(repoDir, lane)).toBe(
-    worktreePathFor(repoDir, lane),
-  );
-});
-
-test("buildResolverBrief: a lane→default finalize (base = the default branch) cd's into the repo root, NOT a nonexistent <repo>--<default> lane", () => {
-  const repoDir = "/Users/me/code/foo";
-  const brief = buildResolverBrief({
-    epicId: "fn-9-foo",
-    // The production shape: the epic base branch merged INTO the default branch.
-    reason: mergeConflictReason("keeper/epic/fn-9-foo", "main"),
-    repoDir,
-  });
-  // The worker cd's into the repo root (the shared default checkout finalize merged in),
-  // never the fabricated lane dir that made the resolver launch ENOENT.
-  expect(brief).toContain(`cd ${repoDir}`);
-  expect(brief).not.toContain(worktreePathFor(repoDir, "main"));
-  expect(brief).toContain("git merge --no-ff keeper/epic/fn-9-foo");
-});
-
-test("buildResolverBrief: encodes recreate + both-intents + test-gate + retry on the clear path, BLOCKED + unstick on everything else", () => {
-  const repoDir = "/Users/me/code/foo";
-  const base = "keeper/epic/fn-9-foo";
-  const source = "fn-9-foo.2";
-  const brief = buildResolverBrief({
-    epicId: "fn-9-foo",
-    reason: mergeConflictReason(source, base),
-    repoDir,
-  });
-  // Recreate the merge in the base worktree with --no-ff (never squash/rebase).
-  expect(brief).toContain(worktreePathFor(repoDir, base));
-  expect(brief).toContain(`git merge --no-ff ${source}`);
-  expect(brief).toContain("--squash");
-  expect(brief).toContain("rebase");
-  // NO global pause/play — the daemon scopes recovery per-epic while this resolver
-  // is live (fn-1095), so a crash never durably pauses the board and concurrent
-  // resolvers never race on a shared flag. The brief PROHIBITS a pause (the only
-  // mention of "pause" is the "Do NOT" guard) and issues NO terminal `play`.
-  expect(brief).toContain("Do NOT `keeper autopilot pause`");
-  expect(brief).toContain("per-epic recover exclusion");
-  expect(brief).not.toContain("keeper autopilot play");
-  // The CLEAR path: BOTH intents, run the epic tests, commit, retry the close.
-  expect(brief).toContain("BOTH");
-  expect(brief).toContain("tests");
-  expect(brief).toContain("keeper autopilot retry close::fn-9-foo");
-  // Intent archaeology BEFORE classifying: read each side's primary sources
-  // (commits + keeper history) to ground classification in intent, not diff text.
-  expect(brief).toContain("INTENT ARCHAEOLOGY");
-  expect(brief).toContain(
-    "keeper history files --format json --limit 20 -- <path>",
-  );
-  expect(brief).toContain(
-    "keeper history search --syntax literal --format json --limit 20 -- <term>",
-  );
-  expect(brief).not.toContain("keeper find-file-history");
-  expect(brief).not.toContain("keeper search-history");
-  // The do-not-invent-new-behaviour guard: compose verbatim or default to BLOCKED.
-  expect(brief).toContain("Do NOT invent new behaviour");
-  // The guardrail classes named VERBATIM + unsure-defaults-to-BLOCKED.
-  expect(brief).toContain("state machine");
-  expect(brief).toContain("schema");
-  expect(brief).toContain("security");
-  expect(brief).toContain("transaction-boundary");
-  expect(brief).toContain("BLOCKED");
-  expect(brief).toContain("UNSURE");
-  // The schema-version collision carve-out: the tool's exit-0-clear / refusal-BLOCKED
-  // boundary, distinct from a schema SHAPE decision.
-  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
-  expect(brief).toContain("bun scripts/rebase-schema-migration.ts");
-  expect(brief).toContain("schema SHAPE decision");
-  // The literal unstick sentence.
-  expect(brief).toContain("to proceed, tell me exactly:");
-  // The NOT-clear path aborts to a clean lane (never a half-merge).
-  expect(brief).toContain("git merge --abort");
-  // The foreign-staged guard: before BOTH the concluding commit and the decline abort,
-  // unstage (leave-in-tree) any path staged OUTSIDE this merge's own set — a concurrent
-  // commit's staged work a whole-index commit / abort would otherwise sweep or destroy.
-  // Keyed on the merge's OWN set (`git diff HEAD MERGE_HEAD`) so a resolved-then-staged
-  // conflict file is never mistaken for foreign work.
-  expect(brief).toContain("FOREIGN staged path");
-  expect(brief).toContain("git restore --staged");
-  expect(brief).toContain("git diff --cached --name-only");
-  expect(brief).toContain("git diff --name-only HEAD MERGE_HEAD");
-  // The free-text reason rides as a body line.
-  expect(brief).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
-});
-
-test("buildResolverBrief: a parse-miss degrades to a still-actionable brief (never throws)", () => {
-  const brief = buildResolverBrief({
-    epicId: "fn-9-foo",
-    reason: "worktree-merge-conflict: something unparseable happened",
-    repoDir: "/Users/me/code/foo",
-  });
-  expect(brief).toContain("close::fn-9-foo");
-  expect(brief).toContain("--no-ff");
-  expect(brief).toContain("Do NOT `keeper autopilot pause`");
-  expect(brief).not.toContain("keeper autopilot play");
-  expect(brief).toContain("BLOCKED");
-  expect(brief).toContain("to proceed, tell me exactly:");
-  // The archaeology step + do-not-invent guard ride the shared guardrail into the
-  // parse-miss branch too.
-  expect(brief).toContain("INTENT ARCHAEOLOGY");
-  expect(brief).toContain(
-    "keeper history files --format json --limit 20 -- <path>",
-  );
-  expect(brief).not.toContain("keeper find-file-history");
-  expect(brief).not.toContain("keeper search-history");
-  expect(brief).toContain("Do NOT invent new behaviour");
-  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
-  // The foreign-staged guard rides the shared blockedPath (abort) + clear-path commit
-  // into the parse-miss branch too.
-  expect(brief).toContain("FOREIGN staged path");
-  expect(brief).toContain("git restore --staged");
-  expect(brief).toContain("git diff --name-only HEAD MERGE_HEAD");
-});
-
-test("buildResolverBrief: a null/empty repoDir degrades to the manual body (never throws)", () => {
-  const brief = buildResolverBrief({
-    epicId: "fn-9-foo",
-    reason: mergeConflictReason("fn-9-foo.2", "keeper/epic/fn-9-foo"),
-    repoDir: null,
-  });
-  expect(brief).toContain("close::fn-9-foo");
-  expect(brief).toContain("--no-ff");
-  expect(brief).toContain("Do NOT `keeper autopilot pause`");
-  expect(brief).not.toContain("keeper autopilot play");
-  expect(brief).toContain("BLOCKED");
-  // The archaeology step + do-not-invent guard ride the shared guardrail into the
-  // null-repo manual branch too.
-  expect(brief).toContain("INTENT ARCHAEOLOGY");
-  expect(brief).toContain("Do NOT invent new behaviour");
-  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
-});
-
-// ---- runResolverDispatchSweep (orchestration core, injected deps) ------------
-
-interface ResolverMintCall {
-  id: string;
-  outcome: ResolverDispatchOutcome;
-}
-
-function fakeResolverSweepDeps(opts: {
-  pending: PendingResolverDispatch[];
-  stillPending?: (id: string) => boolean;
-  dispatch?: (row: PendingResolverDispatch) => Promise<ResolverDispatchResult>;
-  selectThrows?: boolean;
-}): {
-  deps: ResolverDispatchSweepDeps;
-  mints: ResolverMintCall[];
-  dispatches: PendingResolverDispatch[];
-} {
-  const mints: ResolverMintCall[] = [];
-  const dispatches: PendingResolverDispatch[] = [];
-  const deps: ResolverDispatchSweepDeps = {
-    selectPending: () => {
-      if (opts.selectThrows) throw new Error("read boom");
-      return opts.pending;
-    },
-    stillPending: opts.stillPending ?? (() => true),
-    dispatchResolver: async (row) => {
-      dispatches.push(row);
-      return (await opts.dispatch?.(row)) ?? "dispatched";
-    },
-    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
-  };
-  return { deps, mints, dispatches };
-}
-
-test("runResolverDispatchSweep: a dispatchable close launches ONE resolver and mints attempted{dispatched}", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-  });
-  await runResolverDispatchSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect(dispatches[0]?.id).toBe("fn-1-foo");
-  // The terminal `dispatched` outcome stamps the once-marker (via the fold); NEVER a
-  // DispatchCleared (the sweep has no clear path — only retry_dispatch clears).
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatched" }]);
-});
-
-test("runResolverDispatchSweep: a non-token reason in the pending set is NOT dispatched (defense-in-depth gate)", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: "worktree-merge-lock-timeout: could not acquire the lock",
-        dir: "/repo/root",
-      },
-    ],
-  });
-  await runResolverDispatchSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runResolverDispatchSweep: a dispatch_failed outcome is recorded and leaves the latch unset (re-sweepable)", async () => {
-  const { deps, mints } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "dispatch_failed",
-  });
-  await runResolverDispatchSweep(deps);
-  // dispatch_failed mints attempted{dispatch_failed} — the fold no-ops on it, so the
-  // latch stays NULL and the next sweep retries.
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
-});
-
-test("runResolverDispatchSweep: a THROWING dispatcher never aborts the sweep (records dispatch_failed)", async () => {
-  const { deps, mints } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => {
-      throw new Error("boom");
-    },
-  });
-  await runResolverDispatchSweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "dispatch_failed" }]);
-});
-
-test("runResolverDispatchSweep: a row cleared mid-sweep (stillPending false) is skipped — no dispatch, no mint", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    stillPending: () => false,
-  });
-  await runResolverDispatchSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runResolverDispatchSweep: a checkout_busy skip mints NOTHING (row re-sweeps once the base checkout frees)", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-        dir: "/repo/root",
-      },
-    ],
-    dispatch: async () => "checkout_busy",
-  });
-  await runResolverDispatchSweep(deps);
-  // The resolver dispatch was attempted but the base checkout is held by another live
-  // escalation — no `resolver_dispatched_at` once-marker minted, so the row re-sweeps.
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([]);
-});
-
-test("runResolverDispatchSweep: an empty pending set is a no-op", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({ pending: [] });
-  await runResolverDispatchSweep(deps);
-  expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
-});
-
-test("runResolverDispatchSweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, dispatches } = fakeResolverSweepDeps({
-    pending: [],
-    selectThrows: true,
-  });
-  await runResolverDispatchSweep(deps);
-  expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
-});
-
 // ---- fn-1129 escalation cap/occupancy/classify (pure helpers over a jobs set) --
 
 function escJob(planVerb: string, planRef: string, state: string): Job {
@@ -11937,7 +10876,7 @@ function escJob(planVerb: string, planRef: string, state: string): Job {
   } as unknown as Job;
 }
 
-function escJobCwd(
+function _escJobCwd(
   planVerb: string,
   planRef: string,
   state: string,
@@ -11951,157 +10890,6 @@ function escJobCwd(
     cwd,
   } as unknown as Job;
 }
-
-test("countLiveEscalationSessions: counts only TURN-ACTIVE (working) unblock:: + deconflict:: rows; a stopped/terminal escalation frees its cap slot", () => {
-  const jobs: Job[] = [
-    escJob("deconflict", "fn-1-foo", "working"), // turn-active → counts
-    escJob("unblock", "fn-2-bar.3", "working"), // turn-active → counts
-    escJob("unblock", "fn-7-idle.1", "stopped"), // finished-but-idling → no longer counts
-    escJob("deconflict", "fn-3-dead", "ended"), // terminal — not counted
-    escJob("deconflict", "fn-4-killed", "killed"), // terminal — not counted
-    escJob("resolve", "fn-5-res", "working"), // the resolver is NOT an escalation
-    escJob("work", "fn-6-work.1", "working"), // a plain worker — not counted
-  ];
-  // Turn-active occupancy: only the two `working` escalation rows count — the stopped
-  // (idling) session released its cap slot, so a re-block can re-dispatch under the cap.
-  expect(countLiveEscalationSessions(jobs)).toBe(2);
-  expect(countLiveEscalationSessions([])).toBe(0);
-});
-
-test("countLiveEscalationSessions: a work `deconflict::<taskId>` shares the SAME cap as a close `deconflict::<epic>` (no starvation)", () => {
-  // fn-1240: the work-verb deconflict dispatches through the SAME `dispatchEscalationSession`
-  // as the close path, keyed on the `deconflict` verb regardless of whether its id is an
-  // epic id (close) or a task id (work). Both count toward the one global cap, so neither
-  // starves the other — as slots free, whichever sweep runs next dispatches.
-  const jobs: Job[] = [
-    escJob("deconflict", "fn-1-foo", "working"), // close: epic id
-    escJob("deconflict", "fn-2-bar.3", "working"), // work: task id — SAME cap
-    escJob("unblock", "fn-3-baz.1", "working"), // shares the cap too
-  ];
-  expect(countLiveEscalationSessions(jobs)).toBe(3);
-  // The per-key liveness guard distinguishes the two deconflict namespaces exactly.
-  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-2-bar.3")).toBe(true);
-  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-1-foo")).toBe(true);
-});
-
-test("escalationSessionLiveFor: matches a live session for the exact verb+id only", () => {
-  const jobs: Job[] = [
-    escJob("deconflict", "fn-1-foo", "working"),
-    escJob("unblock", "fn-1-foo", "ended"), // same id, wrong verb + terminal
-  ];
-  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-1-foo")).toBe(true);
-  // The unblock row for the same id is terminal → not live.
-  expect(escalationSessionLiveFor(jobs, "unblock", "fn-1-foo")).toBe(false);
-  // No row for this key at all.
-  expect(escalationSessionLiveFor(jobs, "deconflict", "fn-9-none")).toBe(false);
-  // A finished-but-idling (stopped) session no longer occupies its per-key slot —
-  // turn-active occupancy releases it so a re-block re-dispatches instead of starving.
-  expect(
-    escalationSessionLiveFor(
-      [escJob("unblock", "fn-8-idle.2", "stopped")],
-      "unblock",
-      "fn-8-idle.2",
-    ),
-  ).toBe(false);
-});
-
-test("escalationCheckoutOccupiedBy: a live deconflict in the SAME checkout occupies a different-epic candidate (same-repo serialization)", () => {
-  const jobs: Job[] = [
-    escJobCwd("deconflict", "fn-1-foo", "working", "/repo/root"),
-  ];
-  // A second same-repo escalation (different epic) resolving to the same shared checkout
-  // is blocked while the first is live.
-  expect(
-    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
-  ).toBe(true);
-  expect(
-    escalationCheckoutOccupiedBy(jobs, "/repo/root", "resolve", "fn-2-bar"),
-  ).toBe(true);
-});
-
-test("escalationCheckoutOccupiedBy: a live resolve occupies the checkout too (both classes recreate the merge)", () => {
-  const jobs: Job[] = [
-    escJobCwd("resolve", "fn-1-foo", "working", "/repo/root"),
-  ];
-  expect(
-    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
-  ).toBe(true);
-});
-
-test("escalationCheckoutOccupiedBy: a checkout in a DIFFERENT repo is free (per checkout, never global — cross-repo concurrency)", () => {
-  const jobs: Job[] = [
-    escJobCwd("deconflict", "fn-1-foo", "working", "/repo-a/root"),
-  ];
-  // The candidate's checkout is a different repo root → the two dispatch concurrently.
-  expect(
-    escalationCheckoutOccupiedBy(
-      jobs,
-      "/repo-b/root",
-      "deconflict",
-      "fn-2-bar",
-    ),
-  ).toBe(false);
-});
-
-test("escalationCheckoutOccupiedBy: an unblock session never occupies (it recreates no merge)", () => {
-  const jobs: Job[] = [
-    escJobCwd("unblock", "fn-1-foo.3", "working", "/repo/root"),
-  ];
-  expect(
-    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-2-bar"),
-  ).toBe(false);
-});
-
-test("escalationCheckoutOccupiedBy: the candidate's OWN key never self-blocks", () => {
-  const jobs: Job[] = [
-    escJobCwd("deconflict", "fn-1-foo", "working", "/repo/root"),
-  ];
-  expect(
-    escalationCheckoutOccupiedBy(jobs, "/repo/root", "deconflict", "fn-1-foo"),
-  ).toBe(false);
-});
-
-test("escalationCheckoutOccupiedBy: a TERMINAL occupant frees the checkout (the deferred second re-sweeps and dispatches)", () => {
-  // The first escalation reached a terminal state → its checkout is free again, so the
-  // second (which deferred while it was live) now dispatches.
-  const ended: Job[] = [
-    escJobCwd("deconflict", "fn-1-foo", "ended", "/repo/root"),
-  ];
-  expect(
-    escalationCheckoutOccupiedBy(ended, "/repo/root", "deconflict", "fn-2-bar"),
-  ).toBe(false);
-  const killed: Job[] = [
-    escJobCwd("resolve", "fn-1-foo", "killed", "/repo/root"),
-  ];
-  expect(
-    escalationCheckoutOccupiedBy(
-      killed,
-      "/repo/root",
-      "deconflict",
-      "fn-2-bar",
-    ),
-  ).toBe(false);
-});
-
-test("escalationCheckoutOccupiedBy: an empty checkout (unresolved cwd) is never occupied, and a NULL job cwd never matches", () => {
-  expect(
-    escalationCheckoutOccupiedBy(
-      [escJobCwd("deconflict", "fn-1-foo", "working", "")],
-      "",
-      "deconflict",
-      "fn-2-bar",
-    ),
-  ).toBe(false);
-  // A live occupant with a null cwd cannot collide with a resolved candidate checkout.
-  expect(
-    escalationCheckoutOccupiedBy(
-      [escJobCwd("deconflict", "fn-1-foo", "working", null)],
-      "/repo/root",
-      "deconflict",
-      "fn-2-bar",
-    ),
-  ).toBe(false);
-});
 
 test("classifyEscalationOutcome: turn-active + launch-window → not terminal; stopped+open → declined; killed/ended+open → died; incident closed → not terminal", () => {
   // A turn-active session (working) → the notify waits, even with the incident open.
@@ -12159,58 +10947,6 @@ test("classifyEscalationOutcome: turn-active + launch-window → not terminal; s
       false,
     ),
   ).toEqual({ terminal: false });
-});
-
-test("permission-parked pin: a session parked on a mid-turn permission prompt stays 'working' until Stop, so turn-active occupancy is NOT freed while parked", () => {
-  // The load-bearing pin for turn-active occupancy: `escalationJobLive` keys on
-  // `state === 'working'`, so a session that STOPPED off `working` mid-turn while parked
-  // on a permission prompt would prematurely free its escalation slot. Fold a real
-  // permission-prompt lifecycle through the reducer and prove the parked session never
-  // leaves `working` before its turn-final Stop — so no parked-marker live arm is needed.
-  const { db } = freshMemDb();
-  seedEvent(db, "esc-sess", "SessionStart", 1);
-  seedEvent(db, "esc-sess", "UserPromptSubmit", 2);
-  // A tool-permission dialog: `Notification` with event_type `permission_prompt`. The
-  // reducer STAMPS `last_permission_prompt_at` but never flips `state` (the pill layers
-  // `[awaiting:…]` on top of the live turn).
-  db.run(
-    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
-       VALUES (3, 'esc-sess', 4242, 'Notification', 'permission_prompt', '{}')`,
-  );
-  drainToCompletion(db);
-
-  const parked = db
-    .query(
-      "SELECT state, last_permission_prompt_at FROM jobs WHERE job_id = 'esc-sess'",
-    )
-    .get() as { state: string; last_permission_prompt_at: number | null };
-  // The prompt folded (marker stamped) yet the session is STILL turn-active.
-  expect(parked.last_permission_prompt_at).not.toBeNull();
-  expect(parked.state).toBe("working");
-  // The exported per-key guard the dispatch sweep consults sees the parked session as
-  // occupying its slot — it must NOT be freed mid-turn.
-  const parkedJob = {
-    plan_verb: "unblock",
-    plan_ref: "esc-sess",
-    state: parked.state,
-    backend_exec_pane_id: null,
-  } as unknown as Job;
-  expect(escalationSessionLiveFor([parkedJob], "unblock", "esc-sess")).toBe(
-    true,
-  );
-
-  // The turn-final Stop is the ONLY thing that frees occupancy.
-  seedEvent(db, "esc-sess", "Stop", 4);
-  drainToCompletion(db);
-  const stopped = db
-    .query("SELECT state FROM jobs WHERE job_id = 'esc-sess'")
-    .get() as { state: string };
-  expect(stopped.state).toBe("stopped");
-  const stoppedJob = { ...parkedJob, state: stopped.state } as unknown as Job;
-  expect(escalationSessionLiveFor([stoppedJob], "unblock", "esc-sess")).toBe(
-    false,
-  );
-  db.close();
 });
 
 test("resolveEscalationJobsFor: reads only the matching verb+id rows; empty DB → []", () => {
@@ -12356,381 +11092,6 @@ test("resolveEscalationJobsFor: cross-instance NULL contamination — a resolved
   db.close();
 });
 
-// ---- dispatchEscalationSession (shared cap + occupancy + launch) --------------
-
-function fakeEscalationDispatchDeps(opts: {
-  countLive?: number;
-  isLive?: boolean;
-  checkoutBusy?: boolean;
-  launchOk?: boolean;
-  launchThrows?: boolean;
-  config?: { model: string; effort: string };
-}): {
-  deps: EscalationDispatchDeps;
-  launches: { spec: unknown; cwd: string; label: string }[];
-} {
-  const launches: { spec: unknown; cwd: string; label: string }[] = [];
-  const deps: EscalationDispatchDeps = {
-    countLiveEscalations: () => opts.countLive ?? 0,
-    isEscalationLive: () => opts.isLive ?? false,
-    isCheckoutOccupied: () => opts.checkoutBusy ?? false,
-    resolveConfig: () => opts.config ?? { model: "sonnet", effort: "high" },
-    launch: async (args) => {
-      if (opts.launchThrows) throw new Error("launch boom");
-      launches.push(args);
-      return { ok: opts.launchOk ?? true };
-    },
-  };
-  return { deps, launches };
-}
-
-test("dispatchEscalationSession: under cap + not live → launches ONE session at the config model/effort and returns dispatched", async () => {
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    config: { model: "sonnet", effort: "high" },
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/wt",
-  });
-  expect(outcome).toBe("dispatched");
-  expect(launches.length).toBe(1);
-  expect(launches[0]?.label).toBe("deconflict::fn-1-foo");
-  expect(launches[0]?.cwd).toBe("/repo/wt");
-  expect(launches[0]?.spec).toEqual({
-    prompt: "/plan:deconflict fn-1-foo",
-    claudeName: "deconflict::fn-1-foo",
-    model: "sonnet",
-    effort: "high",
-  });
-});
-
-test("dispatchEscalationSession: a launch miss returns dispatch_failed", async () => {
-  const { deps } = fakeEscalationDispatchDeps({ launchOk: false });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/wt",
-  });
-  expect(outcome).toBe("dispatch_failed");
-});
-
-test("dispatchEscalationSession: at the global cap → at_cap, launch NOT called (row stays pending)", async () => {
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    countLive: MAX_LIVE_ESCALATION_SESSIONS,
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "unblock",
-    id: "fn-1-foo.3",
-    prompt: "/plan:unblock fn-1-foo.3",
-    cwd: "/repo",
-  });
-  expect(outcome).toBe("at_cap");
-  expect(launches).toEqual([]);
-});
-
-test("dispatchEscalationSession: an already-live session → already_live, launch NOT called (occupancy guard wins over the cap)", async () => {
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    isLive: true,
-    // Even under cap, occupancy short-circuits first.
-    countLive: 0,
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/wt",
-  });
-  expect(outcome).toBe("already_live");
-  expect(launches).toEqual([]);
-});
-
-test("dispatchEscalationSession: an occupied base checkout → checkout_busy, launch NOT called (the per-checkout serialization guard)", async () => {
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    checkoutBusy: true,
-    // Under cap and not the same key live — only the per-checkout guard blocks.
-    countLive: 0,
-    isLive: false,
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-2-bar",
-    prompt: "/plan:deconflict fn-2-bar",
-    cwd: "/repo/root",
-  });
-  expect(outcome).toBe("checkout_busy");
-  expect(launches).toEqual([]);
-});
-
-test("dispatchEscalationSession: the per-key already_live guard wins over a busy checkout", async () => {
-  // Both guards would fire; already_live is checked first (the specific-key short-circuit).
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    isLive: true,
-    checkoutBusy: true,
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/root",
-  });
-  expect(outcome).toBe("already_live");
-  expect(launches).toEqual([]);
-});
-
-test("dispatchEscalationSession: the checkout guard wins over the cap (an occupied checkout skips before the cap is consulted)", async () => {
-  let capConsulted = false;
-  const launches: { spec: unknown; cwd: string; label: string }[] = [];
-  const deps: EscalationDispatchDeps = {
-    countLiveEscalations: () => {
-      capConsulted = true;
-      return MAX_LIVE_ESCALATION_SESSIONS;
-    },
-    isEscalationLive: () => false,
-    isCheckoutOccupied: () => true,
-    resolveConfig: () => ({ model: "sonnet", effort: "high" }),
-    launch: async (args) => {
-      launches.push(args);
-      return { ok: true };
-    },
-  };
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-2-bar",
-    prompt: "/plan:deconflict fn-2-bar",
-    cwd: "/repo/root",
-  });
-  expect(outcome).toBe("checkout_busy");
-  expect(launches).toEqual([]);
-  expect(capConsulted).toBe(false);
-});
-
-test("dispatchEscalationSession: a free checkout under cap dispatches normally (the guard is not a blanket block)", async () => {
-  const { deps, launches } = fakeEscalationDispatchDeps({
-    checkoutBusy: false,
-  });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/root",
-  });
-  expect(outcome).toBe("dispatched");
-  expect(launches.length).toBe(1);
-});
-
-test("dispatchEscalationSession: a THROWING launcher degrades to dispatch_failed (never throws)", async () => {
-  const { deps } = fakeEscalationDispatchDeps({ launchThrows: true });
-  const outcome = await dispatchEscalationSession(deps, {
-    verb: "deconflict",
-    id: "fn-1-foo",
-    prompt: "/plan:deconflict fn-1-foo",
-    cwd: "/repo/wt",
-  });
-  expect(outcome).toBe("dispatch_failed");
-});
-
-// ---- selectPendingHumanNotifications (the stage-3 working-set read) -----------
-
-test("selectPendingHumanNotifications: picks only dispatched-but-not-notified close rows with the exact token", () => {
-  const { db } = freshMemDb();
-  // Deconflict dispatched, human not yet notified → SELECTED (the stage-3 working set).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-1-foo",
-    reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-    dir: "/repo/root",
-    mergeEscalatedAt: 111,
-  });
-  // Not yet dispatched (merge_escalated_at NULL) → dropped (stage 2 owns it still).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-2-pending",
-    reason: mergeConflictReason("fn-2-pending.1", "keeper/epic/fn-2-pending"),
-    dir: "/repo/root",
-  });
-  // Already human-notified → dropped (notify-once).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-3-notified",
-    reason: mergeConflictReason("fn-3-notified.1", "keeper/epic/fn-3-notified"),
-    dir: "/repo/root",
-    mergeEscalatedAt: 222,
-  });
-  db.run(
-    "UPDATE dispatch_failures SET human_notified_at = 333 WHERE verb = 'close' AND id = ?",
-    ["fn-3-notified"],
-  );
-  // Dispatched but an excluded reason token → dropped.
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-4-lock",
-    reason: "worktree-merge-lock-timeout: could not acquire the lock",
-    mergeEscalatedAt: 444,
-  });
-
-  const rows = selectPendingHumanNotifications(db);
-  expect(rows).toEqual([
-    {
-      id: "fn-1-foo",
-      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-      dir: "/repo/root",
-    },
-  ]);
-  db.close();
-});
-
-test("selectPendingHumanNotifications: empty table returns []", () => {
-  const { db } = freshMemDb();
-  expect(selectPendingHumanNotifications(db)).toEqual([]);
-  db.close();
-});
-
-// ---- runDeconflictHumanNotifySweep (stage-3 orchestration core, injected deps) -
-
-interface HumanNotifyMintCall {
-  id: string;
-  outcome: MergeHumanNotifiedOutcome;
-}
-
-function fakeHumanNotifySweepDeps(opts: {
-  pending: PendingMergeEscalation[];
-  stillPending?: (id: string) => boolean;
-  deconflictOutcome?: (id: string) => ResolverOutcome;
-  notify?: (
-    row: PendingMergeEscalation,
-    verdict: "declined" | "died",
-  ) => Promise<MergeHumanNotifiedOutcome>;
-  selectThrows?: boolean;
-}): {
-  deps: DeconflictHumanNotifySweepDeps;
-  mints: HumanNotifyMintCall[];
-  notifies: { id: string; verdict: "declined" | "died" }[];
-} {
-  const mints: HumanNotifyMintCall[] = [];
-  const notifies: { id: string; verdict: "declined" | "died" }[] = [];
-  const deps: DeconflictHumanNotifySweepDeps = {
-    selectPending: () => {
-      if (opts.selectThrows) throw new Error("read boom");
-      return opts.pending;
-    },
-    stillPending: opts.stillPending ?? (() => true),
-    // Default: the deconflict session already declined (terminal), so the notify fires.
-    deconflictOutcome:
-      opts.deconflictOutcome ??
-      (() => ({ terminal: true, verdict: "declined" })),
-    notifyHuman: async (row, verdict) => {
-      notifies.push({ id: row.id, verdict });
-      return (await opts.notify?.(row, verdict)) ?? "notified";
-    },
-    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
-  };
-  return { deps, mints, notifies };
-}
-
-function humanNotifyPending(): PendingMergeEscalation[] {
-  return [
-    {
-      id: "fn-1-foo",
-      reason: mergeConflictReason("fn-1-foo.2", "keeper/epic/fn-1-foo"),
-      dir: "/repo/root",
-    },
-  ];
-}
-
-test("runDeconflictHumanNotifySweep: a declined deconflict notifies the human ONCE and mints notified", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(notifies).toEqual([{ id: "fn-1-foo", verdict: "declined" }]);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notified" }]);
-});
-
-test("runDeconflictHumanNotifySweep: a DIED deconflict notifies once and carries the died verdict", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-    deconflictOutcome: () => ({ terminal: true, verdict: "died" }),
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(notifies).toEqual([{ id: "fn-1-foo", verdict: "died" }]);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notified" }]);
-});
-
-test("runDeconflictHumanNotifySweep: a notify_failed leaves the marker unset (re-sweepable, never silent)", async () => {
-  const { deps, mints } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-    notify: async () => "notify_failed",
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notify_failed" }]);
-});
-
-test("runDeconflictHumanNotifySweep: a THROWING notify never aborts the sweep (records notify_failed)", async () => {
-  const { deps, mints } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-    notify: async () => {
-      throw new Error("agentbot boom");
-    },
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo", outcome: "notify_failed" }]);
-});
-
-test("runDeconflictHumanNotifySweep: a live/not-yet-terminal deconflict defers — no notify, no mint", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-    deconflictOutcome: () => ({ terminal: false }),
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runDeconflictHumanNotifySweep: a row cleared mid-sweep (stillPending false, e.g. retry_dispatch) is skipped — no notify, no mint", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: humanNotifyPending(),
-    stillPending: () => false,
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runDeconflictHumanNotifySweep: a non-token reason is skipped (defense-in-depth gate)", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo",
-        reason: "worktree-merge-lock-timeout: could not acquire the lock",
-        dir: "/repo/root",
-      },
-    ],
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runDeconflictHumanNotifySweep: an empty pending set is a no-op", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({ pending: [] });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(mints).toEqual([]);
-  expect(notifies).toEqual([]);
-});
-
-test("runDeconflictHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, notifies } = fakeHumanNotifySweepDeps({
-    pending: [],
-    selectThrows: true,
-  });
-  await runDeconflictHumanNotifySweep(deps);
-  expect(mints).toEqual([]);
-  expect(notifies).toEqual([]);
-});
-
 // fn-701 task .3 — @parcel/watcher pre-warm. The native-addon dlopen race is
 // timing-dependent and cannot be regression-tested directly, so these cover the
 // helper's two contractual branches: a healthy load is a silent no-op (invoking
@@ -12787,566 +11148,6 @@ test("prewarmWatcherAddon: the loud assertion does NOT downgrade a genuine failu
       () => {},
     ),
   ).toThrow("ABI mismatch");
-});
-
-// ---- fn-1240 work-verb fan-in merge-conflict escalation (tier-2) --------------
-// The full WORK escalation, mirroring the close pipeline: a stuck `work::<taskId>`
-// `worktree-merge-conflict` row → `resolve::<taskId>` resolver (stage 1) → on its terminal
-// decline a `deconflict::<taskId>` session (stage 2, sequenced behind the resolver's leased
-// terminal verdict) → on ITS terminal decline the human is paged ONCE (stage 3). Identity
-// is task-scoped so `resolve::`/`deconflict::<taskId>` never collide with the close path's
-// epic-scoped sessions; `retry_dispatch` drops the row and re-arms the whole chain.
-
-// ---- selectPendingWorkResolverDispatches (stage-1 working-set read) -----------
-
-test("selectPendingWorkResolverDispatches: picks only work rows with the exact token and a NULL resolver latch", () => {
-  const { db } = freshMemDb();
-  // Dispatchable: a sticky work fan-in conflict, no resolver yet.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-1-foo.2",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    dir: "/wt/lane",
-  });
-  // Already resolver-dispatched (latch set) → dropped (dispatch-once).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-2-done.3",
-    reason: mergeConflictReason("fn-2-done.1", "keeper/epic/fn-2-done"),
-    dir: "/wt/lane2",
-    resolverDispatchedAt: 999,
-  });
-  // A non-merge-conflict work failure → dropped.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-3-launch.1",
-    reason: "launch_failed: worker never bound",
-    dir: "/wt/lane3",
-  });
-  // A `worktree-merge` PREFIX (not the exact token) → dropped.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-4-lock.1",
-    reason: "worktree-merge-lock-timeout: could not acquire the lock",
-    dir: "/wt/lane4",
-  });
-  // A CLOSE merge-conflict row → dropped (this selector is work-verb only).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-5-close",
-    reason: mergeConflictReason("fn-5-close.1", "keeper/epic/fn-5-close"),
-    dir: "/repo/root",
-  });
-
-  expect(selectPendingWorkResolverDispatches(db)).toEqual([
-    {
-      id: "fn-1-foo.2",
-      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-      dir: "/wt/lane",
-    },
-  ]);
-  db.close();
-});
-
-// ---- selectPendingWorkMergeEscalations (stage-2 working-set read) -------------
-
-test("selectPendingWorkMergeEscalations: picks work rows with resolver dispatched but deconflict NOT yet dispatched", () => {
-  const { db } = freshMemDb();
-  // Escalatable: resolver dispatched (latch SET), deconflict latch still NULL.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-1-foo.2",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    dir: "/wt/lane",
-    resolverDispatchedAt: 111,
-  });
-  // Resolver NOT yet dispatched → NOT escalatable (the deconflict is sequenced behind it).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-2-nores.1",
-    reason: mergeConflictReason("fn-2-nores.1", "keeper/epic/fn-2-nores"),
-    dir: "/wt/lane2",
-  });
-  // Already escalated (deconflict dispatched) → dropped (escalate-once).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-3-esc.1",
-    reason: mergeConflictReason("fn-3-esc.1", "keeper/epic/fn-3-esc"),
-    dir: "/wt/lane3",
-    resolverDispatchedAt: 111,
-    mergeEscalatedAt: 222,
-  });
-  // A CLOSE row with the same latch shape → dropped (work-verb only).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-4-close",
-    reason: mergeConflictReason("fn-4-close.1", "keeper/epic/fn-4-close"),
-    dir: "/repo/root",
-    resolverDispatchedAt: 111,
-  });
-
-  expect(selectPendingWorkMergeEscalations(db)).toEqual([
-    {
-      id: "fn-1-foo.2",
-      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-      dir: "/wt/lane",
-    },
-  ]);
-  db.close();
-});
-
-// ---- selectPendingWorkMergeNotifications (stage-3 working-set read) -----------
-// Tier-2: the page is now SEQUENCED — gated on `merge_escalated_at IS NOT NULL` (the
-// deconflict was dispatched), NOT firing straight away as in the page-only tier.
-
-test("selectPendingWorkMergeNotifications: picks work rows with deconflict dispatched but human NOT yet paged", () => {
-  const { db } = freshMemDb();
-  // Pageable: deconflict dispatched (merge_escalated_at SET), not yet paged.
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-1-foo.2",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    dir: "/wt/lane",
-    resolverDispatchedAt: 111,
-    mergeEscalatedAt: 222,
-  });
-  // Deconflict NOT yet dispatched (merge_escalated_at NULL) → dropped (the tier-2 page
-  // waits for the deconflict, unlike the old page-only tier which fired straight away).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-2-noesc.1",
-    reason: mergeConflictReason("fn-2-noesc.1", "keeper/epic/fn-2-noesc"),
-    dir: "/wt/lane2",
-    resolverDispatchedAt: 111,
-  });
-  // Already paged (human_notified_at set) → dropped (page-once).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-3-paged.1",
-    reason: mergeConflictReason("fn-3-paged.1", "keeper/epic/fn-3-paged"),
-    dir: "/wt/lane3",
-    resolverDispatchedAt: 111,
-    mergeEscalatedAt: 222,
-  });
-  db.run(
-    "UPDATE dispatch_failures SET human_notified_at = 333 WHERE verb = 'work' AND id = ?",
-    ["fn-3-paged.1"],
-  );
-  // A non-merge-conflict work failure → dropped (never pages).
-  seedResolverFailureRow(db, {
-    verb: "work",
-    id: "fn-4-launch.1",
-    reason: "launch_failed: worker never bound",
-    dir: "/wt/lane4",
-    mergeEscalatedAt: 222,
-  });
-  // A CLOSE merge-conflict row → dropped (this selector is work-verb only).
-  seedResolverFailureRow(db, {
-    verb: "close",
-    id: "fn-5-close",
-    reason: mergeConflictReason("fn-5-close.1", "keeper/epic/fn-5-close"),
-    dir: "/repo/root",
-    resolverDispatchedAt: 111,
-    mergeEscalatedAt: 222,
-  });
-
-  expect(selectPendingWorkMergeNotifications(db)).toEqual([
-    {
-      id: "fn-1-foo.2",
-      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-      dir: "/wt/lane",
-    },
-  ]);
-  db.close();
-});
-
-test("selectPendingWork* selectors: empty table returns []", () => {
-  const { db } = freshMemDb();
-  expect(selectPendingWorkResolverDispatches(db)).toEqual([]);
-  expect(selectPendingWorkMergeEscalations(db)).toEqual([]);
-  expect(selectPendingWorkMergeNotifications(db)).toEqual([]);
-  db.close();
-});
-
-// ---- buildWorkMergeHumanNotifyBody (pure terminal page body) ------------------
-
-test("buildWorkMergeHumanNotifyBody: names the task, verdict, lane, reason, and the unstick command", () => {
-  const body = buildWorkMergeHumanNotifyBody({
-    taskId: "fn-1-foo.2",
-    lane: "/wt/lane",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    verdict: "declined",
-  });
-  expect(body).toContain("work::fn-1-foo.2");
-  // Tier-2 framing: both the resolver AND the deconflict session gave up.
-  expect(body).toContain("the autonomous merge-resolver AND the");
-  expect(body).toContain("DECLINED");
-  expect(body).toContain("keeper autopilot retry work::fn-1-foo.2");
-  expect(body).toContain("Lane: /wt/lane");
-  expect(body).toContain("CONFLICT (content): Merge conflict in src/foo.ts");
-});
-
-test("buildWorkMergeHumanNotifyBody: a `died` verdict frames the deconflict session death", () => {
-  const body = buildWorkMergeHumanNotifyBody({
-    taskId: "fn-1-foo.2",
-    lane: "/wt/lane",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    verdict: "died",
-  });
-  expect(body).toContain("DIED");
-});
-
-test("buildWorkMergeHumanNotifyBody: a null/empty lane degrades to `?` (never throws)", () => {
-  const body = buildWorkMergeHumanNotifyBody({
-    taskId: "fn-1-foo.2",
-    lane: null,
-    reason: "worktree-merge-conflict: merging a into b — x",
-    verdict: "declined",
-  });
-  expect(body).toContain("Lane: ?");
-});
-
-test("buildWorkMergeHumanNotifyBody: a pathological reason is size-bounded (no unbounded agentbot arg)", () => {
-  const hugeStderr = "CONFLICT ".repeat(500); // ~4.5k chars
-  const body = buildWorkMergeHumanNotifyBody({
-    taskId: "fn-1-foo.2",
-    lane: "/wt/lane",
-    reason: `worktree-merge-conflict: merging a into b — ${hugeStderr}`,
-    verdict: "declined",
-  });
-  expect(body).toContain("[truncated]");
-  // The whole body stays comfortably bounded despite the pathological stderr.
-  expect(body.length).toBeLessThan(1200);
-});
-
-// ---- buildWorkResolverBrief (pure resolver brief) ----------------------------
-
-test("buildWorkResolverBrief: task-scoped framing, the lane cwd DIRECTLY, and the shared guardrail", () => {
-  const brief = buildWorkResolverBrief({
-    taskId: "fn-1-foo.2",
-    reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-    laneDir: "/wt/lane",
-  });
-  // Task-scoped framing + unstick command (never the close path's epic/close::).
-  expect(brief).toContain("task fn-1-foo.2");
-  expect(brief).toContain("work::fn-1-foo.2");
-  expect(brief).toContain("keeper autopilot retry work::fn-1-foo.2");
-  expect(brief).not.toContain("close::");
-  // The worker cds to the lane dir DIRECTLY (per the ADR — not a fabricated worktree path)
-  // and re-runs the fan-in merge of the parsed source.
-  expect(brief).toContain("cd /wt/lane");
-  expect(brief).toContain("git merge --no-ff fn-1-foo.1");
-  // The classify-or-BLOCK guardrail is reused VERBATIM from the close resolver brief.
-  expect(brief).toContain(
-    "GUARDRAIL — your authority is narrower than a human's.",
-  );
-  expect(brief).toContain("SCHEMA-VERSION COLLISION CARVE-OUT");
-  // Green-gate: passing tests are necessary, not sufficient.
-  expect(brief).toContain("passing tests are");
-});
-
-test("buildWorkResolverBrief: a parse-miss / missing lane degrades to a still-actionable brief (never throws)", () => {
-  const brief = buildWorkResolverBrief({
-    taskId: "fn-1-foo.2",
-    reason: "worktree-merge-conflict: unparseable head",
-    laneDir: null,
-  });
-  expect(brief).toContain("task fn-1-foo.2");
-  expect(brief).toContain("keeper autopilot retry work::fn-1-foo.2");
-  // Still carries the guardrail even on the degraded path.
-  expect(brief).toContain(
-    "GUARDRAIL — your authority is narrower than a human's.",
-  );
-});
-
-// ---- runWorkMergeHumanNotifySweep (orchestration core, injected deps) ---------
-
-function fakeWorkMergeSweepDeps(opts: {
-  pending: PendingWorkMergeConflict[];
-  stillPending?: (id: string) => boolean;
-  deconflictOutcome?: (id: string) => ResolverOutcome;
-  notify?: (
-    row: PendingWorkMergeConflict,
-    verdict: "declined" | "died",
-  ) => Promise<MergeHumanNotifiedOutcome>;
-  selectThrows?: boolean;
-}): {
-  deps: WorkMergeHumanNotifySweepDeps;
-  mints: HumanNotifyMintCall[];
-  notifies: Array<{ id: string; verdict: "declined" | "died" }>;
-} {
-  const mints: HumanNotifyMintCall[] = [];
-  const notifies: Array<{ id: string; verdict: "declined" | "died" }> = [];
-  const deps: WorkMergeHumanNotifySweepDeps = {
-    selectPending: () => {
-      if (opts.selectThrows) throw new Error("read boom");
-      return opts.pending;
-    },
-    stillPending: opts.stillPending ?? (() => true),
-    // Default: the deconflict already declined (terminal), so the page fires.
-    deconflictOutcome:
-      opts.deconflictOutcome ??
-      (() => ({ terminal: true, verdict: "declined" }) as ResolverOutcome),
-    notifyHuman: async (row, verdict) => {
-      notifies.push({ id: row.id, verdict });
-      return (await opts.notify?.(row, verdict)) ?? "notified";
-    },
-    mintAttempted: (id, outcome) => mints.push({ id, outcome }),
-  };
-  return { deps, mints, notifies };
-}
-
-function workMergePending(): PendingWorkMergeConflict[] {
-  return [
-    {
-      id: "fn-1-foo.2",
-      reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-      dir: "/wt/lane",
-    },
-  ];
-}
-
-test("runWorkMergeHumanNotifySweep: a declined deconflict pages the human ONCE with the verdict and mints notified", async () => {
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([{ id: "fn-1-foo.2", verdict: "declined" }]);
-  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notified" }]);
-});
-
-test("runWorkMergeHumanNotifySweep: a LIVE (non-terminal) deconflict session defers the page — no page, no mint", async () => {
-  // Sequencing: the human is paged ONLY at the deconflict's terminal decline. While it is
-  // live (or its job has not folded yet) the sweep skips without minting — a successful
-  // deconflict would clear the sticky before this ever fires.
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-    deconflictOutcome: () => ({ terminal: false }),
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runWorkMergeHumanNotifySweep: a died deconflict pages with the `died` verdict", async () => {
-  const { deps, notifies } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-    deconflictOutcome: () => ({ terminal: true, verdict: "died" }),
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([{ id: "fn-1-foo.2", verdict: "died" }]);
-});
-
-test("runWorkMergeHumanNotifySweep: an empty pending set (already-paged row dropped by selector) is a no-op", async () => {
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({ pending: [] });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runWorkMergeHumanNotifySweep: a failed page leaves the marker unminted-terminal (notify_failed re-sweeps)", async () => {
-  const { deps, mints } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-    notify: async () => "notify_failed",
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  // notify_failed mints attempted{notify_failed} — the fold no-ops on it, so the marker
-  // stays NULL and the next sweep retries the page.
-  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
-});
-
-test("runWorkMergeHumanNotifySweep: a THROWING notifier never aborts the sweep (records notify_failed)", async () => {
-  const { deps, mints } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-    notify: async () => {
-      throw new Error("agentbot boom");
-    },
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "notify_failed" }]);
-});
-
-test("runWorkMergeHumanNotifySweep: a row cleared mid-sweep (stillPending false) is skipped — no page, no mint", async () => {
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
-    pending: workMergePending(),
-    stillPending: () => false,
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runWorkMergeHumanNotifySweep: a non-token reason in the pending set is NOT paged (defense-in-depth gate)", async () => {
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo.2",
-        reason: "worktree-merge-lock-timeout: could not acquire the lock",
-        dir: "/wt/lane",
-      },
-    ],
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runWorkMergeHumanNotifySweep: a throwing selectPending degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, notifies } = fakeWorkMergeSweepDeps({
-    pending: [],
-    selectThrows: true,
-  });
-  await runWorkMergeHumanNotifySweep(deps);
-  expect(mints).toEqual([]);
-  expect(notifies).toEqual([]);
-});
-
-// ---- workLaneBusyForResolver (the retry-in-flight resolver exclusion) ---------
-
-test("workLaneBusyForResolver: a live work OR resolve session for the task blocks; a stopped/dead one does not", () => {
-  const taskId = "fn-1-foo.2";
-  // A manual `retry_dispatch` re-dispatched the work lane → a live `work::<taskId>` → busy.
-  expect(
-    workLaneBusyForResolver(
-      [mkResolveJob({ plan_verb: "work", plan_ref: taskId, state: "working" })],
-      taskId,
-    ),
-  ).toBe(true);
-  // A resolver already in flight → live `resolve::<taskId>` → busy (double-dispatch guard).
-  expect(
-    workLaneBusyForResolver(
-      [mkResolveJob({ plan_ref: taskId, state: "working" })],
-      taskId,
-    ),
-  ).toBe(true);
-  // A stopped work/resolve session has yielded its turn → NOT busy.
-  expect(
-    workLaneBusyForResolver(
-      [
-        mkResolveJob({ plan_verb: "work", plan_ref: taskId, state: "stopped" }),
-        mkResolveJob({ plan_ref: taskId, state: "killed" }),
-      ],
-      taskId,
-    ),
-  ).toBe(false);
-  // A DIFFERENT task's live work session never blocks this one.
-  expect(
-    workLaneBusyForResolver(
-      [
-        mkResolveJob({
-          plan_verb: "work",
-          plan_ref: "fn-2-bar.1",
-          state: "working",
-        }),
-      ],
-      taskId,
-    ),
-  ).toBe(false);
-  // Empty jobs → not busy.
-  expect(workLaneBusyForResolver([], taskId)).toBe(false);
-});
-
-// ---- classifyWorkResolverOutcome (the leased resolver-outcome gate) -----------
-
-test("classifyWorkResolverOutcome: a declined/died/live resolver classifies exactly as the base (no lease)", () => {
-  const taskId = "fn-1-foo.2";
-  const now = 10_000;
-  // Stopped resolver, sticky survives → declined.
-  const declined = new Map<string, Job>([
-    ["j", mkResolveJob({ plan_ref: taskId, state: "stopped" })],
-  ]);
-  expect(
-    classifyWorkResolverOutcome(
-      declined,
-      taskId,
-      100,
-      now,
-      WORK_RESOLVER_LEASE_SEC,
-    ),
-  ).toEqual({ terminal: true, verdict: "declined" });
-  // Killed resolver → died.
-  const died = new Map<string, Job>([
-    ["j", mkResolveJob({ plan_ref: taskId, state: "killed" })],
-  ]);
-  expect(
-    classifyWorkResolverOutcome(
-      died,
-      taskId,
-      100,
-      now,
-      WORK_RESOLVER_LEASE_SEC,
-    ),
-  ).toEqual({ terminal: true, verdict: "died" });
-  // Working resolver → NOT terminal, and NEVER leased out even with an ancient latch.
-  const live = new Map<string, Job>([
-    ["j", mkResolveJob({ plan_ref: taskId, state: "working" })],
-  ]);
-  expect(
-    classifyWorkResolverOutcome(live, taskId, 1, now, WORK_RESOLVER_LEASE_SEC),
-  ).toEqual({ terminal: false });
-});
-
-test("classifyWorkResolverOutcome: a never-folded resolver waits within the lease, then reclaims as died (no deadlock)", () => {
-  const taskId = "fn-1-foo.2";
-  const empty = new Map<string, Job>(); // launch reported ok, jobs row never folded
-  const dispatchedAt = 1_000;
-  // Within the lease: still waiting for the row to fold (base non-terminal).
-  expect(
-    classifyWorkResolverOutcome(
-      empty,
-      taskId,
-      dispatchedAt,
-      dispatchedAt + WORK_RESOLVER_LEASE_SEC - 1,
-      WORK_RESOLVER_LEASE_SEC,
-    ),
-  ).toEqual({ terminal: false });
-  // Past the lease with no live resolver → reclaim as died so the deconflict dispatches.
-  expect(
-    classifyWorkResolverOutcome(
-      empty,
-      taskId,
-      dispatchedAt,
-      dispatchedAt + WORK_RESOLVER_LEASE_SEC + 1,
-      WORK_RESOLVER_LEASE_SEC,
-    ),
-  ).toEqual({ terminal: true, verdict: "died" });
-  // A NULL latch (no dispatch recorded) never reclaims — nothing to lease against.
-  expect(
-    classifyWorkResolverOutcome(
-      empty,
-      taskId,
-      null,
-      10_000_000,
-      WORK_RESOLVER_LEASE_SEC,
-    ),
-  ).toEqual({ terminal: false });
-});
-
-test("runMergeEscalationSweep + classifyWorkResolverOutcome: a leased-out crashed resolver dispatches the work deconflict (end-to-end)", async () => {
-  // The stage-2 sweep is the generic `runMergeEscalationSweep`; wired with the work-verb
-  // leased resolver-outcome classifier, a crashed/never-folded resolver past the lease reads
-  // terminal and the deconflict dispatches — the no-deadlock guarantee end-to-end.
-  const empty = new Map<string, Job>();
-  const { deps, mints, dispatches } = fakeMergeSweepDeps({
-    pending: [
-      {
-        id: "fn-1-foo.2",
-        reason: mergeConflictReason("fn-1-foo.1", "keeper/epic/fn-1-foo"),
-        dir: "/wt/lane",
-      },
-    ],
-    resolverOutcome: (id) =>
-      classifyWorkResolverOutcome(
-        empty,
-        id,
-        1_000,
-        1_000 + WORK_RESOLVER_LEASE_SEC + 5,
-        WORK_RESOLVER_LEASE_SEC,
-      ),
-  });
-  await runMergeEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect(mints).toEqual([{ id: "fn-1-foo.2", outcome: "dispatched" }]);
 });
 
 // ---------------------------------------------------------------------------

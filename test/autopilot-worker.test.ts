@@ -101,7 +101,6 @@ import {
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
   epicFrameVerdict,
-  epicHasActiveResolver,
   epicPresentAndNotDone,
   epicRecoverVerdictById,
   extractCloseFinalizeReceipt,
@@ -241,7 +240,6 @@ import {
   planPendingDispatchSweep,
   planTerminalSessionClaimReleases,
   runSharedCheckoutPageSweep,
-  shouldEscalateMergeConflict,
   terminalSessionClaimIsReleaseable,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "../src/db";
@@ -1210,54 +1208,6 @@ test("fn-811 isOccupyingJob: stopped-with-DEAD-pane no longer occupies (the wedg
   );
   // No pane id at all is likewise not live-provable here.
   expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set())).toBe(false);
-});
-
-test("fn-1095 epicHasActiveResolver: true only for a LIVE `resolve::<epic>` job, keyed per-epic", () => {
-  const jobs = new Map<string, Job>();
-  jobs.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "resolve",
-      plan_ref: "fn-1-foo",
-      state: "working",
-      backend_exec_pane_id: "%1",
-    }),
-  );
-  // A live resolver for fn-1-foo → excluded; an unrelated epic is untouched (the
-  // per-epic scope, not a global flag).
-  expect(epicHasActiveResolver(jobs, "fn-1-foo", null)).toBe(true);
-  expect(epicHasActiveResolver(jobs, "fn-2-bar", null)).toBe(false);
-});
-
-test("fn-1095 epicHasActiveResolver: a reaped/terminal resolver no longer excludes (auto-lift on crash/exit)", () => {
-  const jobs = new Map<string, Job>();
-  // The resolver's pane is DEAD (absent from the live set) and the job is stopped —
-  // a crashed/exited resolver. The exclusion must lift so recover reclaims the lane.
-  jobs.set(
-    "j-1",
-    makeJob({
-      job_id: "j-1",
-      plan_verb: "resolve",
-      plan_ref: "fn-1-foo",
-      state: "stopped",
-      backend_exec_pane_id: "%7",
-    }),
-  );
-  expect(epicHasActiveResolver(jobs, "fn-1-foo", new Set(["%99"]))).toBe(false);
-  // A `work`/`close` job for the same id is NOT a resolver — never excludes recover.
-  const other = new Map<string, Job>();
-  other.set(
-    "j-2",
-    makeJob({
-      job_id: "j-2",
-      plan_verb: "close",
-      plan_ref: "fn-1-foo",
-      state: "working",
-      backend_exec_pane_id: "%2",
-    }),
-  );
-  expect(epicHasActiveResolver(other, "fn-1-foo", null)).toBe(false);
 });
 
 test("classifyResolverOutcome: no resolve job row is not terminal (launch window — the escalation waits)", () => {
@@ -16171,9 +16121,6 @@ test("fn-1050 worktreeRecoverEpicDispatchId: composite is retry_dispatch-able, s
   // it, and a recover REASON (`worktree-recover-*`) never trips the escalate-once sweep
   // meant for provision/finalize `worktree-merge-conflict` blocks.
   expect(key.startsWith(MERGE_ESCALATION_REASON_TOKEN)).toBe(false);
-  expect(
-    shouldEscalateMergeConflict("worktree-recover-conflict: merging …"),
-  ).toBe(false);
 });
 
 test("fn-1119 deploy transition: an old-scheme bare-epic recover row is RETAINED under positive-evidence clearing (persists until retry_dispatch); a genuine close-sink conflict is untouched", async () => {
@@ -16229,26 +16176,26 @@ test("loadReconcileSnapshot routes only unclaimed incident rows with an attachme
     const insert = (
       id: string,
       claim: string | null,
-      resolverAt: number | null,
-      mergeAt: number | null,
+      attachments: number,
     ): void => {
       db.run(
         `INSERT INTO dispatch_failures
            (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-            claim_session_id, resolver_dispatched_at, merge_escalated_at)
-         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?, ?)`,
+            claim_session_id, owner_redispatch_attempts)
+         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?)`,
         [
           id,
           "worktree-merge-conflict: merging source into base — pending owner integration",
           claim,
-          resolverAt,
-          mergeAt,
+          attachments,
         ],
       );
     };
-    insert("fn-1-open.1", null, null, null);
-    insert("fn-2-claimed.1", "live-owner", null, null);
-    insert("fn-3-exhausted.1", null, 10, 20);
+    // Open (0 attachments, has a slot), claimed (owned), exhausted (both slots
+    // consumed → count at the lease limit).
+    insert("fn-1-open.1", null, 0);
+    insert("fn-2-claimed.1", "live-owner", 0);
+    insert("fn-3-exhausted.1", null, 2);
 
     const snapshot = await loadReconcileSnapshot(db);
     expect([...(snapshot.incidentOwnerKeys ?? [])]).toEqual([

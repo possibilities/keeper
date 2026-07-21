@@ -300,7 +300,7 @@ export function evaluateDurableAwaitConditions(
     .all() as Array<Record<string, unknown>>;
   const deadLetters = db.query("SELECT 1 FROM dead_letters").all().length;
   const blockEscalations = db
-    .query("SELECT 1 FROM block_escalations")
+    .query("SELECT 1 FROM dispatch_failures WHERE verb = 'block'")
     .all().length;
   const needsHuman = projectNeedsHuman({
     dispatchFailures,

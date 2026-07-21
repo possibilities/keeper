@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted.
+Superseded by [ADR 0089](../0089-in-session-escalation-subagents.md): escalation execution
+moved from a dispatched out-of-band session into a confined Task subagent inside the
+owning `/work`/`/close` session. The rest of this record describes the dispatched-session
+machinery it replaced.
 
 ## Context
 

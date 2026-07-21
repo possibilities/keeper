@@ -161,8 +161,9 @@ export interface DeconflictIncident {
     base_branch: string | null;
     stderr: string | null;
     repo_dir: string | null;
-    merge_escalated_at: number | null;
-    resolver_dispatched_at: number | null;
+    /** Durable owner-attachment count consumed by this incident — the collapsed
+     *  home of the retired `resolver_dispatched_at` / `merge_escalated_at` lease. */
+    owner_redispatch_attempts: number;
     /** The incident-fenced clear identities (ADR 0070). */
     instance_event_id: number | null;
     attempt_id: number | null;
@@ -529,7 +530,7 @@ function buildDeconflictIncident(
   const degraded: string[] = [];
   const row = db
     .query(
-      `SELECT reason, dir, merge_escalated_at, resolver_dispatched_at,
+      `SELECT reason, dir, owner_redispatch_attempts,
               instance_event_id, attempt_id, claim_session_id, claim_pid,
               claim_start_time, claimed_at
          FROM dispatch_failures WHERE verb = ? AND id = ?`,
@@ -537,8 +538,7 @@ function buildDeconflictIncident(
     .get(verb, stickyId) as {
     reason: string;
     dir: string | null;
-    merge_escalated_at: number | null;
-    resolver_dispatched_at: number | null;
+    owner_redispatch_attempts: number;
     instance_event_id: number | null;
     attempt_id: number | null;
     claim_session_id: string | null;
@@ -561,8 +561,7 @@ function buildDeconflictIncident(
       base_branch: parsed?.base ?? null,
       stderr: parsed?.stderr ?? null,
       repo_dir: row.dir,
-      merge_escalated_at: row.merge_escalated_at,
-      resolver_dispatched_at: row.resolver_dispatched_at,
+      owner_redispatch_attempts: row.owner_redispatch_attempts,
       instance_event_id: row.instance_event_id,
       attempt_id: row.attempt_id,
       claim:

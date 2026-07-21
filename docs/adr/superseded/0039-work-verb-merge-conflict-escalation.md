@@ -2,11 +2,12 @@
 
 ## Status
 
-Proposed. ADR number PROVISIONAL — assigned at merge (renumber if a sibling epic lands
-one first). Amends 0007: extends its close-scoped escalation pipeline (resolver →
-deconflict → one terminal agentbot page) to the `work` verb's fan-in conflicts. 0007's
-dispatch-once latching and single-page discipline, and 0017's turn-active lifecycle,
-stand unchanged and are reused here.
+Superseded by [ADR 0089](../0089-in-session-escalation-subagents.md): the resolver →
+deconflict → page pipeline this record extended to the `work` verb now runs as an
+in-session merge-resolver/deconflicter Task subagent pair inside the owning `/work`
+session, sharing one incident with the `close` path rather than a separate dispatched
+`work`-scoped session. The rest of this record describes the dispatched-session machinery
+it replaced. Amended 0007 (autonomous escalation dispatch), also superseded.
 
 ## Context
 

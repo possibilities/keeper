@@ -76,6 +76,7 @@ import {
 } from "./autopilot-projection";
 import { getCollection } from "./collections";
 import { effectivePerRootCap } from "./db";
+import { parsePlanRef } from "./derivers";
 import {
   type BootStatus,
   type EventStoreStatus,
@@ -2294,14 +2295,16 @@ export function subscribeReadiness(
       limit: SCHEDULED_TASKS_PAGE_LIMIT,
     },
   );
-  // `block_escalations` (fn-941) — one row per currently-blocked plan task the
-  // daemon producer has armed. The wire pk is `task_id`; the snapshot reads from
-  // `byId` (the pk is single-column, so no collapse). An empty steady state still
-  // produces a `result` with `rows: []` so the first-paint gate clears.
+  // `block_escalations` — one row per currently-blocked plan task the daemon
+  // producer has armed, collapsed onto the `dispatch_failures` `verb='block'`
+  // subset. The wire pk is the incident `id` (the task id); the snapshot reads from
+  // `byId` (the pk is single-column, so no collapse) and projects each row back into
+  // the `BlockEscalation` shape below. An empty steady state still produces a
+  // `result` with `rows: []` so the first-paint gate clears.
   const blockEscalations = makeState(
     "block_escalations",
     blockEscalationsSubId,
-    "task_id",
+    "id",
     {
       type: "query",
       collection: "block_escalations",
@@ -2679,11 +2682,39 @@ export function subscribeReadiness(
     // `(job_id, cron_id)` identity rides a single-column `job_id` wire pk, so
     // `byId` would collapse a multi-cron session to one row.
     const scheduledTasksTyped = projectRows<ScheduledTask>(scheduledTasks);
-    // fn-941: the escalation latch rows. `task_id` is the single-column wire pk,
-    // so `byId` carries every row without collapse — read from `state.rows` for
-    // symmetry with the other projections.
-    const blockEscalationsTyped =
-      projectRows<BlockEscalation>(blockEscalations);
+    // The block incidents — the `dispatch_failures` `verb='block'` subset — projected
+    // back into the `BlockEscalation` snapshot shape the board / status / await / watch
+    // surfaces read. The incident `id` IS the task id; the epic id is its prefix
+    // (`parsePlanRef`); `block_status` / `block_outcome` map to the latch's
+    // `status` / `outcome`. Read from `state.rows` for symmetry with the other
+    // projections.
+    const blockEscalationsTyped: BlockEscalation[] = projectRows<{
+      id?: unknown;
+      blocked_since?: unknown;
+      block_status?: unknown;
+      block_outcome?: unknown;
+      owner_redispatch_attempts?: unknown;
+      last_event_id?: unknown;
+      human_notified_at?: unknown;
+    }>(blockEscalations).map((r) => {
+      const taskId = typeof r.id === "string" ? r.id : "";
+      return {
+        task_id: taskId,
+        epic_id: parsePlanRef(taskId)?.epic_id ?? taskId,
+        blocked_since:
+          typeof r.blocked_since === "number" ? r.blocked_since : 0,
+        status: typeof r.block_status === "string" ? r.block_status : "",
+        outcome: typeof r.block_outcome === "string" ? r.block_outcome : null,
+        last_event_id:
+          typeof r.last_event_id === "number" ? r.last_event_id : 0,
+        human_notified_at:
+          typeof r.human_notified_at === "number" ? r.human_notified_at : null,
+        owner_redispatch_attempts:
+          typeof r.owner_redispatch_attempts === "number"
+            ? r.owner_redispatch_attempts
+            : 0,
+      };
+    });
     // fn-952: the `tmux_client_focus` singleton — read the one row (`id = 1`)
     // off `byId` like `autopilot_state`. Absent (no-tmux env, or a worker that
     // never connected) → `undefined`, which the banner renders as `[focus:

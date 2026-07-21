@@ -920,7 +920,6 @@ describe("decideWrappedGuard — deny-precedence / single-state intent", () => {
     for (const extraEnv of [
       { KEEPER_WRAPPED_ENVELOPE: "/tmp/leg-result.json" },
       { KEEPER_WRAPPED_GUARD_PHASE: "closeout" },
-      { KEEPER_ESCALATION_ROLE: "deconflict" },
     ]) {
       const d = decideWrappedGuard(
         editPayload("Edit", `${REPO}/src/x.ts`),

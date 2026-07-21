@@ -182,20 +182,26 @@ const asStr = (x: unknown): string =>
 export function projectNeedsHuman(
   inputs: NeedsHumanInputs,
 ): NeedsHumanProjection {
-  const rows: ClassifiedNeedsHumanRow[] = inputs.dispatchFailures.map((r) => {
-    const verb = asStr(r.verb);
-    const id = asStr(r.id);
-    const reason = asStr(r.reason);
-    const dir = asStr(r.dir);
-    return {
-      verb,
-      id,
-      reason,
-      cls: classifyNeedsHumanRow(reason),
-      isJam: isJamReason(reason),
-      target: resolveFailureTarget({ verb, id, dir }, inputs.epicIds),
-    };
-  });
+  // Block incidents ride the SAME `dispatch_failures` projection now (the collapsed
+  // `verb='block'` subset), but they are counted ONCE under `blockEscalations` (the
+  // independent adder below), so exclude them here — a `block` row is never a
+  // `stuckDispatches` sticky, keeping the umbrella total free of a double-count.
+  const rows: ClassifiedNeedsHumanRow[] = inputs.dispatchFailures
+    .filter((r) => asStr(r.verb) !== "block")
+    .map((r) => {
+      const verb = asStr(r.verb);
+      const id = asStr(r.id);
+      const reason = asStr(r.reason);
+      const dir = asStr(r.dir);
+      return {
+        verb,
+        id,
+        reason,
+        cls: classifyNeedsHumanRow(reason),
+        isJam: isJamReason(reason),
+        target: resolveFailureTarget({ verb, id, dir }, inputs.epicIds),
+      };
+    });
 
   const stuckDispatches = rows.length;
   const finalizeNonFf = rows.filter((r) => r.cls === "finalize-non-ff").length;

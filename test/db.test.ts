@@ -536,6 +536,136 @@ test("every autopilot_state rebuild copy list covers every current column", () =
   }
 });
 
+test("v142 collapse migration: carries block_escalations + merge once-markers into dispatch_failures, page-once preserved, old shape dropped (fn-1352.2)", () => {
+  const { db } = freshMemDb();
+  // Re-materialize the PRE-collapse shape on the migrated DB: the retired
+  // `block_escalations` table + the two merge once-marker columns, so the v142
+  // apply runs as a genuine in-place upgrade over live pre-collapse state.
+  db.run(`CREATE TABLE block_escalations (
+    epic_id TEXT NOT NULL, task_id TEXT NOT NULL, blocked_since INTEGER NOT NULL,
+    status TEXT NOT NULL, outcome TEXT, last_event_id INTEGER NOT NULL,
+    human_notified_at REAL, owner_redispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (epic_id, task_id))`);
+  db.run("ALTER TABLE dispatch_failures ADD COLUMN merge_escalated_at REAL");
+  db.run(
+    "ALTER TABLE dispatch_failures ADD COLUMN resolver_dispatched_at REAL",
+  );
+
+  const insertEvt = (ts: number): number =>
+    Number(
+      db.run(
+        "INSERT INTO events (ts, session_id, hook_event, event_type) VALUES (?, 's', 'X', 'x')",
+        [ts],
+      ).lastInsertRowid,
+    );
+  // Arming (blocked_since) + last-touching (last_event_id) events — the ts JOIN source.
+  const armPaged = insertEvt(1700);
+  const lastPaged = insertEvt(1750);
+  const armUnpaged = insertEvt(1800);
+
+  // A PAGED block latch (human_notified_at set) and an UNPAGED one (NULL).
+  db.run(
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at, owner_redispatch_attempts)
+       VALUES ('fn-e', 'fn-e.1', ?, 'attempted', 'dispatched', ?, 1720000000.5, 3)`,
+    [armPaged, lastPaged],
+  );
+  db.run(
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, human_notified_at, owner_redispatch_attempts)
+       VALUES ('fn-e', 'fn-e.2', ?, 'pending', NULL, ?, NULL, 0)`,
+    [armUnpaged, armUnpaged],
+  );
+
+  // A merge incident with BOTH once-markers set (a full 2-slot lease) and one with
+  // only the resolver slot set (1 attachment).
+  db.run(
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, merge_escalated_at, resolver_dispatched_at)
+       VALUES ('close', 'fn-e', 'worktree-merge-conflict', 1700, 10, 1700, 1700, 1750, 1755)`,
+  );
+  db.run(
+    `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at, resolver_dispatched_at)
+       VALUES ('work', 'fn-e.9', 'worktree-merge-conflict: x', 1700, 11, 1700, 1700, 1755)`,
+  );
+
+  // Run the collapse step as an in-place upgrade from v141.
+  const step = SCHEMA_STEPS.find((s) => s.version === 142);
+  expect(step).toBeDefined();
+  // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
+  step!.apply({ db, preMigrateStoredVersion: 141, needsEventsRebuild: false });
+
+  // Block incidents carried forward onto ('block', task_id) rows. The paged row's
+  // page-once `human_notified_at` survives (no re-page); ts/created_at come from the
+  // arm event, updated_at from the last-touching event.
+  expect(
+    db
+      .query(
+        `SELECT blocked_since, block_status, block_outcome, owner_redispatch_attempts,
+                human_notified_at, ts, created_at, updated_at, reason
+           FROM dispatch_failures WHERE verb = 'block' AND id = 'fn-e.1'`,
+      )
+      .get(),
+  ).toEqual({
+    blocked_since: armPaged,
+    block_status: "attempted",
+    block_outcome: "dispatched",
+    owner_redispatch_attempts: 3,
+    human_notified_at: 1720000000.5,
+    ts: 1700,
+    created_at: 1700,
+    updated_at: 1750,
+    reason: "block-incident",
+  });
+  // The UNPAGED row keeps exactly one future page (human_notified_at NULL).
+  expect(
+    db
+      .query(
+        "SELECT block_status, human_notified_at, owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'block' AND id = 'fn-e.2'",
+      )
+      .get(),
+  ).toEqual({
+    block_status: "pending",
+    human_notified_at: null,
+    owner_redispatch_attempts: 0,
+  });
+
+  // The merge once-markers collapsed into the owner-attachment count (2 slots → 2, 1 → 1).
+  expect(
+    (
+      db
+        .query(
+          "SELECT owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-e'",
+        )
+        .get() as { owner_redispatch_attempts: number }
+    ).owner_redispatch_attempts,
+  ).toBe(2);
+  expect(
+    (
+      db
+        .query(
+          "SELECT owner_redispatch_attempts FROM dispatch_failures WHERE verb = 'work' AND id = 'fn-e.9'",
+        )
+        .get() as { owner_redispatch_attempts: number }
+    ).owner_redispatch_attempts,
+  ).toBe(1);
+
+  // The old shape is gone: no `block_escalations` table, no once-marker columns.
+  expect(
+    db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'block_escalations'",
+      )
+      .all(),
+  ).toEqual([]);
+  const cols = (
+    db.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(cols).not.toContain("merge_escalated_at");
+  expect(cols).not.toContain("resolver_dispatched_at");
+
+  db.close();
+});
+
 test("SCHEMA_STEPS versions are unique — a duplicate version is a structural error", () => {
   const versions = SCHEMA_STEPS.map((s) => s.version);
   const uniq = new Set(versions);
@@ -789,8 +919,10 @@ test("openDb adds nullable incident claim identity, generation, and freshness co
     notnull: number;
     dflt_value: string | null;
   }[];
+  // The four incident-collapse columns now trail, so the claim block sits at
+  // [-8, -4) rather than the tail.
   expect(
-    columns.slice(-4).map(({ name, type, notnull, dflt_value }) => ({
+    columns.slice(-8, -4).map(({ name, type, notnull, dflt_value }) => ({
       name,
       type,
       notnull,
@@ -829,6 +961,95 @@ test("openDb adds nullable incident claim identity, generation, and freshness co
     claimed_at: null,
   });
   db.close();
+});
+
+test("the v141 incident-collapse columns are the byte-identical dispatch_failures tail on fresh vs migrated", () => {
+  // The four groundwork columns the escalation-retirement collapse re-points
+  // onto are kept OUT of the CREATE_DISPATCH_FAILURES literal and appended as the
+  // last `addColumnIfMissing` calls, so they must land as the trailing columns of
+  // `table_info(dispatch_failures)` — same order, same nullability/default — on
+  // both the fresh CREATE path and a stepped upgrade over a legacy row-shaped
+  // table. `owner_redispatch_attempts` is NOT NULL DEFAULT 0 (the count's
+  // never-set value IS 0, so the default is re-fold-safe); the other three are
+  // nullable NO DEFAULT (never-set value is NULL for a non-block row).
+  const expectedTail = [
+    { name: "blocked_since", type: "INTEGER", notnull: 0, dflt_value: null },
+    { name: "block_status", type: "TEXT", notnull: 0, dflt_value: null },
+    { name: "block_outcome", type: "TEXT", notnull: 0, dflt_value: null },
+    {
+      name: "owner_redispatch_attempts",
+      type: "INTEGER",
+      notnull: 1,
+      dflt_value: "0",
+    },
+  ];
+  const colsOf = (
+    database: Database,
+  ): { name: string; type: string; notnull: number; dflt_value: unknown }[] =>
+    database.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[];
+  const tailOf = (
+    cols: {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[],
+  ) =>
+    cols
+      .slice(-expectedTail.length)
+      .map(({ name, type, notnull, dflt_value }) => ({
+        name,
+        type,
+        notnull,
+        dflt_value,
+      }));
+
+  const { db: fresh } = openDb(":memory:");
+  const freshCols = colsOf(fresh);
+  expect(tailOf(freshCols)).toEqual(expectedTail);
+  fresh.close();
+
+  // Seed the LEGACY dispatch_failures shape (the CREATE_DISPATCH_FAILURES base
+  // literal, which predates every marker/claim/collapse column) stamped at an old
+  // version, so migrate()'s idempotent ALTERs append every missing column —
+  // including the four new ones — over a pre-existing table rather than the fresh
+  // CREATE materializing them.
+  const old = new Database(dbPath, { create: true });
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  old.run(
+    `CREATE TABLE dispatch_failures (
+        verb TEXT NOT NULL,
+        id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        dir TEXT,
+        ts REAL NOT NULL,
+        last_event_id INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (verb, id)
+      )`,
+  );
+  old.close();
+
+  const { db: migrated } = openDb(dbPath);
+  expect(
+    (
+      migrated
+        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value: string }
+    ).value,
+  ).toBe(String(SCHEMA_VERSION));
+  const migratedCols = colsOf(migrated);
+  expect(tailOf(migratedCols)).toEqual(expectedTail);
+  // Fresh and stepped-upgrade converge on the same full column order.
+  expect(migratedCols.map((c) => c.name)).toEqual(freshCols.map((c) => c.name));
+  migrated.close();
 });
 
 test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {

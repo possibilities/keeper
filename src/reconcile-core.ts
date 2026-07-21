@@ -146,8 +146,10 @@ export interface IncidentOwnerFailureFacts {
   reason: string;
   dir?: string | null;
   claimSessionId: string | null;
-  resolverDispatchedAt: number | null;
-  mergeEscalatedAt: number | null;
+  /** Durable owner-attachment count consumed by this incident (the collapsed home
+   *  of the retired `resolver_dispatched_at` / `merge_escalated_at` two-slot lease),
+   *  bounded by {@link INCIDENT_OWNER_ATTACHMENT_LIMIT}. */
+  ownerRedispatchAttempts: number;
   humanNotifiedAt: number | null;
 }
 
@@ -170,23 +172,21 @@ export function isOwnerRoutableIncident(
   );
 }
 
-/** Number of durable owner attachments already consumed by this incident. */
+/** Number of durable owner attachments already consumed by this incident — the
+ *  collapsed `owner_redispatch_attempts` count, saturated at
+ *  {@link INCIDENT_OWNER_ATTACHMENT_LIMIT}. */
 export function incidentOwnerAttachmentCount(
-  row: Pick<
-    IncidentOwnerFailureFacts,
-    "resolverDispatchedAt" | "mergeEscalatedAt"
-  >,
+  row: Pick<IncidentOwnerFailureFacts, "ownerRedispatchAttempts">,
 ): number {
-  return (
-    Number(row.resolverDispatchedAt != null) +
-    Number(row.mergeEscalatedAt != null)
-  );
+  return Math.min(row.ownerRedispatchAttempts, INCIDENT_OWNER_ATTACHMENT_LIMIT);
 }
 
 /**
- * The next durable marker an ordinary owner admission consumes. The two legacy
- * once-markers form a bounded two-slot attachment lease until escalation state is
- * collapsed; claimed, paged, exhausted, and non-incident rows consume no slot.
+ * The next attachment slot an ordinary owner admission consumes. The collapsed
+ * `owner_redispatch_attempts` count forms the bounded attachment lease: the two
+ * event names (`resolver` for the first slot, `merge` for the second) are retained
+ * so the producer's mint stays a distinct-event two-step, but both fold onto the one
+ * count. Claimed, paged, exhausted, and non-incident rows consume no slot.
  */
 export function nextIncidentOwnerAttachmentMarker(
   row: IncidentOwnerFailureFacts,
@@ -198,8 +198,10 @@ export function nextIncidentOwnerAttachmentMarker(
   ) {
     return null;
   }
-  if (row.resolverDispatchedAt == null) return "resolver";
-  if (row.mergeEscalatedAt == null) return "merge";
+  if (row.ownerRedispatchAttempts <= 0) return "resolver";
+  if (row.ownerRedispatchAttempts < INCIDENT_OWNER_ATTACHMENT_LIMIT) {
+    return "merge";
+  }
   return null;
 }
 
@@ -1832,8 +1834,7 @@ export function epicResourceTeardownBlocked(
 export function isOccupyingJob(
   jobs: Map<string, Job>,
   // `Verb | "resolve"`: the reconciler's own dispatch verbs PLUS the daemon's
-  // autonomous merge-resolver (`resolve::<epic>`), whose liveness the recover
-  // pass reads through {@link epicHasActiveResolver}. The check is verb-agnostic
+  // autonomous merge-resolver (`resolve::<epic>`). The check is verb-agnostic
   // — a `plan_verb` string compare — so admitting `resolve` costs nothing.
   verb: Verb | "resolve",
   id: string,
@@ -1851,27 +1852,6 @@ export function isOccupyingJob(
     }
   }
   return false;
-}
-
-/**
- * Whether an autonomous merge-resolver worker (`resolve::<epicId>`) is currently
- * LIVE for `epicId` — the SCOPED, per-epic exclusion that replaces the resolver
- * brief's former GLOBAL `keeper autopilot pause`. The recover sweep's pass-1
- * interrupted-merge abort skips a lane whose epic has a live resolver, so the
- * resolver's own in-progress `git merge` (MERGE_HEAD set) is never raced and
- * aborted out from under it. The exclusion auto-lifts the instant the resolver
- * job reaps — a CLEAN exit OR a CRASH — so a dead resolver strands NOTHING (no
- * durable board-wide pause halting unrelated epics) and concurrent stuck fan-ins
- * stay independent (each epic gated on its OWN resolver job, never a shared
- * global flag one resolver's `play` could flip while another is mid-merge).
- * Reuses {@link isOccupyingJob}'s liveness arms.
- */
-export function epicHasActiveResolver(
-  jobs: Map<string, Job>,
-  epicId: string,
-  livePaneIds: ReadonlySet<string> | null,
-): boolean {
-  return isOccupyingJob(jobs, "resolve", epicId, livePaneIds);
 }
 
 /**
@@ -1909,16 +1889,13 @@ export function epicHasOccupyingJob(
  *
  * TURN-ACTIVE occupancy, mirroring {@link classifyEscalationOutcome}'s
  * `escalationJobLive`: a `resolve::<epic>` session is a one-shot interactive
- * `/plan:resolve` session that idles forever after its turn ends, so pane/pid liveness
- * (the {@link epicHasActiveResolver} rule) would count a FINISHED-but-idling resolver as
- * live and STARVE the deconflict dispatch indefinitely — the ghost-worker pitfall
- * (liveness is not progress). A resolver occupies only while `state === 'working'` (a
- * live turn); a `stopped` resolver has yielded its turn and reads TERMINAL. A mid-turn
- * permission prompt stamps `last_permission_prompt_at` but never flips `state` off
- * `working`, so a parked resolver stays turn-active here without a marker arm.
- * {@link epicHasActiveResolver} is left untouched — the recover pass's MERGE_HEAD-race
- * guard keeps the pane-liveness rule (a mid-merge resolver may not be re-`git merge`d
- * out from under, a distinct concern from terminal-outcome sequencing).
+ * `/plan:resolve` session that idles forever after its turn ends, so plain pane/pid
+ * liveness would count a FINISHED-but-idling resolver as live and STARVE the
+ * deconflict dispatch indefinitely — the ghost-worker pitfall (liveness is not
+ * progress). A resolver occupies only while `state === 'working'` (a live turn); a
+ * `stopped` resolver has yielded its turn and reads TERMINAL. A mid-turn permission
+ * prompt stamps `last_permission_prompt_at` but never flips `state` off `working`, so
+ * a parked resolver stays turn-active here without a marker arm.
  *
  *  - `{ terminal: false }` — a resolver is still turn-active (`working`) OR no
  *    `resolve::<epic>` row has folded yet (the launch → SessionStart window). The

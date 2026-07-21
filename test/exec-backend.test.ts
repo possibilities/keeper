@@ -753,11 +753,7 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // session env and folds onto someone else's row.
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -818,11 +814,7 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -890,11 +882,7 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -944,11 +932,7 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     // is present only when the caller threads the original job id (pinned below).
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -1016,11 +1000,7 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -1091,10 +1071,10 @@ test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JO
   // by its own `--x-tmux-env`.
   const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
   expect(argv[idx - 1]).toBe("--x-tmux-env");
-  // Eleven repeated env carriers: session/lane/branch/job-id/escalation-role +
+  // Ten repeated env carriers: session/lane/branch/job-id +
   // three dispatched-cell carriers + two wrapped-cell carriers + the always-empty
   // handoff-envelope stale-overwrite carrier.
-  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(11);
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(10);
   // Identity (job id) and the resume key (native target) stay DISTINCT.
   expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
   expect(idEntries[0]).not.toContain("d98a2d54-native");
@@ -1148,10 +1128,7 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // The 5th carrier — empty here (a work launch, not an escalation).
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -1209,10 +1186,7 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
-    // The 5th carrier — empty here (a worktree resume, not an escalation).
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
+    // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
     "--x-tmux-env",
     "KEEPER_PLAN_DISPATCHED_MODEL=",
@@ -1268,52 +1242,13 @@ test("buildKeeperAgentLaunchArgv: serial (empty/absent worktreePath) ALWAYS emit
     a.startsWith("KEEPER_PLAN_WORKTREE_BRANCH="),
   );
   expect(branchEntries).toEqual(["KEEPER_PLAN_WORKTREE_BRANCH="]);
-  // ...and the escalation-role carrier is the 5th always-emitted-empty sibling,
-  // so a non-escalation launch reusing a tmux session cannot inherit a stale role.
+  // ...and the launch carries NO escalation-role marker at all: no
+  // `KEEPER_ESCALATION_ROLE` entry is emitted, so a reused tmux session cannot
+  // inherit even an empty role.
   const roleEntries = absent.filter((a) =>
     a.startsWith("KEEPER_ESCALATION_ROLE="),
   );
-  expect(roleEntries).toEqual(["KEEPER_ESCALATION_ROLE="]);
-});
-
-test("buildKeeperAgentLaunchArgv: an escalation launch carries the verb in KEEPER_ESCALATION_ROLE, still one entry (byte-pinned)", () => {
-  const argv = buildKeeperAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    session: "autopilot",
-    prompt: "/plan:unblock fn-1-x.3",
-    claudeName: "unblock::fn-1-x.3",
-    escalationRole: "unblock",
-    noConfirm: true,
-  });
-  // Exactly one role entry, carrying the escalation verb — emitted right after the
-  // job-identity carrier and before the permission posture.
-  const roleEntries = argv.filter((a) =>
-    a.startsWith("KEEPER_ESCALATION_ROLE="),
-  );
-  expect(roleEntries).toEqual(["KEEPER_ESCALATION_ROLE=unblock"]);
-  const branchIdx = argv.indexOf("KEEPER_PLAN_WORKTREE_BRANCH=");
-  expect(argv[branchIdx + 1]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 2]).toBe("KEEPER_JOB_ID=");
-  expect(argv[branchIdx + 3]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 4]).toBe("KEEPER_ESCALATION_ROLE=unblock");
-  // Then the three always-present dispatched-cell carriers (ADR 0047), EMPTY on a
-  // non-work escalation launch, before the permission posture.
-  expect(argv[branchIdx + 5]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 6]).toBe("KEEPER_PLAN_DISPATCHED_MODEL=");
-  expect(argv[branchIdx + 7]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 8]).toBe("KEEPER_PLAN_DISPATCHED_TIER=");
-  expect(argv[branchIdx + 9]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 10]).toBe("KEEPER_PLAN_DISPATCH_CONSTRAINT=");
-  // Then the two always-present wrapped-cell guard carriers (task .1), EMPTY on a
-  // non-work escalation launch, before the permission posture.
-  expect(argv[branchIdx + 11]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 12]).toBe("KEEPER_WRAPPED_CELL=");
-  expect(argv[branchIdx + 13]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 14]).toBe("KEEPER_WRAPPED_ENVELOPE=");
-  // Then the always-present handoff carrier clears any stale capture destination.
-  expect(argv[branchIdx + 15]).toBe("--x-tmux-env");
-  expect(argv[branchIdx + 16]).toBe("KEEPER_HANDOFF_ENVELOPE=");
-  expect(argv[branchIdx + 17]).toBe("--permission-mode");
+  expect(roleEntries).toEqual([]);
 });
 
 test("buildKeeperAgentLaunchArgv: a constrained work launch carries the dispatched cell + constraint (ADR 0047)", () => {

@@ -28,6 +28,20 @@
 export const MERGE_ESCALATION_REASON_TOKEN = "worktree-merge-conflict";
 
 /**
+ * The `reason` a block incident carries on its `('block', task_id)`
+ * `dispatch_failures` row — the collapsed home of the retired `block_escalations`
+ * latch. A block incident is keyed off the `block` verb (never `work` / `close`),
+ * so this reason is inert to {@link routeDispatchFailure} (its `unknown` arm) and
+ * to the pill join ({@link resolveFailureTarget} drops a `block` row), and the
+ * needs-human projector counts a `block` row under `blockEscalations`, never
+ * `stuckDispatches`. The reason exists only to satisfy the NOT-NULL column and to
+ * read distinctly in the incident brief. NOT a `blocked:` surface-and-stop
+ * `work::` reason ({@link BLOCKED_WORK_REASON_PREFIX}) — a different row entirely.
+ * The db migration seed hardcodes this literal (db.ts cannot import this leaf).
+ */
+export const BLOCK_INCIDENT_REASON = "block-incident";
+
+/**
  * The `reason` prefix every `recoverWorktrees` failure carries
  * (`worktree-recover-conflict`, `-push-failed`, `-not-on-default`, …). The
  * level-triggered auto-clear keys on it to scope clearing to RECOVER-originated

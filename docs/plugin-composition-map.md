@@ -185,35 +185,24 @@ roster byte-for-byte as `~/.config/keeper/panel.yaml`; `keeper agent presets lis
 exposes each panel's members, authored strength, and description. Neither file is compiled
 or a `--plugin-dir`; this inventory keeps both alongside the host `matrix.yaml`.
 
-The daemon's own **merge-resolver dispatch** (`resolve::<epic>`, launched by the
-resolver-dispatch sweep on a stuck worktree fan-in close) rides this SAME
-`buildKeeperAgentLaunchArgv` path — it is another launch producer of the
-autopilot/dispatch-worker channel, inheriting the identical additive base set, never a
-separate isolation channel.
+Autopilot's only dispatch producers are `work`, `close`, and a wrapped cell's provider leg;
+`resolveDispatchLaunchConfig` (`src/dispatch-launch-config.ts`) resolves each `{model,
+effort}` from the `dispatch:` table in `presets.yaml`, floored to the compiled-in worker
+constants when a row is absent or the catalog fails to parse. Claude-only; a non-claude
+triple resolves its model/effort but warns once per (verb, harness) rather than launching a
+foreign harness.
 
-Three further daemon producers ride the same path: the **escalation dispatches** —
-`unblock::<task>` (the block-escalation sweep), `deconflict::<epic>` (the
-merge-escalation sweep, sequenced behind the tier-1 `resolve::` resolver), and
-`repair::<repo_token>` (the SAME block-escalation sweep, routing a `SHARED_BASE_BROKEN`
-category to one write-capable session per (repo, fingerprint) instead of the task's own
-unblock). All three inherit the identical additive base set plus their target
-`/plan:unblock`, `/plan:deconflict`, or `/plan:repair` skill. What sets them apart is the
-launch config, not the plugin channel: every dispatched verb — `work`, `close`, `resolve`,
-`unblock`, `deconflict`, `repair`, `handoff` — resolves its `{model, effort}` through the
-ONE `resolveDispatchLaunchConfig` leaf (`src/dispatch-launch-config.ts`) reading the
-per-verb `dispatch:` table in `presets.yaml` (a `<harness>::<model>::<effort>` triple per
-row), floored to the compiled-in reconcile-core constants when a row is absent or the
-catalog fails to parse: `work`/`close`/`resolve` float to the worker constants,
-`unblock`/`deconflict`/`repair` to the escalation constants, `handoff` to the harness's own
-default. The escalation rows stay independently tunable from the work/close/resolve rows —
-retuning one verb's tier is one `dispatch:` line, never a perturbation of the others.
-Claude-only; a non-claude triple resolves its model/effort but warns once per (verb,
-harness) rather than launching a foreign harness. Every escalation session is additionally
-constrained by the keeper plugin's sixth hook, escalation-guard (`PreToolUse(Bash)`), which
-is role-keyed on the launch-injected `KEEPER_ESCALATION_ROLE` marker to a per-role Bash
-command-family allowlist — unblock and resolve stay diagnosis-only, deconflict and repair
-get write-capable families — failing CLOSED for a marked session regardless of
-`--dangerously-skip-permissions`.
+A merge, block, or shared-base incident never mints a separate top-level session or launch
+channel. Its owning `/work`/`/close` session — already inside the base set above — claims
+the incident (`keeper incident claim`, fenced on `instance_event_id`) and runs one of four
+confined Task subagents (merge-resolver, deconflicter, unblocker, repairer; none may nest a
+Task) in its own plugin composition. Every mutating call these subagents make is denied by
+default and allowed only under a daemon-published grant leaf (`src/grant-leaf.ts`) whose
+whole tuple validates — parent job, exact agent type, incident and fencing identities,
+writable root, role, and expiry — enforced by the keeper plugin's `grant-guard` hook
+(`PreToolUse(Bash|Write|Edit|MultiEdit|NotebookEdit)`), keyed on the hook payload's
+subagent identity rather than an env-injected role marker. Protected paths stay denied even
+under a valid grant; the unblocker is diagnosis-only by role, never write-capable.
 
 ## Worker isolation gate
 

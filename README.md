@@ -11,8 +11,8 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
-  lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
-  Resource holds remain independently observable and recoverable
+  lanes, merge handling, and confined-subagent incident recovery; Harness activity,
+  Dispatch claims, and exact Resource holds remain independently observable and recoverable
 - **Account routing** — Claude launches use process-bound claude-swap Account routes from
   a fresh Capacity observation. claude-swap owns `usageStatus`, raw quota values, and
   bounded account-capacity metadata; `keeper usage` shows available categories, explicit

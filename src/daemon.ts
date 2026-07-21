@@ -73,7 +73,6 @@ import type {
   WorktreeRepoStatusMessage,
 } from "./autopilot-worker";
 import {
-  classifyResolverOutcome,
   createSharedCheckoutDirtyTracker,
   runDeadWriterCheckoutSweep,
   type SharedCheckoutWriter,
@@ -188,8 +187,6 @@ import {
   parsePlanRef,
 } from "./derivers";
 import {
-  defaultPlanPrompt,
-  type EscalationVerb,
   isRetryableDispatchKey,
   type RetryDispatchVerb,
 } from "./dispatch-command";
@@ -346,8 +343,6 @@ import {
 import {
   applyProviderConstraint,
   buildPlannedLaunchSpec,
-  ESCALATION_EFFORT,
-  ESCALATION_MODEL,
   type HostMatrixAxes,
   INCIDENT_OWNER_ATTACHMENT_LIMIT,
   type IncidentOwnerFailureFacts,
@@ -471,7 +466,7 @@ import {
   backupThenCleanSharedCheckout,
   probeLaneMergeHead,
 } from "./worktree-git";
-import { repoToken, worktreePathFor } from "./worktree-plan";
+import { repoToken } from "./worktree-plan";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
 const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
@@ -1625,13 +1620,14 @@ export function selectPendingBlockEscalations(
 ): PendingBlockEscalation[] {
   const latches = db
     .query(
-      `SELECT epic_id, task_id, status, outcome, owner_redispatch_attempts
-         FROM block_escalations
-        WHERE status = 'pending'
-           OR (status = 'attempted' AND outcome = 'skipped_category')`,
+      `SELECT id AS task_id, block_status AS status, block_outcome AS outcome,
+              owner_redispatch_attempts
+         FROM dispatch_failures
+        WHERE verb = 'block'
+          AND (block_status = 'pending'
+               OR (block_status = 'attempted' AND block_outcome = 'skipped_category'))`,
     )
     .all() as {
-    epic_id: string;
     task_id: string;
     status: string;
     outcome: string | null;
@@ -1640,9 +1636,12 @@ export function selectPendingBlockEscalations(
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
   for (const latch of latches) {
+    // The block incident stores only the task id (`id`); its epic id is the id's
+    // prefix (a `block` row never carries a separate `epic_id` column).
+    const epicId = parsePlanRef(latch.task_id)?.epic_id ?? "";
     const epicRow = db
       .query(`SELECT project_dir, tasks FROM epics WHERE epic_id = ?`)
-      .get(latch.epic_id) as
+      .get(epicId) as
       | { project_dir: string | null; tasks: string }
       | null
       | undefined;
@@ -1676,7 +1675,7 @@ export function selectPendingBlockEscalations(
       }
     }
     out.push({
-      epic_id: latch.epic_id,
+      epic_id: epicId,
       task_id: latch.task_id,
       status: latch.status,
       outcome: latch.outcome,
@@ -1885,8 +1884,10 @@ export function probeBlockOwner(
 /**
  * Decide the next bounded block-handling rung. Only a witnessed owner death
  * beyond grace can act: live, grace-held, and absent owners all defer. A dead
- * owner receives a bounded number of `work::<task>` attachment attempts before
- * the legacy `unblock::<task>` fallback becomes eligible. Pure.
+ * owner receives a bounded number of `work::<task>` attachment attempts; once the
+ * lease is exhausted the block surfaces and waits on the board (no escalation
+ * session is dispatched — the in-session unblocker rides the owning `/work`
+ * turn). Pure.
  */
 export function blockOwnerEscalationDecision(
   liveness: BlockOwnerLiveness,
@@ -1894,13 +1895,13 @@ export function blockOwnerEscalationDecision(
   nowMs: number,
   graceMs: number = BLOCK_OWNER_GRACE_MS,
   attemptLimit: number = BLOCK_OWNER_REDISPATCH_LIMIT,
-): "defer" | "redispatch_owner" | "dispatch_legacy_unblock" {
+): "defer" | "redispatch_owner" | "surface_exhausted" {
   if (liveness.state !== "dead" || nowMs - liveness.diedAtMs < graceMs) {
     return "defer";
   }
   return ownerRedispatchAttempts < attemptLimit
     ? "redispatch_owner"
-    : "dispatch_legacy_unblock";
+    : "surface_exhausted";
 }
 
 /** The outcome the producer records on the `block_escalations` latch (the
@@ -1919,7 +1920,7 @@ export type BlockEscalationOutcome =
   | "skipped_unblocked";
 
 /** Injectable dependency surface for {@link runBlockEscalationSweep} — the block/
- *  unblock DISPATCH sweep. Mirrors {@link MergeEscalationSweepDeps}'s fail-open
+ *  unblock DISPATCH sweep. A fail-open
  *  injectable-deps discipline so the producer is testable with synthetic rows + an
  *  injected dispatcher, and never throws into the daemon loop. */
 export interface BlockEscalationSweepDeps {
@@ -1943,24 +1944,15 @@ export interface BlockEscalationSweepDeps {
     taskId: string,
     outcome: BlockEscalationOutcome,
   ) => void;
-  /** Launch ONE `unblock::<task>` escalation session for the blocked row (into the
-   *  managed session, at the escalation model/effort, with the `/plan:unblock`
-   *  prompt). DELEGATES to the shared {@link dispatchEscalationSession} in
-   *  production, so the global cap + per-key occupancy guard apply. Async +
-   *  fail-open — every error degrades to `dispatch_failed`, and a SKIP (`at_cap` /
-   *  `already_live`) mints nothing so the row re-sweeps. */
-  readonly dispatchUnblock: (
-    row: PendingBlockEscalation,
-  ) => Promise<EscalationDispatchOutcome>;
   /** Launch one `work::<task>` orchestrator. Used for ordinary owner attachment
-   *  and an AUDIT_READY resume. A real launch success or failure consumes one
-   *  durable attempt; occupancy/cap skips consume none. */
+   *  and an AUDIT_READY resume; the in-session unblocker rides that turn. A real
+   *  launch success or failure consumes one durable attempt; occupancy/cap skips
+   *  consume none. */
   readonly dispatchOwner: (
     row: PendingBlockEscalation,
   ) => Promise<EscalationDispatchOutcome>;
-  /** True IFF block handling for ANY task in `epicId` is already live — either an
-   *  owning work orchestrator or a legacy unblock fallback. This preserves the
-   *  per-epic serialization guard across both ladder rungs. */
+  /** True IFF an owning `work::<task>` orchestrator for ANY task in `epicId` is
+   *  already live. Preserves the per-epic serialization guard for the owner rung. */
   readonly isEpicBlockHandlingLive: (epicId: string) => boolean;
   /** Classify the ordinary blocked task's owning `work::<task>` orchestrator.
    *  Optional absent reads `absent`, which safely defers. */
@@ -2043,9 +2035,9 @@ export type BlockCandidateDropClass =
  * greppable within one sweep instead of invisible. A row is dropped by exactly one
  * class-carrying gate per cycle — never double-logged.
  *
- * NEVER throws — every helper edge degrades to a recorded outcome (mirrors {@link
- * runMergeEscalationSweep}). The spawn lives ONLY here in the producer, never
- * reachable from `applyEvent`, so a re-fold never re-fires a launch.
+ * NEVER throws — every helper edge degrades to a recorded outcome. The spawn lives
+ * ONLY here in the producer, never reachable from `applyEvent`, so a re-fold never
+ * re-fires a launch.
  */
 export async function runBlockEscalationSweep(
   deps: BlockEscalationSweepDeps,
@@ -2178,14 +2170,11 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
-    // AUDIT_READY and ordinary blocks share the bounded owner-fenced work ladder.
-    // AUDIT_SEVERE keeps the immediate legacy unblock route.
-    const usesBoundedOwnerRung =
-      route === "work" ||
-      (route === "unblock" && category !== AUDIT_SEVERE_CATEGORY);
-    let handlingRung: "redispatch_owner" | "dispatch_legacy_unblock" =
-      "dispatch_legacy_unblock";
-    if (usesBoundedOwnerRung) {
+    // Every non-skip route rides the bounded owner-fenced work ladder: the owning
+    // `work::<task>` session is re-attached (running the in-session unblocker), and
+    // once the attachment lease is exhausted the block surfaces and waits on the
+    // board. No escalation session is ever dispatched.
+    {
       const liveness: BlockOwnerLiveness =
         route === "work"
           ? (auditLiveness ?? { state: "absent" })
@@ -2195,8 +2184,9 @@ export async function runBlockEscalationSweep(
         row.owner_redispatch_attempts,
         (deps.now ?? Date.now)(),
       );
-      if (decision === "defer") continue;
-      handlingRung = decision;
+      // `defer` (owner may recover) and `surface_exhausted` (lease spent — the
+      // block stays visible pending an operator) both skip without dispatching.
+      if (decision !== "redispatch_owner") continue;
     }
 
     // Defensive guard, mirrors {@link selectRepairCandidates}'s `empty_repo`: since
@@ -2232,9 +2222,9 @@ export async function runBlockEscalationSweep(
     claimedEpics.add(row.epic_id);
 
     // Re-probe at the dispatch boundary. The owner may have attached after the
-    // first decision but before this row won per-epic serialization; every bounded
-    // rung takes the defer direction on that race instead of double-handling the block.
-    if (usesBoundedOwnerRung) {
+    // first decision but before this row won per-epic serialization; the bounded
+    // rung takes the skip direction on that race instead of double-handling the block.
+    {
       const liveness: BlockOwnerLiveness =
         route === "work"
           ? (deps.auditOrchestratorLiveness?.(row) ?? { state: "absent" })
@@ -2244,80 +2234,43 @@ export async function runBlockEscalationSweep(
         row.owner_redispatch_attempts,
         (deps.now ?? Date.now)(),
       );
-      if (refreshed === "defer") continue;
-      handlingRung = refreshed;
+      if (refreshed !== "redispatch_owner") continue;
     }
 
-    // The work rung launches the audit resume or an ordinary owning-work
-    // attachment before any legacy escalation session can launch. Both a
-    // successful launch and a real launch failure consume one durable attempt;
-    // occupancy/cap skips do not. The attempted fold resets the latch to `pending`
-    // while incrementing the owner-attempt column, so daemon restarts resume at the
-    // same rung.
-    if (handlingRung === "redispatch_owner") {
-      let ownerOutcome: EscalationDispatchOutcome;
-      try {
-        ownerOutcome = await deps.dispatchOwner(row);
-      } catch (err) {
-        note(
-          `# warn: owner redispatch threw for ${row.task_id} (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        ownerOutcome = "dispatch_failed";
-      }
-      if (
-        ownerOutcome === "at_cap" ||
-        ownerOutcome === "already_live" ||
-        ownerOutcome === "checkout_busy"
-      ) {
-        note(
-          `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=owner_${ownerOutcome}`,
-        );
-        continue;
-      }
-      deps.mintRequested(row.epic_id, row.task_id);
-      deps.mintAttempted(
-        row.epic_id,
-        row.task_id,
-        ownerOutcome === "dispatched"
-          ? "owner_redispatched"
-          : "owner_redispatch_failed",
-      );
-      continue;
-    }
-
-    // The legacy serialization-winner row. Launch the `unblock::<task>` session,
-    // then record the outcome. A SKIP (`at_cap` / `already_live`) mints nothing — the
-    // latch stays `pending` and re-sweeps (at cap, or once the in-flight session
-    // folds). Only a real attempt (`dispatched` / `dispatch_failed`) mints
-    // Requested→Attempted: the fold advances the latch to `attempted` on `dispatched`
-    // and RESETS it to `pending` on `dispatch_failed` (a re-sweepable retry).
-    let outcome: EscalationDispatchOutcome;
+    // The bounded work rung re-attaches the audit resume or an ordinary owning-work
+    // session; the in-session unblocker rides that turn. Both a successful launch and
+    // a real launch failure consume one durable attempt; occupancy/cap skips do not.
+    // The attempted fold resets the latch to `pending` while incrementing the
+    // owner-attempt column, so daemon restarts resume at the same rung.
+    let ownerOutcome: EscalationDispatchOutcome;
     try {
-      outcome = await deps.dispatchUnblock(row);
+      ownerOutcome = await deps.dispatchOwner(row);
     } catch (err) {
-      // The dispatcher is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a non-terminal outcome and never aborts the sweep.
       note(
-        `# warn: unblock dispatch threw for ${row.task_id} (non-fatal): ${
+        `# warn: owner redispatch threw for ${row.task_id} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      outcome = "dispatch_failed";
+      ownerOutcome = "dispatch_failed";
     }
     if (
-      outcome === "at_cap" ||
-      outcome === "already_live" ||
-      outcome === "checkout_busy"
+      ownerOutcome === "at_cap" ||
+      ownerOutcome === "already_live" ||
+      ownerOutcome === "checkout_busy"
     ) {
       note(
-        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=${outcome}`,
+        `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=owner_${ownerOutcome}`,
       );
       continue;
     }
     deps.mintRequested(row.epic_id, row.task_id);
-    deps.mintAttempted(row.epic_id, row.task_id, outcome);
+    deps.mintAttempted(
+      row.epic_id,
+      row.task_id,
+      ownerOutcome === "dispatched"
+        ? "owner_redispatched"
+        : "owner_redispatch_failed",
+    );
   }
 }
 
@@ -2333,9 +2286,9 @@ export async function runBlockEscalationSweep(
 // the leave-blocked `TaskSnapshot` fold, so this sweep never sees a resolved block.
 
 /**
- * A dispatched-but-not-yet-notified `block_escalations` latch row — the stage-3
- * working set (keyed `(epic_id, task_id)`). Bounded by the number of concurrently
- * dispatched-and-declined unblock escalations, never a history scan.
+ * A dispatched-but-not-yet-notified block incident — the stage-3 working set.
+ * Bounded by the number of concurrently dispatched-and-declined unblock
+ * escalations, never a history scan.
  */
 export interface PendingBlockHumanNotify {
   epic_id: string;
@@ -2343,24 +2296,32 @@ export interface PendingBlockHumanNotify {
 }
 
 /**
- * Select every `block_escalations` latch whose `unblock::<task>` session was
- * DISPATCHED (`status='attempted'`, `outcome='dispatched'`) but whose human has NOT
- * yet been notified (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
- * `outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
+ * Select every block incident (the `dispatch_failures` `verb='block'` subset) whose
+ * `unblock::<task>` session was DISPATCHED (`block_status='attempted'`,
+ * `block_outcome='dispatched'`) but whose human has NOT yet been notified
+ * (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
+ * `block_outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
  * them), and a stamped `human_notified_at` (the terminal `notified` fold) drops the
  * row — the notify-once guarantee. The leave-blocked DELETE re-arms the whole chain.
+ * The `epic_id` is derived from the incident id (a `block` row carries only the task
+ * id) for the `BlockHumanNotified` mint's payload.
  */
 export function selectPendingBlockHumanNotifications(
   db: Database,
 ): PendingBlockHumanNotify[] {
-  return db
+  const rows = db
     .query(
-      `SELECT epic_id, task_id FROM block_escalations
-         WHERE status = 'attempted'
-           AND outcome = 'dispatched'
+      `SELECT id FROM dispatch_failures
+         WHERE verb = 'block'
+           AND block_status = 'attempted'
+           AND block_outcome = 'dispatched'
            AND human_notified_at IS NULL`,
     )
-    .all() as PendingBlockHumanNotify[];
+    .all() as { id: string }[];
+  return rows.map((r) => ({
+    task_id: r.id,
+    epic_id: parsePlanRef(r.id)?.epic_id ?? "",
+  }));
 }
 
 /** The outcome the unblock human-notify sweep records on the `BlockHumanNotified`
@@ -2503,8 +2464,8 @@ export function buildSharedCheckoutPageBody(row: {
 }
 
 /** Injectable dependency surface for {@link runBlockHumanNotifySweep} — the stage-3
- *  unblock human-notify sweep. Same fail-open injectable-deps discipline as
- *  {@link DeconflictHumanNotifySweepDeps}. */
+ *  unblock human-notify sweep. Same fail-open injectable-deps discipline as its sibling
+ *  sweeps. */
 export interface BlockHumanNotifySweepDeps {
   /** The current-state pending working set (DELEGATES to
    *  {@link selectPendingBlockHumanNotifications} in production). */
@@ -2551,8 +2512,8 @@ export interface BlockHumanNotifySweepDeps {
  * sweep's selector drops the row; a `notify_failed` (agentbot absent / failed) leaves
  * the marker NULL so the row re-sweeps and the notification is never lost (the block
  * is operator-visible the whole time). NEVER throws — every helper edge degrades to a
- * recorded outcome (mirrors {@link runDeconflictHumanNotifySweep}). The spawn lives
- * ONLY here in the producer, never reachable from `applyEvent`.
+ * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
+ * `applyEvent`.
  */
 export async function runBlockHumanNotifySweep(
   deps: BlockHumanNotifySweepDeps,
@@ -3541,38 +3502,12 @@ export async function runSharedCheckoutPageSweep(
   }
 }
 
-// ---------------------------------------------------------------------------
-// fn-1009 — daemon worktree-merge-conflict close-escalation producer
-// ---------------------------------------------------------------------------
-
 // The escalation reason token lives in the dep-free `dispatch-failure-key` leaf
-// (the single dispatch-failure vocabulary). Re-exported here so the SQL twin
-// `selectPendingMergeEscalations` and `keeper query` keep importing it from
-// `daemon`. The gate matches the leading token EXACTLY — never a `worktree-merge`
-// prefix — so `worktree-merge-lock-timeout` / `-local-timeout` and the
+// (the single dispatch-failure vocabulary). Re-exported here so `keeper query` keeps
+// importing it from `daemon`. The gate matches the leading token EXACTLY — never a
+// `worktree-merge` prefix — so `worktree-merge-lock-timeout` / `-local-timeout` and the
 // `worktree-finalize-*` / `worktree-recover*` siblings never escalate.
 export { MERGE_ESCALATION_REASON_TOKEN };
-
-/**
- * A sticky `worktree-merge-conflict` close failure row — the merge-escalation
- * sweep's current-state working set, read straight off `dispatch_failures`
- * (bounded by the number of concurrently-stuck closes, never a history scan). The
- * `id` is the close-row key (the epic id; `verb` is always `close`).
- */
-export interface PendingMergeEscalation {
-  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
-  id: string;
-  /** The close failure reason — the `worktree-merge-conflict: …` string to parse. */
-  reason: string;
-  /** The close row's `dir` — the repo root, for {@link mergeConflictBaseCheckout}. */
-  dir: string | null;
-}
-
-/** The outcome the deconflict-dispatch sweep records on the `MergeEscalationAttempted`
- *  event. The TERMINAL `dispatched` (the `deconflict::<epic>` session launched) stamps
- *  the `merge_escalated_at` once-marker (task .1's fold); `dispatch_failed` is
- *  NON-terminal — the row stays re-sweepable. */
-export type MergeEscalationOutcome = "dispatched" | "dispatch_failed";
 
 /** The outcome the deconflict human-notify sweep (stage 3) records on the
  *  `MergeHumanNotified` event. The TERMINAL `notified` (the one agentbot notification
@@ -3581,1129 +3516,23 @@ export type MergeEscalationOutcome = "dispatched" | "dispatch_failed";
 export type MergeHumanNotifiedOutcome = "notified" | "notify_failed";
 
 /** The result of one shared-helper escalation dispatch. `dispatched` /
- *  `dispatch_failed` are the two MINT outcomes ({@link MergeEscalationOutcome});
- *  `at_cap` (the global concurrency cap is saturated), `already_live` (a
- *  `<verb>::<id>` session is already running, i.e. the mint fold has not caught up),
- *  and `checkout_busy` (a DIFFERENT merge-recreating escalation session already holds
- *  the resolved base checkout) are SKIP outcomes — no marker is minted and the row
- *  re-sweeps next tick. */
+ *  `dispatch_failed` are the two MINT outcomes; `at_cap` (the global concurrency cap is
+ *  saturated), `already_live` (a `<verb>::<id>` session is already running, i.e. the
+ *  mint fold has not caught up), and `checkout_busy` (a DIFFERENT merge-recreating
+ *  escalation session already holds the resolved base checkout) are SKIP outcomes — no
+ *  marker is minted and the row re-sweeps next tick. */
 export type EscalationDispatchOutcome =
-  | MergeEscalationOutcome
+  | "dispatched"
+  | "dispatch_failed"
   | "at_cap"
   | "already_live"
   | "checkout_busy";
-
-/** Global cap on concurrent escalation sessions (`unblock::` + `deconflict::`
- *  combined). At cap the dispatch is SKIPPED — the row stays pending and re-sweeps —
- *  so a board with many stuck escalations never fans out an unbounded number of
- *  sessions. A coarse safety valve read off the live jobs projection (plus the
- *  producer's not-yet-folded in-flight memo). */
-export const MAX_LIVE_ESCALATION_SESSIONS = 3;
 
 /** TTL (ms) for the producer's in-flight escalation memo — a launched-but-not-yet-folded
  *  `<verb>::<id>` key is pruned once its `jobs` row folds OR it ages past this ceiling
  *  (a launch that reported `ok` but never folded a jobs row), so the memo can never
  *  wedge a cap slot forever. Well above the launch → birth-ingest fold lag. */
 export const INFLIGHT_ESCALATION_TTL_MS = 5 * 60_000;
-
-/**
- * Select every sticky `worktree-merge-conflict` close failure that has NOT yet been
- * escalated. Reads `dispatch_failures` on the passed connection — production passes
- * MAIN's writable connection so the read is sequenced inside the same writer that
- * mints. The token filter is the SQL twin of {@link shouldEscalateMergeConflict}:
- * the leading token (text up to the FIRST `:`) must be EXACTLY
- * {@link MERGE_ESCALATION_REASON_TOKEN}, so a `worktree-merge-lock-timeout` /
- * `worktree-merge-local-timeout` / `worktree-finalize-non-fast-forward` /
- * `worktree-recover*` row never matches. `merge_escalated_at IS NULL` is the
- * escalate-once gate — a stamped row (the terminal escalation fold) drops out.
- *
- * `resolver_dispatched_at IS NOT NULL` sequences the escalation BEHIND the resolver:
- * the sibling resolver-dispatch sweep owns the conflict first, so a row whose resolver
- * has not yet been dispatched (a fresh row, a paused board, or the window after a
- * `retry_dispatch` re-armed both markers at NULL) is NOT escalatable — the human
- * notify waits. A dispatched-but-still-running resolver is filtered downstream in the
- * sweep by its terminal-outcome check ({@link classifyResolverOutcome}); this SQL gate
- * only rules out the not-yet-dispatched case cheaply off the durable column.
- */
-export function selectPendingMergeEscalations(
-  db: Database,
-): PendingMergeEscalation[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'close'
-           AND merge_escalated_at IS NULL
-           AND resolver_dispatched_at IS NOT NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
-}
-
-/**
- * Load the `resolve::<epic>` job rows for `epicId` into the map shape {@link
- * classifyResolverOutcome} reads — the deconflict-dispatch sweep's terminal-resolver
- * probe. Bounded (a handful of rows per epic on the `plan_verb='resolve'` partial
- * index), selecting only the columns the turn-active arm touches. A jobs read failure
- * degrades to an EMPTY map, which classifies as `{terminal:false}` so the escalation
- * conservatively WAITS (never a premature dispatch on a transient error).
- *
- * `instance` scopes the read to the CURRENT block instance (the sticky close row's
- * `instance_event_id`, which task .2 stamps onto the resolve session's
- * `escalation_instance`) so a stale resolve row from a RESOLVED instance can neither
- * suppress nor prematurely mark terminal a re-block's sequencing. The predicate is
- * `escalation_instance = ?instance OR escalation_instance IS NULL` — NULL-stamped rows
- * (the corroboration-miss edge) are conservatively INCLUDED so a stamp-missed resolver
- * can still classify rather than wait forever. A NULL `instance` (absent sticky /
- * legacy caller) falls back to the unscoped verb+ref match. Module-level twin of
- * {@link resolveEscalationJobsFor}.
- */
-function resolveJobsForEpic(
-  db: Database,
-  epicId: string,
-  instance: number | null,
-): Map<string, Job> {
-  const jobs = new Map<string, Job>();
-  try {
-    const rows =
-      instance == null
-        ? (db
-            .query(
-              "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ?",
-            )
-            .all(epicId) as unknown as Job[])
-        : (db
-            .query(
-              "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, escalation_instance FROM jobs WHERE plan_verb = 'resolve' AND plan_ref = ? AND (escalation_instance = ? OR escalation_instance IS NULL)",
-            )
-            .all(epicId, instance) as unknown as Job[]);
-    for (const row of rows) {
-      jobs.set(row.job_id, row);
-    }
-  } catch {
-    // Transient jobs read failure → empty map → terminal:false → wait next tick.
-  }
-  return jobs;
-}
-
-/**
- * The escalation gate: escalate IFF the reason's leading token (the text up to the
- * first `:`) is EXACTLY {@link MERGE_ESCALATION_REASON_TOKEN}. Routes through the
- * `dispatch-failure-key` leaf's {@link isMergeEscalationReason} so this gate and the
- * row router can never diverge — defense-in-depth over {@link
- * selectPendingMergeEscalations}'s SQL filter (re-applied per row in the sweep).
- * Pure; never throws; null/colon-less reason → false. The exact-token match keeps
- * the `worktree-merge-lock-timeout` / `worktree-merge-local-timeout` /
- * `worktree-finalize-non-fast-forward` / `worktree-recover*` siblings OUT.
- */
-export function shouldEscalateMergeConflict(reason: string | null): boolean {
-  if (reason == null) return false;
-  return isMergeEscalationReason(reason);
-}
-
-/**
- * Parse the `<source>` + `<base>` branches out of a
- * `worktree-merge-conflict: merging <source> into <base> — <stderr>` reason. Splits
- * on the FIRST ` — ` em-dash (so a stderr that happens to contain one can't poison
- * the branch parse), then lifts `<source>` / `<base>` from the head via
- * `merging … into …`. Returns null on any structural miss — the body builder
- * degrades a parse-miss to a human-actionable brief rather than throwing the sweep.
- * Pure.
- */
-function parseMergeConflictReason(
-  reason: string,
-): { source: string; base: string } | null {
-  const dash = reason.indexOf(" — ");
-  const head = dash >= 0 ? reason.slice(0, dash) : reason;
-  const m = head.match(
-    /^\s*worktree-merge-conflict:\s*merging\s+(\S.*?)\s+into\s+(\S.*?)\s*$/,
-  );
-  if (m == null) return null;
-  return { source: m[1], base: m[2] };
-}
-
-/**
- * The checkout directory where a merge-conflict reason's BASE branch lives — the cwd
- * where finalize ran the failing merge, so the conflict physically sits there. A
- * `keeper/epic/…` lane base (a rib fan-in into the epic lane) resolves to its worktree
- * lane; the DEFAULT-branch base (a lane→default finalize, e.g. `main`) is NEVER laned,
- * so it resolves to the repo root itself — the shared default checkout `mergeBranchInto`
- * lands in. Passing the default branch to {@link worktreePathFor} would fabricate a
- * nonexistent `<repo>--<default>` dir, and the launch would then ENOENT on the cwd (the
- * whole escalation ladder wedges — the resolver never dispatches, so the human is never
- * paged). Pure.
- */
-export function mergeConflictBaseCheckout(
-  repoDir: string,
-  base: string,
-): string {
-  return base.startsWith("keeper/epic/")
-    ? worktreePathFor(repoDir, base)
-    : repoDir;
-}
-
-/** Injectable dependency surface for {@link runMergeEscalationSweep} — the daemon's
- *  DECONFLICT-DISPATCH sweep (stage 2). Mirrors {@link ResolverDispatchSweepDeps}'s
- *  fail-open injectable-deps discipline so the producer is testable with synthetic
- *  rows + an injected dispatcher, and never throws into the daemon loop. */
-export interface MergeEscalationSweepDeps {
-  /** The current-state pending working set (DELEGATES to
-   *  {@link selectPendingMergeEscalations} in production). */
-  readonly selectPending: () => PendingMergeEscalation[];
-  /** Re-read that the sticky close row for `id` is STILL present with
-   *  `merge_escalated_at IS NULL` — checked immediately before the launch to narrow
-   *  the clear-mid-sweep window (a `retry_dispatch` between select and launch drops
-   *  the row). Reads the live projection on the writable connection in production. */
-  readonly stillPending: (id: string) => boolean;
-  /** Classify the dispatched `resolve::<epic>` resolver's outcome for `id`
-   *  (DELEGATES to {@link classifyResolverOutcome} over the live `jobs` map in
-   *  production). The deconflict dispatches only after a TERMINAL resolver verdict;
-   *  while the resolver is live or its job has not folded yet it returns
-   *  `{terminal:false}` and the sweep skips the row (the resolver, tier 1, owns the
-   *  conflict first). */
-  readonly resolverOutcome: (id: string) => ResolverOutcome;
-  /** Launch ONE `deconflict::<epic>` escalation session for the sticky row (into the
-   *  managed session, at the escalation model/effort, with the `/plan:deconflict`
-   *  prompt). DELEGATES to the shared {@link dispatchEscalationSession} in production,
-   *  so the global cap + per-key occupancy guard apply. Async + fail-open — every
-   *  error degrades to `dispatch_failed`, and a SKIP (`at_cap` / `already_live`) mints
-   *  nothing so the row re-sweeps. */
-  readonly dispatchDeconflict: (
-    row: PendingMergeEscalation,
-  ) => Promise<EscalationDispatchOutcome>;
-  /** Mint a `MergeEscalationAttempted{outcome}` synthetic event. Task .1's fold stamps
-   *  `merge_escalated_at` ONLY on the terminal `dispatched`; it NEVER clears the sticky
-   *  row — only `retry_dispatch` (`DispatchCleared`) does. */
-  readonly mintAttempted: (id: string, outcome: MergeEscalationOutcome) => void;
-  /** Warn sink for non-fatal diagnostics. */
-  readonly noteLine?: (line: string) => void;
-}
-
-/**
- * Run one daemon deconflict-dispatch sweep (stage 2) — the producer half of the
- * dispatch-once loop for a stuck worktree fan-in close whose tier-1 resolver has
- * DECLINED or DIED. Walk the sticky `worktree-merge-conflict` close rows, gate each by
- * {@link shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL
- * filter), re-read that the row is STILL pending immediately before the launch
- * (narrowing the clear-mid-sweep window), sequence behind the resolver's TERMINAL
- * verdict, then launch ONE `deconflict::<epic>` session and mint
- * `MergeEscalationAttempted{outcome}`.
- *
- * DISPATCHES ONLY — the sweep NEVER mints `DispatchCleared` and never clears the
- * sticky row; only `retry_dispatch` does (a successful deconflict session fires it on
- * the clear path, dropping the row and every marker with it, so stage 3 never runs).
- * The TERMINAL `dispatched` stamps the `merge_escalated_at` once-marker (task .1's
- * fold), so the next sweep's selector drops the row; a `dispatch_failed` leaves the
- * marker NULL so the row stays re-sweepable, and a SKIP (`at_cap` / `already_live`)
- * mints nothing at all. Each close failure keys on its own epic (`close::<epic>`), so
- * there is one row per epic and no coalescing is needed. NEVER throws — every helper
- * edge degrades to a recorded outcome (mirrors {@link runResolverDispatchSweep}). The
- * spawn lives ONLY here in the producer, never reachable from `applyEvent`, so a
- * re-fold never re-fires a launch.
- */
-export async function runMergeEscalationSweep(
-  deps: MergeEscalationSweepDeps,
-): Promise<void> {
-  const note = deps.noteLine ?? (() => {});
-  let pending: PendingMergeEscalation[];
-  try {
-    pending = deps.selectPending();
-  } catch (err) {
-    note(
-      `# warn: deconflict-dispatch sweep read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  if (pending.length === 0) return;
-
-  for (const row of pending) {
-    // Defense-in-depth gate: the selector already filters by the exact token, but
-    // re-apply the pure gate so an injected/loosened selector can never dispatch a
-    // deconflict session for a non-merge-conflict reason.
-    if (!shouldEscalateMergeConflict(row.reason)) continue;
-    // Re-read immediately before the launch: a `retry_dispatch` that cleared the row
-    // (or the fold that stamped the marker) between select and launch means there is
-    // nothing left to deconflict — skip without minting.
-    if (!deps.stillPending(row.id)) continue;
-    // Sequence behind the resolver (tier 1): the sibling resolver-dispatch sweep owns
-    // the conflict first (the selector already required `resolver_dispatched_at`), so
-    // the deconflict dispatch waits until that resolver reaches a TERMINAL outcome.
-    // While it is live — or its job has not folded yet (the launch window) — skip
-    // without minting, so the row re-sweeps next tick. `retry_dispatch` re-arms the
-    // whole flow by deleting the row.
-    if (!deps.resolverOutcome(row.id).terminal) continue;
-
-    let outcome: EscalationDispatchOutcome;
-    try {
-      outcome = await deps.dispatchDeconflict(row);
-    } catch (err) {
-      // The dispatcher is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a non-terminal outcome and never aborts the sweep.
-      note(
-        `# warn: deconflict dispatch threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      outcome = "dispatch_failed";
-    }
-    // A SKIP (`at_cap` / `already_live` / `checkout_busy`) mints nothing: the marker
-    // stays NULL and the row re-sweeps next tick (at cap, once the in-flight session
-    // folds, or once the occupied base checkout frees). Only a real dispatch attempt
-    // (`dispatched` / `dispatch_failed`) mints — the fold stamps the once-marker ONLY
-    // on the terminal `dispatched`, so a `dispatch_failed` folds to a no-op and the row
-    // stays re-sweepable.
-    if (
-      outcome === "at_cap" ||
-      outcome === "already_live" ||
-      outcome === "checkout_busy"
-    ) {
-      continue;
-    }
-    deps.mintAttempted(row.id, outcome);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// fn-1129 — daemon deconflict human-notify sweep (stage 3)
-// ---------------------------------------------------------------------------
-//
-// The TERMINAL stage of the deconflict escalation path. Where stage 2
-// (`runMergeEscalationSweep`) DISPATCHES a `deconflict::<epic>` session once its
-// tier-1 resolver declined/died, this sweep fires the ONE human notification — via
-// agentbot — only once that deconflict session ALSO declines or dies. A successful
-// deconflict ends with its own `keeper autopilot retry close::<epic>`, which drops the
-// sticky row and every marker with it, so this sweep never sees a resolved close.
-
-/**
- * Select every sticky `worktree-merge-conflict` close failure whose deconflict session
- * has been DISPATCHED (`merge_escalated_at IS NOT NULL`) but whose human has NOT yet
- * been notified (`human_notified_at IS NULL`) — the stage-3 working set. The SQL twin
- * of {@link selectPendingMergeEscalations}, gated on the THIRD once-marker. The
- * leading-token filter is identical (exact {@link MERGE_ESCALATION_REASON_TOKEN}), so a
- * non-merge-conflict sibling never matches. A stamped `human_notified_at` (the terminal
- * `notified` fold) drops the row out — the notify-once guarantee. `retry_dispatch`
- * re-arms the whole chain by deleting the row (all three markers back to NULL).
- */
-export function selectPendingHumanNotifications(
-  db: Database,
-): PendingMergeEscalation[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'close'
-           AND merge_escalated_at IS NOT NULL
-           AND human_notified_at IS NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
-}
-
-/**
- * Build the ONE structured operator notification the deconflict human-notify sweep
- * sends over agentbot when a `deconflict::<epic>` session DECLINES (stamped BLOCKED) or
- * DIES. Short by design — the sticky close row already carries the full context on the
- * board (`keeper status`); this is the courtesy ping that names the epic, the verdict,
- * and the single unstick command. The free-text reason is trimmed onto its own line
- * (it rides as a agentbot argv element via an array-form spawn, never a shell string, so
- * no interpolation fires). Pure.
- */
-export function buildDeconflictHumanNotifyBody(args: {
-  epicId: string;
-  reason: string;
-  verdict: "declined" | "died";
-}): string {
-  const epic = args.epicId;
-  const verdictLine =
-    args.verdict === "died"
-      ? `its job DIED before resolving`
-      : `it DECLINED (not mechanically clear — stamped BLOCKED)`;
-  return [
-    `🔴 keeper: deconflict::${epic} needs you — the autonomous merge-resolver AND the`,
-    `deconflict escalation session both gave up on \`close::${epic}\` (${verdictLine});`,
-    `the worktree fan-in close is STUCK and will NOT auto-retry.`,
-    ``,
-    `Resolve the conflict by hand in the epic's base worktree (merge BOTH intents,`,
-    `never pick one side), then unstick the board:`,
-    `  keeper autopilot retry close::${epic}`,
-    ``,
-    `Failure reason: ${args.reason.trim()}`,
-  ].join("\n");
-}
-
-/** Injectable dependency surface for {@link runDeconflictHumanNotifySweep} — the
- *  stage-3 human-notify sweep. Same fail-open injectable-deps discipline as
- *  {@link MergeEscalationSweepDeps}. */
-export interface DeconflictHumanNotifySweepDeps {
-  /** The current-state pending working set (DELEGATES to
-   *  {@link selectPendingHumanNotifications} in production). */
-  readonly selectPending: () => PendingMergeEscalation[];
-  /** Re-read that the sticky close row for `id` is STILL present with
-   *  `human_notified_at IS NULL` — checked immediately before the notify to narrow the
-   *  clear-mid-sweep window (a `retry_dispatch` between select and notify drops the
-   *  row). Reads the live projection on the writable connection in production. */
-  readonly stillPending: (id: string) => boolean;
-  /** Classify the dispatched `deconflict::<epic>` session's outcome for `id`
-   *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
-   *  production). The human is notified ONLY on a terminal verdict; while the deconflict
-   *  session is live or its job has not folded yet it returns `{terminal:false}` and the
-   *  sweep skips the row (a successful deconflict clears the sticky before this runs). */
-  readonly deconflictOutcome: (id: string) => ResolverOutcome;
-  /** Send the ONE agentbot notification about the declined/dead deconflict session.
-   *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
-   *  (the sticky stays operator-visible meanwhile), never a wedge or a silent drop. */
-  readonly notifyHuman: (
-    row: PendingMergeEscalation,
-    verdict: "declined" | "died",
-  ) => Promise<MergeHumanNotifiedOutcome>;
-  /** Mint a `MergeHumanNotified{outcome}` synthetic event. The fold stamps
-   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the sticky
-   *  row — only `retry_dispatch` (`DispatchCleared`) does. */
-  readonly mintAttempted: (
-    id: string,
-    outcome: MergeHumanNotifiedOutcome,
-  ) => void;
-  /** Warn sink for non-fatal diagnostics. */
-  readonly noteLine?: (line: string) => void;
-}
-
-/**
- * Run one daemon deconflict human-notify sweep (stage 3) — the terminal "notify the
- * human ONCE" half of the deconflict escalation path. Walk the sticky
- * `worktree-merge-conflict` close rows whose deconflict session was dispatched but
- * whose human is not yet notified, gate each by {@link shouldEscalateMergeConflict}
- * (defense-in-depth), re-read that the row is STILL pending, sequence behind the
- * deconflict session's TERMINAL decline/death, send ONE agentbot notification, then mint
- * `MergeHumanNotified{outcome}`.
- *
- * NOTIFIES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
- * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
- * selector drops the row; a `notify_failed` (agentbot absent / failed) leaves the marker
- * NULL so the row re-sweeps and the notification is never lost (the sticky is
- * operator-visible the whole time). NEVER throws — every helper edge degrades to a
- * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
- * `applyEvent`.
- */
-export async function runDeconflictHumanNotifySweep(
-  deps: DeconflictHumanNotifySweepDeps,
-): Promise<void> {
-  const note = deps.noteLine ?? (() => {});
-  let pending: PendingMergeEscalation[];
-  try {
-    pending = deps.selectPending();
-  } catch (err) {
-    note(
-      `# warn: deconflict human-notify sweep read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  if (pending.length === 0) return;
-
-  for (const row of pending) {
-    if (!shouldEscalateMergeConflict(row.reason)) continue;
-    // Re-read immediately before the notify: a `retry_dispatch` that cleared the row
-    // (or the fold that stamped the marker) between select and notify means there is
-    // nothing left to notify — skip without minting.
-    if (!deps.stillPending(row.id)) continue;
-    // Sequence behind the deconflict session: notify the human only once that session
-    // reached a TERMINAL decline/death. While it is live — or its job has not folded
-    // yet — skip without minting, so the row re-sweeps next tick. A CLEAR deconflict
-    // fires `retry_dispatch`, deleting the row before this sweep ever sees it.
-    const outcome = deps.deconflictOutcome(row.id);
-    if (!outcome.terminal) continue;
-
-    let result: MergeHumanNotifiedOutcome;
-    try {
-      result = await deps.notifyHuman(row, outcome.verdict);
-    } catch (err) {
-      // The helper is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a non-terminal outcome and never aborts the sweep.
-      note(
-        `# warn: deconflict human-notify threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      result = "notify_failed";
-    }
-    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
-    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
-    deps.mintAttempted(row.id, result);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// fn-1240 — daemon work-verb fan-in merge-conflict human-notify sweep (tier-2 stage 3)
-// ---------------------------------------------------------------------------
-//
-// The TERMINAL page of the WORK-verb fan-in conflict escalation, the exact analog of
-// the close-scoped deconflict human-notify (stage 3). A completed upstream lane that
-// will not merge cleanly into a downstream task's base lane mints a sticky
-// `work::<taskId>` `worktree-merge-conflict` row (via `provision()`'s pre-merge in
-// autopilot-worker.ts). Its tier-1 `resolve::<taskId>` resolver ran and DECLINED, then a
-// `deconflict::<taskId>` escalation session was dispatched (stamping `merge_escalated_at`)
-// and it TOO declined/died — only THEN does this sweep fire the one agentbot page. It pages
-// ONCE per conflict identity — the `(work, taskId)` PK — via the `human_notified_at`
-// once-marker, re-arming when `retry_dispatch` drops the row so a genuine re-conflict
-// re-pages. Gated on `merge_escalated_at IS NOT NULL` (the deconflict was dispatched) AND
-// sequenced behind that deconflict session's TERMINAL decline/death, so a deconflict that
-// SUCCEEDS (clears the sticky via its own retry) never pages.
-
-/** A sticky `work::<taskId>` `worktree-merge-conflict` failure whose deconflict was
- *  dispatched but whose human is not yet paged — the work-verb notify sweep's
- *  current-state working set, read straight off `dispatch_failures` (bounded by the
- *  number of concurrently-stuck fan-in conflicts, never a history scan). */
-export interface PendingWorkMergeConflict {
-  /** The sticky work-row `dispatch_failures.id` (the task id; verb is always `work`). */
-  id: string;
-  /** The conflict reason — `worktree-merge-conflict: merging <src> into <base> — <stderr>`. */
-  reason: string;
-  /** The work row's `dir` — the dependent task's LANE worktree where the conflict sits. */
-  dir: string | null;
-}
-
-/**
- * Select every sticky `work::<taskId>` `worktree-merge-conflict` failure whose deconflict
- * session was DISPATCHED (`merge_escalated_at IS NOT NULL`) but whose human is not yet
- * paged (`human_notified_at IS NULL`) — the work-verb stage-3 working set. The SQL twin
- * of {@link selectPendingHumanNotifications}, on the WORK verb: the tier-2 chain now
- * dispatches a resolver then a deconflict that stamp the resolver columns, so the page is
- * SEQUENCED — gated on `merge_escalated_at` (the deconflict was dispatched) rather than
- * firing straight away. The leading-token filter is identical (exact
- * {@link MERGE_ESCALATION_REASON_TOKEN}), so a non-merge-conflict work failure
- * (`launch_failed` / `worktree-lane-premerge-*` / …) never matches. A stamped
- * `human_notified_at` (the terminal `notified` fold) drops the row out — the page-once
- * guarantee. `retry_dispatch` re-arms by deleting the row (all three markers back to NULL).
- */
-export function selectPendingWorkMergeNotifications(
-  db: Database,
-): PendingWorkMergeConflict[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'work'
-           AND merge_escalated_at IS NOT NULL
-           AND human_notified_at IS NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingWorkMergeConflict[];
-}
-
-/** Cap the conflict reason carried into the page body so a pathological git stderr
- *  (many conflicting files) can never bloat the agentbot arg. The array-form spawn
- *  already blocks shell interpolation of a hunk; this bounds size. */
-const WORK_MERGE_NOTIFY_REASON_CAP = 600;
-
-/**
- * Build the ONE structured operator page the work-verb fan-in notify sweep sends over
- * agentbot once a stuck `work::<taskId>` merge conflict's autonomous resolver AND its
- * deconflict escalation session both gave up. Short by design — the sticky work row
- * already carries the full context on the board (`keeper status`); this is the terminal
- * page that names the task, the verdict, its lane worktree, the conflicting file set (the
- * git stderr carried on the reason, size-bounded), and the single unstick command. The
- * free-text reason rides as a literal agentbot argv element via an array-form spawn (never
- * a shell string, so no hunk interpolates). Pure.
- */
-export function buildWorkMergeHumanNotifyBody(args: {
-  taskId: string;
-  lane: string | null;
-  reason: string;
-  verdict: "declined" | "died";
-}): string {
-  const lane = args.lane != null && args.lane !== "" ? args.lane : "?";
-  const reason = args.reason.trim();
-  const boundedReason =
-    reason.length > WORK_MERGE_NOTIFY_REASON_CAP
-      ? `${reason.slice(0, WORK_MERGE_NOTIFY_REASON_CAP)} … [truncated]`
-      : reason;
-  const verdictLine =
-    args.verdict === "died"
-      ? `its deconflict session DIED before resolving`
-      : `it DECLINED (not mechanically clear — stamped BLOCKED)`;
-  return [
-    `🔴 keeper: work::${args.taskId} needs you — the autonomous merge-resolver AND the`,
-    `deconflict escalation session both gave up on the worktree fan-in conflict`,
-    `(${verdictLine}); it blocks the task and every dependent and will NOT auto-retry.`,
-    ``,
-    `Resolve the conflict by hand in the task's base lane (merge BOTH intents,`,
-    `never pick one side), then unstick the board:`,
-    `  keeper autopilot retry work::${args.taskId}`,
-    ``,
-    `Lane: ${lane}`,
-    `Conflict: ${boundedReason}`,
-  ].join("\n");
-}
-
-/** Injectable dependency surface for {@link runWorkMergeHumanNotifySweep} — the
- *  work-verb fan-in stage-3 notify sweep. Same fail-open injectable-deps discipline as
- *  {@link DeconflictHumanNotifySweepDeps}, including the deconflict session-sequencing
- *  gate (the tier-2 page fires only at the deconflict's terminal verdict). */
-export interface WorkMergeHumanNotifySweepDeps {
-  /** The current-state pending working set (DELEGATES to
-   *  {@link selectPendingWorkMergeNotifications} in production). */
-  readonly selectPending: () => PendingWorkMergeConflict[];
-  /** Re-read that the `work::<id>` row is STILL present with `human_notified_at IS
-   *  NULL` — checked immediately before the page to narrow the clear-mid-sweep window
-   *  (a `retry_dispatch` between select and notify drops the row). */
-  readonly stillPending: (id: string) => boolean;
-  /** Classify the dispatched `deconflict::<taskId>` session's outcome for `id`
-   *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
-   *  production). The human is paged ONLY on a terminal verdict; while the deconflict
-   *  session is live or its job has not folded yet it returns `{terminal:false}` and the
-   *  sweep skips the row (a successful deconflict clears the sticky before this runs). */
-  readonly deconflictOutcome: (id: string) => ResolverOutcome;
-  /** Send the ONE agentbot page about the declined/dead deconflict session. Async +
-   *  fail-open — every error degrades to `notify_failed` so the row re-sweeps (the sticky
-   *  stays operator-visible meanwhile), never a wedge or a silent drop. */
-  readonly notifyHuman: (
-    row: PendingWorkMergeConflict,
-    verdict: "declined" | "died",
-  ) => Promise<MergeHumanNotifiedOutcome>;
-  /** Mint a `MergeHumanNotified{verb:"work", outcome}` synthetic event. The fold stamps
-   *  `human_notified_at` on the `(work, id)` row ONLY on the terminal `notified`; it
-   *  NEVER clears the sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
-  readonly mintAttempted: (
-    id: string,
-    outcome: MergeHumanNotifiedOutcome,
-  ) => void;
-  /** Warn sink for non-fatal diagnostics. */
-  readonly noteLine?: (line: string) => void;
-}
-
-/**
- * Run one daemon work-verb fan-in merge-conflict human-notify sweep — the TERMINAL page
- * of the WORK escalation path, the analog of {@link runDeconflictHumanNotifySweep}. Walk
- * the sticky `work::<taskId>` `worktree-merge-conflict` rows whose deconflict was
- * dispatched but whose human is not yet paged, gate each by {@link
- * shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL token filter),
- * re-read that the row is STILL pending, sequence behind the deconflict session's TERMINAL
- * decline/death, send ONE agentbot page, then mint `MergeHumanNotified{verb:"work",
- * outcome}`.
- *
- * PAGES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
- * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
- * selector drops the row; a `notify_failed` (agentbot absent / failed) leaves the marker
- * NULL so the row re-sweeps and the page is never lost (the sticky is operator-visible
- * the whole time). While the deconflict session is live — or its job has not folded yet —
- * the sweep skips the row without minting (a CLEAR deconflict fires `retry_dispatch`,
- * deleting the row before this sweep ever sees it). NEVER throws — every helper edge
- * degrades to a recorded outcome. The spawn lives ONLY here in the producer, never
- * reachable from `applyEvent`.
- */
-export async function runWorkMergeHumanNotifySweep(
-  deps: WorkMergeHumanNotifySweepDeps,
-): Promise<void> {
-  const note = deps.noteLine ?? (() => {});
-  let pending: PendingWorkMergeConflict[];
-  try {
-    pending = deps.selectPending();
-  } catch (err) {
-    note(
-      `# warn: work fan-in human-notify sweep read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  if (pending.length === 0) return;
-
-  for (const row of pending) {
-    if (!shouldEscalateMergeConflict(row.reason)) continue;
-    // Re-read immediately before the page: a `retry_dispatch` that cleared the row (or
-    // the fold that stamped the marker) between select and notify means there is
-    // nothing left to page — skip without minting.
-    if (!deps.stillPending(row.id)) continue;
-    // Sequence behind the deconflict session: page the human only once that session
-    // reached a TERMINAL decline/death. While it is live — or its job has not folded
-    // yet — skip without minting, so the row re-sweeps next tick. A CLEAR deconflict
-    // fires `retry_dispatch`, deleting the row before this sweep ever sees it.
-    const outcome = deps.deconflictOutcome(row.id);
-    if (!outcome.terminal) continue;
-
-    let result: MergeHumanNotifiedOutcome;
-    try {
-      result = await deps.notifyHuman(row, outcome.verdict);
-    } catch (err) {
-      // The helper is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a non-terminal outcome and never aborts the sweep.
-      note(
-        `# warn: work fan-in human-notify threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      result = "notify_failed";
-    }
-    // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
-    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
-    deps.mintAttempted(row.id, result);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// fn-1088 — daemon resolver-dispatch producer (the merge-resolver worker)
-// ---------------------------------------------------------------------------
-//
-// A SIBLING of the merge-escalation sweep above, riding the SAME sticky
-// `worktree-merge-conflict` close rows. Where the merge-escalation sweep NOTIFIES a
-// human (`planner@<epic>`) once, this sweep DISPATCHES one autonomous `resolve::<epic>`
-// worker once — a narrower-authority automation that resolves ONLY mechanically-clear
-// conflicts and stamps BLOCKED for anything state-machine / schema / security /
-// transaction-boundary shaped. Each latches on its own `dispatch_failures` column, but
-// the resolver goes FIRST: the human escalation is SEQUENCED behind it — the notify fires
-// only after a resolver was dispatched AND reached a terminal verdict (declined/BLOCKED or
-// job death), so the two never race the same base worktree. The close audit is unchanged
-// whichever path resolves.
-
-/** The outcome the resolver-dispatch producer records on the `ResolverDispatchAttempted`
- *  event. The TERMINAL `dispatched` (the `resolve::<epic>` worker launched) stamps the
- *  `resolver_dispatched_at` once-marker (the reducer fold); `dispatch_failed` is
- *  NON-terminal — the row stays re-sweepable. */
-export type ResolverDispatchOutcome = "dispatched" | "dispatch_failed";
-
-/** What one resolver-dispatch attempt resolves to. `dispatched` / `dispatch_failed` are
- *  the two MINT outcomes ({@link ResolverDispatchOutcome}); `checkout_busy` is a SKIP —
- *  a DIFFERENT merge-recreating escalation session already holds the resolved base
- *  checkout, so no marker is minted and the row re-sweeps once the checkout frees
- *  (sibling of the shared dispatch path's {@link EscalationDispatchOutcome} skips). */
-export type ResolverDispatchResult = ResolverDispatchOutcome | "checkout_busy";
-
-/**
- * A sticky `worktree-merge-conflict` close failure that has NOT yet had a resolver
- * dispatched — the resolver-dispatch sweep's current-state working set, read straight
- * off `dispatch_failures` (bounded by the number of concurrently-stuck closes, never a
- * history scan). The `id` is the close-row key (the epic id; `verb` is always `close`).
- */
-export interface PendingResolverDispatch {
-  /** The sticky close-row `dispatch_failures.id` (the epic id; verb is `close`). */
-  id: string;
-  /** The close failure reason — the `worktree-merge-conflict: …` string to parse. */
-  reason: string;
-  /** The close row's `dir` — the repo root, for {@link mergeConflictBaseCheckout}. */
-  dir: string | null;
-}
-
-/**
- * Select every sticky `worktree-merge-conflict` close failure that has NOT yet had a
- * resolver dispatched. The SQL twin of {@link selectPendingMergeEscalations}, gated on
- * `resolver_dispatched_at IS NULL` (its own once-latch, INDEPENDENT of
- * `merge_escalated_at` — a row can be human-escalated AND resolver-dispatched, in
- * either order). The leading-token filter is identical: the text up to the FIRST `:`
- * must be EXACTLY {@link MERGE_ESCALATION_REASON_TOKEN}, so a `worktree-merge-lock-timeout`
- * / `-local-timeout` / `worktree-finalize-non-fast-forward` / `worktree-recover*` row
- * never matches. A stamped row (the terminal `dispatched` fold) drops out — the
- * once-per-condition guarantee.
- */
-export function selectPendingResolverDispatches(
-  db: Database,
-): PendingResolverDispatch[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'close'
-           AND resolver_dispatched_at IS NULL
-           AND claim_session_id IS NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingResolverDispatch[];
-}
-
-/** The literal unstick sentence a resolver stamps into its BLOCKED verdict — the exact
- *  ask the human answers to settle a non-mechanically-clear conflict. Shared verbatim by
- *  the close {@link buildResolverBrief} and the work {@link buildWorkResolverBrief}. */
-const RESOLVER_UNSTICK_SENTENCE = `to proceed, tell me exactly: whether to keep both sides, pick one, or how to reconcile them`;
-
-/** The foreign-staged guard shared by the abort and the concluding commit: a concurrent
- *  `keeper plan` mint can leave pathspec files staged in a shared checkout that neither a
- *  `git merge --abort` nor a whole-index commit may sweep. Identify by the merge's OWN set
- *  (`git diff HEAD MERGE_HEAD`), so a resolved-then-staged conflict file is never mistaken
- *  for foreign work. Shared verbatim by both resolver briefs. */
-const RESOLVER_FOREIGN_STAGED =
-  "a staged path in `git diff --cached --name-only` that is NOT in " +
-  "`git diff --name-only HEAD MERGE_HEAD` (this merge's own set — auto-merged plus " +
-  "the conflicts you resolved)";
-
-/** The classify-or-BLOCK guardrail — the decision boundary encoded from three
- *  mechanically-clear exemplars, the schema-collision carve-out, and the default-BLOCK
- *  rule. Shared VERBATIM by the close {@link buildResolverBrief} and the work
- *  {@link buildWorkResolverBrief}: a work fan-in conflict is classified by the exact same
- *  boundary as a close-sink conflict (both are worktree fan-in merges), so the two briefs
- *  reuse one guardrail rather than re-authoring it. */
-const RESOLVER_GUARDRAIL_LINES = [
-  `INTENT ARCHAEOLOGY — before you classify, read the PRIMARY SOURCES behind each`,
-  `side, not just the conflict-marker diff text. For each conflicting commit, read`,
-  `its commit message (\`git show\`/\`git log\` the conflicting shas) and run`,
-  `\`keeper history files --format json --limit 20 -- <path>\` and`,
-  `\`keeper history search --syntax literal --format json --limit 20 -- <term>\``,
-  `to recover WHY each change was made. Ground your classification in each side's`,
-  `INTENT — the`,
-  `diff alone hides whether two edits are independent or encode one shared decision.`,
-  ``,
-  `GUARDRAIL — your authority is narrower than a human's. Resolve ONLY a`,
-  `MECHANICALLY-CLEAR conflict: both sides are INDEPENDENT ADDITIVE edits to the`,
-  `same region (e.g. an install-script fan-in gaining two idempotent steps, a CLI`,
-  `help-block gaining two entries, a skill/doc section gaining two bullets) that`,
-  `compose by keeping BOTH intents verbatim. The moment the two sides encode a`,
-  `shared DECISION — a state machine, a schema, a security posture, a`,
-  `transaction-boundary, or an ordering/precedence choice — where keeping both would`,
-  `be incoherent, it is NOT clear. When UNSURE, default to BLOCKED. A`,
-  `confident-but-wrong merge is worse than a stuck close.`,
-  ``,
-  `SCHEMA-VERSION COLLISION CARVE-OUT — if the conflict is two lanes' SCHEMA_STEPS`,
-  `entries colliding on the same version number, run`,
-  `\`bun scripts/rebase-schema-migration.ts\` instead of hand-editing: the tool`,
-  `exiting 0 is mechanically clear — commit its rewritten output. A tool REFUSAL,`,
-  `or any schema SHAPE decision (what a column means, whether a rewind is right, a`,
-  `CREATE-literal conflict), is NOT clear — stays BLOCKED for the human exactly as`,
-  `today.`,
-  ``,
-  `Do NOT invent new behaviour — resolve by composing the two intents VERBATIM or`,
-  `not at all. If a coherent merge would require writing anything NEITHER side wrote,`,
-  `it is NOT mechanically clear: default to BLOCKED.`,
-];
-
-/** The NOT-mechanically-clear path — abort clean, stamp BLOCKED with category + evidence
- *  + the literal unstick sentence, and EXIT leaving the sticky + human escalation intact.
- *  Shared verbatim by both resolver briefs. */
-const RESOLVER_BLOCKED_PATH_LINES = [
-  `IF NOT mechanically clear (or you are unsure):`,
-  `  - FIRST \`git restore --staged\` any FOREIGN staged path (${RESOLVER_FOREIGN_STAGED}),`,
-  `    leaving it in the tree, so the abort cannot destroy a concurrent commit's work.`,
-  `  - \`git merge --abort\` to leave the lane CLEAN (the recover pass covers any`,
-  `    residue); do NOT commit a half-merge.`,
-  `  - Stamp BLOCKED with: the guardrail CATEGORY (state-machine / schema / security /`,
-  `    transaction-boundary / ordering / unsure), the EVIDENCE (the conflicting`,
-  `    hunks + why keeping both is incoherent), and the literal unstick sentence:`,
-  `    \`${RESOLVER_UNSTICK_SENTENCE}\``,
-  `  - EXIT. Leave the sticky close row and the human escalation exactly as they`,
-  `    are — the human resolves it. (Do NOT pause/play autopilot — the daemon`,
-  `    scopes recovery around you; see above.)`,
-];
-
-/**
- * Build the autonomous resolver brief the resolver-dispatch producer spawns as the
- * `resolve::<epic>` worker's prompt. The ACTIVE sibling of {@link
- * buildMergeEscalationBody} (which briefs a HUMAN): same source/base parse + `--no-ff`
- * recreate recipe + verbatim guardrail classes, but framed as a worker that CLASSIFIES
- * then resolves-or-BLOCKS with authority deliberately narrower than a human's.
- *
- * The decision boundary is encoded from this session's three mechanically-clear
- * exemplars (an install-script fan-in, a CLI help-block fan-in, a skill/doc-section
- * fan-in): a conflict is CLEAR only when both sides are INDEPENDENT ADDITIVE edits to
- * the same region that compose by keeping BOTH intents verbatim; it is NOT CLEAR the
- * moment the two sides encode a shared DECISION (a state machine, a schema, a security
- * posture, a transaction boundary, an ordering/precedence choice) where keeping both
- * would be incoherent. Unsure DEFAULTS to BLOCKED — a confident-but-wrong merge is
- * worse than a stuck close.
- *
- * The CLEAR path resolves preserving both intents, runs the epic's test gate within a
- * bounded budget, commits the merge, then `keeper autopilot retry close::<epic>` (which
- * clears the sticky, dropping BOTH once-markers). The NOT-CLEAR path aborts to a clean
- * lane, stamps BLOCKED with category + evidence + the literal unstick sentence, and
- * leaves the sticky + human escalation exactly as today. The brief NO LONGER pauses/
- * plays autopilot: the recover sweep is excluded per-epic while this worker's
- * `resolve::<epic>` job is live (`epicHasActiveResolver`), so a crash never durably
- * pauses the board and concurrent resolvers never race on a shared global flag. A
- * parse-miss (or missing repo dir) DEGRADES to a still-actionable brief — this producer
- * never throws on a reason it can't parse. Pure.
- */
-export function buildResolverBrief(args: {
-  epicId: string;
-  reason: string;
-  repoDir: string | null;
-}): string {
-  const epic = args.epicId;
-  const parsed = parseMergeConflictReason(args.reason);
-  const hasRepo = args.repoDir != null && args.repoDir !== "";
-  const foreignStaged = RESOLVER_FOREIGN_STAGED;
-  const guardrail = RESOLVER_GUARDRAIL_LINES;
-  const blockedPath = RESOLVER_BLOCKED_PATH_LINES;
-  if (parsed == null || !hasRepo) {
-    // Parse-miss / no repo dir → a still-actionable brief, never a throw.
-    return [
-      `You are the autopilot merge-resolver for epic ${epic}. A worktree fan-in close`,
-      `is STUCK on a merge conflict (\`close::${epic}\`). Recreate it, classify it, and`,
-      `resolve it ONLY if it is mechanically clear — otherwise stamp BLOCKED and leave`,
-      `it for the human.`,
-      ``,
-      `Do NOT \`keeper autopilot pause\` — the daemon holds a per-epic recover`,
-      `exclusion for as long as THIS worker is live, so the recover sweep will not`,
-      `race your merge and the rest of the board keeps moving. A global pause would`,
-      `needlessly halt every unrelated epic.`,
-      ``,
-      `Open the epic's base worktree, RE-RUN the failed \`git merge --no-ff <source>\``,
-      `(NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
-      `fan-in) to recreate the conflict markers, then:`,
-      ``,
-      ...guardrail,
-      ``,
-      `IF mechanically clear: resolve merging BOTH intents (never pick one side and`,
-      `drop the other), run the epic's tests/build within a bounded budget (passing`,
-      `tests are necessary, not sufficient). Before committing, \`git restore --staged\``,
-      `any FOREIGN staged path (${foreignStaged}), leaving it in the tree, so the merge`,
-      `commit carries ONLY this merge's content. Commit the merge commit, then unstick`,
-      `the board: \`keeper autopilot retry close::${epic}\`, then EXIT (no \`play\` — you never paused).`,
-      ``,
-      ...blockedPath,
-      ``,
-      `Failure reason:`,
-      args.reason.trim(),
-    ].join("\n");
-  }
-  // The checkout where finalize ran the failing merge, for the worker's `cd`: a
-  // default-branch base resolves to the repo root (the shared default checkout, never
-  // laned), a `keeper/epic/…` lane base to its worktree.
-  const worktree = mergeConflictBaseCheckout(
-    args.repoDir as string,
-    parsed.base,
-  );
-  return [
-    `You are the autopilot merge-resolver for epic ${epic}. A worktree fan-in close is`,
-    `STUCK on a merge conflict (\`close::${epic}\`) — the base worktree's merge was`,
-    `aborted CLEAN and the sticky close row is staged for retry. Recreate the conflict,`,
-    `classify it, and resolve it ONLY if it is mechanically clear.`,
-    ``,
-    `Do NOT \`keeper autopilot pause\` — the daemon holds a per-epic recover exclusion`,
-    `for as long as THIS worker is live, so the recover sweep will not race your merge`,
-    `and the rest of the board keeps moving. A global pause would needlessly halt every`,
-    `unrelated epic; it also strands the board if you crash before playing.`,
-    ``,
-    `  1. cd ${worktree}`,
-    `  2. git merge --no-ff ${parsed.source}`,
-    `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
-    `     fan-in; \`--no-ff\` makes ${parsed.source} an ancestor so the retry merge`,
-    `     no-ops. The base worktree is left CLEAN after the abort, so RE-RUN the merge`,
-    `     to recreate the conflict markers.)`,
-    `  3. Classify the conflict:`,
-    ``,
-    ...guardrail,
-    ``,
-    `  4a. IF mechanically clear: resolve merging BOTH intents — never pick one side`,
-    `      and drop the other. Run the epic's tests/build within a bounded budget`,
-    `      (passing tests are necessary, not sufficient). Before committing,`,
-    `      \`git restore --staged\` any FOREIGN staged path (${foreignStaged}), leaving`,
-    `      it in the tree, so the merge commit carries ONLY this merge's content. Commit`,
-    `      the merge commit, then verify \`git branch --contains ${parsed.source}\` lists`,
-    `      the base branch.`,
-    `      Unstick the board and EXIT (no \`play\` — you never paused):`,
-    `        keeper autopilot retry close::${epic}`,
-    ``,
-    `  4b. ${blockedPath[0]}`,
-    ...blockedPath.slice(1).map((line) => `      ${line}`),
-    ``,
-    `Failure reason:`,
-    args.reason.trim(),
-  ].join("\n");
-}
-
-/**
- * Build the autonomous resolver brief the WORK-verb resolver-dispatch producer spawns as
- * the `resolve::<taskId>` worker's prompt. The task-scoped twin of {@link
- * buildResolverBrief}: it reuses the SAME classify-or-BLOCK guardrail and BLOCKED path
- * VERBATIM (a work fan-in conflict is classified by the identical mechanically-clear
- * boundary), and the same green-gate + foreign-staged discipline. It differs on two axes
- * the ADR pins: the conflict sits in the dependent task's OWN lane worktree (the row's
- * `dir`), which is checked out on the base-lane branch — so the worker `cd`s to that lane
- * DIRECTLY and re-runs `git merge --no-ff <source>` there, NOT the close path's
- * default-branch-assuming `mergeConflictBaseCheckout`; and the framing is task-scoped
- * (`work::<taskId>`, `keeper autopilot retry work::<taskId>`). A parse-miss (or missing
- * lane dir) DEGRADES to a still-actionable brief — this producer never throws on a reason
- * it can't parse. Pure.
- */
-export function buildWorkResolverBrief(args: {
-  taskId: string;
-  reason: string;
-  laneDir: string | null;
-}): string {
-  const task = args.taskId;
-  const parsed = parseMergeConflictReason(args.reason);
-  const hasLane = args.laneDir != null && args.laneDir !== "";
-  if (parsed == null || !hasLane) {
-    // Parse-miss / no lane dir → a still-actionable brief, never a throw.
-    return [
-      `You are the autopilot merge-resolver for task ${task}. A worktree fan-in merge`,
-      `into this task's base lane is STUCK on a conflict (\`work::${task}\`), blocking`,
-      `the task and every dependent. Recreate it, classify it, and resolve it ONLY if it`,
-      `is mechanically clear — otherwise stamp BLOCKED and leave it for the human.`,
-      ``,
-      `Do NOT \`keeper autopilot pause\` — the daemon holds a per-task recover exclusion`,
-      `for as long as THIS worker is live, so the rest of the board keeps moving. A global`,
-      `pause would needlessly halt every unrelated epic.`,
-      ``,
-      `Open this task's base lane worktree, RE-RUN the failed \`git merge --no-ff <source>\``,
-      `(NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
-      `fan-in) to recreate the conflict markers, then:`,
-      ``,
-      ...RESOLVER_GUARDRAIL_LINES,
-      ``,
-      `IF mechanically clear: resolve merging BOTH intents (never pick one side and`,
-      `drop the other), run the tests/build within a bounded budget (passing tests are`,
-      `necessary, not sufficient). Before committing, \`git restore --staged\` any FOREIGN`,
-      `staged path (${RESOLVER_FOREIGN_STAGED}), leaving it in the tree, so the merge`,
-      `commit carries ONLY this merge's content. Commit the merge commit, then unstick`,
-      `the board: \`keeper autopilot retry work::${task}\`, then EXIT (no \`play\` — you never paused).`,
-      ``,
-      ...RESOLVER_BLOCKED_PATH_LINES,
-      ``,
-      `Failure reason:`,
-      args.reason.trim(),
-    ].join("\n");
-  }
-  // The conflict physically sits in the dependent task's OWN lane worktree (the sticky
-  // work row's `dir`), already checked out on the base-lane branch — so the worker `cd`s
-  // there directly and re-runs the fan-in merge, NOT the close path's default-branch
-  // `mergeConflictBaseCheckout` (which would fabricate a wrong nested worktree path).
-  const lane = args.laneDir as string;
-  return [
-    `You are the autopilot merge-resolver for task ${task}. A worktree fan-in merge into`,
-    `this task's base lane is STUCK on a conflict (\`work::${task}\`) — the lane's merge`,
-    `was aborted CLEAN and the sticky work row is staged for retry. It blocks the task and`,
-    `every dependent. Recreate the conflict, classify it, and resolve it ONLY if it is`,
-    `mechanically clear.`,
-    ``,
-    `Do NOT \`keeper autopilot pause\` — the daemon holds a per-task recover exclusion for`,
-    `as long as THIS worker is live, so the rest of the board keeps moving. A global pause`,
-    `would needlessly halt every unrelated epic; it also strands the board if you crash`,
-    `before playing.`,
-    ``,
-    `  1. cd ${lane}`,
-    `  2. git merge --no-ff ${parsed.source}`,
-    `     (NOT \`--squash\` or rebase — a single-parent commit re-conflicts on the next`,
-    `     fan-in; \`--no-ff\` makes ${parsed.source} an ancestor so the retry merge`,
-    `     no-ops. The lane is left CLEAN after the abort, so RE-RUN the merge to recreate`,
-    `     the conflict markers.)`,
-    `  3. Classify the conflict:`,
-    ``,
-    ...RESOLVER_GUARDRAIL_LINES,
-    ``,
-    `  4a. IF mechanically clear: resolve merging BOTH intents — never pick one side and`,
-    `      drop the other. Run the tests/build within a bounded budget (passing tests are`,
-    `      necessary, not sufficient). Before committing, \`git restore --staged\` any`,
-    `      FOREIGN staged path (${RESOLVER_FOREIGN_STAGED}), leaving it in the tree, so the`,
-    `      merge commit carries ONLY this merge's content. Commit the merge commit, then`,
-    `      verify \`git branch --contains ${parsed.source}\` lists the base branch.`,
-    `      Unstick the board and EXIT (no \`play\` — you never paused):`,
-    `        keeper autopilot retry work::${task}`,
-    ``,
-    `  4b. ${RESOLVER_BLOCKED_PATH_LINES[0]}`,
-    ...RESOLVER_BLOCKED_PATH_LINES.slice(1).map((line) => `      ${line}`),
-    ``,
-    `Failure reason:`,
-    args.reason.trim(),
-  ].join("\n");
-}
-
-/** Injectable dependency surface for {@link runResolverDispatchSweep}. Mirrors
- *  {@link MergeEscalationSweepDeps}'s fail-open injectable-deps discipline so the
- *  producer is testable with synthetic rows + an injected dispatcher, and never throws
- *  into the daemon loop. */
-export interface ResolverDispatchSweepDeps {
-  /** The current-state pending working set (DELEGATES to
-   *  {@link selectPendingResolverDispatches} in production). */
-  readonly selectPending: () => PendingResolverDispatch[];
-  /** Re-read that the sticky close row for `id` is STILL present with
-   *  `resolver_dispatched_at IS NULL` — checked immediately before the launch to narrow
-   *  the clear-mid-sweep window (a `retry_dispatch` between select and launch drops the
-   *  row). Reads the live projection on the writable connection in production. */
-  readonly stillPending: (id: string) => boolean;
-  /** Launch ONE `resolve::<epic>` worker for the sticky row (into the epic lane, with
-   *  the resolver brief as its prompt). Async + fail-open — every error degrades to
-   *  `dispatch_failed`, never throws into the sweep. Returns the `checkout_busy` SKIP
-   *  when the resolved base checkout is already held by a live merge-recreating
-   *  escalation session, so the sweep re-sweeps it without minting. */
-  readonly dispatchResolver: (
-    row: PendingResolverDispatch,
-  ) => Promise<ResolverDispatchResult>;
-  /** Mint a `ResolverDispatchAttempted{outcome}` synthetic event. The fold stamps
-   *  `resolver_dispatched_at` ONLY on a terminal `dispatched`; it NEVER clears the
-   *  sticky row — only `retry_dispatch` (`DispatchCleared`) does. */
-  readonly mintAttempted: (
-    id: string,
-    outcome: ResolverDispatchOutcome,
-  ) => void;
-  /** Warn sink for non-fatal diagnostics. */
-  readonly noteLine?: (line: string) => void;
-}
-
-/**
- * Run one daemon resolver-dispatch sweep — the producer half of the dispatch-once loop
- * for a stuck worktree fan-in close. Walk the sticky `worktree-merge-conflict` close
- * rows that have not yet had a resolver dispatched, gate each by {@link
- * shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL filter),
- * re-read that the row is STILL pending immediately before the launch (narrowing the
- * clear-mid-sweep window), launch ONE `resolve::<epic>` worker, then mint
- * `ResolverDispatchAttempted{outcome}`.
- *
- * DISPATCHES ONCE — the sweep NEVER mints `DispatchCleared` and never clears the sticky
- * row; only `retry_dispatch` does (the resolver worker fires it on the clear path, or a
- * human does). A TERMINAL `dispatched` stamps the once-marker so the next sweep's
- * selector drops the row — even if the resolver then declines (BLOCKED) or dies, the
- * latch stays stamped and NO second resolver is dispatched until the sticky clears (no
- * resolver churn loop). A `dispatch_failed` leaves the marker NULL so the row stays
- * re-sweepable. Each close failure keys on its own epic, so there is one row per epic
- * and no coalescing is needed. NEVER throws — every helper edge degrades to a recorded
- * outcome (mirrors {@link runMergeEscalationSweep}). The spawn lives ONLY here in the
- * producer, never reachable from `applyEvent`, so a re-fold never re-fires a launch.
- */
-export async function runResolverDispatchSweep(
-  deps: ResolverDispatchSweepDeps,
-): Promise<void> {
-  const note = deps.noteLine ?? (() => {});
-  let pending: PendingResolverDispatch[];
-  try {
-    pending = deps.selectPending();
-  } catch (err) {
-    note(
-      `# warn: resolver-dispatch sweep read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  if (pending.length === 0) return;
-
-  for (const row of pending) {
-    // Defense-in-depth gate: the selector already filters by the exact token, but
-    // re-apply the pure gate so an injected/loosened selector can never dispatch a
-    // resolver for a non-merge-conflict reason.
-    if (!shouldEscalateMergeConflict(row.reason)) continue;
-    // Re-read immediately before the launch: a `retry_dispatch` that cleared the row
-    // (or the fold that stamped the marker) between select and launch means there is
-    // nothing left to resolve — skip without minting.
-    if (!deps.stillPending(row.id)) continue;
-
-    let outcome: ResolverDispatchResult;
-    try {
-      outcome = await deps.dispatchResolver(row);
-    } catch (err) {
-      // The dispatcher is fail-open by contract; this catch is defense-in-depth so a
-      // surprise throw still records a non-terminal outcome and never aborts the sweep.
-      note(
-        `# warn: resolver dispatch threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      outcome = "dispatch_failed";
-    }
-    // A `checkout_busy` SKIP mints nothing: the resolved base checkout is held by a live
-    // merge-recreating escalation session, so the marker stays NULL and the row
-    // re-sweeps once that session terminates and frees the checkout (per checkout, never
-    // global — a different repo's checkout dispatches concurrently).
-    if (outcome === "checkout_busy") continue;
-    // Mint the attempt regardless of the remaining outcome: the fold stamps the
-    // once-marker ONLY on a terminal `dispatched`, so a `dispatch_failed` folds to a
-    // no-op and the row stays re-sweepable next tick.
-    deps.mintAttempted(row.id, outcome);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Incident-claim producer (owner-mediated merge integration).
@@ -5040,23 +3869,21 @@ export function selectPendingIncidentOwnerPages(
   const rows = db
     .query(
       `SELECT verb, id, reason, dir, claim_session_id, instance_event_id,
-              resolver_dispatched_at, merge_escalated_at, human_notified_at
+              owner_redispatch_attempts, human_notified_at
          FROM dispatch_failures
         WHERE verb IN ('work', 'close')
           AND claim_session_id IS NULL
-          AND resolver_dispatched_at IS NOT NULL
-          AND merge_escalated_at IS NOT NULL
+          AND owner_redispatch_attempts >= ?
           AND human_notified_at IS NULL`,
     )
-    .all() as Array<{
+    .all(INCIDENT_OWNER_ATTACHMENT_LIMIT) as Array<{
     verb: "work" | "close";
     id: string;
     reason: string;
     dir: string | null;
     claim_session_id: string | null;
     instance_event_id: number | null;
-    resolver_dispatched_at: number | null;
-    merge_escalated_at: number | null;
+    owner_redispatch_attempts: number;
     human_notified_at: number | null;
   }>;
   return rows
@@ -5067,8 +3894,7 @@ export function selectPendingIncidentOwnerPages(
       dir: row.dir,
       claimSessionId: row.claim_session_id,
       instanceEventId: row.instance_event_id,
-      resolverDispatchedAt: row.resolver_dispatched_at,
-      mergeEscalatedAt: row.merge_escalated_at,
+      ownerRedispatchAttempts: row.owner_redispatch_attempts,
       humanNotifiedAt: row.human_notified_at,
     }))
     .filter(
@@ -5403,168 +4229,6 @@ export function runTrunkLeaseSweep(
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// fn-1240 — work-verb fan-in resolver + deconflict inputs (tier-2 stages 1–2)
-// ---------------------------------------------------------------------------
-//
-// The tier-2 escalation reuses the SAME generic {@link runResolverDispatchSweep} /
-// {@link runMergeEscalationSweep} bodies as the close path (verb-agnostic), wired with
-// these work-verb selectors + the leased resolver-outcome classifier + the retry-in-flight
-// exclusion guard. The pipeline: a sticky `work::<taskId>` `worktree-merge-conflict` row →
-// resolver-dispatch (stamps `resolver_dispatched_at`) → on the resolver's terminal decline
-// a `deconflict::<taskId>` dispatches (stamps `merge_escalated_at`) → on ITS terminal
-// decline the human is paged once (stage 3, above). Identity is task-scoped throughout so
-// `resolve::<taskId>` / `deconflict::<taskId>` never collide with the close path's
-// `resolve::<epic>` / `deconflict::<epic>` (task-id and epic-id namespaces are disjoint).
-
-/**
- * The TTL/lease (seconds) on the work-verb `resolver_dispatched_at` latch. A resolver
- * that launched OK but whose `jobs` row never folds (a crash before birth-ingest, or a
- * launch that reported `ok` but died) would otherwise leave {@link
- * classifyWorkResolverOutcome} stuck at `{terminal:false}` forever — the deconflict never
- * dispatches, the human is never paged, and the pipeline DEADLOCKS. Once the latch ages
- * past this lease WITHOUT a live resolver, the classifier reclaims it as `died` so the
- * escalation proceeds. Set to the shared {@link INFLIGHT_ESCALATION_TTL_MS} horizon (well
- * above the launch → birth-ingest fold lag), so a genuinely-alive resolver — always
- * `working` on a folded row, never subject to the lease — is never pre-empted.
- */
-export const WORK_RESOLVER_LEASE_SEC = INFLIGHT_ESCALATION_TTL_MS / 1000;
-
-/**
- * Select every sticky `work::<taskId>` `worktree-merge-conflict` failure that has NOT yet
- * had a resolver dispatched — the work-verb tier-1 working set. The SQL twin of {@link
- * selectPendingResolverDispatches}, on the WORK verb (its `id` is the task id). Gated on
- * `resolver_dispatched_at IS NULL` (the dispatch-once latch) + the exact leading-token
- * filter ({@link MERGE_ESCALATION_REASON_TOKEN}), so a non-merge-conflict work failure
- * (`launch_failed` / `worktree-lane-premerge-*` / `worktree-merge-lock-timeout`) never
- * matches. A stamped row (the terminal `dispatched` fold) drops out — the resolver fires
- * once per condition; `retry_dispatch` re-arms by deleting the row.
- */
-export function selectPendingWorkResolverDispatches(
-  db: Database,
-): PendingResolverDispatch[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'work'
-           AND resolver_dispatched_at IS NULL
-           AND claim_session_id IS NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingResolverDispatch[];
-}
-
-/**
- * Select every sticky `work::<taskId>` `worktree-merge-conflict` failure whose resolver
- * was DISPATCHED (`resolver_dispatched_at IS NOT NULL`) but whose deconflict has NOT yet
- * been dispatched (`merge_escalated_at IS NULL`) — the work-verb tier-2 stage-2 working
- * set. The SQL twin of {@link selectPendingMergeEscalations}, on the WORK verb: the
- * deconflict is SEQUENCED behind the resolver (the sibling stage-1 sweep owns the conflict
- * first), so a row whose resolver has not yet been dispatched is NOT escalatable. A
- * dispatched-but-still-running resolver is filtered downstream in the sweep by its
- * terminal-outcome check ({@link classifyWorkResolverOutcome}); this SQL gate only rules
- * out the not-yet-dispatched case cheaply off the durable column. Same exact-leading-token
- * filter as the sibling selectors.
- */
-export function selectPendingWorkMergeEscalations(
-  db: Database,
-): PendingMergeEscalation[] {
-  return db
-    .query(
-      `SELECT id, reason, dir FROM dispatch_failures
-         WHERE verb = 'work'
-           AND merge_escalated_at IS NULL
-           AND resolver_dispatched_at IS NOT NULL
-           AND reason IS NOT NULL
-           AND instr(reason, ':') > 0
-           AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
-    )
-    .all(MERGE_ESCALATION_REASON_TOKEN) as PendingMergeEscalation[];
-}
-
-/**
- * Is the work lane for `taskId` occupied by a TURN-ACTIVE (`working`) session that a new
- * autonomous resolver must never race — either a live `resolve::<taskId>` (a resolver
- * already in flight; the dispatch-once latch's not-yet-folded window) OR a live
- * `work::<taskId>` (a manual `retry_dispatch` re-dispatched the task worker, which is
- * re-running the fan-in merge by hand). The retry-in-flight exclusion the ADR requires,
- * modelled on {@link epicHasActiveResolver}: a resolver launched while the human's own
- * hand-fix is in flight would clobber it. A `stopped`/`killed`/`ended` session has yielded
- * its turn and no longer holds the lane, so it does not block. Pure over the passed rows;
- * exported for tests.
- */
-export function workLaneBusyForResolver(
-  jobs: readonly Job[],
-  taskId: string,
-): boolean {
-  for (const job of jobs) {
-    if (job.plan_ref !== taskId) continue;
-    if (job.plan_verb !== "work" && job.plan_verb !== "resolve") continue;
-    if (job.state === "working") return true;
-  }
-  return false;
-}
-
-/**
- * Classify the work-verb `resolve::<taskId>` resolver's terminal outcome for the stage-2
- * deconflict gate — {@link classifyResolverOutcome} PLUS a TTL/lease that breaks the
- * never-folded deadlock. Returns the base classification unchanged when it is terminal (a
- * `stopped` resolver that declined, or a `killed`/`ended` resolver that died) or when a
- * resolver is genuinely LIVE (`working` on a folded row — never pre-empted). ONLY when the
- * base is non-terminal AND no resolver row is live — i.e. the launch's `jobs` row never
- * folded — does the lease apply: once `resolver_dispatched_at` ages past `leaseSec`, the
- * crashed/never-born resolver is reclaimed as `died` so the deconflict dispatches and the
- * pipeline never deadlocks. Reads ONLY the passed jobs + the latch value + `nowSec` (the
- * producer's wall-clock, never inside a fold), so it stays a pure producer helper.
- * Exported for tests.
- */
-export function classifyWorkResolverOutcome(
-  jobs: Map<string, Job>,
-  taskId: string,
-  resolverDispatchedAtSec: number | null,
-  nowSec: number,
-  leaseSec: number,
-): ResolverOutcome {
-  const base = classifyResolverOutcome(jobs, taskId);
-  if (base.terminal) return base;
-  // Non-terminal ⟹ a resolver is `working` OR no resolver row has folded yet. Never lease
-  // out a genuinely-live resolver (racing it would clobber a merge mid-flight).
-  for (const job of jobs.values()) {
-    if (
-      job.plan_verb === "resolve" &&
-      job.plan_ref === taskId &&
-      job.state === "working"
-    ) {
-      return base;
-    }
-  }
-  // No live resolver and no terminal row ⟹ the dispatched launch's `jobs` row never
-  // folded. Reclaim the lease once it expires: a crashed/never-born resolver must not
-  // deadlock the escalation — proceed as `died` so the deconflict dispatches.
-  if (
-    resolverDispatchedAtSec != null &&
-    nowSec - resolverDispatchedAtSec > leaseSec
-  ) {
-    return { terminal: true, verdict: "died" };
-  }
-  return base;
-}
-
-// ---------------------------------------------------------------------------
-// fn-1129 — shared escalation-dispatch substrate (deconflict:: + unblock::)
-// ---------------------------------------------------------------------------
-//
-// The launch machinery both escalation sweeps use to fire a purpose-built plan-skill
-// session — the deconflict-dispatch sweep here, the unblock-dispatch sweep in the
-// sibling task. A `<verb>::<id>` escalation session is a fresh sonnet/high context that
-// boots `/plan:<verb>` and resolves the incident WITHOUT the creator's context; it is
-// NEVER a worker cell, so it reads the SEPARATE escalation launch config. The shared
-// helper enforces the two guards that keep the fan-out bounded: a global concurrency
-// cap across BOTH verbs, and a per-key occupancy guard so cadence + fold lag can never
-// double-dispatch the same key.
-
 /**
  * Is this `jobs` row a TURN-ACTIVE escalation session — occupying its slot RIGHT NOW?
  * TRUE iff `state === 'working'` (a live turn). An escalation session is a one-shot
@@ -5584,92 +4248,15 @@ function escalationJobLive(job: Job): boolean {
   return job.state === "working";
 }
 
-/**
- * Count the LIVE escalation sessions (`unblock::` + `deconflict::` combined) in `jobs`
- * — the global-cap denominator. Pure over the passed rows; exported for tests.
- */
-export function countLiveEscalationSessions(jobs: readonly Job[]): number {
-  let n = 0;
-  for (const job of jobs) {
-    if (job.plan_verb !== "unblock" && job.plan_verb !== "deconflict") continue;
-    if (escalationJobLive(job)) n += 1;
-  }
-  return n;
-}
-
-/**
- * Is a `<verb>::<id>` escalation session already LIVE in `jobs`? The per-key occupancy
- * guard: after a dispatch mints its attempt, the once-marker fold may lag the next
- * sweep tick, so the sweep re-reads a still-`NULL` marker — this catches the live
- * session and skips the re-dispatch. Pure over the passed rows; exported for tests.
- */
-export function escalationSessionLiveFor(
-  jobs: readonly Job[],
-  verb: EscalationVerb,
-  id: string,
-): boolean {
-  for (const job of jobs) {
-    if (job.plan_verb !== verb || job.plan_ref !== id) continue;
-    if (escalationJobLive(job)) return true;
-  }
-  return false;
-}
-
-/**
- * Is `checkout` (a merge-conflict BASE checkout dir) currently OCCUPIED by a live
- * MERGE-RECREATING escalation session — a `resolve::` or `deconflict::` job whose `cwd`
- * is exactly that checkout? Both classes physically re-run the failing merge in the base
- * checkout, so two of them sharing one checkout contend for its single working tree; the
- * `unblock::` class runs in a task checkout and never recreates a merge, so it is neither
- * an occupant here nor a gated candidate. Excludes the candidate's OWN `<verb>::<id>` key
- * so a session never self-blocks (the per-key {@link escalationSessionLiveFor} guard owns
- * that case). Empty `checkout` (an unresolved cwd) is never occupied — a false serialize
- * that wedged an unresolvable launch would be worse than the contention it prevents. Pure
- * over the passed rows; exported for tests.
- */
-export function escalationCheckoutOccupiedBy(
-  jobs: readonly Job[],
-  checkout: string,
-  selfVerb: string,
-  selfId: string,
-): boolean {
-  if (checkout === "") return false;
-  for (const job of jobs) {
-    if (job.plan_verb !== "resolve" && job.plan_verb !== "deconflict") continue;
-    if (job.plan_verb === selfVerb && job.plan_ref === selfId) continue;
-    if (job.cwd !== checkout) continue;
-    if (escalationJobLive(job)) return true;
-  }
-  return false;
-}
-
-/**
- * Is any `unblock::<task>` session for a task in `epicId` LIVE in `jobs`? The
- * per-EPIC serialization guard for the block/unblock dispatch sweep: at most one live
- * unblock session per epic, so a mass-block never fans an epic's siblings out at once.
- * Each live `unblock` row's `plan_ref` is a task id (`<epic>.<ordinal>`), mapped back
- * to its epic via {@link parsePlanRef} — the same parser the reducer's jobs→epic
- * fan-out uses, so the epic mapping never diverges. Pure over the passed rows;
- * exported for tests.
- */
-export function epicHasLiveUnblock(
-  jobs: readonly Job[],
-  epicId: string,
-): boolean {
-  for (const job of jobs) {
-    if (job.plan_verb !== "unblock") continue;
-    if (!escalationJobLive(job)) continue;
-    const parsed = parsePlanRef(job.plan_ref ?? null);
-    if (parsed != null && parsed.epic_id === epicId) return true;
-  }
-  return false;
-}
+/** The block/unblock + deconflict escalation session verbs {@link
+ *  classifyEscalationOutcome} / {@link resolveEscalationJobsFor} classify jobs rows
+ *  against — the surviving twin of the retired manual-dispatch grammar. */
+type EscalationVerb = "unblock" | "deconflict";
 
 /**
  * Classify a `<verb>::<id>` escalation session's terminal outcome off `jobs` PLUS the
- * caller's board-state `incidentOpen` — the generalized twin of {@link
- * classifyResolverOutcome} for the deconflict / unblock verbs (the resolver classifier
- * is hard-keyed to `resolve`). `{terminal:false}` while any matching row is TURN-ACTIVE
+ * caller's board-state `incidentOpen`, for the deconflict / unblock verbs.
+ * `{terminal:false}` while any matching row is TURN-ACTIVE
  * or no `<verb>::<id>` row has folded yet (the launch window), AND while the incident is
  * already closed (`incidentOpen === false` — the escalation resolved it, so there is
  * nothing to page). Otherwise `{terminal:true, verdict}`: `died` when a `killed`/`ended`
@@ -5713,7 +4300,7 @@ export function classifyEscalationOutcome(
  * deconflict probe. Bounded (a handful of rows per key), selecting only the columns the
  * liveness arms touch. A jobs read failure degrades to an EMPTY array, which classifies
  * as `{terminal:false}` so the notify conservatively WAITS (never a premature notify on a
- * transient error). Module-level twin of {@link resolveJobsForEpic}.
+ * transient error).
  *
  * `instance` scopes the read to the CURRENT block instance (the caller's `blocked_since`
  * for unblock, the sticky row's `instance_event_id` for deconflict/resolve/repair) so a
@@ -5752,111 +4339,6 @@ export function resolveEscalationJobsFor(
   } catch {
     return [];
   }
-}
-
-/** Injectable dependency surface for {@link dispatchEscalationSession}. Fail-open by
- *  contract — no dep throws into a sweep. */
-export interface EscalationDispatchDeps {
-  /** Count of currently-live escalation sessions (both verbs) for the global cap.
-   *  Production: {@link countLiveEscalationSessions} over the live jobs read PLUS the
-   *  producer's not-yet-folded in-flight memo. */
-  readonly countLiveEscalations: () => number;
-  /** True iff a `<verb>::<id>` session is already live — the per-key occupancy guard.
-   *  Production: {@link escalationSessionLiveFor} over the same reads. */
-  readonly isEscalationLive: (verb: EscalationVerb, id: string) => boolean;
-  /** True iff `cwd` (the resolved base checkout) is already held by a DIFFERENT live
-   *  merge-recreating escalation session — the per-checkout occupancy guard that
-   *  serializes same-checkout escalations. Production: {@link escalationCheckoutOccupiedBy}
-   *  over the live jobs read PLUS the in-flight launch memo, gated to the merge-recreating
-   *  `deconflict` verb (an `unblock` candidate is never checkout-gated). */
-  readonly isCheckoutOccupied: (
-    verb: EscalationVerb,
-    id: string,
-    cwd: string,
-  ) => boolean;
-  /** Resolve the `<verb>` escalation session's `{model, effort}` from the
-   *  `dispatch:` table (DELEGATES to {@link resolveDispatchLaunchConfig}, floored to
-   *  the `ESCALATION_*` constants, in production). Verb-parameterized (ADR 0040) so
-   *  each escalation verb's row is honored independently. */
-  readonly resolveConfig: (verb: EscalationVerb) => {
-    model: string;
-    effort: string;
-  };
-  /** Launch ONE `<verb>::<id>` session with the built {@link LaunchSpec} + cwd; returns
-   *  `{ ok }`. Async + fail-open (a throw is caught and mapped to `dispatch_failed`). */
-  readonly launch: (args: {
-    spec: LaunchSpec;
-    cwd: string;
-    label: string;
-  }) => Promise<{ ok: boolean }>;
-  /** Warn sink for non-fatal diagnostics. */
-  readonly noteLine?: (line: string) => void;
-}
-
-/**
- * Dispatch ONE `<verb>::<id>` escalation session — the shared launch path both the
- * deconflict-dispatch sweep and the unblock-dispatch sweep call. Enforces, in order:
- * the per-key occupancy guard ({@link EscalationDispatchDeps.isEscalationLive} — a
- * still-live session means the mint fold has not caught up, so skip → `already_live`),
- * then the global concurrency cap ({@link MAX_LIVE_ESCALATION_SESSIONS} — at cap the
- * row stays pending and re-sweeps → `at_cap`). Only past both guards does it resolve
- * the escalation `{model, effort}` and launch the session at `--name <verb>::<id>` +
- * the `/plan:<verb>` prompt. Returns `dispatched` on a successful launch,
- * `dispatch_failed` on a launch miss (or a launcher throw — caught), so the caller
- * mints the once-marker ONLY on `dispatched` and re-sweeps otherwise. NEVER throws.
- */
-export async function dispatchEscalationSession(
-  deps: EscalationDispatchDeps,
-  args: { verb: EscalationVerb; id: string; prompt: string; cwd: string },
-): Promise<EscalationDispatchOutcome> {
-  const note = deps.noteLine ?? (() => {});
-  const label = `${args.verb}::${args.id}`;
-  // Occupancy guard FIRST: a live session for this key means a prior tick already
-  // launched it and the marker fold is still catching up — skip without launching.
-  if (deps.isEscalationLive(args.verb, args.id)) {
-    note(`# escalation dispatch skipped — ${label} already live`);
-    return "already_live";
-  }
-  // Per-checkout occupancy guard: a DIFFERENT merge-recreating escalation session already
-  // holds the resolved base checkout, so recreating the merge there would contend for the
-  // one working tree. Skip WITHOUT launching — the row re-sweeps and dispatches once the
-  // occupying session reaches a terminal state. Per checkout, never global: a session for
-  // a different repo's checkout dispatches concurrently.
-  if (deps.isCheckoutOccupied(args.verb, args.id, args.cwd)) {
-    note(
-      `# escalation dispatch skipped — checkout ${args.cwd} busy; ${label} stays pending`,
-    );
-    return "checkout_busy";
-  }
-  // Global cap: bound the total concurrent escalation sessions across BOTH verbs. At
-  // cap the row stays pending and re-sweeps once a session frees a slot.
-  if (deps.countLiveEscalations() >= MAX_LIVE_ESCALATION_SESSIONS) {
-    note(
-      `# escalation dispatch skipped — at cap (${MAX_LIVE_ESCALATION_SESSIONS}); ${label} stays pending`,
-    );
-    return "at_cap";
-  }
-  const { model, effort } = deps.resolveConfig(args.verb);
-  const spec: LaunchSpec = {
-    prompt: args.prompt,
-    claudeName: label,
-    model,
-    effort,
-  };
-  let result: { ok: boolean };
-  try {
-    result = await deps.launch({ spec, cwd: args.cwd, label });
-  } catch (err) {
-    // The launcher is fail-open by contract; this catch is defense-in-depth so a
-    // surprise throw still records a non-terminal outcome and never aborts the sweep.
-    note(
-      `# warn: escalation launch threw for ${label} (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return "dispatch_failed";
-  }
-  return result.ok ? "dispatched" : "dispatch_failed";
 }
 
 /**
@@ -14157,7 +12639,7 @@ function startDaemonWithExitAttribution(
     const row = db
       .query(
         `SELECT verb, id, reason, dir, claim_session_id,
-                resolver_dispatched_at, merge_escalated_at, human_notified_at
+                owner_redispatch_attempts, human_notified_at
            FROM dispatch_failures
           WHERE verb = ? AND id = ?`,
       )
@@ -14167,8 +12649,7 @@ function startDaemonWithExitAttribution(
       reason: string;
       dir: string | null;
       claim_session_id: string | null;
-      resolver_dispatched_at: number | null;
-      merge_escalated_at: number | null;
+      owner_redispatch_attempts: number;
       human_notified_at: number | null;
     } | null;
     if (row == null) return null;
@@ -14178,8 +12659,7 @@ function startDaemonWithExitAttribution(
       reason: row.reason,
       dir: row.dir,
       claimSessionId: row.claim_session_id,
-      resolverDispatchedAt: row.resolver_dispatched_at,
-      mergeEscalatedAt: row.merge_escalated_at,
+      ownerRedispatchAttempts: row.owner_redispatch_attempts,
       humanNotifiedAt: row.human_notified_at,
     };
   }
@@ -14659,147 +13139,12 @@ function startDaemonWithExitAttribution(
   }
 
   /**
-   * Mint one synthetic `MergeEscalationAttempted` event onto the writable
-   * connection — the only write path into the `dispatch_failures.merge_escalated_at`
-   * once-marker for both the close-scoped deconflict-dispatch sweep (`verb:"close"`,
-   * the epic id) and the work-verb fan-in escalation sweep (`verb:"work"`, the task
-   * id); it never UPDATEs the projection directly (the reducer fold owns that, stamping
-   * the marker ONLY on a terminal outcome and NEVER clearing the sticky row). The row
-   * `id` rides the entity-key overload on `session_id` so a re-fold correlates the row
-   * WITHOUT re-parsing `data`; the full payload also rides `data` for the strict fold
-   * parser. The `verb` defaults to `close` and is OMITTED from the payload in that case,
-   * keeping the close-path event byte-identical to before verb-parameterization.
-   * NON-FATAL on insert failure — the next heartbeat sweep re-attempts (the marker stays
-   * NULL on a non-terminal/failed mint).
-   */
-  function mintMergeEscalationEvent(
-    id: string,
-    outcome: MergeEscalationOutcome,
-    verb: "close" | "work" = "close",
-  ): void {
-    try {
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: id,
-        $pid: null,
-        $hook_event: "MergeEscalationAttempted",
-        $event_type: "dispatch_failures",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data:
-          verb === "close"
-            ? JSON.stringify({ id, outcome })
-            : JSON.stringify({ id, outcome, verb }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      wakePending = true;
-      pumpWakes();
-    } catch (err) {
-      console.error(
-        `[keeperd] MergeEscalationAttempted mint threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-
-  /**
-   * Mint one synthetic `ResolverDispatchAttempted` event onto the writable connection
-   * — the only write path into the `dispatch_failures.resolver_dispatched_at`
-   * once-marker for both the close-scoped resolver-dispatch sweep (`verb:"close"`, the
-   * epic id, `resolve::<epic>`) and the work-verb fan-in resolver-dispatch sweep
-   * (`verb:"work"`, the task id, `resolve::<taskId>`); it never UPDATEs the projection
-   * directly (the reducer fold owns that, stamping the marker ONLY on a terminal
-   * `dispatched` and NEVER clearing the sticky row). Sibling of
-   * {@link mintMergeEscalationEvent}. The row `id` rides the entity-key overload on
-   * `session_id` so a re-fold correlates the row WITHOUT re-parsing `data`; the full
-   * payload also rides `data` for the strict fold parser. The `verb` defaults to `close`
-   * and is OMITTED from the payload in that case, keeping the close-path event
-   * byte-identical to before verb-parameterization. NON-FATAL on insert failure — the
-   * next heartbeat sweep re-attempts (the marker stays NULL on a `dispatch_failed`).
-   */
-  function mintResolverDispatchEvent(
-    id: string,
-    outcome: ResolverDispatchOutcome,
-    verb: "close" | "work" = "close",
-  ): void {
-    try {
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: id,
-        $pid: null,
-        $hook_event: "ResolverDispatchAttempted",
-        $event_type: "dispatch_failures",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data:
-          verb === "close"
-            ? JSON.stringify({ id, outcome })
-            : JSON.stringify({ id, outcome, verb }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      wakePending = true;
-      pumpWakes();
-    } catch (err) {
-      console.error(
-        `[keeperd] ResolverDispatchAttempted mint threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-
-  /**
    * Mint one synthetic `MergeHumanNotified` event onto the writable connection — the
    * only write path into the `dispatch_failures.human_notified_at` once-marker for both
    * the deconflict human-notify sweep (stage 3, `verb:"close"`) and the work-verb fan-in
    * page sweep (`verb:"work"`); it never UPDATEs the projection directly (the reducer
    * fold owns that, stamping the marker ONLY on the terminal `notified` and NEVER
-   * clearing the sticky row). Sibling of {@link mintMergeEscalationEvent}. The row `id`
+   * clearing the sticky row). The row `id`
    * rides the entity-key overload on `session_id` so a re-fold correlates the row WITHOUT
    * re-parsing `data`; the full payload also rides `data` for the strict fold parser. The
    * `verb` defaults to `close` and is OMITTED from the payload in that case, keeping the
@@ -15076,9 +13421,9 @@ function startDaemonWithExitAttribution(
    * Mint one synthetic `RepairDispatched` event onto the writable connection — the
    * repair sweep's only write path into the `dispatch_failures.repair_dispatched_at`
    * once-marker (the reducer fold owns the UPDATE, stamping ONLY on a terminal
-   * `dispatched` and NEVER clearing the sticky row). Sibling of
-   * {@link mintResolverDispatchEvent}; the repo-token `id` rides the entity-key overload
-   * on `session_id`. NON-FATAL on insert failure — the next heartbeat sweep re-attempts.
+   * `dispatched` and NEVER clearing the sticky row). The repo-token `id` rides the
+   * entity-key overload on `session_id`. NON-FATAL on insert failure — the next
+   * heartbeat sweep re-attempts.
    */
   function mintRepairDispatchedEvent(
     id: string,
@@ -15507,81 +13852,10 @@ function startDaemonWithExitAttribution(
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
-  // Shared escalation-dispatch production wiring (fn-1129) — the deconflict-dispatch
-  // sweep AND the block/unblock-dispatch sweep both launch a
-  // `<verb>::<id>` plan-skill session through `dispatchEscalationSession`, bounded by the
-  // global concurrency cap + a per-key occupancy guard. `inFlightEscalations` is a
-  // producer-side memo of keys THIS process launched that may not have folded into the
-  // `jobs` projection yet (a session boots + emits a birth record + gets ingested SECONDS
-  // after launch), so the cap counts them until they fold and a within-tick burst can't
-  // over-dispatch. It is GC'd once a key appears in the jobs read (folded — live OR
-  // terminal) or ages past its TTL (a never-folded launch), so it stays bounded and is
-  // NEVER a fold input.
-  const inFlightEscalations = new Map<string, number>();
   // Owning-work attachment launches that have not folded a fresh `jobs` row yet.
   // This closes the launch→SessionStart gap inside one daemon lifetime; the durable
   // attempt count bounds recovery after a restart.
   const inFlightBlockOwners = new Map<string, number>();
-  // Producer-side memo of the resolved base CHECKOUT each merge-recreating escalation
-  // (`resolve::` / `deconflict::`) was launched into, keyed by `<verb>::<id>` label — the
-  // per-checkout occupancy guard's not-yet-folded arm (a launch's `jobs.cwd` folds SECONDS
-  // after launch, so a within-tick burst of same-checkout dispatches would otherwise all
-  // slip past the live-jobs probe). GC'd on the SAME rule as `inFlightEscalations` (folded
-  // into the widened jobs read OR aged past its TTL), so it stays bounded and is NEVER a
-  // fold input. `unblock::` launches never land here — they recreate no merge.
-  const inFlightCheckouts = new Map<string, { cwd: string; ts: number }>();
-  function readLiveEscalationJobs(): Job[] {
-    let jobs: Job[];
-    try {
-      // `resolve` rides this read too (beyond the cap's `unblock`/`deconflict`): it is a
-      // merge-recreating occupant of a base checkout, so the per-checkout guard must see
-      // live resolvers. The cap count + per-key liveness filter to their own verbs, so
-      // the extra rows never inflate either.
-      jobs = db
-        .query(
-          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, cwd FROM jobs WHERE plan_verb IN ('resolve', 'unblock', 'deconflict', 'repair')",
-        )
-        .all() as unknown as Job[];
-    } catch {
-      // A transient jobs read failure degrades to an empty set — the cap/occupancy
-      // guards then rely on the in-flight memo alone (never a false skip that loses a
-      // dispatch, never a false over-count that wedges the cap).
-      jobs = [];
-    }
-    if (inFlightEscalations.size > 0 || inFlightCheckouts.size > 0) {
-      const cutoff = Date.now() - INFLIGHT_ESCALATION_TTL_MS;
-      const folded = new Set(jobs.map((j) => `${j.plan_verb}::${j.plan_ref}`));
-      for (const [key, ts] of inFlightEscalations) {
-        if (folded.has(key) || ts < cutoff) inFlightEscalations.delete(key);
-      }
-      for (const [key, rec] of inFlightCheckouts) {
-        if (folded.has(key) || rec.ts < cutoff) inFlightCheckouts.delete(key);
-      }
-    }
-    return jobs;
-  }
-  // The per-checkout occupancy probe both merge-recreating dispatch paths consult: a
-  // DIFFERENT live `resolve::`/`deconflict::` session (folded into `jobs`, or still
-  // in-flight in the memo) already holds `checkout`. Excludes the candidate's own
-  // `<verb>::<id>` key so a session never self-blocks. Empty checkout → never occupied.
-  function escalationCheckoutOccupied(
-    selfVerb: string,
-    selfId: string,
-    checkout: string,
-  ): boolean {
-    if (checkout === "") return false;
-    const selfLabel = `${selfVerb}::${selfId}`;
-    // `readLiveEscalationJobs` GCs the in-flight memo first, so the two arms are disjoint
-    // (folded-live jobs + not-yet-folded launches).
-    const jobs = readLiveEscalationJobs();
-    if (escalationCheckoutOccupiedBy(jobs, checkout, selfVerb, selfId))
-      return true;
-    for (const [label, rec] of inFlightCheckouts) {
-      if (label === selfLabel) continue;
-      if (rec.cwd === checkout) return true;
-    }
-    return false;
-  }
   function readBlockOwnerJobs(taskId: string): Job[] {
     try {
       return db
@@ -15670,378 +13944,6 @@ function startDaemonWithExitAttribution(
       return [];
     }
   }
-  const liveEscalationDispatchDeps: EscalationDispatchDeps = {
-    countLiveEscalations: () =>
-      // GC-then-count: `readLiveEscalationJobs` prunes folded keys from the memo first,
-      // so the two summands are disjoint (folded-live jobs + not-yet-folded in-flight).
-      countLiveEscalationSessions(readLiveEscalationJobs()) +
-      inFlightEscalations.size,
-    isEscalationLive: (verb, id) => {
-      const jobs = readLiveEscalationJobs();
-      return (
-        inFlightEscalations.has(`${verb}::${id}`) ||
-        escalationSessionLiveFor(jobs, verb, id)
-      );
-    },
-    // The per-checkout guard applies ONLY to the merge-recreating `deconflict` verb — an
-    // `unblock` session runs in a task checkout and recreates no merge, so it is never
-    // checkout-gated (the resolver's own path is gated in `dispatchResolver` directly).
-    isCheckoutOccupied: (verb, id, cwd) =>
-      verb === "deconflict" && escalationCheckoutOccupied(verb, id, cwd),
-    resolveConfig: (verb) => {
-      const cfg = resolveDispatchLaunchConfig(verb);
-      return {
-        model: cfg.model ?? ESCALATION_MODEL,
-        effort: cfg.effort ?? ESCALATION_EFFORT,
-      };
-    },
-    launch: async ({ spec, cwd, label }) => {
-      const result = await keeperAgentLaunch({
-        noteLine: (line) => console.error(`[keeperd] ${line}`),
-        launcherArgvPrefix,
-        session: MANAGED_EXEC_SESSION,
-        cwd,
-        label,
-        spec,
-      });
-      // Record the just-launched key so the cap counts it until its jobs row folds. A
-      // `deconflict::` launch also records its base checkout so the per-checkout guard
-      // serializes a within-tick sibling before the jobs row folds; `unblock::` never
-      // recreates a merge, so it stays out of the checkout memo.
-      if (result.ok) {
-        inFlightEscalations.set(label, Date.now());
-        if (label.startsWith("deconflict::")) {
-          inFlightCheckouts.set(label, { cwd, ts: Date.now() });
-        }
-      }
-      return { ok: result.ok };
-    },
-    noteLine: (line) => console.error(`[keeperd] ${line}`),
-  };
-
-  // Launch ONE `deconflict::<epic>` escalation session for a sticky close whose tier-1
-  // resolver declined/died. Mirrors `dispatchResolver`: cwd = the epic's base worktree
-  // (a parse-miss leaves the repo root; the skill re-derives context from its escalation
-  // brief), the prompt is `/plan:deconflict <epic>`, and the launch runs at the SEPARATE
-  // escalation model/effort via the shared `dispatchEscalationSession` (so the cap +
-  // occupancy guard apply). Producer-only — never reachable from a fold.
-  async function dispatchDeconflict(
-    row: PendingMergeEscalation,
-  ): Promise<EscalationDispatchOutcome> {
-    // The checkout where finalize ran the failing merge — see `dispatchResolver`:
-    // `mergeConflictBaseCheckout` maps a default-branch base to the repo root (never
-    // laned) and a `keeper/epic/…` lane base to its worktree, so Bun.spawn never ENOENTs.
-    const parsed = parseMergeConflictReason(row.reason);
-    const hasRepo = row.dir != null && row.dir !== "";
-    const cwd =
-      parsed != null && hasRepo
-        ? mergeConflictBaseCheckout(row.dir as string, parsed.base)
-        : (row.dir ?? "");
-    return dispatchEscalationSession(liveEscalationDispatchDeps, {
-      verb: "deconflict",
-      id: row.id,
-      prompt: defaultPlanPrompt("deconflict", row.id),
-      cwd,
-    });
-  }
-
-  // Send the ONE agentbot notification about a declined/dead `deconflict::<epic>` session
-  // (stage 3). ASYNC spawn (never `spawnSync` — that would block the main loop), array
-  // form so the free-text body rides as a literal argv element (no shell interpolation).
-  // A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal, so the
-  // marker stays NULL and the row re-sweeps: the notification is never lost, and the
-  // sticky close row stays operator-visible via `keeper status` throughout, so it never
-  // goes silent.
-  async function notifyHumanOfDeconflict(
-    row: PendingMergeEscalation,
-    verdict: "declined" | "died",
-  ): Promise<MergeHumanNotifiedOutcome> {
-    const body = buildDeconflictHumanNotifyBody({
-      epicId: row.id,
-      reason: row.reason,
-      verdict,
-    });
-    return notifyHuman(body);
-  }
-
-  // Producer-side deconflict-dispatch sweep (fn-1129 stage 2), the rewired successor to
-  // the merge-escalation planner@ notify. Each heartbeat tick walks the sticky
-  // `worktree-merge-conflict` close rows whose tier-1 resolver reached a TERMINAL
-  // verdict, and DISPATCHES one `deconflict::<epic>` escalation session per stuck close
-  // (never a planner@ bus message). A terminal `dispatched` stamps the
-  // `merge_escalated_at` once-marker (the reducer fold), so a daemon dispatches a given
-  // stuck close's deconflict ONCE; a `dispatch_failed` or a cap/occupancy SKIP leaves it
-  // re-sweepable. All wall-clock + spawn lives HERE in the producer; the spawn lives only
-  // here, so a re-fold never re-fires a launch. Rides the SAME 60s heartbeat as the block
-  // tick. `void` + `.catch`: the async launch must not block the heartbeat.
-  async function _runMergeEscalationSweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    // Paused = the human is in control (the `[paused]` banner is authoritative); a paused
-    // board never auto-dispatches a NEW escalation session, mirroring the resolver-
-    // dispatch + reconciler pause gate. So a fresh sticky on a paused board defers the
-    // deconflict dispatch (and, downstream, the human notify) until play.
-    if (autopilotPaused) return;
-    await runMergeEscalationSweep({
-      selectPending: () => selectPendingMergeEscalations(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND merge_escalated_at IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          // A point-read failure (unexpected) conservatively skips THIS tick's launch
-          // for the row — the selector already succeeded, the marker stays NULL, and
-          // the next heartbeat re-sweeps. Never a false dispatch.
-          return false;
-        }
-      },
-      resolverOutcome: (id) =>
-        classifyResolverOutcome(
-          resolveJobsForEpic(db, id, stickyCloseInstanceFor(id)),
-          id,
-        ),
-      dispatchDeconflict: (row) => dispatchDeconflict(row),
-      mintAttempted: (id, outcome) => mintMergeEscalationEvent(id, outcome),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  // Owner-mediated incidents never launch a top-level deconflict session. Keep
-  // the legacy sweep callable for bounded compatibility tests, but do not arm it.
-  const mergeEscalationSweepTimer: ReturnType<typeof setInterval> | null = null;
-
-  // The stage-3 board-state gate for the deconflict notify: is the epic's sticky
-  // `close::<epic>` merge-conflict row still present? A successful deconflict clears it
-  // (its own `retry_dispatch`) before the notify fires, so a surviving row means the
-  // conflict is unresolved — the incident {@link classifyEscalationOutcome} may page on.
-  // A read miss degrades to `false` (incident treated closed → the notify WAITS, never a
-  // premature page on a transient error), mirroring the empty-jobs `{terminal:false}`
-  // fallback.
-  function deconflictIncidentOpen(id: string): boolean {
-    try {
-      return (
-        db
-          .query(
-            "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? LIMIT 1",
-          )
-          .get(id) != null
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  // The sticky close row's `instance_event_id` — the block-instance anchor the
-  // resolver-outcome probe (stage 2) and the deconflict human-notify (stage 3) both
-  // scope their jobs reads on, so a stale resolve/deconflict row from a resolved
-  // incident never suppresses or prematurely fires a re-escalated close. The column is
-  // marker-agnostic (the first-appearance incident id, preserved through UPSERT), so
-  // one read serves both stages. A read miss or absent row degrades to NULL (the
-  // unscoped verb+ref fallback), never a thrown error.
-  function stickyCloseInstanceFor(id: string): number | null {
-    try {
-      const row = db
-        .query(
-          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ? LIMIT 1",
-        )
-        .get(id) as { instance_event_id: number | null } | null;
-      return row?.instance_event_id ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  // Producer-side deconflict human-notify sweep (fn-1129 stage 3). Each heartbeat tick
-  // walks the sticky closes whose deconflict session was dispatched but whose human is
-  // not yet notified, and sends ONE agentbot notification once that session reaches a
-  // TERMINAL decline/death — then mints `MergeHumanNotified{outcome}`. A terminal
-  // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE;
-  // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
-  // `retry_dispatch`) before this ever fires. Same pause + autopilot-role gating as the
-  // dispatch sweep.
-  async function _runDeconflictHumanNotifySweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    if (autopilotPaused) return;
-    await runDeconflictHumanNotifySweep({
-      selectPending: () => selectPendingHumanNotifications(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND human_notified_at IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          return false;
-        }
-      },
-      deconflictOutcome: (id) =>
-        classifyEscalationOutcome(
-          resolveEscalationJobsFor(
-            db,
-            "deconflict",
-            id,
-            stickyCloseInstanceFor(id),
-          ),
-          "deconflict",
-          id,
-          deconflictIncidentOpen(id),
-        ),
-      notifyHuman: (row, verdict) => notifyHumanOfDeconflict(row, verdict),
-      mintAttempted: (id, outcome) => mintMergeHumanNotifiedEvent(id, outcome),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  const deconflictHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
-    null;
-
-  // The sticky work row's `instance_event_id` — the block-instance anchor the work-verb
-  // resolver-outcome probe (stage 2) and the work human-notify (stage 3) scope their jobs
-  // reads on, so a stale resolve/deconflict row from a resolved prior fan-in conflict
-  // never suppresses or prematurely fires a re-escalated task. The work-verb analog of
-  // {@link stickyCloseInstanceFor}. A read miss or absent row degrades to NULL (the
-  // unscoped verb+ref fallback), never a thrown error.
-  function stickyWorkInstanceFor(taskId: string): number | null {
-    try {
-      const row = db
-        .query(
-          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
-        )
-        .get(taskId) as { instance_event_id: number | null } | null;
-      return row?.instance_event_id ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  // The sticky work row's `resolver_dispatched_at` latch value (seconds) — the anchor the
-  // leased {@link classifyWorkResolverOutcome} ages against so a crashed/never-folded
-  // resolver cannot deadlock the deconflict gate. A read miss or absent row degrades to
-  // NULL (no lease → wait for the jobs row to fold), never a thrown error.
-  function workResolverDispatchedAt(taskId: string): number | null {
-    try {
-      const row = db
-        .query(
-          "SELECT resolver_dispatched_at FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
-        )
-        .get(taskId) as { resolver_dispatched_at: number | null } | null;
-      return row?.resolver_dispatched_at ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  // The `work::<taskId>` + `resolve::<taskId>` jobs for the retry-in-flight resolver
-  // exclusion — a bounded point read (a handful of rows per task) feeding
-  // {@link workLaneBusyForResolver}. A read failure degrades to `[]` → not busy → the
-  // resolver dispatch proceeds under its remaining guards, never a false skip that loses a
-  // dispatch. Work verb sits OUTSIDE `readLiveEscalationJobs`'s escalation-only read, so
-  // this is a separate targeted query.
-  function readWorkLaneJobs(taskId: string): Job[] {
-    try {
-      return db
-        .query(
-          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id FROM jobs WHERE plan_verb IN ('work', 'resolve') AND plan_ref = ?",
-        )
-        .all(taskId) as unknown as Job[];
-    } catch {
-      return [];
-    }
-  }
-
-  // The stage-3 board-state gate for the work-verb page: is the task's sticky
-  // `work::<taskId>` merge-conflict row still present? A successful deconflict clears it
-  // (its own `retry_dispatch`) before the page fires, so a surviving row means the conflict
-  // is unresolved — the incident {@link classifyEscalationOutcome} may page on. A read miss
-  // degrades to `false` (incident treated closed → the page WAITS, never a premature page
-  // on a transient error). Work-verb analog of `deconflictIncidentOpen`.
-  function workMergeIncidentOpen(taskId: string): boolean {
-    try {
-      return (
-        db
-          .query(
-            "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? LIMIT 1",
-          )
-          .get(taskId) != null
-      );
-    } catch {
-      return false;
-    }
-  }
-
-  // Send the ONE agentbot page about a stuck `work::<taskId>` fan-in merge conflict whose
-  // resolver AND deconflict session both declined/died (tier-2 stage 3). ASYNC spawn
-  // (never `spawnSync` — that would block the main loop), array form so the free-text body
-  // rides as a literal argv element (no shell interpolation of a hunk). A non-zero exit OR
-  // a missing agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and
-  // the row re-sweeps: the page is never lost, and the sticky work row stays
-  // operator-visible via `keeper status` throughout.
-  async function notifyHumanOfWorkMergeConflict(
-    row: PendingWorkMergeConflict,
-    verdict: "declined" | "died",
-  ): Promise<MergeHumanNotifiedOutcome> {
-    const body = buildWorkMergeHumanNotifyBody({
-      taskId: row.id,
-      lane: row.dir,
-      reason: row.reason,
-      verdict,
-    });
-    return notifyHuman(body);
-  }
-
-  // Producer-side work-verb fan-in merge-conflict TERMINAL page sweep (fn-1240 tier-2
-  // stage 3), the analog of `runDeconflictHumanNotifySweepTick`. Each heartbeat tick walks
-  // the sticky `work::<taskId>` rows whose deconflict was dispatched but whose human is not
-  // yet paged, and sends ONE agentbot page once that deconflict session reaches a TERMINAL
-  // decline/death — then mints `MergeHumanNotified{verb:"work", outcome}`. A terminal
-  // `notified` stamps the `human_notified_at` once-marker so the human is paged ONCE; a
-  // `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
-  // `retry_dispatch`) before this ever fires; `retry_dispatch` also re-arms the whole chain
-  // for a genuine re-conflict. Same pause + autopilot-role gating as the sibling sweeps.
-  async function _runWorkMergeHumanNotifySweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    if (autopilotPaused) return;
-    await runWorkMergeHumanNotifySweep({
-      selectPending: () => selectPendingWorkMergeNotifications(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND human_notified_at IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          return false;
-        }
-      },
-      deconflictOutcome: (id) =>
-        classifyEscalationOutcome(
-          resolveEscalationJobsFor(
-            db,
-            "deconflict",
-            id,
-            stickyWorkInstanceFor(id),
-          ),
-          "deconflict",
-          id,
-          workMergeIncidentOpen(id),
-        ),
-      notifyHuman: (row, verdict) =>
-        notifyHumanOfWorkMergeConflict(row, verdict),
-      mintAttempted: (id, outcome) =>
-        mintMergeHumanNotifiedEvent(id, outcome, "work"),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  const workMergeHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
-    null;
 
   function incidentOwnerActive(row: PendingIncidentOwnerPage): boolean {
     try {
@@ -16086,12 +13988,16 @@ function startDaemonWithExitAttribution(
                 `SELECT 1 FROM dispatch_failures
                   WHERE verb = ? AND id = ? AND instance_event_id IS ?
                     AND claim_session_id IS NULL
-                    AND resolver_dispatched_at IS NOT NULL
-                    AND merge_escalated_at IS NOT NULL
+                    AND owner_redispatch_attempts >= ?
                     AND human_notified_at IS NULL
                   LIMIT 1`,
               )
-              .get(row.verb, row.id, row.instanceEventId) != null
+              .get(
+                row.verb,
+                row.id,
+                row.instanceEventId,
+                INCIDENT_OWNER_ATTACHMENT_LIMIT,
+              ) != null
           );
         } catch {
           return false;
@@ -16115,159 +14021,6 @@ function startDaemonWithExitAttribution(
         });
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
-
-  // Launch ONE `deconflict::<taskId>` escalation session for a stuck work fan-in conflict
-  // whose tier-1 resolver declined/died (fn-1240 tier-2 stage 2). The work-verb twin of
-  // `dispatchDeconflict`: cwd = the task's OWN lane worktree (`row.dir`) where the conflict
-  // physically sits — NOT the close path's default-branch `mergeConflictBaseCheckout`, per
-  // the ADR — the prompt is `/plan:deconflict <taskId>`, and the launch runs via the shared
-  // `dispatchEscalationSession` so the GLOBAL escalation cap (shared with close deconflicts
-  // + unblock) and the per-key + per-checkout occupancy guards apply. Producer-only.
-  async function dispatchWorkDeconflict(
-    row: PendingMergeEscalation,
-  ): Promise<EscalationDispatchOutcome> {
-    const cwd = row.dir ?? "";
-    return dispatchEscalationSession(liveEscalationDispatchDeps, {
-      verb: "deconflict",
-      id: row.id,
-      prompt: defaultPlanPrompt("deconflict", row.id),
-      cwd,
-    });
-  }
-
-  // Producer-side work-verb deconflict-dispatch sweep (fn-1240 tier-2 stage 2), reusing the
-  // generic `runMergeEscalationSweep`. Each heartbeat tick walks the sticky `work::<taskId>`
-  // rows whose resolver reached a TERMINAL verdict (leased so a crashed resolver never
-  // deadlocks) and dispatches ONE `deconflict::<taskId>` session, stamping `merge_escalated_at`
-  // on a terminal `dispatched`. Same pause + autopilot-role gating as the sibling sweeps.
-  async function _runWorkMergeEscalationSweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    if (autopilotPaused) return;
-    await runMergeEscalationSweep({
-      selectPending: () => selectPendingWorkMergeEscalations(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND merge_escalated_at IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          return false;
-        }
-      },
-      resolverOutcome: (id) =>
-        classifyWorkResolverOutcome(
-          resolveJobsForEpic(db, id, stickyWorkInstanceFor(id)),
-          id,
-          workResolverDispatchedAt(id),
-          Date.now() / 1000,
-          WORK_RESOLVER_LEASE_SEC,
-        ),
-      dispatchDeconflict: (row) => dispatchWorkDeconflict(row),
-      mintAttempted: (id, outcome) =>
-        mintMergeEscalationEvent(id, outcome, "work"),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  const workMergeEscalationSweepTimer: ReturnType<typeof setInterval> | null =
-    null;
-
-  // Launch ONE autonomous `resolve::<taskId>` merge-resolver worker for a stuck work
-  // fan-in conflict (fn-1240 tier-2 stage 1), the work-verb twin of `dispatchResolver`.
-  // The conflict sits in the dependent task's OWN lane worktree (`row.dir`), already on the
-  // base-lane branch — so the launch cwd IS `row.dir` directly (NOT the close path's
-  // default-branch `mergeConflictBaseCheckout`, per the ADR). Two skip guards fire before
-  // the launch, each mapping to `checkout_busy` so the sweep re-sweeps WITHOUT minting the
-  // once-marker: the retry-in-flight exclusion ({@link workLaneBusyForResolver} — never
-  // race a live `resolve::`/`work::<taskId>` hand-fix), then the shared per-checkout
-  // occupancy guard (a DIFFERENT live merge-recreating session holding this lane). A
-  // successful launch stamps the once-marker and records the lane in the in-flight checkout
-  // memo so a within-tick sibling serializes before the jobs row folds. Producer-only.
-  async function dispatchWorkResolver(
-    row: PendingResolverDispatch,
-  ): Promise<ResolverDispatchResult> {
-    const cwd = row.dir ?? "";
-    // Retry-in-flight / double-dispatch exclusion (mirror `epicHasActiveResolver`): never
-    // launch a resolver while a `resolve::<taskId>` is already live OR a manual
-    // `retry_dispatch` re-dispatched `work::<taskId>` (the human's hand-fix is in flight) —
-    // a second merge in the same lane would clobber it.
-    if (workLaneBusyForResolver(readWorkLaneJobs(row.id), row.id)) {
-      console.error(
-        `[keeperd] # work resolver dispatch skipped — lane busy (live work::/resolve::${row.id}); stays pending`,
-      );
-      return "checkout_busy";
-    }
-    // Per-checkout occupancy guard: a DIFFERENT live merge-recreating escalation session
-    // already holds this lane checkout. SKIP without launching — the row re-sweeps once it
-    // frees. Per checkout, never global.
-    if (escalationCheckoutOccupied("resolve", row.id, cwd)) {
-      console.error(
-        `[keeperd] # work resolver dispatch skipped — checkout ${cwd} busy; resolve::${row.id} stays pending`,
-      );
-      return "checkout_busy";
-    }
-    // The `resolve` dispatch honors the operator's `dispatch.resolve` row (ADR
-    // 0040), floored to the WORKER_* constants when unset — so a `dispatch:`-less
-    // catalog launches byte-identically to the prior inline default.
-    const resolveLaunch = resolveDispatchLaunchConfig("resolve");
-    const spec: LaunchSpec = {
-      prompt: buildWorkResolverBrief({
-        taskId: row.id,
-        reason: row.reason,
-        laneDir: row.dir,
-      }),
-      claudeName: `resolve::${row.id}`,
-      model: resolveLaunch.model ?? WORKER_MODEL,
-      effort: resolveLaunch.effort ?? WORKER_EFFORT,
-    };
-    const result = await keeperAgentLaunch({
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-      launcherArgvPrefix,
-      session: MANAGED_EXEC_SESSION,
-      cwd,
-      label: `resolve::${row.id}`,
-      spec,
-    });
-    if (result.ok) {
-      inFlightCheckouts.set(`resolve::${row.id}`, { cwd, ts: Date.now() });
-    }
-    return result.ok ? "dispatched" : "dispatch_failed";
-  }
-
-  // Producer-side work-verb resolver-dispatch sweep (fn-1240 tier-2 stage 1), reusing the
-  // generic `runResolverDispatchSweep`. Each heartbeat tick walks the sticky `work::<taskId>`
-  // rows with a NULL resolver latch and launches ONE `resolve::<taskId>` worker, stamping
-  // `resolver_dispatched_at` on a terminal `dispatched`. Same pause + autopilot-role gating
-  // as the sibling sweeps: a paused board defers the launch (the human is in control).
-  async function _runWorkResolverDispatchSweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    if (autopilotPaused) return;
-    await runResolverDispatchSweep({
-      selectPending: () => selectPendingWorkResolverDispatches(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          return false;
-        }
-      },
-      dispatchResolver: (r) => dispatchWorkResolver(r),
-      mintAttempted: (id, outcome) =>
-        mintResolverDispatchEvent(id, outcome, "work"),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  const workResolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
-    null;
 
   function readWorkerProvider(): WorkerProvider | null {
     try {
@@ -16498,42 +14251,7 @@ function startDaemonWithExitAttribution(
     return "dispatch_failed";
   }
 
-  // Launch ONE `unblock::<task>` escalation session for a non-audit blocked task.
-  // Sibling of `dispatchDeconflict`: cwd = the task's effective
-  // repo (the lane worktree / project dir — the skill re-derives context from its
-  // escalation brief), the prompt is `/plan:unblock <task>`, and the launch runs at the
-  // SEPARATE escalation model/effort via the shared `dispatchEscalationSession` (so the
-  // global cap + per-key occupancy guard apply). Producer-only — never reachable from a
-  // fold.
-  async function dispatchUnblock(
-    row: PendingBlockEscalation,
-  ): Promise<EscalationDispatchOutcome> {
-    return dispatchEscalationSession(liveEscalationDispatchDeps, {
-      verb: "unblock",
-      id: row.task_id,
-      prompt: defaultPlanPrompt("unblock", row.task_id),
-      cwd: effectiveBlockEscalationRepo(row.target_repo, row.project_dir),
-    });
-  }
-
-  // The per-EPIC serialization guard: is any `unblock::<task>` session for a task in
-  // `epicId` already live? Reads the live jobs (mapped task→epic via `epicHasLiveUnblock`)
-  // PLUS the producer's not-yet-folded in-flight memo (a session launched THIS tick that
-  // has not folded a jobs row yet), so a same-epic sibling can never double-dispatch while
-  // one is in flight. `readLiveEscalationJobs` GCs the memo first, so the two reads stay
-  // disjoint.
-  function epicUnblockLive(epicId: string): boolean {
-    const jobs = readLiveEscalationJobs();
-    for (const key of inFlightEscalations.keys()) {
-      if (!key.startsWith("unblock::")) continue;
-      const parsed = parsePlanRef(key.slice("unblock::".length));
-      if (parsed != null && parsed.epic_id === epicId) return true;
-    }
-    return epicHasLiveUnblock(jobs, epicId);
-  }
-
   function epicBlockHandlingLive(epicId: string): boolean {
-    if (epicUnblockLive(epicId)) return true;
     for (const taskId of inFlightBlockOwners.keys()) {
       if (parsePlanRef(taskId)?.epic_id === epicId) return true;
     }
@@ -16566,7 +14284,7 @@ function startDaemonWithExitAttribution(
   }
 
   // Send the ONE agentbot notification about a declined/dead `unblock::<task>` session
-  // (stage 3). Sibling of `notifyHumanOfDeconflict`: ASYNC spawn, array form so the body
+  // (stage 3). ASYNC spawn, array form so the body
   // rides as a literal argv element (no shell interpolation). A non-zero exit OR a missing
   // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and the row
   // re-sweeps: the notification is never lost, and the blocked task stays operator-visible
@@ -16611,7 +14329,6 @@ function startDaemonWithExitAttribution(
           taskId,
           outcome,
         ),
-      dispatchUnblock: (row) => dispatchUnblock(row),
       dispatchOwner: (row) => dispatchBlockOwner(row),
       isEpicBlockHandlingLive: (epicId) => epicBlockHandlingLive(epicId),
       ownerLiveness: (row) => blockOwnerLiveness(row),
@@ -16669,19 +14386,17 @@ function startDaemonWithExitAttribution(
     : null;
 
   // The stage-3 board-state gate for the unblock notify: is the task's block still OPEN
-  // under an `attempted` latch? The `block_escalations` latch is DELETED the moment the
-  // task leaves `blocked`, so a surviving `status='attempted'` row means the escalation
-  // was dispatched AND the task is still blocked — the incident {@link
+  // under an `attempted` incident? The `('block', task_id)` incident is DELETED the moment
+  // the task leaves `blocked`, so a surviving `block_status='attempted'` row means the
+  // escalation was dispatched AND the task is still blocked — the incident {@link
   // classifyEscalationOutcome} may page on. A read miss degrades to `false` (incident
   // treated closed → the notify WAITS, never a premature page on a transient error).
-  // `task_id` is globally unique (`<epic>.<ordinal>`), so it keys the (epic_id, task_id)
-  // latch alone.
   function unblockIncidentOpen(taskId: string): boolean {
     try {
       return (
         db
           .query(
-            "SELECT 1 FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+            "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' LIMIT 1",
           )
           .get(taskId) != null
       );
@@ -16690,16 +14405,16 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // The block latch's `blocked_since` — the block-instance anchor stage-3 scopes
+  // The block incident's `blocked_since` — the block-instance anchor stage-3 scopes
   // {@link resolveEscalationJobsFor} on so a stale row from a resolved (unblocked) prior
   // instance never suppresses or prematurely pages a re-blocked task's fresh escalation.
-  // A read miss or absent latch degrades to NULL (the unscoped verb+ref fallback), never
-  // a thrown error. `task_id` is globally unique, keying the latch alone.
+  // A read miss or absent incident degrades to NULL (the unscoped verb+ref fallback),
+  // never a thrown error.
   function unblockInstanceFor(taskId: string): number | null {
     try {
       const row = db
         .query(
-          "SELECT blocked_since FROM block_escalations WHERE task_id = ? AND status = 'attempted' LIMIT 1",
+          "SELECT blocked_since FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' LIMIT 1",
         )
         .get(taskId) as { blocked_since: number } | null;
       return row?.blocked_since ?? null;
@@ -16721,14 +14436,14 @@ function startDaemonWithExitAttribution(
     if (autopilotPaused) return;
     await runBlockHumanNotifySweep({
       selectPending: () => selectPendingBlockHumanNotifications(db),
-      stillPending: (epicId, taskId) => {
+      stillPending: (_epicId, taskId) => {
         try {
           return (
             db
               .query(
-                "SELECT 1 FROM block_escalations WHERE epic_id = ? AND task_id = ? AND status = 'attempted' AND outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
               )
-              .get(epicId, taskId) != null
+              .get(taskId) != null
           );
         } catch {
           return false;
@@ -17385,119 +15100,6 @@ function startDaemonWithExitAttribution(
         });
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
-
-  // Producer-side resolver-dispatch (fn-1088), the ACTIVE sibling of the
-  // merge-escalation notify above. Where that sweep pings a human ONCE, this one
-  // launches ONE autonomous `resolve::<epic>` merge-resolver worker ONCE per sticky
-  // condition — narrower authority (mechanically-clear conflicts only; everything else
-  // stamps BLOCKED and stays for the human). The `resolver_dispatched_at` latch is a
-  // DISTINCT column from `merge_escalated_at`, but the two are no longer independent: the
-  // human escalation is SEQUENCED behind this resolver (the notify fires only once a
-  // resolver was dispatched AND reached a terminal verdict — declined/BLOCKED or job
-  // death), so the two never race the same base. Both re-arm at NULL only when
-  // `retry_dispatch` drops the row.
-  //
-  // Spawns into the MANAGED autopilot session with `--name resolve::<epic>`, so the
-  // worker folds a first-class `jobs` row and every reap / instant-death-breaker /
-  // slot-occupancy discipline applies to it like any dispatch key. That live jobs row
-  // IS the mutex: the recover sweep's pass-1 skips a lane whose epic has a live
-  // `resolve::<epic>` job (`epicHasActiveResolver`), a SCOPED per-epic exclusion that
-  // replaced the resolver's old GLOBAL `keeper autopilot pause` — so a crashed resolver
-  // strands nothing (the skip auto-lifts on reap) and concurrent fan-ins stay
-  // independent. The launch cwd is the epic's base worktree (where the fan-in lives).
-  async function dispatchResolver(
-    row: PendingResolverDispatch,
-  ): Promise<ResolverDispatchResult> {
-    // The checkout where finalize ran the failing merge (the conflict lives there):
-    // `mergeConflictBaseCheckout` maps a default-branch base to the repo root (the shared
-    // default checkout, never laned) and a `keeper/epic/…` lane base to its worktree. A
-    // parse-miss / no repo dir degrades to the repo root; the brief guides the worker.
-    const parsed = parseMergeConflictReason(row.reason);
-    const hasRepo = row.dir != null && row.dir !== "";
-    const cwd =
-      parsed != null && hasRepo
-        ? mergeConflictBaseCheckout(row.dir as string, parsed.base)
-        : (row.dir ?? "");
-    // Per-checkout occupancy guard: a DIFFERENT live merge-recreating escalation session
-    // (`resolve::`/`deconflict::`) already holds this base checkout, so recreating the
-    // merge here would contend for the one working tree. SKIP without launching — the row
-    // re-sweeps and dispatches once the occupying session terminates. Per checkout, never
-    // global: a resolver for a different repo's checkout dispatches concurrently.
-    if (escalationCheckoutOccupied("resolve", row.id, cwd)) {
-      console.error(
-        `[keeperd] # resolver dispatch skipped — checkout ${cwd} busy; resolve::${row.id} stays pending`,
-      );
-      return "checkout_busy";
-    }
-    // The `resolve` dispatch honors the operator's `dispatch.resolve` row (ADR
-    // 0040), floored to the WORKER_* constants when unset — so a `dispatch:`-less
-    // catalog launches byte-identically to the prior inline default.
-    const resolveLaunch = resolveDispatchLaunchConfig("resolve");
-    const spec: LaunchSpec = {
-      prompt: buildResolverBrief({
-        epicId: row.id,
-        reason: row.reason,
-        repoDir: row.dir,
-      }),
-      claudeName: `resolve::${row.id}`,
-      model: resolveLaunch.model ?? WORKER_MODEL,
-      effort: resolveLaunch.effort ?? WORKER_EFFORT,
-    };
-    const result = await keeperAgentLaunch({
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-      launcherArgvPrefix,
-      session: MANAGED_EXEC_SESSION,
-      cwd,
-      label: `resolve::${row.id}`,
-      spec,
-    });
-    // A launch failure (bad launcher / ENOENT cwd / non-zero exit) is NON-terminal:
-    // the marker stays NULL and the row re-sweeps next tick, exactly like the
-    // merge-escalation `send_failed`. A successful launch stamps the once-marker, so
-    // even a resolver that then declines or dies mints no second dispatch — and records
-    // its base checkout so the per-checkout guard serializes a within-tick sibling
-    // before the resolver's jobs row folds.
-    if (result.ok) {
-      inFlightCheckouts.set(`resolve::${row.id}`, { cwd, ts: Date.now() });
-    }
-    return result.ok ? "dispatched" : "dispatch_failed";
-  }
-
-  async function _runResolverDispatchSweepTick(): Promise<void> {
-    if (shuttingDown) return;
-    // Paused = the human is in control (the `[paused]` banner is authoritative); a
-    // paused board never auto-dispatches a NEW resolver, mirroring the reconciler's own
-    // pause gate. Pause does NOT stop an in-flight resolver, and the merge-escalation
-    // sweep still runs — it stays sequenced behind that resolver's verdict. So a fresh
-    // sticky on a paused board defers BOTH the launch and the notify until play (a human
-    // watching a paused board reads the sticky via `keeper status` meanwhile).
-    if (autopilotPaused) return;
-    await runResolverDispatchSweep({
-      selectPending: () => selectPendingResolverDispatches(db),
-      stillPending: (id) => {
-        try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
-              )
-              .get(id) != null
-          );
-        } catch {
-          // A point-read failure (unexpected) conservatively skips THIS tick's launch
-          // for the row — the selector already succeeded, the marker stays NULL, and
-          // the next heartbeat re-sweeps. Never a false dispatch.
-          return false;
-        }
-      },
-      dispatchResolver: (r) => dispatchResolver(r),
-      mintAttempted: (id, outcome) => mintResolverDispatchEvent(id, outcome),
-      noteLine: (line) => console.error(`[keeperd] ${line}`),
-    });
-  }
-  // Merge incidents reattach their ordinary owner; no top-level resolver is armed.
-  const resolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
-    null;
 
   // Incident-claim producer. Validates a session's spooled claim/release
   // against the live incident row + claimant liveness and mints the synthetic
@@ -19074,26 +16676,8 @@ function startDaemonWithExitAttribution(
     if (repairEscalationSweepTimer !== null) {
       clearInterval(repairEscalationSweepTimer);
     }
-    if (mergeEscalationSweepTimer !== null) {
-      clearInterval(mergeEscalationSweepTimer);
-    }
-    if (deconflictHumanNotifySweepTimer !== null) {
-      clearInterval(deconflictHumanNotifySweepTimer);
-    }
-    if (workMergeHumanNotifySweepTimer !== null) {
-      clearInterval(workMergeHumanNotifySweepTimer);
-    }
     if (incidentOwnerPageSweepTimer !== null) {
       clearInterval(incidentOwnerPageSweepTimer);
-    }
-    if (workMergeEscalationSweepTimer !== null) {
-      clearInterval(workMergeEscalationSweepTimer);
-    }
-    if (workResolverDispatchSweepTimer !== null) {
-      clearInterval(workResolverDispatchSweepTimer);
-    }
-    if (resolverDispatchSweepTimer !== null) {
-      clearInterval(resolverDispatchSweepTimer);
     }
     if (incidentClaimSweepTimer !== null) {
       clearInterval(incidentClaimSweepTimer);
