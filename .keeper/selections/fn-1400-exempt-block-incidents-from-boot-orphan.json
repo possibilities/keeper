@@ -1,26 +1,31 @@
 {
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
   "cells": [
     {
-      "confidence": 0.86,
+      "confidence": 0.7,
       "label_source": "heuristic-guided",
-      "model": "gpt-5.3-codex-spark",
-      "rationale": "Fully-diagnosed, fixed-shape edit across three explicitly named files \u2014 a one-line block-verb continue exemption mirroring the existing repair guard, a regression test alongside existing exemption cases, and a comment rewrite \u2014 mechanical implementation of an already-specified correctness invariant with no design choice.",
-      "spark_exclusion": null,
-      "spark_fit": true,
+      "model": "sonnet",
+      "rationale": "F1/F2 are mechanical but F3 requires cross-module discovery of the needs-human count read path plus reasoning about a phantom-count drift invariant in the re-fold-deterministic event-sourcing core, which is judgment-heavy under-specified work in delicate in-repo idiom yet short of a nameable opus reason.",
+      "spark_exclusion": "cross-module-discovery",
+      "spark_fit": false,
       "task_id": "fn-1400-exempt-block-incidents-from-boot-orphan.1",
-      "tier": "medium"
+      "tier": "high"
     }
   ],
   "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
-  "created_at": "2026-07-21T17:31:35.267000Z",
+  "created_at": "2026-07-21T18:04:04.361000Z",
   "epic_id": "fn-1400-exempt-block-incidents-from-boot-orphan",
-  "input_hash": "40a027866ebadc2e2724580238b5102255019e281b8e72fc6e51ef73d13d40da",
+  "input_hash": "d6e07a93646867668ec9a36d25aca0f5cf017c7095233c72a50af5d12d85f006",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 1084237702,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-diagnosed, fixed-shape edit across three explicitly named files \u2014 a one-line block-verb continue exemption mirroring the existing repair guard, a regression test alongside existing exemption cases, and a comment rewrite \u2014 mechanical implementation of an already-specified correctness invariant with no design choice.\",\"confidence\":0.86,\"spark_fit\":true,\"spark_exclusion\":null}]}\n"
+  "shuffle_seed": 3605035667,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1400-exempt-block-incidents-from-boot-orphan.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"F1/F2 are mechanical but F3 requires cross-module discovery of the needs-human count read path plus reasoning about a phantom-count drift invariant in the re-fold-deterministic event-sourcing core, which is judgment-heavy under-specified work in delicate in-repo idiom yet short of a nameable opus reason.\",\"confidence\":0.7,\"spark_fit\":false,\"spark_exclusion\":\"cross-module-discovery\"}]}\n"
 }

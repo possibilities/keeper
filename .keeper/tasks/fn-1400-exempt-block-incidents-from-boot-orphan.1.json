@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-21T17:31:35.028000Z",
   "depends_on": [],
   "epic": "fn-1400-exempt-block-incidents-from-boot-orphan",
   "id": "fn-1400-exempt-block-incidents-from-boot-orphan.1",
-  "model": "gpt-5.3-codex-spark",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "medium",
+  "tier": "high",
   "title": "Guard block rows in boot-GC",
-  "updated_at": "2026-07-21T18:02:15.557000Z"
+  "updated_at": "2026-07-21T18:04:04.361000Z"
 }
