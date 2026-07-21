@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T21:30:34.759000Z",
+  "depends_on": [
+    "fn-1402-expose-agent-runtime-diagnostics.1",
+    "fn-1402-expose-agent-runtime-diagnostics.2"
+  ],
+  "epic": "fn-1402-expose-agent-runtime-diagnostics",
+  "id": "fn-1402-expose-agent-runtime-diagnostics.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Add telemetry threshold awaits",
+  "updated_at": "2026-07-21T21:30:34.759000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T21:30:34.759000Z",
+  "depends_on": [
+    "fn-1402-expose-agent-runtime-diagnostics.1"
+  ],
+  "epic": "fn-1402-expose-agent-runtime-diagnostics",
+  "id": "fn-1402-expose-agent-runtime-diagnostics.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Expose capacity routing diagnostics",
+  "updated_at": "2026-07-21T21:30:34.759000Z"
+}
