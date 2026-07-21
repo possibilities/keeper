@@ -20,19 +20,26 @@
  *    condition and a reconnect-cap breach are NOT fatal: `-N` fails when no server
  *    runs, so focus observation degrades + retries forever.
  *
- * Control-mode hard invariants (host tmux is 3.6b — verified by the planning
- * scouts):
+ * Control-mode hard invariants (re-verified live against the host's served
+ * tmux 3.7b):
  *  - `no-output` is set ONCE at attach (`-f no-output,…`) and re-asserted via
- *    `refresh-client -f no-output`, NEVER toggled off→on (the ≤3.6 toggle hangs
- *    the client). `copy-mode -q` is sent defensively on connect (no `%config-error`
- *    on 3.6b → a config error would otherwise silently hang the client).
+ *    `refresh-client -f no-output`, NEVER toggled off→on — a live probe against
+ *    3.7b confirms the set-once/re-assert path replies cleanly (`%begin`/`%end`,
+ *    no hang); the never-toggle discipline is kept regardless, since a toggle
+ *    buys nothing an assert doesn't already give. `copy-mode -q` is sent
+ *    defensively on connect to force-clear any pane mode (copy/view) left over
+ *    from a prior client, independent of `%config-error` — a live probe
+ *    confirms 3.7b DOES emit `%config-error` as an unsolicited notification
+ *    (parsed by `createControlStreamParser`, non-structural — it never changes
+ *    focus so it does not dirty a re-read).
  *  - The reader is a dedicated async loop that drains stdout straight into the
  *    task-1 parser, NEVER blocking on a DB write or a command round-trip — a
  *    notification burst against a stalled reader fills the (small, on macOS) pipe
  *    and trips `%exit "too far behind"`.
  *  - The server generation is read FIRST on every connect; ALL cached ids are
- *    discarded on `%exit`/EOF (tmux reuses pane/window/session ids across
- *    restarts) and the surface is re-bootstrapped via a framed re-read.
+ *    discarded on `%exit`/EOF — a live probe confirms 3.7b reuses pane/window/
+ *    session ids across a server restart — and the surface is re-bootstrapped
+ *    via a framed re-read.
  *
  * The PURE pieces below (`buildAttachArgs`, `pickAnchorSession`, `focusDedupKey`,
  * `decideReconnect`, `isStructuralNotification`) carry no I/O so the fast tier

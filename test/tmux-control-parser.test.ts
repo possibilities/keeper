@@ -123,6 +123,33 @@ describe("parseControlStream — notifications", () => {
     ]);
   });
 
+  // Captured from a live 3.7b `tmux -C` transcript: `source-file` against a
+  // config with an unknown command emits `%config-error` as an UNSOLICITED
+  // notification (never inside the command's own `%begin`/`%end` reply block,
+  // which closes empty) — distinct from a runtime command failure, which
+  // replies `%error` inside its block instead.
+  test("a live-captured %config-error decodes as an unsolicited notification", () => {
+    const transcript = [
+      "%begin 1700000000 4 1",
+      "%end 1700000000 4 1",
+      "%config-error /home/user/.tmux.conf:1: unknown command: bogus-directive",
+    ].join("\n");
+    const events = parseControlStream(transcript);
+    expect(events).toEqual([
+      { kind: "reply", cmdNum: 4, lines: [], isError: false },
+      {
+        kind: "notification",
+        verb: "config-error",
+        args: [
+          "/home/user/.tmux.conf:1:",
+          "unknown",
+          "command:",
+          "bogus-directive",
+        ],
+      },
+    ]);
+  });
+
   test("an unknown %-verb parses-and-ignores (no throw, no emit)", () => {
     const events = parseControlStream("%totally-made-up arg1 arg2\n");
     expect(events).toEqual([]);
