@@ -657,6 +657,124 @@ test("gcUnretryableDispatchFailures: sweeps only the rows the retry wire path ca
   db.close();
 });
 
+test("gcUnretryableDispatchFailures: block incidents survive boot GC and the needs-human source equals the live block subset", () => {
+  // Exercise the fresh DB's full migration ladder: its retained base literal is
+  // needed until the collapse migration retires the old table.
+  const { db } = openDb(":memory:");
+  expect(
+    db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'block_escalations'",
+      )
+      .get(),
+  ).toBeNull();
+
+  const expectedBlockTaskIds = ["fn-1400-block.1", "fn-1400-block.2"];
+  const insert = db.prepare(
+    `INSERT INTO dispatch_failures (
+       verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+       instance_event_id, blocked_since, block_status, owner_redispatch_attempts
+     ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'pending', 0)`,
+  );
+  insert.run(
+    "block",
+    expectedBlockTaskIds[0],
+    "block-incident",
+    100,
+    51,
+    100,
+    100,
+    51,
+    51,
+  );
+  insert.run(
+    "block",
+    expectedBlockTaskIds[1],
+    "block-incident",
+    101,
+    52,
+    101,
+    101,
+    52,
+    52,
+  );
+  // A same-task work row and an unrelated daemon row must not inflate the
+  // block-escalation count shown on needs-human surfaces.
+  insert.run(
+    "work",
+    expectedBlockTaskIds[0],
+    "other incident",
+    102,
+    53,
+    102,
+    102,
+    53,
+    53,
+  );
+  insert.run(
+    "daemon",
+    "other-incident",
+    "other incident",
+    103,
+    54,
+    103,
+    103,
+    54,
+    54,
+  );
+
+  const liveBlockCount = (
+    db
+      .query(
+        "SELECT COUNT(*) AS count FROM dispatch_failures WHERE verb = 'block'",
+      )
+      .get() as { count: number }
+  ).count;
+  expect(liveBlockCount).toBe(2);
+
+  // `ReadinessClientSnapshot.blockEscalations`, whose length feeds the
+  // needs-human block count, comes from this descriptor's filtered wire result.
+  const blockEscalations = runQuery(db, 0, {
+    type: "query",
+    collection: "block_escalations",
+    limit: 0,
+  });
+  if (blockEscalations.type !== "result") {
+    throw new Error("block_escalations query must return a result");
+  }
+  expect(blockEscalations.total).toBe(liveBlockCount);
+  expect(blockEscalations.rows).toHaveLength(liveBlockCount);
+  expect(
+    (blockEscalations.rows as Array<{ id: string }>)
+      .map((row) => row.id)
+      .sort(),
+  ).toEqual([...expectedBlockTaskIds].sort());
+
+  const cleared: Array<{
+    verb: string;
+    id: string;
+    expected_attempt_id: number | null;
+    expected_instance_event_id: number | null;
+  }> = [];
+  expect(
+    gcUnretryableDispatchFailures(db, (verb, id, fences) =>
+      cleared.push({ verb, id, ...fences }),
+    ),
+  ).toBe(1);
+  expect(cleared.map(({ verb, id }) => `${verb}::${id}`)).toEqual([
+    "daemon::other-incident",
+  ]);
+  expect(cleared.some(({ verb }) => verb === "block")).toBe(false);
+  expect(
+    db
+      .query(
+        "SELECT id FROM dispatch_failures WHERE verb = 'block' ORDER BY id",
+      )
+      .all(),
+  ).toEqual(expectedBlockTaskIds.map((id) => ({ id })));
+  db.close();
+});
+
 test("gcUnretryableDispatchFailures: the crash-loop distress row is EXEMPT (self-managed, never orphan-swept)", () => {
   const { db } = freshMemDb();
   // The distress row's synthetic verb is un-retryable by the wire validator BY
