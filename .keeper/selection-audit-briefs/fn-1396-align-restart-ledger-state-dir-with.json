@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "medium",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 2,
+        "insertions": 106
+      },
+      "done_summary": "Extracted resolveKeeperStateDir (honoring XDG_STATE_HOME, matching install.sh's fingerprint_dir) and rebuilt resolveRestartLedgerPath on top of it, so the operator-reload attribution leaf reader and install.sh writer now agree under both default and non-default XDG_STATE_HOME; added a deterministic test pinning the resolution across both env states plus KEEPER_RESTART_LEDGER override precedence.",
+      "input_hash": "48b8fd4b8a4ad0bcd20a68320910fe26de7c4fa4791842fccd472fd3865887a5",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1913,
+      "spec_md": "## Description\n\nFinding F1 (Should-fix). Evidence: `resolveOperatorReloadAttributionPath`\n(src/restart-ledger.ts:907) derives the operator-reload leaf path from\n`dirname(resolveRestartLedgerPath())`; `resolveRestartLedgerPath`\n(src/db.ts:5166-5171) hardcodes `join(homedir(), \".local\", \"state\",\n\"keeper\", ...)` and only honors the `KEEPER_RESTART_LEDGER` override, so it\nignores `XDG_STATE_HOME`. `scripts/install.sh:451` sets\n`fingerprint_dir=\"${XDG_STATE_HOME:-${HOME}/.local/state}/keeper\"` and\nwrites `install-reload-attribution.json` there. With `XDG_STATE_HOME` set to\na non-default value the daemon reads from a different directory than\ninstall.sh wrote to, and the operator verdict silently degrades to\n`no-evidence`.\n\nFiles: src/db.ts (resolveRestartLedgerPath), src/restart-ledger.ts\n(leaf-path resolvers derived from it), scripts/install.sh (fingerprint_dir).\nPick ONE convention and make both sides agree: either read `XDG_STATE_HOME`\nin resolveRestartLedgerPath (preferred \u2014 keeps install.sh unchanged and\nmatches the XDG default it already documents), or drop the `XDG_STATE_HOME`\nfallback in install.sh. Keep the `KEEPER_RESTART_LEDGER` override precedence\nintact.\n\n## Acceptance\n\n- [ ] Writer and reader resolve the same directory for both a set and an\n      unset `XDG_STATE_HOME` (with the non-default value exercised).\n- [ ] A deterministic, in-process test pins the resolution across both\n      env states; the `KEEPER_RESTART_LEDGER` override still wins when set.\n\n## Done summary\nExtracted resolveKeeperStateDir (honoring XDG_STATE_HOME, matching install.sh's fingerprint_dir) and rebuilt resolveRestartLedgerPath on top of it, so the operator-reload attribution leaf reader and install.sh writer now agree under both default and non-default XDG_STATE_HOME; added a deterministic test pinning the resolution across both env states plus KEEPER_RESTART_LEDGER override precedence.\n## Evidence\n",
+      "task_id": "fn-1396-align-restart-ledger-state-dir-with.1",
+      "tier": "medium",
+      "title": "Honor XDG_STATE_HOME for the leaf"
+    }
+  ],
+  "created_at": "2026-07-21T07:24:25.882000Z",
+  "epic_id": "fn-1396-align-restart-ledger-state-dir-with",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "48b8fd4b8a4ad0bcd20a68320910fe26de7c4fa4791842fccd472fd3865887a5",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
