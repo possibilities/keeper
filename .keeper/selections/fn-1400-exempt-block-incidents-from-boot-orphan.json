@@ -1,0 +1,26 @@
+{
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fully-diagnosed, fixed-shape edit across three explicitly named files \u2014 a one-line block-verb continue exemption mirroring the existing repair guard, a regression test alongside existing exemption cases, and a comment rewrite \u2014 mechanical implementation of an already-specified correctness invariant with no design choice.",
+      "spark_exclusion": null,
+      "spark_fit": true,
+      "task_id": "fn-1400-exempt-block-incidents-from-boot-orphan.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T17:31:35.267000Z",
+  "epic_id": "fn-1400-exempt-block-incidents-from-boot-orphan",
+  "input_hash": "40a027866ebadc2e2724580238b5102255019e281b8e72fc6e51ef73d13d40da",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1084237702,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-diagnosed, fixed-shape edit across three explicitly named files \u2014 a one-line block-verb continue exemption mirroring the existing repair guard, a regression test alongside existing exemption cases, and a comment rewrite \u2014 mechanical implementation of an already-specified correctness invariant with no design choice.\",\"confidence\":0.86,\"spark_fit\":true,\"spark_exclusion\":null}]}\n"
+}
