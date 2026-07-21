@@ -111,6 +111,7 @@ import type {
   BirthRecordsChangedMessage,
 } from "./birth-ingest-worker";
 import {
+  type BirthOwnerTuple,
   type BirthRecord,
   defaultBirthDir,
   ownerTupleFromBirthRecord,
@@ -6154,13 +6155,15 @@ export type EventsIngestContext = {
   counters: BackstopCounters;
   backstopLogPath: string;
   /**
-   * Per-leg last-logged provider-leg grant-wait cause. The birth scan consults +
-   * updates it through {@link decideProviderLegGrantWaitLog} so a waiting owned
-   * birth emits ONE `[keeperd]` line per (leg, cause) transition, never once per
-   * scan. Absent in unit tests that do not assert the transition log; when absent
-   * the wait branch stays silent (unchanged pre-split behavior).
+   * Per-leg last-logged provider-leg grant-wait signature — the cause, plus the
+   * blocking sibling id for the `sibling-live` cause so a changed blocker re-logs
+   * once. The birth scan consults + updates it through
+   * {@link decideProviderLegGrantWaitLog} so a waiting owned birth emits ONE
+   * `[keeperd]` line per (leg, cause[, sibling]) transition, never once per scan.
+   * Absent in unit tests that do not assert the transition log; when absent the
+   * wait branch stays silent (unchanged pre-split behavior).
    */
-  providerLegGrantWaitLog?: Map<string, ProviderLegGrantWaitCause>;
+  providerLegGrantWaitLog?: Map<string, string>;
 };
 
 /**
@@ -6923,13 +6926,19 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
 
 /**
  * WHY an owned birth cannot be granted YET, but may still become grantable — the
- * three level-triggered lag states the birth scan re-probes each cycle. Each is a
+ * four level-triggered lag states the birth scan re-probes each cycle. Each is a
  * DISTINCT cause the visibility line surfaces so a stuck leg names what it waits on.
+ * `sibling-live` is the single-live-leg admission rail: an otherwise-grantable leg
+ * holds while a DIFFERENT leg still owns the exact same wrapper attempt, so a
+ * wait-timeout / RESUME-exhausted relaunch never double-mints two live legs onto
+ * one lane. It is a WAIT (recoverable), NOT a deny: the moment the sibling settles
+ * the SAME record is admitted, so it must never park/discard like a terminal deny.
  */
 export type ProviderLegGrantWaitCause =
   | "wrapper-unfolded" // no wrapper job row yet — its fold is behind the birth scan
   | "claim-absent" // wrapper folded but carries no claim for this exact attempt
-  | "claim-unbound"; // claim acquired, the wrapper SessionStart bind has not folded
+  | "claim-unbound" // claim acquired, the wrapper SessionStart bind has not folded
+  | "sibling-live"; // a DIFFERENT live leg already owns this exact wrapper attempt
 
 /** WHY an owned birth can NEVER be granted — a terminal, non-recoverable state. */
 export type ProviderLegGrantDenyCause =
@@ -6939,14 +6948,56 @@ export type ProviderLegGrantDenyCause =
 
 export type ProviderLegGrantVerdict =
   | { decision: "grant" }
-  | { decision: "wait"; cause: ProviderLegGrantWaitCause }
+  // `sibling` carries the blocking leg's launch id, set ONLY for `sibling-live`.
+  | { decision: "wait"; cause: ProviderLegGrantWaitCause; sibling?: string }
   | { decision: "deny"; cause: ProviderLegGrantDenyCause };
+
+/**
+ * The single-live-leg admission read: the launch id of a DIFFERENT leg that still
+ * holds `owner`'s exact wrapper attempt, or null when this leg may take sole
+ * ownership. A sibling blocks ONLY on exact folded evidence it is still live — its
+ * ownership row is `live` AND its own leg session has not folded terminal
+ * (`ended`/`killed`). A settled ownership row (`terminal`/`transferred`/`aborted`),
+ * a moved owner tuple, or a leg whose session folded terminal never blocks, so a
+ * legacy or cascade-released duplicate can never wedge admission forever. The
+ * deterministic `leg_launch_id` total order names ONE stable blocker. A PURE
+ * projection read — never wall-clock or process liveness (the cascade owns its own
+ * TTL machinery); the block lifts only on the sibling's folded settle/terminal
+ * transition or an ownership transfer, never on elapsed time.
+ */
+function liveSiblingLegLaunchId(
+  db: Database,
+  owner: BirthOwnerTuple,
+): string | null {
+  const row = db
+    .query(
+      `SELECT o.leg_launch_id AS leg_launch_id
+         FROM provider_leg_ownership o
+         LEFT JOIN jobs lj ON lj.job_id = o.leg_session_id
+        WHERE o.wrapper_job_id = ?
+          AND o.wrapper_dispatch_attempt_id = ?
+          AND o.leg_launch_id != ?
+          AND o.state = 'live'
+          AND (lj.state IS NULL OR lj.state NOT IN ('ended', 'killed'))
+        ORDER BY o.leg_launch_id
+        LIMIT 1`,
+    )
+    .get(
+      owner.wrapper_job_id,
+      owner.wrapper_dispatch_attempt_id,
+      owner.leg_launch_id,
+    ) as { leg_launch_id: string } | null;
+  return row?.leg_launch_id ?? null;
+}
 
 /**
  * Classify an owned birth's grant readiness AND surface WHY. Probes the claim and
  * the wrapper job separately (the prior single JOIN collapsed every non-grant
  * state into a bare `wait`): the split preserves EVERY grant/wait/deny routing
  * decision but distinguishes the lag causes so the wait branch is no longer silent.
+ * The final gate before grant is the single-live-leg admission rail
+ * ({@link liveSiblingLegLaunchId}): an otherwise-grantable leg becomes a
+ * `sibling-live` WAIT while a different live leg still owns the same attempt.
  */
 export function providerLegGrantStatus(
   db: Database,
@@ -6995,43 +7046,57 @@ export function providerLegGrantStatus(
   if (claim.claim_state === "acquired") {
     return { decision: "wait", cause: "claim-unbound" };
   }
-  return claim.claim_state === "bound" &&
-    claim.session_id === owner.wrapper_job_id
-    ? { decision: "grant" }
-    : { decision: "deny", cause: "claim-foreign" };
+  if (
+    claim.claim_state !== "bound" ||
+    claim.session_id !== owner.wrapper_job_id
+  ) {
+    return { decision: "deny", cause: "claim-foreign" };
+  }
+  // Otherwise-grantable: admit exactly one live leg per attempt. A different live
+  // leg still owning this attempt holds the grant as a recoverable wait, never a
+  // second concurrent editor of the same lane.
+  const sibling = liveSiblingLegLaunchId(db, owner);
+  if (sibling !== null) {
+    return { decision: "wait", cause: "sibling-live", sibling };
+  }
+  return { decision: "grant" };
 }
 
 /**
  * One bounded `[keeperd]` visibility line for a provider-leg grant-wait
- * transition, or `null` when the cause is unchanged since the last logged one for
- * this leg (so the line fires once per (leg, cause) transition, NEVER once per
- * poll). Mutates `memo` in place — the caller clears a leg via
+ * transition, or `null` when the signature is unchanged since the last logged one
+ * for this leg (so the line fires once per (leg, cause) transition, NEVER once per
+ * poll). For `sibling-live` the signature also folds in the blocking `sibling`, so
+ * a NEW blocker on the same attempt re-logs exactly once and the line names both
+ * legs. Mutates `memo` in place — the caller clears a leg via
  * {@link clearProviderLegGrantWaitLog} the moment it settles (grant/deny) so the
- * memo stays bounded to legs still waiting. Pure over `(memo, leg, cause)`.
+ * memo stays bounded to legs still waiting. Pure over `(memo, leg, cause, sibling)`.
  */
 export function decideProviderLegGrantWaitLog(
-  memo: Map<string, ProviderLegGrantWaitCause>,
+  memo: Map<string, string>,
   leg: {
     legLaunchId: string;
     wrapperJobId: string;
     wrapperAttemptId: number;
   },
   cause: ProviderLegGrantWaitCause,
+  sibling?: string,
 ): string | null {
-  if (memo.get(leg.legLaunchId) === cause) {
+  const signature = sibling === undefined ? cause : `${cause}\0${sibling}`;
+  if (memo.get(leg.legLaunchId) === signature) {
     return null;
   }
-  memo.set(leg.legLaunchId, cause);
-  return (
+  memo.set(leg.legLaunchId, signature);
+  const base =
     `[keeperd] provider-leg grant wait: leg ${leg.legLaunchId} ` +
-    `wrapper ${leg.wrapperJobId} attempt ${leg.wrapperAttemptId} cause ${cause}`
-  );
+    `wrapper ${leg.wrapperJobId} attempt ${leg.wrapperAttemptId} cause ${cause}`;
+  return sibling === undefined ? base : `${base} sibling ${sibling}`;
 }
 
 /** Drop a settled leg from the grant-wait log memo so it never leaks a per-leg
  *  entry past the leg's own wait window. */
 export function clearProviderLegGrantWaitLog(
-  memo: Map<string, ProviderLegGrantWaitCause> | undefined,
+  memo: Map<string, string> | undefined,
   legLaunchId: string,
 ): void {
   memo?.delete(legLaunchId);
@@ -7451,9 +7516,10 @@ export function scanBirthDir(
         );
       }
       if (verdict?.decision === "wait") {
-        // The owner fold may still be catching up. Surface the DISTINCT lag cause
-        // once per transition, then keep the promoted identity visible so a later
-        // scan can recheck it without launching paid work.
+        // The owner fold may still be catching up, or a sibling leg still owns the
+        // attempt. Surface the DISTINCT lag cause (naming the blocking sibling for
+        // `sibling-live`) once per transition, then keep the promoted identity
+        // visible so a later scan can recheck it without launching paid work.
         if (owner !== null && ctx?.providerLegGrantWaitLog !== undefined) {
           const line = decideProviderLegGrantWaitLog(
             ctx.providerLegGrantWaitLog,
@@ -7463,6 +7529,7 @@ export function scanBirthDir(
               wrapperAttemptId: owner.wrapper_dispatch_attempt_id,
             },
             verdict.cause,
+            verdict.sibling,
           );
           if (line !== null) {
             console.error(line);

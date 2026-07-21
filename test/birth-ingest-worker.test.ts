@@ -40,10 +40,7 @@ import {
   writeBirthIntent,
   writeBirthRecord,
 } from "../src/birth-record";
-import type {
-  EventsIngestContext,
-  ProviderLegGrantWaitCause,
-} from "../src/daemon";
+import type { EventsIngestContext } from "../src/daemon";
 import {
   BIRTH_STUCK_STATUS,
   decideProviderLegGrantWaitLog,
@@ -811,6 +808,48 @@ function seedWrapperClaim(
   ).run(state, sessionId);
 }
 
+/**
+ * Seed a `provider_leg_ownership` row directly (deterministic, no fold) so the
+ * single-live-leg admission read has a sibling to consult. Defaults place the leg
+ * on the `OWNED_LEG_OVERRIDES` attempt so it is a sibling of `leg-status-1`.
+ */
+function seedOwnershipRow(
+  db: ReturnType<typeof freshMemDb>["db"],
+  opts: {
+    legLaunchId: string;
+    wrapperJobId?: string;
+    attemptId?: number;
+    state?: string;
+    legSessionId?: string | null;
+  },
+): void {
+  db.query(
+    `INSERT INTO provider_leg_ownership
+       (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+        ownership_epoch_event_id, leg_session_id, state, last_event_id,
+        created_at, updated_at)
+     VALUES (?, ?, ?, 1, ?, ?, 1, 1, 1)`,
+  ).run(
+    opts.legLaunchId,
+    opts.wrapperJobId ?? "wrapper-status-1",
+    opts.attemptId ?? 700,
+    opts.legSessionId ?? null,
+    opts.state ?? "live",
+  );
+}
+
+/** Seed a leg session's own jobs row (its independent lifecycle state). */
+function seedLegJob(
+  db: ReturnType<typeof freshMemDb>["db"],
+  jobId: string,
+  state: string,
+): void {
+  db.query(
+    `INSERT INTO jobs (job_id, state, created_at, updated_at, last_event_id)
+     VALUES (?, ?, 1, 1, 1)`,
+  ).run(jobId, state);
+}
+
 test("providerLegGrantStatus: no wrapper job row yet is a transient wrapper-unfolded wait", () => {
   const { db } = freshMemDb();
   const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
@@ -889,12 +928,271 @@ test("providerLegGrantStatus: an incomplete owner tuple denies owner-incomplete"
 });
 
 // ---------------------------------------------------------------------------
+// providerLegGrantStatus — single-live-leg admission rail. An otherwise-grantable
+// leg (working wrapper + claim bound to it) is admitted ONLY if no DIFFERENT leg
+// still holds the exact same wrapper attempt live, so a wait-timeout / RESUME
+// relaunch never double-mints two legs editing one lane concurrently.
+// ---------------------------------------------------------------------------
+
+test("providerLegGrantStatus: a DIFFERENT live sibling on the same attempt holds the grant as a sibling-live wait", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // leg-sibling-1 already granted + live on attempt 700, its session still working.
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-sibling-1",
+    legSessionId: "leg-sibling-sess-1",
+  });
+  seedLegJob(db, "leg-sibling-sess-1", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES); // leg-status-1, same attempt
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-sibling-1",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: a sibling whose ownership folded terminal no longer blocks (admits)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-sibling-1",
+    legSessionId: "leg-sibling-sess-1",
+    state: "terminal",
+  });
+  seedLegJob(db, "leg-sibling-sess-1", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("providerLegGrantStatus: the requesting leg's OWN live ownership row never self-blocks (idempotent re-poll grant)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // A crash-replayed delivery re-requests: leg-status-1's own row is already live.
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-status-1",
+    legSessionId: "grant-status-leg",
+  });
+  seedLegJob(db, "grant-status-leg", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("providerLegGrantStatus: among legacy duplicates (two terminal + one live) only the live sibling blocks", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-old-a",
+    state: "terminal",
+    legSessionId: "leg-old-a-sess",
+  });
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-old-b",
+    state: "terminal",
+    legSessionId: "leg-old-b-sess",
+  });
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-live-c",
+    state: "live",
+    legSessionId: "leg-live-c-sess",
+  });
+  seedLegJob(db, "leg-live-c-sess", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-live-c",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: a live-ownership sibling whose leg session folded terminal never wedges admission (admits)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // The ownership row is still 'live' but the leg's OWN session ended — exact
+  // folded terminal evidence, so a stale/legacy duplicate can never block forever.
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-dead-1",
+    legSessionId: "leg-dead-sess-1",
+    state: "live",
+  });
+  seedLegJob(db, "leg-dead-sess-1", "ended");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("providerLegGrantStatus: a live leg on a DIFFERENT attempt or wrapper never blocks this attempt's grant", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-other-attempt",
+    attemptId: 701,
+    legSessionId: "s1",
+  });
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-other-wrapper",
+    wrapperJobId: "wrapper-other",
+    legSessionId: "s2",
+  });
+  seedLegJob(db, "s1", "working");
+  seedLegJob(db, "s2", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("providerLegGrantStatus: a live sibling with no folded leg session (null) still blocks and the read never throws", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  seedOwnershipRow(db, { legLaunchId: "leg-nulljob-1", legSessionId: null });
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-nulljob-1",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: the admission rail never overrides a terminal deny (a foreign claim denies even with a live sibling)", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "someone-else");
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-sibling-1",
+    legSessionId: "leg-sibling-sess-1",
+  });
+  seedLegJob(db, "leg-sibling-sess-1", "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "claim-foreign",
+  });
+  db.close();
+});
+
+test("scanBirthDir end-to-end: a second leg on a live attempt is withheld (no grant leaf, no mint, record retained) and admitted once the sibling settles", () => {
+  const { db } = freshMemDb();
+  // A live wrapper attempt with its claim bound, and leg-int-1 already live on it.
+  db.query(
+    `INSERT INTO jobs (job_id, state, created_at, updated_at, last_event_id)
+     VALUES ('wrapper-int-1', 'working', 1, 1, 1)`,
+  ).run();
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, legacy_unfenced,
+        acquired_at, bound_at, last_event_id, updated_at)
+     VALUES ('work', 'fn-int.1', 500, 'bound', 'wrapper-int-1', 0, 1, 2, 1, 2)`,
+  ).run();
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-int-1",
+    wrapperJobId: "wrapper-int-1",
+    attemptId: 500,
+    legSessionId: "leg-int-1-session",
+    state: "live",
+  });
+  seedLegJob(db, "leg-int-1-session", "working");
+
+  const leg2 = makeBirthRecord({
+    session_id: "leg-int-2-session",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-int-2",
+    wrapper_job_id: "wrapper-int-1",
+    wrapper_dispatch_attempt_id: 500,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:500",
+  });
+  writeBirthRecord(birthDir, leg2);
+  const full = soleNewRecordPath();
+
+  const memo = new Map<string, string>();
+  const ctx: EventsIngestContext = {
+    counters: new BackstopCounters(),
+    backstopLogPath: join(tmpDir, "backstop.ndjson"),
+    providerLegGrantWaitLog: memo,
+  };
+
+  const errors: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  };
+  try {
+    scanBirthDir(db, birthDir, ctx);
+  } finally {
+    console.error = origError;
+  }
+
+  // Withheld: no synthetic events, no ownership row, no grant leaf, no park.
+  expect(sessionStartCount(db, "leg-int-2-session")).toBe(0);
+  expect(
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM provider_leg_ownership WHERE leg_launch_id = 'leg-int-2'",
+      )
+      .get(),
+  ).toEqual({ n: 0 });
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-int-2",
+      wrapper_job_id: "wrapper-int-1",
+      wrapper_dispatch_attempt_id: 500,
+    }),
+  ).toBe(false);
+  expect(birthDeadLetterRows(db)).toEqual([]);
+  // Retained for a later admission — a live pid, so the stuck-GC does not retire.
+  expect(existsSync(full)).toBe(true);
+  // Exactly one bounded visibility line, naming both legs.
+  const waitLines = errors.filter((l) => l.includes("provider-leg grant wait"));
+  expect(waitLines).toEqual([
+    "[keeperd] provider-leg grant wait: leg leg-int-2 wrapper wrapper-int-1 attempt 500 cause sibling-live sibling leg-int-1",
+  ]);
+
+  // The sibling settles (its folded terminal transition lands): a re-scan admits.
+  db.run(
+    "UPDATE provider_leg_ownership SET state = 'terminal' WHERE leg_launch_id = 'leg-int-1'",
+  );
+  scanBirthDir(db, birthDir, ctx);
+  drainToCompletion(db);
+
+  expect(sessionStartCount(db, "leg-int-2-session")).toBe(1);
+  expect(
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE hook_event = 'ProviderLegBorn'
+            AND json_extract(data, '$.leg_launch_id') = 'leg-int-2'`,
+      )
+      .get(),
+  ).toEqual({ n: 1 });
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-int-2",
+      wrapper_job_id: "wrapper-int-1",
+      wrapper_dispatch_attempt_id: 500,
+    }),
+  ).toBe(true);
+  expect(existsSync(full)).toBe(false); // the granted record is consumed
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
 // decideProviderLegGrantWaitLog — ONE bounded visibility line per (leg, cause)
 // transition, never once per poll.
 // ---------------------------------------------------------------------------
 
 test("decideProviderLegGrantWaitLog: one line per (leg, cause) transition, none per repeat poll", () => {
-  const memo = new Map<string, ProviderLegGrantWaitCause>();
+  const memo = new Map<string, string>();
   const leg = {
     legLaunchId: "leg-x",
     wrapperJobId: "work::fn-9.1",
@@ -920,7 +1218,7 @@ test("decideProviderLegGrantWaitLog: one line per (leg, cause) transition, none 
 });
 
 test("decideProviderLegGrantWaitLog: distinct legs each get their own transition line", () => {
-  const memo = new Map<string, ProviderLegGrantWaitCause>();
+  const memo = new Map<string, string>();
   const a = decideProviderLegGrantWaitLog(
     memo,
     { legLaunchId: "leg-a", wrapperJobId: "w", wrapperAttemptId: 1 },
@@ -934,4 +1232,28 @@ test("decideProviderLegGrantWaitLog: distinct legs each get their own transition
   expect(a).not.toBeNull();
   expect(b).not.toBeNull();
   expect(a).not.toBe(b);
+});
+
+test("decideProviderLegGrantWaitLog: sibling-live names both legs and re-logs once when the blocker changes", () => {
+  const memo = new Map<string, string>();
+  const leg = {
+    legLaunchId: "leg-x",
+    wrapperJobId: "work::fn-9.1",
+    wrapperAttemptId: 42,
+  };
+  const lines: string[] = [];
+  // The blocker holds (no re-log), then a NEW sibling takes over (one re-log).
+  for (const sibling of ["leg-a", "leg-a", "leg-b", "leg-b"]) {
+    const line = decideProviderLegGrantWaitLog(
+      memo,
+      leg,
+      "sibling-live",
+      sibling,
+    );
+    if (line !== null) lines.push(line);
+  }
+  expect(lines).toEqual([
+    "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause sibling-live sibling leg-a",
+    "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause sibling-live sibling leg-b",
+  ]);
 });
