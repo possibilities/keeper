@@ -317,6 +317,10 @@ import type {
   MaintenancePageMessage,
   MaintenanceWorkerData,
 } from "./maintenance-worker";
+import {
+  findOsMemoryKillEvidence,
+  type OsMemoryKillEvidence,
+} from "./os-memory-scan";
 import type {
   PlanCommitChangedMessage,
   PlanWorkerData,
@@ -365,6 +369,7 @@ import type { RenamerWorkerData } from "./renamer-worker";
 import {
   appendDurableRestartBoot,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   boundRestartReason,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
@@ -378,13 +383,20 @@ import {
   decideRepeatedNativeCrash,
   type ExitAttributionRecorder,
   isNativeCrashAttributed,
+  matchOperatorReloadAttribution,
   planNativeCrashEnrichLines,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
+  readServeHealthHistory,
   removeExitAttribution,
   resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
+  resolveServeHealthHistoryPath,
+  type ServeHealthHistory,
+  writeServeHealthHistory,
 } from "./restart-ledger";
 import type {
   BackendExecStartMessage,
@@ -6690,10 +6702,21 @@ export {
   scanCrashReports,
 } from "./crash-report-scan";
 export type {
+  OsMemoryKillEvidence,
+  OsMemoryKillWindow,
+} from "./os-memory-scan";
+export {
+  findOsMemoryKillEvidence,
+  OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
+} from "./os-memory-scan";
+export type {
   ExitAttributionKind,
   ExitAttributionRecord,
   ExitAttributionRecorder,
   ExitAttributionSignal,
+  ExitVerdict,
+  ExitVerdictKind,
+  OperatorReloadAttribution,
   RestartBoot,
   RestartBootIdentity,
   RestartBootLine,
@@ -6702,16 +6725,20 @@ export type {
   RestartLedgerSnapshot,
   RestartNativeCrashFields,
   RestartProvenance,
+  ServeHealthHistory,
+  ServeHealthReportSample,
 } from "./restart-ledger";
 // Restart-ledger parsing and persistence live in a dependency-free leaf shared
 // with daemon-control readers. Re-export the pure contract for compatibility.
 export {
   appendDurableRestartBoot,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   boundRestartReason,
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_WINDOW_MS,
   CRASH_LOOP_YOUNG_RUNTIME_MS,
+  classifyExitVerdict,
   classifyRestartProvenance,
   collapseRestartLedger,
   compactRestartLedger,
@@ -6723,6 +6750,7 @@ export {
   HARD_KILL_EXIT_ATTRIBUTION_REASON,
   isNativeCrashAttributed,
   KEEPERD_LAUNCHD_LABEL,
+  matchOperatorReloadAttribution,
   parseRestartLedger,
   parseRestartLedgerLine,
   planNativeCrashEnrichLines,
@@ -6732,14 +6760,20 @@ export {
   RESTART_LEDGER_NATIVE_FIELD_MAX_LEN,
   RESTART_LEDGER_REASON_MAX_LEN,
   readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
   readRestartLedgerSnapshot,
+  readServeHealthHistory,
   removeExitAttribution,
   resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
+  resolveServeHealthHistoryPath,
+  SERVE_HEALTH_HISTORY_MAX_REPORTS,
   serializeRestartLedgerLine,
   shouldEnrichPriorExitAttribution,
   writeExitAttribution,
   writeRestartLedger,
+  writeServeHealthHistory,
 } from "./restart-ledger";
 
 /**
@@ -9802,6 +9836,15 @@ export function publishNonFableFocusProjection(
 }
 
 const NATIVE_CRASH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * `log show` window trailer past a boot's recorded death — a jetsam kill line
+ * can land a second or two after the pid is actually gone.
+ */
+const OS_MEMORY_KILL_PROBE_TRAILING_MS = 3_000;
+/** Hard budget for the last-resort `log show` subprocess; a wedged probe is killed, never hung. */
+const OS_MEMORY_KILL_PROBE_TIMEOUT_MS = 2_000;
+const OS_MEMORY_KILL_PROBE_PREDICATE =
+  'eventMessage contains "jetsam" OR eventMessage contains "memorystatus_kill" OR eventMessage contains "SIGKILL" OR eventMessage contains "low swap"';
 
 type NativeCrashAttributionProbeOutcome = {
   scanned: number;
@@ -10247,6 +10290,15 @@ function startDaemonWithExitAttribution(
   let prevWatchdogCpuUsage: ReturnType<typeof process.cpuUsage> | null = null;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
+  // Bounded ring buffer of MAIN's own RSS, persisted each watchdog tick (never
+  // only at exit — a hard kill gives zero warning) so a memory-growth death
+  // leaves a visible ramp for the NEXT boot's enrich pass to read.
+  const serveHealthHistoryPath =
+    resolveServeHealthHistoryPath(restartLedgerPath);
+  let serveHealthHistory: ServeHealthHistory = {
+    boot_id: restartLedgerBootId,
+    reports: [],
+  };
   // Includes a successfully inserted event that has not folded yet. The fixed key
   // plus this latch suppresses event churn while a bus-only degradation persists.
   let serveBusDistressPending = false;
@@ -11772,7 +11824,66 @@ function startDaemonWithExitAttribution(
   let priorBootId: string | null = null;
   let priorExitAttribution: ReturnType<typeof readExitAttribution> = null;
 
-  const enrichPriorExitAttribution = (): void => {
+  // Last-resort OS-level evidence for a boot no leaf/operator-reload/native-crash
+  // explains: scan the unified log's own window for a jetsam/memory-pressure kill
+  // naming the dead pid. `log show` is a real subprocess, so this stays ASYNC
+  // (never `spawnSync`/`execFileSync` here — that would block the main loop) and
+  // bounded by a hard timeout that kills a wedged probe rather than hanging it.
+  function formatLogShowTimestamp(ms: number): string {
+    const d = new Date(ms);
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    return (
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    );
+  }
+  async function probeOsMemoryKillEvidence(window: {
+    pid: number;
+    startedAtMs: number;
+    diedAtMs: number;
+  }): Promise<OsMemoryKillEvidence | null> {
+    if (process.platform !== "darwin") return null;
+    try {
+      const proc = Bun.spawn(
+        [
+          "/usr/bin/log",
+          "show",
+          "--start",
+          formatLogShowTimestamp(window.startedAtMs),
+          "--end",
+          formatLogShowTimestamp(
+            window.diedAtMs + OS_MEMORY_KILL_PROBE_TRAILING_MS,
+          ),
+          "--predicate",
+          OS_MEMORY_KILL_PROBE_PREDICATE,
+          "--info",
+        ],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      const killTimer = setTimeout(() => {
+        try {
+          proc.kill();
+        } catch {}
+      }, OS_MEMORY_KILL_PROBE_TIMEOUT_MS);
+      try {
+        const [, text] = await Promise.all([
+          proc.exited,
+          new Response(proc.stdout).text(),
+        ]);
+        return findOsMemoryKillEvidence(text, {
+          pid: window.pid,
+          startedAtMs: window.startedAtMs,
+          diedAtMs: window.diedAtMs,
+        });
+      } finally {
+        clearTimeout(killTimer);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const enrichPriorExitAttribution = async (): Promise<void> => {
     if (priorBootId === null) return;
     try {
       const priorBoot = collapseRestartLedger(
@@ -11787,6 +11898,22 @@ function startDaemonWithExitAttribution(
         }
         return;
       }
+      const operatorReload = matchOperatorReloadAttribution(
+        readOperatorReloadAttribution(
+          resolveOperatorReloadAttributionPath(restartLedgerPath),
+        ),
+        { startedAtMs: priorBoot.ts, diedAtMs: Date.now() },
+      );
+      const osMemoryKill =
+        priorExitAttribution === null &&
+        operatorReload === null &&
+        priorBoot.pid !== null
+          ? await probeOsMemoryKillEvidence({
+              pid: priorBoot.pid,
+              startedAtMs: priorBoot.ts,
+              diedAtMs: Date.now(),
+            })
+          : null;
       appendRestartLedgerLine(
         restartLedgerPath,
         decideExitAttribution({
@@ -11794,9 +11921,33 @@ function startDaemonWithExitAttribution(
           ts: Date.now(),
           exitAttribution: priorExitAttribution,
           nativeCrash: priorBoot,
+          operatorReload,
+          osMemoryKill,
         }),
       );
       removeExitAttribution(resolveExitAttributionPath(restartLedgerPath));
+      try {
+        const priorHistory = readServeHealthHistory(
+          resolveServeHealthHistoryPath(restartLedgerPath),
+        );
+        if (
+          priorHistory !== null &&
+          priorHistory.boot_id === priorBootId &&
+          priorHistory.reports.length > 0
+        ) {
+          const reports = priorHistory.reports;
+          const firstMb = Math.round(reports[0].rss_bytes / 1e6);
+          const lastMb = Math.round(
+            reports[reports.length - 1].rss_bytes / 1e6,
+          );
+          console.error(
+            `[keeperd] prior boot RSS history: ${reports.length} report(s), ` +
+              `${firstMb}MB -> ${lastMb}MB`,
+          );
+        }
+      } catch {
+        // RSS history is forensic-only; never blocks enrich on a read failure.
+      }
     } catch {
       // The attribution leaf remains for a future boot if its ledger enrichment fails.
     }
@@ -11960,15 +12111,15 @@ function startDaemonWithExitAttribution(
         reprobesRemaining -= 1;
         const exhausted = reprobesRemaining === 0;
         runNativeCrashProbe(exhausted);
-        enrichPriorExitAttribution();
+        void enrichPriorExitAttribution();
         if (reprobesRemaining > 0) scheduleReprobe();
       }, 30_000);
     };
     runNativeCrashProbe(false);
-    enrichPriorExitAttribution();
+    void enrichPriorExitAttribution();
     scheduleReprobe();
   } else {
-    enrichPriorExitAttribution();
+    void enrichPriorExitAttribution();
   }
 
   // fn-1311: durably record THIS boot's catch-up window (start/end wall-clock +
@@ -18643,6 +18794,19 @@ function startDaemonWithExitAttribution(
           cpuMicros / wallMicros >= SERVE_STARVATION_OURFAULT_CPU_FRACTION;
       }
       prevWatchdogCpuUsage = cpuNow;
+
+      // Main-thread RSS ramp: sampled every tick, persisted (never only at exit —
+      // a hard/jetsam kill gives zero chance to write anything at death time) so a
+      // memory-growth death leaves a visible ramp for the next boot's enrich pass.
+      serveHealthHistory = appendServeHealthReportSample(serveHealthHistory, {
+        ts: Date.now(),
+        rss_bytes: process.memoryUsage().rss,
+      });
+      try {
+        writeServeHealthHistory(serveHealthHistoryPath, serveHealthHistory);
+      } catch {
+        // Best-effort; RSS history is forensic-only and never blocks the tick.
+      }
 
       const arming = resolveProbeArming({
         serverServed: serverWorker != null,
