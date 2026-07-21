@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Arbitrate close claims on holder liveness",
-  "updated_at": "2026-07-21T06:31:55.212000Z"
+  "updated_at": "2026-07-21T18:18:37.275000Z",
+  "worker_done_at": "2026-07-21T18:18:37.275000Z"
 }

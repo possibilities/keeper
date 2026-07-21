@@ -35,5 +35,5 @@ plugins/plan/test/ (session-marker arbitration tests).
 - [ ] CLOSE_CLAIM_STALE_MS shrunk to the backstop bound with tests updated.
 
 ## Done summary
-
+Made close-claim arbitration in session_markers.ts liveness-aware: markers now record pid + process start-time, readRivalCloseClaims probes rival holders via a pid/start-time recycle check (injected pure seam), a provably dead holder's marker is treated as abandoned and removed with bounded logging while inconclusive probes defer to the stale bound, claimCloseExclusive wins against abandoned markers in the same pass, and CLOSE_CLAIM_STALE_MS shrank from 7d to 24h as the un-probeable-marker backstop.
 ## Evidence
