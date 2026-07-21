@@ -1514,6 +1514,79 @@ test("providerLegGrantStatus crash-window (b): the requesting leg's OWN unfolded
   db.close();
 });
 
+/** A COMPLETE owned birth on the shared `wrapper-status-1`/700 attempt with a chosen
+ *  leg_launch_id, so two competing legs contest exactly one slot. */
+function ownedRecordFor(legLaunchId: string): BirthRecord {
+  return makeBirthRecord({
+    ...OWNED_LEG_OVERRIDES,
+    session_id: `${legLaunchId}-sess`,
+    leg_launch_id: legLaunchId,
+  });
+}
+
+test("providerLegGrantStatus regression: a durable higher-id owner (leg-z) coexisting with a fresh lower-id winner (leg-a) grants leg-z and waits leg-a naming it — NO mutual wait", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // leg-z holds the durable slot (its crash-replay ProviderLegBorn is unfolded above
+  // the cursor) while a fresh lower-id leg-a competes in the SAME scan. The same-scan
+  // winner is the fresh leg_launch_id-order minimum (leg-a) — the exact deadlock
+  // trigger: were leg-z to exclude its own reservation it would defer to leg-a while
+  // leg-a defers to leg-z, and neither would ever grant.
+  insertUnfoldedProviderLegBorn(db, { legLaunchId: "leg-z" });
+  const admission = { slotWinner: "leg-a" };
+  // leg-z equals the sole durable owner → idempotent re-grant; slotWinner is ignored.
+  expect(
+    providerLegGrantStatus(db, ownedRecordFor("leg-z"), admission),
+  ).toEqual({
+    decision: "grant",
+  });
+  // leg-a sees the durable owner leg-z → recoverable wait naming it, never a grant
+  // that would double-admit the slot.
+  expect(
+    providerLegGrantStatus(db, ownedRecordFor("leg-a"), admission),
+  ).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-z",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus regression: multiple durable reservations resolve ONE deterministic owner — the minimum grants, every other waits naming it", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  // Three durable reservations on one attempt across BOTH sources — a folded live
+  // ownership row plus two unfolded event-tail reservations. The leg_launch_id-order
+  // minimum across the union is the sole owner, so no two replaying owners wait on
+  // each other.
+  seedOwnershipRow(db, {
+    legLaunchId: "leg-dur-b",
+    legSessionId: "leg-dur-b-sess",
+  });
+  seedLegJob(db, "leg-dur-b-sess", "working");
+  insertUnfoldedProviderLegBorn(db, { legLaunchId: "leg-dur-a" });
+  insertUnfoldedProviderLegBorn(db, { legLaunchId: "leg-dur-c" });
+  // leg-dur-a is the union minimum → the sole granted owner...
+  expect(providerLegGrantStatus(db, ownedRecordFor("leg-dur-a"))).toEqual({
+    decision: "grant",
+  });
+  // ...and every other durable holder waits naming leg-dur-a, never itself — even
+  // leg-dur-b, whose own folded live row defers to the lower-id owner.
+  expect(providerLegGrantStatus(db, ownedRecordFor("leg-dur-b"))).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-dur-a",
+  });
+  expect(providerLegGrantStatus(db, ownedRecordFor("leg-dur-c"))).toEqual({
+    decision: "wait",
+    cause: "sibling-live",
+    sibling: "leg-dur-a",
+  });
+  db.close();
+});
+
 test("scanBirthDir single-live-leg (c): the winner is the GLOBAL leg_launch_id-order minimum across BOTH buckets, never the first file processed", () => {
   const { db } = freshMemDb();
   db.query(

@@ -6953,19 +6953,20 @@ export type ProviderLegGrantVerdict =
   | { decision: "deny"; cause: ProviderLegGrantDenyCause };
 
 /**
- * The single-live-leg admission read: the launch id of a DIFFERENT leg that still
- * holds `owner`'s exact wrapper attempt, or null when this leg may take sole
- * ownership. A sibling blocks ONLY on exact folded evidence it is still live — its
- * ownership row is `live` AND its own leg session has not folded terminal
- * (`ended`/`killed`). A settled ownership row (`terminal`/`transferred`/`aborted`),
- * a moved owner tuple, or a leg whose session folded terminal never blocks, so a
- * legacy or cascade-released duplicate can never wedge admission forever. The
- * deterministic `leg_launch_id` total order names ONE stable blocker. A PURE
+ * Source (a) of the durable slot-owner read: the minimum `leg_launch_id` among
+ * folded live ownership rows for `owner`'s exact wrapper attempt — INCLUDING
+ * `owner`'s OWN id — or null. A row counts ONLY on exact folded evidence it is
+ * still live: its ownership state is `live` AND its own leg session has not folded
+ * terminal (`ended`/`killed`). A settled ownership row (`terminal`/`transferred`/
+ * `aborted`), a moved owner tuple, or a leg whose session folded terminal never
+ * counts, so a legacy or cascade-released duplicate can never wedge admission
+ * forever. Self is INCLUDED so a crash replay resolves the SAME leg as owner and
+ * re-grants; the caller compares the resolved owner to the requester's id. A PURE
  * projection read — never wall-clock or process liveness (the cascade owns its own
- * TTL machinery); the block lifts only on the sibling's folded settle/terminal
+ * TTL machinery); the reservation lifts only on the holder's folded settle/terminal
  * transition or an ownership transfer, never on elapsed time.
  */
-function liveSiblingLegLaunchId(
+function liveOwnerLegLaunchId(
   db: Database,
   owner: BirthOwnerTuple,
 ): string | null {
@@ -6976,34 +6977,30 @@ function liveSiblingLegLaunchId(
          LEFT JOIN jobs lj ON lj.job_id = o.leg_session_id
         WHERE o.wrapper_job_id = ?
           AND o.wrapper_dispatch_attempt_id = ?
-          AND o.leg_launch_id != ?
           AND o.state = 'live'
           AND (lj.state IS NULL OR lj.state NOT IN ('ended', 'killed'))
         ORDER BY o.leg_launch_id
         LIMIT 1`,
     )
-    .get(
-      owner.wrapper_job_id,
-      owner.wrapper_dispatch_attempt_id,
-      owner.leg_launch_id,
-    ) as { leg_launch_id: string } | null;
+    .get(owner.wrapper_job_id, owner.wrapper_dispatch_attempt_id) as {
+    leg_launch_id: string;
+  } | null;
   return row?.leg_launch_id ?? null;
 }
 
 /**
- * Source (b) of the single-live-leg admission read: the launch id of a DIFFERENT
- * leg that has RESERVED `owner`'s exact wrapper attempt via an unfolded
- * `ProviderLegBorn` event ABOVE the reducer cursor, or null. The inserted event IS
- * the durable, restart-safe reservation the instant it commits — a crash after the
- * mint but before its fold leaves the reservation right here, so a fresh boot scan
- * (which runs BEFORE boot drain) still withholds the slot from a second leg. It
- * ignores `owner`'s OWN launch id so a crash replay re-admits the SAME leg
- * (idempotent). Below-cursor legs are already folded — {@link liveSiblingLegLaunchId}
- * covers those with its liveness filter; splitting on the cursor is what keeps this
- * from blocking forever on a long-settled sibling. A PURE projection read — never
- * wall-clock or process liveness.
+ * Source (b) of the durable slot-owner read: the minimum `leg_launch_id` among
+ * UNFOLDED `ProviderLegBorn` events ABOVE the reducer cursor for `owner`'s exact
+ * wrapper attempt — INCLUDING `owner`'s OWN id — or null. The inserted event IS the
+ * durable, restart-safe reservation the instant it commits — a crash after the mint
+ * but before its fold leaves the reservation right here, so a fresh boot scan (which
+ * runs BEFORE boot drain) still resolves the same durable owner. Self is INCLUDED so
+ * a crash replay resolves the SAME leg as owner and re-grants. Below-cursor legs are
+ * already folded — {@link liveOwnerLegLaunchId} covers those with its liveness
+ * filter; splitting on the cursor is what keeps this from counting a long-settled
+ * reservation. A PURE projection read — never wall-clock or process liveness.
  */
-function unfoldedSiblingLegLaunchId(
+function unfoldedOwnerLegLaunchId(
   db: Database,
   owner: BirthOwnerTuple,
 ): string | null {
@@ -7016,32 +7013,32 @@ function unfoldedSiblingLegLaunchId(
           AND json_valid(data)
           AND json_extract(data, '$.wrapper_job_id') = ?
           AND json_extract(data, '$.wrapper_dispatch_attempt_id') = ?
-          AND json_extract(data, '$.leg_launch_id') != ?
         ORDER BY json_extract(data, '$.leg_launch_id')
         LIMIT 1`,
     )
-    .get(
-      owner.wrapper_job_id,
-      owner.wrapper_dispatch_attempt_id,
-      owner.leg_launch_id,
-    ) as { leg_launch_id: string } | null;
+    .get(owner.wrapper_job_id, owner.wrapper_dispatch_attempt_id) as {
+    leg_launch_id: string;
+  } | null;
   return row?.leg_launch_id ?? null;
 }
 
 /**
- * The single stable leg that has RESERVED `owner`'s wrapper attempt across BOTH
- * durable sources — folded live ownership ({@link liveSiblingLegLaunchId}) and the
- * unfolded ProviderLegBorn event tail ({@link unfoldedSiblingLegLaunchId}) — or
- * null when no other leg holds the slot. Returns the deterministic
- * `leg_launch_id`-order minimum so ONE stable blocker is named. The two sources are
- * disjoint by the reducer cursor, so this is their union under a single total order.
+ * The single deterministic leg that OWNS `owner`'s wrapper-attempt slot across BOTH
+ * durable sources — folded live ownership ({@link liveOwnerLegLaunchId}) and the
+ * unfolded ProviderLegBorn event tail ({@link unfoldedOwnerLegLaunchId}) — INCLUDING
+ * `owner`'s OWN id, or null when NO durable reservation holds the slot. Returns the
+ * `leg_launch_id`-order minimum so ONE stable owner is named across ANY number of
+ * durable reservations. The two sources are disjoint by the reducer cursor, so this
+ * is their union under a single total order. Including self is load-bearing: the
+ * caller grants exactly the leg equal to this owner and waits every other, so two
+ * crash-replaying owners can never each defer to the other and wedge the slot.
  */
-function reservedSiblingLegLaunchId(
+function reservedOwnerLegLaunchId(
   db: Database,
   owner: BirthOwnerTuple,
 ): string | null {
-  const folded = liveSiblingLegLaunchId(db, owner);
-  const unfolded = unfoldedSiblingLegLaunchId(db, owner);
+  const folded = liveOwnerLegLaunchId(db, owner);
+  const unfolded = unfoldedOwnerLegLaunchId(db, owner);
   if (folded === null) return unfolded;
   if (unfolded === null) return folded;
   return folded < unfolded ? folded : unfolded;
@@ -7079,11 +7076,15 @@ function completeOwnedBirthTuple(record: BirthRecord): BirthOwnerTuple | null {
  * state into a bare `wait`): the split preserves EVERY grant/wait/deny routing
  * decision but distinguishes the lag causes so the wait branch is no longer silent.
  * The final gate before grant is the single-live-leg admission rail, which admits
- * exactly ONE leg per wrapper attempt across THREE reservation sources: folded live
- * ownership + the unfolded ProviderLegBorn event tail ({@link reservedSiblingLegLaunchId}),
- * and the same-scan pre-discovered GLOBAL winner (`admission.slotWinner`). A durable
- * reservation wins over the same-scan winner, and each source ignores this leg's OWN
- * launch id, so an already-granted leg is never revoked and a crash replay re-admits.
+ * exactly ONE leg per wrapper attempt. It first resolves the durable slot owner: the
+ * deterministic `leg_launch_id`-order minimum across folded live ownership + the
+ * unfolded ProviderLegBorn event tail, INCLUDING this leg's OWN id ({@link
+ * reservedOwnerLegLaunchId}). When ANY durable reservation exists it is authoritative
+ * and `admission.slotWinner` is IGNORED: the leg equal to the durable owner grants
+ * (idempotent re-issue on crash replay) and every other leg waits naming it — so an
+ * already-reserved leg is never revoked and two crash-replaying owners never each
+ * defer to the other. ONLY when NO durable reservation exists does the same-scan
+ * pre-discovered GLOBAL winner (`admission.slotWinner`) take the slot.
  */
 export function providerLegGrantStatus(
   db: Database,
@@ -7139,15 +7140,20 @@ export function providerLegGrantStatus(
   ) {
     return { decision: "deny", cause: "claim-foreign" };
   }
-  // Otherwise-grantable: admit exactly ONE live leg per wrapper attempt. A durable
-  // reservation — a folded live sibling or an unfolded ProviderLegBorn event tail
-  // above the reducer cursor — holds the grant as a recoverable wait, never a
-  // second concurrent editor of the same lane. It ignores this leg's OWN launch id
-  // so a crash replay re-issues the same leg's grant, and it wins over the same-scan
-  // winner so an already-granted (even higher-id) leg is never revoked.
-  const durableSibling = reservedSiblingLegLaunchId(db, owner);
-  if (durableSibling !== null) {
-    return { decision: "wait", cause: "sibling-live", sibling: durableSibling };
+  // Otherwise-grantable: admit exactly ONE live leg per wrapper attempt. Resolve the
+  // durable slot owner — the deterministic leg_launch_id-order minimum across folded
+  // live ownership + the unfolded ProviderLegBorn event tail above the reducer
+  // cursor, INCLUDING this leg's OWN id. When any durable reservation exists it is
+  // authoritative over the same-scan winner: the leg equal to the owner grants
+  // (idempotent re-issue on crash replay) and every other leg waits naming it, never
+  // a second concurrent editor of the same lane. Including self is load-bearing — a
+  // leg that excluded its own reservation would defer to a fresh lower-id winner
+  // while that winner waits on the reservation, a mutual wait where neither grants.
+  const durableOwner = reservedOwnerLegLaunchId(db, owner);
+  if (durableOwner !== null) {
+    return durableOwner === owner.leg_launch_id
+      ? { decision: "grant" }
+      : { decision: "wait", cause: "sibling-live", sibling: durableOwner };
   }
   // No durable reservation yet: the same-scan pre-discovered GLOBAL winner (the
   // stable leg_launch_id-order minimum across BOTH birth buckets) takes the sole
