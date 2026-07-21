@@ -23,7 +23,11 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { readMarker } from "../plugin/hooks/lib.ts";
 import { CANONICAL_EFFORTS } from "../src/host_matrix.ts";
-import { writeWorkMarker } from "../src/session_markers.ts";
+import {
+  resetSessionMarkerProcessProbe,
+  setSessionMarkerProcessProbe,
+  writeWorkMarker,
+} from "../src/session_markers.ts";
 
 const REPO = join(import.meta.dir, "..");
 const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
@@ -465,7 +469,15 @@ describe("work marker round-trip (writeWorkMarker → readMarker)", () => {
     process.env.HOME = home;
     process.env.CLAUDE_CODE_SESSION_ID = sessionId;
 
-    writeWorkMarker(taskId);
+    setSessionMarkerProcessProbe({
+      readStartTime: () => "test:process-start",
+      holderLiveness: () => "alive",
+    });
+    try {
+      writeWorkMarker(taskId);
+    } finally {
+      resetSessionMarkerProcessProbe();
+    }
     const marker = await readMarker(sessionId);
 
     expect(marker).not.toBeNull();
@@ -473,6 +485,10 @@ describe("work marker round-trip (writeWorkMarker → readMarker)", () => {
     expect((marker as Record<string, unknown>).task_id).toBe(taskId);
     // A work marker carries no epic_id.
     expect("epic_id" in (marker as Record<string, unknown>)).toBe(false);
-    expect((marker as Record<string, unknown>).schema_version).toBe(1);
+    expect((marker as Record<string, unknown>).schema_version).toBe(2);
+    expect((marker as Record<string, unknown>).pid).toBe(process.pid);
+    expect((marker as Record<string, unknown>).start_time).toBe(
+      "test:process-start",
+    );
   });
 });

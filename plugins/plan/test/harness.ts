@@ -35,6 +35,11 @@ import {
   setExec,
 } from "../src/exec.ts";
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
+import {
+  resetSessionMarkerProcessProbe,
+  type SessionMarkerProcessProbe,
+  setSessionMarkerProcessProbe,
+} from "../src/session_markers.ts";
 import { resolveDataDirOrDefault } from "../src/state_path.ts";
 import {
   resetStdinProvider,
@@ -283,7 +288,16 @@ export interface RunOptions {
   input?: string;
   /** HOME for the env build. Defaults to <cwd>/.home; withProject sets a real one. */
   home?: string;
+  /** Deterministic process-identity seam for session-marker arbitration. */
+  sessionMarkerProcessProbe?: SessionMarkerProcessProbe;
 }
+
+export const TEST_SESSION_MARKER_START_TIME = "test:process-start";
+
+const testSessionMarkerProcessProbe: SessionMarkerProcessProbe = {
+  readStartTime: () => TEST_SESSION_MARKER_START_TIME,
+  holderLiveness: () => "alive",
+};
 
 /** Private carrier the patched process.exit throws so an exiting verb unwinds to
  * runCli's catch with its intended code rather than killing the test process. */
@@ -321,6 +335,9 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
   // Route external-command spawns (gist's gh / opener) through the driver
   // registry so no real binary or PATH shim runs.
   setExec(execDriver);
+  setSessionMarkerProcessProbe(
+    opts.sessionMarkerProcessProbe ?? testSessionMarkerProcessProbe,
+  );
 
   try {
     process.env = buildEnv(home, opts.env);
@@ -363,6 +380,7 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
     resetStdinProvider();
     resetVcs();
     resetExec();
+    resetSessionMarkerProcessProbe();
   }
 
   return { code, stdout, stderr, output: stdout + stderr };
