@@ -590,6 +590,18 @@ export interface TrunkGitResult {
   stderr: string;
 }
 
+/** The verdict of running a merge-suite gate against the merged tree in the
+ * private scratch worktree (ADR 0102), mirroring the daemon's own
+ * `MergeSuiteVerdict`. `green` clears the integration to land; `red` is a
+ * semantic-merge breakage (two individually-green sides whose merged tree fails
+ * the suite) that aborts the land visibly; `cannot-run` is a gate that could not
+ * produce a verdict (install/suite crash/timeout) and DEFERS — never a silent
+ * land, never a false red. */
+export type MergeSuiteVerdict =
+  | { kind: "green" }
+  | { kind: "red"; detail: string }
+  | { kind: "cannot-run"; detail: string };
+
 /** The result of a bounded lease-acquire request/poll round-trip — a typed
  * value instead of an in-band `emitFinalizeError` exit, so the caller decides
  * which typed error to raise (and a test can inject a deps bundle that never
@@ -618,6 +630,17 @@ export interface TrunkIntegrationDeps {
   ): TrunkLeaseRequestResult;
   releaseLease(stateDir: string, lease: TrunkLeaseLeaf): boolean;
   readLeaseLeaf(stateDir: string, repoRoot: string): TrunkLeaseLeaf | null;
+  /** OPTIONAL merge-suite gate probe (ADR 0102) run against the merged tree in
+   * the private scratch worktree BEFORE the epic lands. `worktreePath` is the
+   * scratch checkout holding the merge; `mergedCommit` is its HEAD. Undefined →
+   * the plan CLI skips the gate: the AUTHORITATIVE merge-suite gate stays
+   * daemon-owned (it re-runs against the same integrated commit the closer
+   * produces), so `realTrunkIntegrationDeps` leaves this unset and the saga tests
+   * inject a fake to drive the green / red / cannot-run decision deterministically. */
+  runMergeSuite?(args: {
+    worktreePath: string;
+    mergedCommit: string;
+  }): MergeSuiteVerdict;
 }
 
 function trunkGit(args: string[], cwd: string): TrunkGitResult {
@@ -750,7 +773,11 @@ function releaseTrunkLease(stateDir: string, lease: TrunkLeaseLeaf): boolean {
 /** Production wiring for {@link TrunkIntegrationDeps} — verbatim git spawns,
  * the real flock-backed commit-work lock, and the real daemon-mediated lease
  * request/release round-trip. Every trunk-merge call site defaults to this;
- * a saga test overrides it with a fake bundle. */
+ * a saga test overrides it with a fake bundle. `runMergeSuite` is deliberately
+ * unset: the AUTHORITATIVE merge-suite gate stays daemon-owned (it re-runs
+ * against the same integrated commit the closer publishes), so the plan CLI
+ * relocates the merge into a private worktree without shelling a heavyweight
+ * suite of its own — the saga tests inject a fake gate to drive the decision. */
 const realTrunkIntegrationDeps: TrunkIntegrationDeps = {
   git: trunkGit,
   acquireLock: acquireTrunkLock,
@@ -813,6 +840,61 @@ function adoptLingeringLease(
   deps.releaseLease(stateDir, leaf);
 }
 
+/** The private scratch worktree + temp branch one lease attempt cuts from the
+ * local default tip: the epic base merges HERE, never in the shared checkout, so
+ * the shared checkout is only ever fast-forwarded and no `MERGE_HEAD` is ever
+ * visible in it (ADR 0102). Keyed on the epic + a random suffix so a retried or
+ * concurrent attempt never collides; reaped on EVERY exit path. */
+interface TrunkScratch {
+  path: string;
+  branch: string;
+}
+
+function trunkScratchFor(epicId: string): TrunkScratch {
+  const token = randomBytes(8).toString("hex");
+  const slug = epicId.replace(/[^A-Za-z0-9._-]/g, "-");
+  return {
+    path: join(tmpdir(), `keeper-trunk-integrate-${slug}-${token}`),
+    branch: `keeper/trunk-integrate/${slug}-${token}`,
+  };
+}
+
+/** Best-effort teardown of the scratch worktree + temp branch — run on EVERY exit
+ * path (success, conflict, gate-red, publish-fail, drift) so an integration attempt
+ * never leaks a worktree or branch. Each step ignores its own result; a leftover
+ * admin husk is swept by the trailing prune. `--force` clears a scratch tree left
+ * dirty or mid-merge (the conflict path). */
+function reapTrunkScratch(
+  deps: TrunkIntegrationDeps,
+  repoRoot: string,
+  scratch: TrunkScratch,
+): void {
+  deps.git(["worktree", "remove", "--force", scratch.path], repoRoot);
+  deps.git(["branch", "-D", scratch.branch], repoRoot);
+  deps.git(["worktree", "prune"], repoRoot);
+}
+
+/** Cut the private scratch worktree at the leased default tip on a fresh temp
+ * branch. Reaps any stale residue first (a crashed prior attempt) so the add never
+ * collides. Returns a typed failure the caller defers on rather than throwing. */
+function provisionTrunkScratch(
+  deps: TrunkIntegrationDeps,
+  repoRoot: string,
+  scratch: TrunkScratch,
+  baseOid: string,
+): { ok: true } | { ok: false; detail: string } {
+  reapTrunkScratch(deps, repoRoot, scratch);
+  const add = deps.git(
+    ["worktree", "add", "-b", scratch.branch, scratch.path, baseOid],
+    repoRoot,
+  );
+  if (add.code !== 0) {
+    reapTrunkScratch(deps, repoRoot, scratch);
+    return { ok: false, detail: (add.stdout + add.stderr).trim() };
+  }
+  return { ok: true };
+}
+
 export function integrateRepoUnderLease(
   epicId: string,
   repoRoot: string,
@@ -870,45 +952,13 @@ export function integrateRepoUnderLease(
         { repo_root: repoRoot, fencing_token: lease.fencing_token },
       );
     }
-    const head = deps.git(["symbolic-ref", "--short", "HEAD"], repoRoot);
-    if (head.code !== 0 || head.stdout.trim() !== lease.default_branch) {
-      lock.release();
-      releaseOrFail();
-      emitFinalizeError(
-        "TRUNK_INTEGRATION_OFF_BRANCH",
-        `${repoRoot} HEAD is ${head.stdout.trim() || "detached"}, expected ${lease.default_branch}; no merge was attempted`,
-        format,
-        { repo_root: repoRoot, expected_branch: lease.default_branch },
-      );
-    }
-    const mergeHead = deps.git(
-      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-      repoRoot,
-    );
-    if (mergeHead.code === 0 && mergeHead.stdout.trim() !== "") {
-      lock.release();
-      releaseOrFail();
-      emitFinalizeError(
-        "TRUNK_INTEGRATION_RESIDUE",
-        `${repoRoot} is already mid-merge (MERGE_HEAD=${mergeHead.stdout.trim()}); the residue must be resolved before trunk integration can resume`,
-        format,
-        { repo_root: repoRoot, merge_head: mergeHead.stdout.trim() },
-      );
-    }
-    const dirty = deps.git(
-      ["status", "--porcelain=v1", "--untracked-files=all"],
-      repoRoot,
-    );
-    if (dirty.code !== 0 || dirty.stdout.trim() !== "") {
-      lock.release();
-      releaseOrFail();
-      emitFinalizeError(
-        "TRUNK_INTEGRATION_DIRTY",
-        `${repoRoot} must be clean before the closer can integrate ${sourceBranch}; no merge was attempted`,
-        format,
-        { repo_root: repoRoot },
-      );
-    }
+    // ADR 0102: the epic base merges in a PRIVATE scratch worktree cut from the
+    // leased default tip, never in the shared checkout. Unrelated dirt or an
+    // off-branch shared checkout no longer BLOCKS integration — the any-dirt
+    // TRUNK_INTEGRATION_DIRTY refusal, the off-branch refusal, and the shared-
+    // checkout MERGE_HEAD residue check all retire — and no MERGE_HEAD is ever
+    // visible in the shared checkout. The shared checkout is only ever
+    // fast-forwarded, and only when it is clean AND on the default branch.
     const sourceTip = deps.git(
       ["rev-parse", "--verify", `refs/heads/${sourceBranch}^{commit}`],
       repoRoot,
@@ -928,6 +978,7 @@ export function integrateRepoUnderLease(
       ["rev-parse", "--verify", `refs/heads/${lease.default_branch}^{commit}`],
       repoRoot,
     );
+    const liveOid = liveTip.stdout.trim();
     const reprobe = ancestryProbe(
       repoRoot,
       sourceBranch,
@@ -951,7 +1002,7 @@ export function integrateRepoUnderLease(
         ),
       ancestry: reprobe,
       observedDefaultTip: lease.observed_default_tip,
-      liveDefaultTip: liveTip.code === 0 ? liveTip.stdout.trim() : null,
+      liveDefaultTip: liveTip.code === 0 ? liveOid : null,
     });
     if (decision.kind === "already-integrated") {
       lock.release();
@@ -974,17 +1025,47 @@ export function integrateRepoUnderLease(
       continue;
     }
 
-    const merged = deps.git(["merge", "--no-edit", sourceOid], repoRoot);
+    // Cut the private scratch worktree at the leased default tip and merge the epic
+    // base THERE — reaped on EVERY exit path below (success, conflict, gate-red,
+    // drift), so an attempt never leaks a worktree or branch.
+    const scratch = trunkScratchFor(epicId);
+    const provisioned = provisionTrunkScratch(deps, repoRoot, scratch, liveOid);
+    if (!provisioned.ok) {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not provision a scratch worktree at ${lease.default_branch} (${liveOid}) in ${repoRoot}: ${provisioned.detail}; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+
+    const merged = deps.git(["merge", "--no-edit", sourceOid], scratch.path);
     if (merged.code !== 0) {
       const conflictHead = deps.git(
         ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
-        repoRoot,
+        scratch.path,
       );
       const conflicts = deps.git(
         ["diff", "--name-only", "--diff-filter=U"],
-        repoRoot,
+        scratch.path,
       );
-      if (conflictHead.code === 0 && conflictHead.stdout.trim() !== "") {
+      const conflicted =
+        conflictHead.code === 0 && conflictHead.stdout.trim() !== "";
+      const mergeHeadOid = conflictHead.stdout.trim();
+      const conflictedFiles = conflicts.stdout
+        .split("\n")
+        .map((p) => p.trim())
+        .filter(Boolean);
+      // Reap the conflicted scratch worktree (its MERGE_HEAD never touches the
+      // shared checkout) BEFORE surfacing the typed receipt.
+      reapTrunkScratch(deps, repoRoot, scratch);
+      if (conflicted) {
+        // Preserve the existing conflict outcome: the closer RETAINS its fenced
+        // lease (no release) so the downstream worktree-merge-conflict resolver /
+        // plan:deconflicter path owns resolution while this closer stays the live
+        // trunk owner.
         lock.release();
         emitFinalizeError(
           "TRUNK_INTEGRATION_CONFLICT",
@@ -995,11 +1076,8 @@ export function integrateRepoUnderLease(
             source_branch: sourceBranch,
             default_branch: lease.default_branch,
             fencing_token: lease.fencing_token,
-            merge_head: conflictHead.stdout.trim(),
-            conflicted_files: conflicts.stdout
-              .split("\n")
-              .map((p) => p.trim())
-              .filter(Boolean),
+            merge_head: mergeHeadOid,
+            conflicted_files: conflictedFiles,
           },
         );
       }
@@ -1007,27 +1085,124 @@ export function integrateRepoUnderLease(
       releaseOrFail();
       emitFinalizeError(
         "TRUNK_INTEGRATION_FAILED",
-        `git merge failed without merge residue in ${repoRoot}: ${(merged.stdout + merged.stderr).trim()}`,
+        `git merge failed without merge residue in the scratch worktree for ${repoRoot}: ${(merged.stdout + merged.stderr).trim()}`,
         format,
         { repo_root: repoRoot, fencing_token: lease.fencing_token },
       );
     }
-    const objective = ancestryProbe(
-      repoRoot,
-      sourceBranch,
-      lease.default_branch,
-      deps,
+    const mergedCommit = deps
+      .git(["rev-parse", "HEAD"], scratch.path)
+      .stdout.trim();
+    // Objective containment: git merge reported success, but prove the source tip
+    // is actually contained in the merged HEAD before landing anything.
+    const contained = deps.git(
+      ["merge-base", "--is-ancestor", sourceOid, "HEAD"],
+      scratch.path,
     );
-    if (objective !== "ancestor") {
+    if (contained.code !== 0) {
+      reapTrunkScratch(deps, repoRoot, scratch);
       lock.release();
       releaseOrFail();
       emitFinalizeError(
         "TRUNK_INTEGRATION_UNVERIFIED",
-        `git merge returned success but ${sourceBranch} is not provably contained in ${lease.default_branch}; teardown remains fenced off`,
+        `git merge returned success but ${sourceBranch} is not provably contained in the merged tree; teardown remains fenced off`,
         format,
         { repo_root: repoRoot, fencing_token: lease.fencing_token },
       );
     }
+
+    // Merge-suite gate (ADR 0102): run the injected gate against the MERGED tree in
+    // the scratch worktree. red aborts the land visibly; cannot-run DEFERS; a
+    // missing probe means the authoritative gate is daemon-owned (see the dep doc).
+    if (deps.runMergeSuite !== undefined) {
+      const verdict = deps.runMergeSuite({
+        worktreePath: scratch.path,
+        mergedCommit,
+      });
+      if (verdict.kind === "red") {
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_SUITE_RED",
+          `the merge-suite gate failed against the merged tree for ${epicId} in ${repoRoot} (merged commit ${mergedCommit}): ${verdict.detail}`,
+          format,
+          {
+            repo_root: repoRoot,
+            fencing_token: lease.fencing_token,
+            merged_commit: mergedCommit,
+          },
+        );
+      }
+      if (verdict.kind === "cannot-run") {
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_DEFERRED",
+          `the merge-suite gate could not run against the merged tree for ${epicId} in ${repoRoot} (${verdict.detail}); no merge was landed`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+    }
+
+    // Publish the merge to the LOCAL default branch. The shared checkout is only
+    // ever fast-forwarded, and only when it is clean AND on the default branch;
+    // otherwise ONLY the fast-forward is deferred — the ref still advances so the
+    // epic lands, and the trailing shared checkout is left to the existing
+    // shared-checkout-desync producer (a visible, self-clearing signal), never a
+    // refusal of the whole integration.
+    const sharedHead = deps.git(["symbolic-ref", "--short", "HEAD"], repoRoot);
+    const onDefault =
+      sharedHead.code === 0 &&
+      sharedHead.stdout.trim() === lease.default_branch;
+    const sharedDirty = deps.git(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      repoRoot,
+    );
+    const sharedClean =
+      sharedDirty.code === 0 && sharedDirty.stdout.trim() === "";
+    if (onDefault && sharedClean) {
+      // Clean, on-branch shared checkout: fast-forward it (ref + working tree) to
+      // the merged commit exactly as before.
+      const ff = deps.git(["merge", "--ff-only", mergedCommit], repoRoot);
+      if (ff.code !== 0) {
+        // The default drifted out from under the fence between the tip read and the
+        // fast-forward; reap and retry from a fresh tip.
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        minimumToken = lease.fencing_token + 1;
+        waitBriefly(150);
+        continue;
+      }
+    } else {
+      // Dirty or off-branch shared checkout: DEFER ONLY THE FF. Advance the default
+      // ref (compare-and-swap against the leased tip) so the merge lands locally,
+      // leaving the working tree trailing for the shared-checkout-desync producer.
+      const advance = deps.git(
+        [
+          "update-ref",
+          `refs/heads/${lease.default_branch}`,
+          mergedCommit,
+          liveOid,
+        ],
+        repoRoot,
+      );
+      if (advance.code !== 0) {
+        // A concurrent local advance won the CAS (the default moved under the
+        // fence); reap and retry from a fresh tip.
+        reapTrunkScratch(deps, repoRoot, scratch);
+        lock.release();
+        releaseOrFail();
+        minimumToken = lease.fencing_token + 1;
+        waitBriefly(150);
+        continue;
+      }
+    }
+
+    reapTrunkScratch(deps, repoRoot, scratch);
     lock.release();
     releaseOrFail();
     return;
