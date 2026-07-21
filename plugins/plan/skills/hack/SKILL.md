@@ -61,6 +61,7 @@ Universal moves, in any mode:
 - Mine session history when the question is who/when/what-happened: the unified Claude/Pi history surface catalogs readable native conversations, optional Keeper aliases, and provenance-graded file evidence; `keeper resume <session-reference>` is the continuation path, not a read.
 - Delegate when wide: if the investigation spans more than one subsystem or repo, or balloons past ~10 reads, fan out parallel read-only Explore agents (Agent tool, one per surface) and keep this context for synthesis and the conversation. Brief each agent to reproduce before theorizing, quote exact evidence with `path:line`, and return conclusions, not file dumps.
 - Use `/keeper:pair` as the intermediate escalation when your mental model feels sticky and one independent critic could materially change the answer — a single partner, lightweight, narrow. A full panel is the exceptional escalation defined by the gate below, not the default second opinion.
+- Agentbrain-specific retrieval, durable submission, source watching, or job-queue inspection → invoke `brain` (Skill tool); it owns Agentbrain's CLI syntax and safety contract, so don't hand-roll `agentbrain` calls here.
 
 Mode-specific moves:
 
