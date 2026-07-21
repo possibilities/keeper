@@ -4,8 +4,9 @@
 //
 // One JSON file per session at `~/.local/state/keeper/sessions/<sid>.json`,
 // schema_version 1: {schema_version, session_id, kind, task_id|epic_id,
-// created_at}. The TS hook dispatchers (plugin/hooks/lib.ts) read these files;
-// the field names + `kind` values are the contract.
+// created_at, pid}. The TS hook dispatchers (plugin/hooks/lib.ts) read these
+// files; the field names + `kind` values are the contract (`pid` is additive —
+// readers that do not probe liveness ignore it).
 //
 // Fail OPEN: an absent tracked harness identity makes every helper a silent
 // no-op. All filesystem errors are swallowed: marker IO
@@ -32,9 +33,22 @@ const SCHEMA_VERSION = 1;
  * that never cleared its marker) so a re-close is never blocked forever. Matches
  * the hook reader's staleness window (plugin/hooks/lib.ts) — one contract. A
  * genuinely-longer close (a closer paused on a planner QUESTION) stays within it,
- * and a clean termination clears the marker outright, so this only ever bounds a
- * true crash leak. */
+ * and a clean termination clears the marker outright. The rival scan's pid
+ * liveness probe dismisses a killed holder's claim the moment its process dies;
+ * this window is the backstop for legacy pid-less markers and pid reuse. */
 const CLOSE_CLAIM_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** True iff `pid` maps to a live process. EPERM (signal not permitted) still
+ * proves liveness; only ESRCH (no such process) is death. Any other failure
+ * fails open (assume live) so a probe error never dismisses a real rival. */
+function pidIsLive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
 
 /** Resolve the session id from the env, fail-open (empty/absent → null). */
 function sessionId(): string | null {
@@ -71,6 +85,7 @@ function writeMarker(
     kind,
     [idField]: targetId,
     created_at: createdAt,
+    pid: process.pid,
   };
   try {
     const path = markerPath(sid);
@@ -144,10 +159,16 @@ interface CloseClaim {
 }
 
 /** Read every OTHER session's LIVE close claim on `epicId` — a fresh close
- * marker naming this epic, excluding `selfSid`. Stale (crash-leaked) and
- * unparseable markers are skipped so a dead claim never blocks a re-close. All
+ * marker naming this epic, excluding `selfSid`. Stale (crash-leaked),
+ * unparseable, and dead-holder markers are skipped so a dead claim never blocks
+ * a re-close: a marker carrying a `pid` whose process is gone is a crash leak
+ * regardless of age (a killed closer never clears its own marker). All
  * filesystem errors are swallowed (fail-open → no competitor seen). */
-function readRivalCloseClaims(epicId: string, selfSid: string): CloseClaim[] {
+function readRivalCloseClaims(
+  epicId: string,
+  selfSid: string,
+  isLive: (pid: number) => boolean = pidIsLive,
+): CloseClaim[] {
   let files: string[];
   try {
     files = readdirSync(sessionsDir());
@@ -183,6 +204,15 @@ function readRivalCloseClaims(epicId: string, selfSid: string): CloseClaim[] {
     if (Number.isNaN(ts) || now - ts > CLOSE_CLAIM_STALE_MS) {
       continue;
     }
+    const pid = r.pid;
+    if (
+      typeof pid === "number" &&
+      Number.isInteger(pid) &&
+      pid > 0 &&
+      !isLive(pid)
+    ) {
+      continue;
+    }
     out.push({ sessionId: r.session_id, createdAt: r.created_at });
   }
   return out;
@@ -203,7 +233,10 @@ function readRivalCloseClaims(epicId: string, selfSid: string): CloseClaim[] {
  * design: the narrow boot-window where two closers scan before either writes is
  * an accepted wasted boot (there is no sanctioned pre-announce write path), and
  * close-finalize is idempotent, so a slipped duplicate never corrupts. */
-export function claimCloseExclusive(epicId: string): { heldBy: string } | null {
+export function claimCloseExclusive(
+  epicId: string,
+  isLive: (pid: number) => boolean = pidIsLive,
+): { heldBy: string } | null {
   const sid = sessionId();
   if (sid === null) {
     return null;
@@ -214,7 +247,7 @@ export function claimCloseExclusive(epicId: string): { heldBy: string } | null {
   }
   let winnerSid = sid;
   let winnerCreatedAt = myCreatedAt;
-  for (const rival of readRivalCloseClaims(epicId, sid)) {
+  for (const rival of readRivalCloseClaims(epicId, sid, isLive)) {
     if (
       rival.createdAt < winnerCreatedAt ||
       (rival.createdAt === winnerCreatedAt && rival.sessionId < winnerSid)

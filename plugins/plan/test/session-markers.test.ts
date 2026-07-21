@@ -19,7 +19,7 @@
 // session_markers.ts deliberately has no reader — that lives in plugin/hooks/lib).
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -394,14 +394,44 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
     return epicId;
   }
 
+  /** Re-stamp a marker's recorded pid. The preflight CLI subprocess has exited
+   * by the time the rival scans, so a "live rival" scenario pins the marker to
+   * a pid that is genuinely alive (this test runner's own). */
+  function stampMarkerPid(home: string, sid: string, pid: number): void {
+    const path = markerFor(home, sid);
+    const record = JSON.parse(readFileSync(path, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    record.pid = pid;
+    writeFileSync(path, JSON.stringify(record));
+  }
+
+  /** A pid that is dead right now, found by pure ESRCH probing — no process is
+   * ever launched (fast-tier policy). High pids are scanned downward; macOS
+   * allocates sequentially, so a just-freed high pid stays free for the test's
+   * lifetime. */
+  function deadPid(): number {
+    for (let pid = 99990; pid > 90000; pid--) {
+      try {
+        process.kill(pid, 0);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") return pid;
+      }
+    }
+    throw new Error("no dead pid found in probe range");
+  }
+
   test("a second concurrent close claim fails loud; the first is unaffected", () => {
     const proj = getProj();
     const epicId = readyEpic(proj, "Exclusive close epic");
 
-    // Session A claims first — succeeds and holds the marker.
+    // Session A claims first — succeeds and holds the marker. Pin A's marker
+    // to a live pid so it reads as a live rival to B.
     const a = preflight(proj, epicId, SID_A);
     expect(a.code).toBe(0);
     expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+    stampMarkerPid(proj.home, SID_A, process.pid);
 
     // Session B races the same epic — loses, fails loud with the typed
     // CLOSE_ALREADY_CLAIMED error, and leaves no marker of its own.
@@ -419,6 +449,44 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
 
     // A's claim survives B's failed attempt.
     expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+  });
+
+  test("a dead holder's close claim never blocks a re-close (killed-closer leak)", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Dead holder epic");
+
+    // Session A claims, then its process "dies" — the marker survives (a
+    // killed closer never clears its own marker) but records a dead pid.
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    stampMarkerPid(proj.home, SID_A, deadPid());
+
+    // Session B claims the same epic — the dead holder's marker is a crash
+    // leak, skipped by the liveness probe; B wins without manual clearing.
+    const b = preflight(proj, epicId, SID_B);
+    expect(b.code).toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
+  });
+
+  test("a legacy pid-less close marker still blocks within the staleness window", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Legacy marker epic");
+
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    const path = markerFor(proj.home, SID_A);
+    const record = JSON.parse(readFileSync(path, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    delete record.pid;
+    writeFileSync(path, JSON.stringify(record));
+
+    // Without a recorded pid there is nothing to probe — the fresh marker
+    // keeps its claim and B fails loud exactly as before the pid field.
+    const b = preflight(proj, epicId, SID_B);
+    expect(b.code).not.toBe(0);
+    const env = parseCliOutput(b.output);
+    expect(env.success).toBe(false);
+    expect((env.error as { code: string }).code).toBe("CLOSE_ALREADY_CLAIMED");
   });
 
   test("the same session re-running preflight re-claims its own epic (no self-block)", () => {
