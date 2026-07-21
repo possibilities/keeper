@@ -30,5 +30,5 @@ a fixture, never a spawned server in the correctness gates.
 - [ ] Any newly-recognized 3.7b control-mode notification is covered by a parser fixture; `bun test ./test/tmux-control-parser.test.ts` and `bun run typecheck` green
 
 ## Done summary
-
+Re-verified all four 3.6-era control-mode invariants live against the host's tmux 3.7b (no-output set-once/re-assert, defensive copy-mode -q, %config-error emission, %exit id-discard) and rewrote the header to state the 3.7b truth with forward-facing reasons; added a live-captured %config-error parser fixture.
 ## Evidence
