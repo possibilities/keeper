@@ -13155,15 +13155,9 @@ function startDaemonWithExitAttribution(
           }`,
         );
       }
-      try {
-        runEventsIngestStallDistressStep();
-      } catch (err) {
-        console.error(
-          `[keeperd] events-log stall probe threw (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
+      // Stall distress is minted only by the absence of ingest, which by
+      // definition never fires this handler — so the stall probe runs solely
+      // on `eventsIngestFallbackTimer` below, not on this hot path.
     };
 
     // Same crash policy as the other workers: any thread failure → fatalExit.
