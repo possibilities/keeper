@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T08:11:18.623000Z",
+  "depends_on": [],
+  "epic": "fn-1398-cover-trunk-lease-integration-error",
+  "id": "fn-1398-cover-trunk-lease-integration-error.1",
+  "model": "gpt-5.3-codex-spark",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Cover trunk-lease error exits",
+  "updated_at": "2026-07-21T08:11:18.623000Z"
+}

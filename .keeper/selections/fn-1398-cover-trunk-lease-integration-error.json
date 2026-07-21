@@ -1,0 +1,26 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fully-specified straight test additions over an existing harness with exact injections and error codes named across one explicitly named file and no production change \u2014 a small fixed-shape edit that is Spark's core fit at a mechanical medium band.",
+      "spark_exclusion": null,
+      "spark_fit": true,
+      "task_id": "fn-1398-cover-trunk-lease-integration-error.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T08:11:18.747000Z",
+  "epic_id": "fn-1398-cover-trunk-lease-integration-error",
+  "input_hash": "354b2b9bb6da2ec9bb0bb1ce20442a33d9ffec0b34b7f91c92e61b438a1d7c64",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 894118811,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-specified straight test additions over an existing harness with exact injections and error codes named across one explicitly named file and no production change \u2014 a small fixed-shape edit that is Spark's core fit at a mechanical medium band.\",\"confidence\":0.9,\"spark_fit\":true,\"spark_exclusion\":null}]}\n"
+}

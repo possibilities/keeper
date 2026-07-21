@@ -48,5 +48,5 @@ plugins/plan/test/saga-close-finalize.test.ts.
 - [ ] Existing saga-close-finalize tests stay green.
 
 ## Done summary
-
+Reworked integrateRepoUnderLease to merge the epic base in a private scratch worktree (ADR 0102): retired the any-dirt TRUNK_INTEGRATION_DIRTY/off-branch/residue refusals, fast-forward the shared checkout only when clean+on-branch else advance the ref and defer only the ff, run an injectable merge-suite gate against the merged tree, and reap the worktree+branch on every exit. Origin push + authoritative gating stay daemon-owned.
 ## Evidence
