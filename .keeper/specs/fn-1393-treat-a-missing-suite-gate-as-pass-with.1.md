@@ -54,5 +54,5 @@ classifier tests).
       next cycle via an emitted resolution (orphan-gap regression test).
 
 ## Done summary
-
+Missing suite-gate script now classifies as pass-with-note distinct from cannot-run; finalize/recover proceed without minting a suite-gate-unavailable row, the baseline analogue matches, and every recover cycle emits a resolution for open recover rows on closed/lane-less epics so they can level-clear.
 ## Evidence
