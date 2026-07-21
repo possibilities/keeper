@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Log real pool failure text privately and failover pre-substantive other failures once",
-  "updated_at": "2026-07-21T13:42:51.876000Z"
+  "updated_at": "2026-07-21T14:00:55.830000Z",
+  "worker_done_at": "2026-07-21T14:00:55.830000Z"
 }

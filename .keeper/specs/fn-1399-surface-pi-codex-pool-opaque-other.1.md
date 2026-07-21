@@ -50,5 +50,5 @@ daemon-load-root), so no daemon restart is owed on landing.
       classifier tests stay green.
 
 ## Done summary
-
+Widened the auth classifier regex for login/session-expiry and credential invalid/expired/missing phrasings, made pre-substantive other-classified pool failures failover once via the existing attempt/exclusion machinery, and added a bounded private NDJSON failure log capturing the real upstream message while the sanitized event stream keeps carrying only the code.
 ## Evidence
