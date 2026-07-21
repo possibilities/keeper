@@ -81,6 +81,7 @@ import {
   createLaneMaintenanceProbe,
   createLaneTeardownGraceTracker,
   createLaneWedgeTracker,
+  createMergeSuiteLoadRetryTracker,
   createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
@@ -824,6 +825,7 @@ interface FakeDepsOptions {
   inventoryLaunchCwdWorkPluginManifests?: ConfirmRunningDeps["inventoryLaunchCwdWorkPluginManifests"];
   physicalPluginDir?: ConfirmRunningDeps["physicalPluginDir"];
   stampEpicCloseRecovery?: ConfirmRunningDeps["stampEpicCloseRecovery"];
+  runMergeSuite?: MergeSuiteProbe;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -914,6 +916,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       opts.inventoryLaunchCwdWorkPluginManifests ?? (() => []),
     physicalPluginDir: opts.physicalPluginDir ?? ((p) => p),
     isEpicDone: opts.isEpicDone ?? (async () => true),
+    runMergeSuite: opts.runMergeSuite,
     async stampEpicCloseRecovery(epicId, projectDir) {
       log.closeRecoveryStamps.push({ epicId, projectDir });
       return opts.stampEpicCloseRecovery
@@ -15521,6 +15524,66 @@ test("owner-mediated recovery accepts pass-with-note, pushes, and emits resoluti
   expect(calls.some((call) => call.args.startsWith("push origin"))).toBe(true);
 });
 
+test("owner-mediated recovery retries one load-suspect verdict before surfacing the suite-red failure", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    originAncestors: new Set([base]),
+    repoHead: "main",
+  });
+  let suiteCalls = 0;
+  let scheduled = 0;
+  const driver = createWorktreeDriver(
+    run,
+    lock,
+    undefined,
+    true,
+    async () => {
+      suiteCalls += 1;
+      return { kind: "load-suspect", detail: "empty-digest crash" };
+    },
+    () => {
+      scheduled += 1;
+    },
+  );
+  const recover = () =>
+    driver.recover(
+      ["/repo"],
+      async () => "done",
+      async () => false,
+      () => false,
+      () => false,
+    );
+
+  const first = await recover();
+  expect(first.failures).toEqual([]);
+  expect(
+    first.resolved.some(
+      (entry) => entry.epicId === "fn-1-foo" && entry.dir === "/repo",
+    ),
+  ).toBe(false);
+  expect(scheduled).toBe(1);
+
+  const second = await recover();
+  expect(second.failures).toHaveLength(1);
+  expect(second.failures[0]).toMatchObject({
+    epicId: "fn-1-foo",
+    dir: "/repo",
+  });
+  const failure = second.failures[0];
+  if (failure === undefined) throw new Error("expected suite-red failure");
+  expect(failure.reason).toStartWith(WORKTREE_FINALIZE_SUITE_RED_REASON);
+  expect(recoverFailureDispatchId(failure)).toBe(
+    worktreeRecoverEpicDispatchId("fn-1-foo", "/repo"),
+  );
+  expect(scheduled).toBe(1);
+  expect(suiteCalls).toBe(2);
+});
+
 test("fn-1119 recoverWorktrees pass-2: a done epic with a LIVE merge-resolver is NOT merge-attempted (gated skip, no observation, rows retained)", async () => {
   // A retargeted conflict dispatched a `resolve::fn-1-foo` worker for this now-done
   // epic; it is mid-`git merge`. Pass-2 must skip re-attempting the same base→default
@@ -16839,9 +16902,17 @@ test("fn-1204 finalizeEpic gate: a RED merge-suite verdict parks a VISIBLE stick
     kind: "red",
     detail: "3 failing test(s): foo > bar",
   });
-  const res = await createWorktreeDriver(run, () => ({
-    release() {},
-  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  let scheduled = 0;
+  const res = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    false,
+    undefined,
+    () => {
+      scheduled += 1;
+    },
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
   expect(res.ok).toBe(false);
   if (!res.ok) {
     // A VISIBLE sticky (mirrors the non-ff arm) — never a retry-skip, so the operator
@@ -16856,11 +16927,109 @@ test("fn-1204 finalizeEpic gate: a RED merge-suite verdict parks a VISIBLE stick
     expect(isWorktreeRecoverReason(res.reason)).toBe(false);
   }
   expect(calls.length).toBe(1);
+  expect(scheduled).toBe(0);
   // Local default NEVER advanced and NOTHING was pushed — so the desync producer sees
   // nothing, and there is no rollback to do.
   expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("finalize producer retries one load-suspect verdict, then mints the existing suite-red row", async () => {
+  const { run, cmds } = makeMergeGit();
+  const { probe, calls } = makeSuiteProbe({
+    kind: "load-suspect",
+    detail: "suite timed out in /scratch/repo",
+  });
+  let scheduled = 0;
+  const driver = createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    false,
+    undefined,
+    () => {
+      scheduled += 1;
+    },
+  );
+  const { deps, log } = makeFakeDeps({
+    worktree: driver,
+    runMergeSuite: probe,
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const runCycle = () =>
+    runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+    );
+
+  await runCycle();
+  expect(log.emissions).toEqual([]);
+  expect(scheduled).toBe(1);
+  expect(calls).toHaveLength(1);
+
+  await runCycle();
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]).toMatchObject({
+    verb: "close",
+    id: worktreeFinalizeDispatchId("fn-1-foo", "/repo"),
+  });
+  expect(log.emissions[0]?.reason).toStartWith(
+    WORKTREE_FINALIZE_SUITE_RED_REASON,
+  );
+  expect(scheduled).toBe(1);
+  expect(calls).toHaveLength(2);
+  expect(cmds.some((cmd) => cmd.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("push origin"))).toBe(false);
+});
+
+test("merge-suite load retry state is bounded per row and resets on green or named red", () => {
+  const tracker = createMergeSuiteLoadRetryTracker(2);
+  const suspect: MergeSuiteVerdict = {
+    kind: "load-suspect",
+    detail: "deadline",
+  };
+  const step = (
+    rowKey: string,
+    mergedCommit: string,
+    verdict: MergeSuiteVerdict = suspect,
+  ) => tracker.step({ rowKey, mergedCommit, verdict });
+
+  expect(step("close::a", "commit-1")).toBe("retry");
+  expect(step("close::a", "commit-1")).toBe("park");
+  expect(step("close::a", "commit-1", { kind: "green" })).toBe("none");
+  expect(step("close::a", "commit-1")).toBe("retry");
+  expect(
+    step("close::a", "commit-1", {
+      kind: "red",
+      detail: "named test failed",
+    }),
+  ).toBe("none");
+  expect(step("close::a", "commit-1")).toBe("retry");
+  expect(step("close::a", "commit-2")).toBe("retry");
+  expect(tracker.pendingCount()).toBe(1);
+
+  expect(step("close::b", "commit-1")).toBe("retry");
+  expect(step("close::c", "commit-1")).toBe("retry");
+  expect(tracker.pendingCount()).toBe(2);
+  expect(step("close::a", "commit-2")).toBe("retry");
+  expect(tracker.pendingCount()).toBe(2);
 });
 
 test("fn-1204 finalizeEpic gate: a CANNOT-RUN verdict degrades to a non-sticky retry-skip, never a push, never a permanent silent block", async () => {
@@ -17149,7 +17318,7 @@ function makeMergeSuiteGit(opts?: {
  *  event fires on deaf ears and every run reads as a timeout. */
 type ChildSpec =
   | { kind: "resolved"; exitCode: number; output?: string }
-  | { kind: "never-closes" };
+  | { kind: "never-closes"; output?: string };
 
 function buildChild(spec: ChildSpec): ChildProcess {
   const child = Object.assign(new EventEmitter(), {
@@ -17157,14 +17326,14 @@ function buildChild(spec: ChildSpec): ChildProcess {
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
   });
-  if (spec.kind === "resolved") {
-    queueMicrotask(() => {
-      if (spec.output && spec.output.length > 0) {
-        (child.stdout as EventEmitter).emit("data", Buffer.from(spec.output));
-      }
+  queueMicrotask(() => {
+    if (spec.output && spec.output.length > 0) {
+      (child.stdout as EventEmitter).emit("data", Buffer.from(spec.output));
+    }
+    if (spec.kind === "resolved") {
       child.emit("close", spec.exitCode, null);
-    });
-  }
+    }
+  });
   return child as unknown as ChildProcess;
 }
 
@@ -17198,7 +17367,10 @@ const resolved = (exitCode: number, output?: string): ChildSpec => ({
   exitCode,
   output,
 });
-const neverCloses = (): ChildSpec => ({ kind: "never-closes" });
+const neverCloses = (output?: string): ChildSpec => ({
+  kind: "never-closes",
+  output,
+});
 
 test("fn-1213 runMergeSuiteGate: an install FAILURE (non-zero exit) degrades to cannot-run — the gate command never runs", async () => {
   const { run } = makeMergeSuiteGit();
@@ -17268,7 +17440,7 @@ test("runMergeSuiteGate: NO named test:gate script passes with a bounded note an
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-test("fn-1213 runMergeSuiteGate: a suite TIMEOUT degrades to cannot-run", async () => {
+test("runMergeSuiteGate: a suite deadline kill is load-suspect", async () => {
   const { run } = makeMergeSuiteGit();
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-suite-to-"));
   const { spawnFn, calls } = makeQueuedSpawn([
@@ -17286,15 +17458,38 @@ test("fn-1213 runMergeSuiteGate: a suite TIMEOUT degrades to cannot-run", async 
       killGraceMs: 5,
     },
   );
-  expect(verdict.kind).toBe("cannot-run");
-  if (verdict.kind === "cannot-run") {
+  expect(verdict.kind).toBe("load-suspect");
+  if (verdict.kind === "load-suspect") {
     expect(verdict.detail).toContain("suite timed out");
   }
   expect(calls.length).toBe(2);
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-test("fn-1213 runMergeSuiteGate: classifyRun == crashed (non-zero exit, no failing-test signal) maps to red, never green/cannot-run", async () => {
+test("runPackageSuiteGate: a named failure stays red even when the deadline kills the suite", async () => {
+  const pkgDir = mkdtempSync(join(tmpdir(), "keeper-mg-named-timeout-"));
+  writeFileSync(
+    join(pkgDir, "package.json"),
+    JSON.stringify({ scripts: { "test:gate": "true" } }),
+  );
+  const { spawnFn } = makeQueuedSpawn([
+    resolved(0),
+    neverCloses("(fail) keeps identity [1ms]\n0 pass\n1 fail\n"),
+  ]);
+  const verdict = await runPackageSuiteGate(pkgDir, {
+    installTimeoutMs: 2_000,
+    suiteDeadlineMs: 5,
+    spawnFn,
+    killGraceMs: 5,
+  });
+  expect(verdict.kind).toBe("red");
+  if (verdict.kind === "red") {
+    expect(verdict.detail).toContain("keeps identity");
+  }
+  rmSync(pkgDir, { recursive: true, force: true });
+});
+
+test("runMergeSuiteGate: an empty-digest crash is load-suspect", async () => {
   const { run } = makeMergeSuiteGit();
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-crash-"));
   const { spawnFn } = makeQueuedSpawn([
@@ -17311,8 +17506,8 @@ test("fn-1213 runMergeSuiteGate: classifyRun == crashed (non-zero exit, no faili
       spawnFn,
     },
   );
-  expect(verdict.kind).toBe("red");
-  if (verdict.kind === "red") {
+  expect(verdict.kind).toBe("load-suspect");
+  if (verdict.kind === "load-suspect") {
     expect(verdict.detail).toContain("suite crashed");
   }
   rmSync(worktreesRoot, { recursive: true, force: true });
@@ -17396,7 +17591,7 @@ test("fn-1309 runMergeSuiteGate: root green + runsSmokeGate=true chains the name
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-test("fn-1309 runMergeSuiteGate: a RED smoke gate short-circuits BEFORE the plan suite ever runs", async () => {
+test("runMergeSuiteGate: a load-suspect smoke gate short-circuits before the plan suite", async () => {
   const { run } = makeMergeSuiteGit({
     planPkgJson: { scripts: { "test:gate": "true" } },
   });
@@ -17421,7 +17616,7 @@ test("fn-1309 runMergeSuiteGate: a RED smoke gate short-circuits BEFORE the plan
       spawnFn,
     },
   );
-  expect(verdict.kind).toBe("red");
+  expect(verdict.kind).toBe("load-suspect");
   expect(calls.length).toBe(3); // the plan install/gate never fired
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
@@ -17479,7 +17674,7 @@ test("fn-1213 runMergeSuiteGate: the scratch worktree is reaped on EVERY verdict
     const { run, cmds } = makeMergeSuiteGit();
     const { spawnFn } = makeQueuedSpawn([
       resolved(0),
-      resolved(1, "no failing-test signal at all"),
+      resolved(1, "(fail) merge semantics [1ms]\n0 pass\n1 fail\n"),
     ]);
     const verdict = await runMergeSuiteGate(
       { repoDir: "/repo", mergedCommit: MG_SHA, runsPlanSuite: false },

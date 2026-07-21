@@ -1214,8 +1214,8 @@ export interface ConfirmRunningDeps {
    * The merge-suite gate probe threaded into `worktree.finalizeEpic` (the {@link
    * isEpicDone} precedent): given the owner-integrated local-default commit, run the
    * fast suite against it in a scratch worktree and return green / pass-with-note /
-   * red / cannot-run. OPTIONAL — omitted makes finalize skip the gate. Production
-   * wires {@link runMergeSuiteGate}; tests inject a fake to drive the verdicts purely.
+   * red / load-suspect / cannot-run. OPTIONAL — omitted makes finalize skip the
+   * gate. Production wires {@link runMergeSuiteGate}; tests inject a fake purely.
    */
   runMergeSuite?: MergeSuiteProbe;
   /**
@@ -1230,18 +1230,76 @@ export interface ConfirmRunningDeps {
 /**
  * The verdict of running the fast suite against a PROSPECTIVE lane→default merge
  * result. `green` and `pass-with-note` clear the merge to advance local default;
- * the latter records that the package has no configured suite. `red` is the
- * semantic-merge-conflict jam (two individually-green sides whose merged tree breaks
- * the suite) that parks the epic on a visible sticky; `cannot-run` is a configured
- * gate that could not produce a verdict (scratch provision / frozen-lockfile install
- * failure / suite timeout) and degrades to a non-sticky retry-skip — NEVER a silent
- * push and NEVER a permanent silent block.
+ * the latter records that the package has no configured suite. `red` is a named
+ * suite failure that parks the epic on a visible sticky; `load-suspect` is a
+ * deadline kill or empty-digest crash, retried once per row/commit before it parks;
+ * `cannot-run` is a configured gate that could not produce a verdict (scratch
+ * provision / frozen-lockfile install failure) and degrades to a retry-skip.
  */
 export type MergeSuiteVerdict =
   | { kind: "green" }
   | { kind: "pass-with-note"; detail: string }
   | { kind: "red"; detail: string }
+  | { kind: "load-suspect"; detail: string }
   | { kind: "cannot-run"; detail: string };
+
+export type MergeSuiteLoadRetryAction = "none" | "retry" | "park";
+
+export interface MergeSuiteLoadRetryTracker {
+  step(args: {
+    rowKey: string;
+    mergedCommit: string;
+    verdict: MergeSuiteVerdict;
+  }): MergeSuiteLoadRetryAction;
+  pendingCount(): number;
+}
+
+const MERGE_SUITE_LOAD_RETRY_MAX_KEYS = 256;
+
+/**
+ * Producer-only, bounded retry state. One entry per row key retains the current
+ * merged commit and whether its single load-suspect retry was consumed. A new
+ * commit starts a fresh episode; green/pass-with-note/named-red ends it. The
+ * fixed-cap insertion order bounds abandoned keys without involving a fold.
+ */
+export function createMergeSuiteLoadRetryTracker(
+  maxKeys = MERGE_SUITE_LOAD_RETRY_MAX_KEYS,
+): MergeSuiteLoadRetryTracker {
+  const capacity =
+    Number.isFinite(maxKeys) && maxKeys > 0 ? Math.floor(maxKeys) : 1;
+  const pending = new Map<string, string>();
+  return {
+    step({ rowKey, mergedCommit, verdict }) {
+      if (
+        verdict.kind === "green" ||
+        verdict.kind === "pass-with-note" ||
+        verdict.kind === "red"
+      ) {
+        pending.delete(rowKey);
+        return "none";
+      }
+      if (verdict.kind !== "load-suspect") return "none";
+
+      if (pending.get(rowKey) === mergedCommit) {
+        pending.delete(rowKey);
+        pending.set(rowKey, mergedCommit);
+        return "park";
+      }
+
+      pending.delete(rowKey);
+      pending.set(rowKey, mergedCommit);
+      while (pending.size > capacity) {
+        const oldest = pending.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        pending.delete(oldest);
+      }
+      return "retry";
+    },
+    pendingCount() {
+      return pending.size;
+    },
+  };
+}
 
 /**
  * Run the fast suite against the prospective merged commit `mergedCommit` checked
@@ -6336,15 +6394,12 @@ export function createWorktreeDriver(
   onResyncSkipped?: (repoDir: string) => void,
   ownerMediatedFinalize = false,
   recoverMergeSuite?: MergeSuiteProbe,
+  scheduleSuiteRetry?: () => void,
 ): WorktreeDriver {
-  // Merge-suite gate memo (fn-1204), keyed by the prospective merged-commit OID: a
-  // TERMINAL verdict (green/pass-with-note/red) is cached so finalize retries never
-  // recompute an UNCHANGED merge. The OID is a pure function of the two tips, so an
-  // advanced default (another lane landed) mints a fresh key and re-runs the suite;
-  // a cannot-run verdict is NEVER cached (it is transient and must recompute). Lives
-  // on the driver closure, so it persists across reconcile cycles for the daemon's
-  // one long-lived driver, and is fresh per driver in a test.
+  // Terminal verdicts are cached by merged commit so retries never recompute an
+  // unchanged merge. Transient and load-suspect verdicts always recompute.
   const mergeSuiteMemo = new Map<string, MergeSuiteVerdict>();
+  const mergeSuiteLoadRetries = createMergeSuiteLoadRetryTracker();
   return {
     async refreshBase(entry, nowSeconds) {
       const baseBranch = baseBranchFor(entry.epic_id);
@@ -6642,11 +6697,35 @@ export function createWorktreeDriver(
                   runsPlanSuite,
                   runsSmokeGate,
                 });
-                if (verdict.kind !== "cannot-run") {
+                if (
+                  verdict.kind !== "cannot-run" &&
+                  verdict.kind !== "load-suspect"
+                ) {
                   mergeSuiteMemo.set(prospect.newValue, verdict);
                 }
               }
+              const suiteRowKey = dispatchKey(
+                "close",
+                worktreeFinalizeDispatchId(epicId, repoDir),
+              );
+              const loadAction = mergeSuiteLoadRetries.step({
+                rowKey: suiteRowKey,
+                mergedCommit: prospect.newValue,
+                verdict,
+              });
               if (verdict.kind === "red") {
+                return {
+                  ok: false,
+                  reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the prospective merge of ${baseBranch} into ${defaultBranch} in ${repoDir} (merged commit ${prospect.newValue}) — ${verdict.detail}`,
+                };
+              }
+              if (verdict.kind === "load-suspect") {
+                if (loadAction === "retry") {
+                  scheduleSuiteRetry?.();
+                  return retrySkip(
+                    `worktree-finalize-suite-gate-load-suspect: the merge-suite gate for ${baseBranch} into ${defaultBranch} in ${repoDir} was load-suspect (${verdict.detail}) — retrying once on the next producer cycle`,
+                  );
+                }
                 return {
                   ok: false,
                   reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the prospective merge of ${baseBranch} into ${defaultBranch} in ${repoDir} (merged commit ${prospect.newValue}) — ${verdict.detail}`,
@@ -6760,6 +6839,9 @@ export function createWorktreeDriver(
             acquireLock,
             runMergeSuite,
             mergeSuiteMemo,
+            dispatchKey("close", worktreeFinalizeDispatchId(epicId, repoDir)),
+            mergeSuiteLoadRetries,
+            scheduleSuiteRetry,
           );
           switch (integrated.kind) {
             case "ready":
@@ -6802,6 +6884,10 @@ export function createWorktreeDriver(
                 ok: false,
                 reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repoDir} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`,
               };
+            case "suite-retry":
+              return retrySkip(
+                `worktree-finalize-suite-gate-load-suspect: the merge-suite gate for integrated ${defaultBranch} in ${repoDir} was load-suspect (${integrated.detail}) — retrying once on the next producer cycle`,
+              );
             case "suite-unavailable":
               return retrySkip(
                 `worktree-finalize-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repoDir} could not run (${integrated.detail}) — deferring the push until the gate can run`,
@@ -7009,6 +7095,8 @@ export function createWorktreeDriver(
         mergeSuiteMemo,
         hasDispatchableCloser,
         openRecoverRows,
+        mergeSuiteLoadRetries,
+        scheduleSuiteRetry,
       );
     },
   };
@@ -7188,6 +7276,7 @@ type OwnerIntegratedTeardownResult =
   | { kind: "tip-drift" }
   | { kind: "lock-timeout" }
   | { kind: "suite-red"; mergedCommit: string; detail: string }
+  | { kind: "suite-retry"; detail: string }
   | { kind: "suite-unavailable"; detail: string }
   | Exclude<PushDefaultResult, { kind: "pushed" }>
   | { kind: "push-unconfirmed" };
@@ -7199,7 +7288,10 @@ async function verifyAndPushOwnerIntegration(
   run: WorktreeGitRunner,
   acquireLock: LockAcquirer | undefined,
   runMergeSuite: MergeSuiteProbe | undefined,
-  mergeSuiteMemo?: Map<string, MergeSuiteVerdict>,
+  mergeSuiteMemo: Map<string, MergeSuiteVerdict> | undefined,
+  suiteRowKey: string,
+  loadRetries: MergeSuiteLoadRetryTracker,
+  scheduleSuiteRetry?: () => void,
 ): Promise<OwnerIntegratedTeardownResult> {
   const ancestry = await run(
     ["merge-base", "--is-ancestor", baseBranch, defaultBranch],
@@ -7237,11 +7329,27 @@ async function verifyAndPushOwnerIntegration(
           run,
         ),
       });
-      if (verdict.kind !== "cannot-run") {
+      if (verdict.kind !== "cannot-run" && verdict.kind !== "load-suspect") {
         mergeSuiteMemo?.set(mergedCommit, verdict);
       }
     }
+    const loadAction = loadRetries.step({
+      rowKey: suiteRowKey,
+      mergedCommit,
+      verdict,
+    });
     if (verdict.kind === "red") {
+      return {
+        kind: "suite-red",
+        mergedCommit,
+        detail: verdict.detail,
+      };
+    }
+    if (verdict.kind === "load-suspect") {
+      if (loadAction === "retry") {
+        scheduleSuiteRetry?.();
+        return { kind: "suite-retry", detail: verdict.detail };
+      }
       return {
         kind: "suite-red",
         mergedCommit,
@@ -7652,13 +7760,11 @@ const MERGE_GATE_MAX_NOTE_LEN = 512;
  * Classifies via the SAME pure baseline-runner core so a compile-error/bail
  * (`crashed`) is never folded to green:
  *  - no gate script → `pass-with-note` (there is no configured suite to run).
- *  - install fail/timeout or suite timeout → `cannot-run` (a configured gate that
- *    could not produce a verdict).
+ *  - install fail/timeout → `cannot-run` (a configured gate that could not start).
  *  - the suite ran clean → `green`.
  *  - the suite reported failing tests → `red`.
- *  - the suite exited non-zero with NO failing-test signal (a compile error / bail in
- *    the merged tree) → `red` — a broken merged build is a VISIBLE park an operator
- *    fixes, never a silent forever-retry.
+ *  - a suite deadline kill or non-zero exit with no failing-test signal →
+ *    `load-suspect`; the row/commit producer decides retry-once versus visible park.
  *
  * `opts.spawnFn` and `opts.killGraceMs` are injectable seams so tests can replace
  * subprocesses and settle timeout paths without the production kill grace.
@@ -7717,11 +7823,8 @@ export async function runPackageSuiteGate(
     opts.suiteDeadlineMs,
     { spawnFn: opts.spawnFn, killGraceMs: opts.killGraceMs },
   );
-  if (raw.timedOut) {
-    return { kind: "cannot-run", detail: `suite timed out in ${pkgDir}` };
-  }
   const parsed = parseGateOutput(raw.output);
-  const cls = classifyRun(raw.exitCode, parsed);
+  const cls = classifyRun(raw.exitCode, parsed, raw.timedOut);
   if (cls === "clean") {
     return { kind: "green" };
   }
@@ -7731,16 +7834,20 @@ export async function runPackageSuiteGate(
       parsed.failingTests.length > names.length
         ? ` (+${parsed.failingTests.length - names.length} more)`
         : "";
+    const detail =
+      names.length > 0
+        ? `${names.join("; ")}${more}`
+        : `${parsed.failCount ?? 1} failing test(s)`;
     return {
       kind: "red",
-      detail: `${pkgDir}: ${names.join("; ")}${more}`,
+      detail: `${pkgDir}: ${detail}`,
     };
   }
-  // crashed: non-zero exit with no failing-test signal — the merged tree does not
-  // even build/run. Park it VISIBLY rather than silently retry-skip forever.
   return {
-    kind: "red",
-    detail: `${pkgDir}: suite crashed (non-zero exit, no failing-test output)`,
+    kind: "load-suspect",
+    detail: raw.timedOut
+      ? `suite timed out in ${pkgDir}`
+      : `${pkgDir}: suite crashed (non-zero exit, no failing-test output)`,
   };
 }
 
@@ -7814,7 +7921,11 @@ export async function runMergeSuiteGate(
       spawnFn: opts.spawnFn,
       killGraceMs: opts.killGraceMs,
     });
-    if (rootVerdict.kind === "red" || rootVerdict.kind === "cannot-run") {
+    if (
+      rootVerdict.kind === "red" ||
+      rootVerdict.kind === "load-suspect" ||
+      rootVerdict.kind === "cannot-run"
+    ) {
       return rootVerdict;
     }
     if (rootVerdict.kind === "pass-with-note") {
@@ -7832,7 +7943,11 @@ export async function runMergeSuiteGate(
         command: MERGE_GATE_SMOKE_COMMAND,
         skipInstall: true,
       });
-      if (smokeVerdict.kind === "red" || smokeVerdict.kind === "cannot-run") {
+      if (
+        smokeVerdict.kind === "red" ||
+        smokeVerdict.kind === "load-suspect" ||
+        smokeVerdict.kind === "cannot-run"
+      ) {
         return smokeVerdict;
       }
       if (smokeVerdict.kind === "pass-with-note") {
@@ -7851,7 +7966,11 @@ export async function runMergeSuiteGate(
           killGraceMs: opts.killGraceMs,
         },
       );
-      if (planVerdict.kind === "red" || planVerdict.kind === "cannot-run") {
+      if (
+        planVerdict.kind === "red" ||
+        planVerdict.kind === "load-suspect" ||
+        planVerdict.kind === "cannot-run"
+      ) {
         return planVerdict;
       }
       if (planVerdict.kind === "pass-with-note") {
@@ -8436,6 +8555,8 @@ export async function recoverWorktrees(
     epicId: string | null;
     dir: string;
   }[] = [],
+  mergeSuiteLoadRetries: MergeSuiteLoadRetryTracker = createMergeSuiteLoadRetryTracker(),
+  scheduleSuiteRetry?: () => void,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -8736,6 +8857,12 @@ export async function recoverWorktrees(
             acquireLock,
             runMergeSuite,
             mergeSuiteMemo,
+            dispatchKey(
+              "close",
+              worktreeRecoverEpicDispatchId(base.epicId, repo),
+            ),
+            mergeSuiteLoadRetries,
+            scheduleSuiteRetry,
           );
           if (integrated.kind === "ready") {
             resolved.push({ epicId: base.epicId, dir: repo });
@@ -8773,6 +8900,8 @@ export async function recoverWorktrees(
               case "suite-red":
                 reason = `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repo} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`;
                 break;
+              case "suite-retry":
+                continue;
               case "suite-unavailable":
                 reason = `worktree-recover-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repo} could not run (${integrated.detail}) — deferring push and teardown`;
                 break;
@@ -11614,6 +11743,7 @@ function main(): void {
       },
       true,
       (a) => runMergeSuiteGate(a),
+      () => requestCycle(),
     ),
     // The MAIN-projection done-ness probe finalize gates on (the closer
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
