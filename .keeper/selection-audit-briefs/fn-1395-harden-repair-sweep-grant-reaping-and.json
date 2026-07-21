@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 18,
+        "files_changed": 3,
+        "insertions": 238
+      },
+      "done_summary": "Made listGrantLeaves scan the full grants directory (no 256-entry truncation before the exclusion decision) and added a bounded, cursor-driven, fail-open reaper that unlinks expired dead-owner grant leaves while retaining the highest fencing token as the crash-safe monotonicity floor.",
+      "input_hash": "b3224305fbd617b11faeea37a05c8f006744c2bd21ed670d140f7ef281223188",
+      "model": "opus",
+      "spec_chars": 2206,
+      "spec_md": "## Description\n\nFinding F1 (with F6 merged). The write-grant leaf is the epic's central\nexclusion lock (\"an unexpired holder prevents every sibling from writing\"),\nbut two mechanics can silently breach it:\n\n- `listGrantLeaves` (`src/grant-leaf.ts:803`) increments its `inspected`\n  counter on every directory entry and breaks at `MAX_TRUNK_LEASE_REQUESTS`\n  (256), sorting by fencing token only after truncation \u2014 so once the shared\n  grants dir exceeds 256 entries the scan can drop the one active holder\n  before returning.\n- Nothing reaps expired or dead-owner leaves: `expireRepairGrant` only\n  rewrites `expires_at`, and there is no unlink/remove of a grant leaf\n  anywhere in the daemon. Leaves accumulate one per distinct\n  `(parent_job_id, agent_type)` ever granted.\n\nTogether, `publishRepairGrant`'s `.some(... Date.now() < leaf.expires_at)`\nexclusion check can return false while a live holder exists, publishing a\nsecond grant for the same shared checkout -> two in-session repairers\nwriting one tree.\n\nFix: reap expired / dead-owner grant leaves in a bounded sweep, and/or\nexempt the exclusion probe from the 256 scan cap so it never truncates\nbefore deciding \"no active holder.\" Preserve fail-open discipline (no throw\ninto the daemon loop) and the fencing-token monotonicity invariant.\n\nFiles: src/grant-leaf.ts (listGrantLeaves + a reaper), src/daemon.ts\n(publishRepairGrant / expireRepairGrant call sites), test/grant-guard.test.ts\nand/or test/daemon.test.ts.\n\n## Acceptance\n\n- [ ] The exclusion probe correctly detects the active holder even when the shared grants directory holds more than 256 entries.\n- [ ] Expired / dead-owner grant leaves are reaped rather than accumulating unboundedly.\n- [ ] A regression test exercises listGrantLeaves / the exclusion probe at and over the 256-entry cap (F6).\n- [ ] Fail-open and fencing-token monotonicity invariants are preserved.\n\n## Done summary\nMade listGrantLeaves scan the full grants directory (no 256-entry truncation before the exclusion decision) and added a bounded, cursor-driven, fail-open reaper that unlinks expired dead-owner grant leaves while retaining the highest fencing token as the crash-safe monotonicity floor.\n## Evidence\n",
+      "task_id": "fn-1395-harden-repair-sweep-grant-reaping-and.1",
+      "tier": "xhigh",
+      "title": "Reap grant leaves, cap-safe exclusion"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "high",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 2,
+        "insertions": 212
+      },
+      "done_summary": "Made the repair maintenance mint idempotence probe reentrancy-safe: a non-reentrant sweep-tick guard plus a pending-mint memo keyed by deterministic maintenance title prevent a not-yet-folded mint or an overlapping tick from double-minting a maintenance epic for the same trunk-red group; the fail-open mint_failed page-once path is preserved.",
+      "input_hash": "b3224305fbd617b11faeea37a05c8f006744c2bd21ed670d140f7ef281223188",
+      "model": "opus",
+      "spec_chars": 1747,
+      "spec_md": "## Description\n\nFinding F2. The maintenance-task mint idempotence probe\n`hasOpenMaintenanceTask` (`src/daemon.ts`) reads the `epics` projection,\nand `runRepairEscalationSweepTick` is scheduled by a bare `setInterval`\n(`daemon.ts` ~16884) with no in-flight / reentrancy guard. Between a mint\n(`keeper plan scaffold` + `validate` subprocess pair) landing and its epic\nfolding into the projection \u2014 or when a tick runs longer than the ~60s\nheartbeat and a second tick overlaps \u2014 a subsequent probe reads false and\nmints a duplicate maintenance epic for one trunk-red incident. Autopilot\nthen dispatches both, so two workers race the same trunk-red repair.\n\nFix: make the sweep tick non-reentrant (an in-flight guard so overlapping\ntimers no-op) and/or dedup by deterministic maintenance title inside\n`keeper plan scaffold` itself, so a not-yet-folded mint cannot be minted\ntwice. Preserve the existing fail-open mint path (mint_failed -> page once).\n\nFiles: src/daemon.ts (runRepairEscalationSweepTick, hasOpenMaintenanceTask,\nmintMaintenanceTask), test/daemon.test.ts.\n\n## Acceptance\n\n- [ ] Exactly one maintenance epic is minted per trunk-red incident when the minted epic has not yet folded into the epics projection.\n- [ ] Overlapping sweep ticks cannot both mint for the same (repo, fingerprint) group.\n- [ ] The fail-open mint path (mint_failed pages once) is preserved.\n\n## Done summary\nMade the repair maintenance mint idempotence probe reentrancy-safe: a non-reentrant sweep-tick guard plus a pending-mint memo keyed by deterministic maintenance title prevent a not-yet-folded mint or an overlapping tick from double-minting a maintenance epic for the same trunk-red group; the fail-open mint_failed page-once path is preserved.\n## Evidence\n",
+      "task_id": "fn-1395-harden-repair-sweep-grant-reaping-and.2",
+      "tier": "high",
+      "title": "Idempotent maintenance-task mint"
+    }
+  ],
+  "created_at": "2026-07-21T18:23:58.223000Z",
+  "epic_id": "fn-1395-harden-repair-sweep-grant-reaping-and",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "b3224305fbd617b11faeea37a05c8f006744c2bd21ed670d140f7ef281223188",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
