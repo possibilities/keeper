@@ -55,6 +55,12 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
       "Reviewed command-boundary compatibility fixture remains isolated and bounded.",
   },
   {
+    file: "plugins/plan/test/session-markers.test.ts",
+    rule: "process-launch",
+    reason:
+      "Reviewed long-argv live-holder fixture exercises the darwin ps start-time probe end-to-end; the child is unref'd, bounded, and killed in finally.",
+  },
+  {
     file: "plugins/plan/test/consistency-generated-guard.test.ts",
     rule: "process-launch",
     reason:
