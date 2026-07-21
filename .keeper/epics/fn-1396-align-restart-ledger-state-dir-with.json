@@ -7,7 +7,7 @@
     "fn-1390-attribute-and-stop-quiet-keeperd-deaths"
   ],
   "id": "fn-1396-align-restart-ledger-state-dir-with",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T07:00:13.138000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T06:49:12.602000Z"
+  "updated_at": "2026-07-21T07:00:13.138000Z"
 }
