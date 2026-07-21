@@ -7,7 +7,7 @@
     "fn-1386-harden-trunk-lease-integration"
   ],
   "id": "fn-1398-cover-trunk-lease-integration-error",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T08:11:18.861000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T08:11:18.623000Z"
+  "updated_at": "2026-07-21T08:11:18.861000Z"
 }
