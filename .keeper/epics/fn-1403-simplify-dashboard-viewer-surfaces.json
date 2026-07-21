@@ -4,7 +4,7 @@
   "created_at": "2026-07-21T22:32:21.914000Z",
   "depends_on_epics": [],
   "id": "fn-1403-simplify-dashboard-viewer-surfaces",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T22:33:28.700000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T22:33:25.374000Z"
+  "updated_at": "2026-07-21T22:33:28.700000Z"
 }
