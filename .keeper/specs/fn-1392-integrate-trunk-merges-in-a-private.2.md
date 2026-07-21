@@ -24,5 +24,5 @@ plugins/plan/skills/close/, CONTEXT.md.
 - [ ] Docs state current behavior only (no history narration outside ADR).
 
 ## Done summary
-
+Split the deferred-ff dirt test into dirty-tracked-only and untracked-only cases, clarified the racing-origin CAS-retry test, documented the TRUNK_* problem codes, and corrected the close skill's stale clean-checkout prose.
 ## Evidence

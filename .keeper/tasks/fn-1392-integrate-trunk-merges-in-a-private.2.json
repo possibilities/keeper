@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Cover deferred-ff paths and update finalize docs",
-  "updated_at": "2026-07-21T06:31:54.523000Z"
+  "updated_at": "2026-07-21T08:53:02.473000Z",
+  "worker_done_at": "2026-07-21T08:53:02.473000Z"
 }
