@@ -7027,7 +7027,7 @@ type IncidentSpoolEntry = ReturnType<
 >[number];
 
 function incidentSpoolEntry(
-  action: "claim" | "release",
+  action: "claim" | "release" | "rotate",
   overrides: Partial<IncidentSpoolEntry["request"]> = {},
 ): IncidentSpoolEntry {
   return {
@@ -7091,6 +7091,7 @@ test("incident claim sweep mints one claim for a live verified claimant and remo
     refused: 0,
     stale: 0,
     expired: 0,
+    rotated: 0,
   });
   expect(removed).toEqual([entry.path]);
   expect(minted).toEqual([
@@ -7628,17 +7629,18 @@ test("buildIncidentGrant pins the resolve tuple to the incident's own lane and t
   });
 });
 
-test("incident claim sweep routes a live owner's re-claim to the grant-rotation seam with no new claim event", () => {
+test("a live owner's DUPLICATE claim is an idempotent no-op and NEVER rotates the grant", () => {
   const entry = incidentSpoolEntry("claim", {
     claimant_session_id: "session-owner",
   });
-  const rotated: Array<[string, string, number, string]> = [];
+  let rotations = 0;
   let mints = 0;
   const result = runIncidentClaimSweep(
     incidentSweepDeps({
       readRequests: () => [entry],
-      // The incident is already held by THIS live claimant at THIS generation —
-      // the in-session decline-receipt transport (re-claim → rotate).
+      // The incident is already held by THIS live claimant at THIS generation — a
+      // duplicate claim delivery / CLI retry, consumed idempotently. An ordinary
+      // claim is NEVER the decline-receipt transport, so the grant never rotates.
       lookupIncident: () => ({
         instanceEventId: 41,
         claimSessionId: "session-owner",
@@ -7648,18 +7650,74 @@ test("incident claim sweep routes a live owner's re-claim to the grant-rotation 
       mintClaimed: () => {
         mints += 1;
       },
-      onOwnerReClaim: (verb, id, instanceEventId, claimSessionId) =>
+      rotateGrant: () => {
+        rotations += 1;
+      },
+    }),
+  );
+  expect(mints).toBe(0);
+  expect(rotations).toBe(0);
+  expect(result.stale).toBe(1);
+  expect(result.rotated).toBe(0);
+});
+
+test("an explicit rotate request routes to the grant-rotation seam, fenced to the live owner, with no claim event", () => {
+  const entry = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  const rotated: Array<[string, string, number, string]> = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      // The incident is held by THIS live owner — the validated decline receipt.
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+      rotateGrant: (verb, id, instanceEventId, claimSessionId) =>
         rotated.push([verb, id, instanceEventId, claimSessionId]),
     }),
   );
   expect(mints).toBe(0);
-  expect(result.stale).toBe(1);
+  expect(result.rotated).toBe(1);
   expect(rotated).toEqual([["work", "fn-3-incident.1", 41, "session-owner"]]);
 });
 
-test("a stale-fenced claim publishes no grant: neither the claim mint nor the rotation seam fires", () => {
-  const entry = incidentSpoolEntry("claim");
-  let mints = 0;
+test("a rotate request from a session that is NOT the current holder is stale and never rotates", () => {
+  const entry = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  let rotations = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      // The incident is held by a DIFFERENT session, so this owner cannot rotate it.
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-other",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      rotateGrant: () => {
+        rotations += 1;
+      },
+    }),
+  );
+  expect(rotations).toBe(0);
+  expect(result.rotated).toBe(0);
+  expect(result.stale).toBe(1);
+});
+
+test("a stale-fenced rotate publishes no grant: the rotation seam never fires", () => {
+  const entry = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
   let rotations = 0;
   const result = runIncidentClaimSweep(
     incidentSweepDeps({
@@ -7667,20 +7725,17 @@ test("a stale-fenced claim publishes no grant: neither the claim mint nor the ro
       // The live incident carries a DIFFERENT instance than the request's fence.
       lookupIncident: () => ({
         instanceEventId: 999,
-        claimSessionId: null,
-        claimPid: null,
-        claimStartTime: null,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
       }),
-      mintClaimed: () => {
-        mints += 1;
-      },
-      onOwnerReClaim: () => {
+      rotateGrant: () => {
         rotations += 1;
       },
     }),
   );
   expect(result.stale).toBe(1);
-  expect(mints).toBe(0);
+  expect(result.rotated).toBe(0);
   expect(rotations).toBe(0);
 });
 
@@ -7766,6 +7821,94 @@ test("expireIncidentGrants retires every leg for the incident on release", () =>
     );
     expect(live).toHaveLength(0);
   });
+});
+
+test("rotate with a FAILING retire leaves resolve-only: deconflict is NOT published and one bounded reason line is emitted", () => {
+  withGrantsDir((grantsDir, root) => {
+    let now = 2_000;
+    const base = incidentGrantDepsFor(grantsDir, root, () => now);
+    publishIncidentResolveGrant(base, "close", "fn-8-r", 21, "sess-r");
+    const liveResolve = () =>
+      listGrantLeaves(grantsDir).filter(
+        (l) => l.role === "resolve" && now < l.expires_at,
+      );
+    expect(liveResolve()).toHaveLength(1);
+
+    now += 1;
+    const notes: string[] = [];
+    // Force the retire write to return false WITHOUT persisting — the positive-
+    // retirement invariant must NOT proceed to publish deconflict while a live
+    // resolve leaf remains un-retired (else the brief's singular advertiser breaks).
+    rotateIncidentGrantToDeconflict(
+      { ...base, writeLeaf: () => false, noteLine: (l) => notes.push(l) },
+      "close",
+      "fn-8-r",
+      21,
+      "sess-r",
+    );
+    expect(
+      listGrantLeaves(grantsDir).some(
+        (l) => l.role === "deconflict" && now < l.expires_at,
+      ),
+    ).toBe(false);
+    expect(liveResolve()).toHaveLength(1);
+    expect(
+      notes.some((n) => n.includes("could not retire the live resolve leaf")),
+    ).toBe(true);
+
+    // A later fenced rotation intent (real writer) retries and completes.
+    now += 1;
+    rotateIncidentGrantToDeconflict(base, "close", "fn-8-r", 21, "sess-r");
+    const live = listGrantLeaves(grantsDir).filter(
+      (l) => l.incident_id === "close::fn-8-r" && now < l.expires_at,
+    );
+    expect(live).toHaveLength(1);
+    expect(live[0]?.role).toBe("deconflict");
+  });
+});
+
+test("rotate with NO live resolve leaf publishes deconflict directly — the fenced intent is authority", () => {
+  withGrantsDir((grantsDir, root) => {
+    const now = 3_000;
+    const deps = incidentGrantDepsFor(grantsDir, root, () => now);
+    // No resolve leaf was ever published (or it already expired). An explicit
+    // rotation intent still transitions straight to deconflict.
+    rotateIncidentGrantToDeconflict(deps, "work", "fn-9-r.2", 33, "sess-x");
+    const live = listGrantLeaves(grantsDir).filter(
+      (l) => l.incident_id === "work::fn-9-r.2" && now < l.expires_at,
+    );
+    expect(live).toHaveLength(1);
+    expect(live[0]?.role).toBe("deconflict");
+  });
+});
+
+test("a duplicate rotate request in one sweep fires the rotation seam exactly once", () => {
+  const a = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  const b = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  // Distinct spool files, byte-identical request content — an idempotent redelivery.
+  b.path = "/spool/rotate-dup.json";
+  let rotations = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [a, b],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      rotateGrant: () => {
+        rotations += 1;
+      },
+    }),
+  );
+  expect(rotations).toBe(1);
+  expect(result.rotated).toBe(1);
+  expect(result.stale).toBe(1);
 });
 
 test("incident grant publish leaves a sibling repair leaf untouched and publishes nothing without a merge row", () => {

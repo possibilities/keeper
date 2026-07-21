@@ -1749,6 +1749,17 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         format_modes: ["json"],
         flags: INCIDENT_CLAIM_FLAGS,
       },
+      {
+        name: "rotate",
+        summary:
+          "Spool the owner's validated decline receipt: rotate the escalation grant resolve→deconflict",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: INCIDENT_CLAIM_FLAGS,
+      },
     ],
   },
   {

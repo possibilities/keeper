@@ -47,6 +47,19 @@ test("buildRequest and parseRequest round-trip the spool contract", () => {
   expect(parseRequest(JSON.stringify(built))).toEqual(built);
 });
 
+test("parseRequest accepts the rotate action — the typed decline-receipt transport", () => {
+  const rotate = buildRequest({
+    action: "rotate",
+    verb: "work",
+    id: "fn-2-incident-store.1",
+    instanceEventId: 73,
+    claimantSessionId: "session-owner",
+    requestedAt: 1_700_000_000_000,
+  });
+  expect(rotate.action).toBe("rotate");
+  expect(parseRequest(JSON.stringify(rotate))).toEqual(rotate);
+});
+
 test("parseRequest rejects oversized and structurally invalid request bodies", () => {
   const valid = request();
   const { instance_event_id: _instanceEventId, ...missingInstance } = valid;

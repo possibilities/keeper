@@ -111,10 +111,10 @@ A Task drop, extra prose, unknown receipt, invalid JSON, or a reason over 240 UT
 
 ### Deconflicter round
 
-Only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. The resolver leg's grant does NOT authorize the deconflicter — its authority is a distinct `deconflict` leaf the daemon publishes only after it retires the resolve leaf. Rotate the grant by re-issuing the claim on the SAME incident fence; the daemon reads a live owner's re-claim as the decline receipt and rotates the leg:
+Only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. The resolver leg's grant does NOT authorize the deconflicter — its authority is a distinct `deconflict` leaf the daemon publishes only after it retires the resolve leaf. Having validated the `declined_clean` receipt, emit the EXPLICIT rotation intent on the SAME incident fence — the daemon rotates the grant only on this typed intent, fenced to the incident instance and this live owner; an ordinary re-claim never rotates authority:
 
 ```bash
-keeper incident claim <incident_id> --instance <instance_event_id>
+keeper incident rotate <incident_id> --instance <instance_event_id>
 keeper escalation-brief <incident.brief_ref>
 ```
 

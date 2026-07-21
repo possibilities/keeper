@@ -150,9 +150,11 @@ import {
   type MergeSuiteVerdict,
   mergeEscalationFailuresToClear,
   mergeLaneBaseIntoDefault,
+  pendingIntegrationReason,
   planTipBaselineRequests,
   prepareWorktreeGeometry,
   probeSharedCheckoutDesync,
+  probeWorkMergeIncidentResolutions,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
@@ -253,6 +255,7 @@ import {
   isRetryableDispatchKey,
   parseDispatchKey,
 } from "../src/dispatch-command";
+import { parseMergeConflictReason } from "../src/dispatch-failure-key";
 import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
 import {
   buildProviderEquivalenceMap,
@@ -21737,15 +21740,17 @@ test("laneFailuresToClear is verb-agnostic — a work AND a close lane row both 
 // ---------------------------------------------------------------------------
 // mergeEscalationFailuresToClear — the positive-evidence level-clear for the bare
 // `close::<epic>` and `work::<taskId>` merge-escalation stickies (the pre-minted
-// `pending owner integration` class included). Clears ONLY on its epic's MERGED-landed
-// evidence — never on task/epic terminal status (done != merged), the exact incident
-// defect it replaces.
+// `pending owner integration` class included). NEVER on task/epic terminal status
+// (done != merged), the exact incident defect it replaces. Two tiers: a close row
+// clears on EPIC-LANDED evidence; a work row clears PRIMARILY on its own incident
+// verdict (source rib merged into its target base + clean checkout), with epic-landed
+// as the straggler fallback and task-terminal as a source-absent corroborator.
 // ---------------------------------------------------------------------------
 
-test("mergeEscalationFailuresToClear: a close::<epic> merge-escalation clears ONLY on its epic's landed evidence, never on a done-but-unmerged base", () => {
+test("mergeEscalationFailuresToClear: a close::<epic> merge-escalation clears ONLY on epic-landed evidence, never on a done-but-unmerged base", () => {
   const closeRow = { verb: "close" as const, id: "fn-3-widget" };
   // Epic base landed (an ancestor of local default, or torn down after merging) →
-  // cleared.
+  // cleared. Deliberately conservative: a close sticky lingers until the base LANDS.
   expect(
     mergeEscalationFailuresToClear(
       [closeRow],
@@ -21753,50 +21758,102 @@ test("mergeEscalationFailuresToClear: a close::<epic> merge-escalation clears ON
       new Set(),
     ),
   ).toEqual([{ verb: "close", id: "fn-3-widget" }]);
-  // No landed evidence this cycle — a done-but-unmerged epic base (the finalize-
-  // pending state) is NOT merged, and an inconclusive merge probe degrades to
-  // NOT-merged → absent from the landed set → RETAINED. Done != merged.
+  // No landed evidence — a done-but-unmerged epic base (the finalize-pending state) is
+  // NOT merged; an inconclusive probe degrades to NOT-merged → absent → RETAINED.
   expect(
     mergeEscalationFailuresToClear([closeRow], new Set(), new Set()),
   ).toEqual([]);
 });
 
-test("mergeEscalationFailuresToClear: a work::<taskId> pending-owner-integration sticky clears on its EPIC's landed evidence, resolving the id through parsePlanRef", () => {
-  // The done-but-never-fanned-in upstream task's pre-mint keys on `work::<taskId>`.
+test("mergeEscalationFailuresToClear: a work::<taskId> fan-in clears SAME cycle on its own `merged` incident verdict while its epic is still open", () => {
   const workRow = { verb: "work" as const, id: "fn-3-widget.2" };
-  // The upstream's epic has NOT landed → the dependent lane still starves → RETAINED.
-  // Clearing here off the task's terminal status is the exact silent-starve defect.
+  // Incident-specific positive evidence (its source rib landed in its target base +
+  // clean checkout) — the epic has NOT landed yet, but the fan-in itself resolved.
   expect(
-    mergeEscalationFailuresToClear([workRow], new Set(), new Set()),
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(), // epic NOT landed
+      new Set(),
+      new Map([["fn-3-widget.2", "merged"]]),
+    ),
+  ).toEqual([{ verb: "work", id: "fn-3-widget.2" }]);
+  // A `defer` verdict (not-yet-ancestor, or a half-done resolution with MERGE_HEAD)
+  // and no landed evidence → the dependent lane still starves → RETAINED.
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(),
+      new Set(),
+      new Map([["fn-3-widget.2", "defer"]]),
+    ),
   ).toEqual([]);
-  // The epic's fan-in genuinely landed (its base reached local default) → the rib is
-  // subsumed into default → cleared.
+});
+
+test("mergeEscalationFailuresToClear: a work `source-absent` verdict clears ONLY when corroborated (epic-landed OR task-terminal), never on bare absence", () => {
+  const workRow = { verb: "work" as const, id: "fn-3-widget.2" };
+  const absent = new Map<string, "merged" | "source-absent" | "defer">([
+    ["fn-3-widget.2", "source-absent"],
+  ]);
+  // Bare absence — the source branch is the evidence carrier, so its disappearance
+  // alone is not proof → RETAINED.
+  expect(
+    mergeEscalationFailuresToClear([workRow], new Set(), new Set(), absent),
+  ).toEqual([]);
+  // Corroborated by the task's own terminal completion → cleared.
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(),
+      new Set(),
+      absent,
+      new Set(["fn-3-widget.2"]),
+    ),
+  ).toEqual([{ verb: "work", id: "fn-3-widget.2" }]);
+  // Corroborated by epic-landed → cleared.
   expect(
     mergeEscalationFailuresToClear(
       [workRow],
       new Set(["fn-3-widget"]),
       new Set(),
+      absent,
     ),
   ).toEqual([{ verb: "work", id: "fn-3-widget.2" }]);
 });
 
-test("mergeEscalationFailuresToClear: a fresh conflict/degrade for the epic this cycle BLOCKS its clear even with landed evidence (never clear what still conflicts)", () => {
+test("mergeEscalationFailuresToClear: epic-landed is the work-row straggler FALLBACK — a row the incident probe could only `defer` still clears once its epic lands", () => {
+  const workRow = { verb: "work" as const, id: "fn-3-widget.2" };
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(["fn-3-widget"]), // epic landed
+      new Set(),
+      new Map([["fn-3-widget.2", "defer"]]), // incident probe inconclusive
+    ),
+  ).toEqual([{ verb: "work", id: "fn-3-widget.2" }]);
+});
+
+test("mergeEscalationFailuresToClear: a fresh conflict/degrade for the epic this cycle BLOCKS either verb's clear even with positive evidence", () => {
   const rows = [
     { verb: "close" as const, id: "fn-4-thing" },
     { verb: "work" as const, id: "fn-4-thing.1" },
   ];
-  // Landed AND blocked → RETAINED for both verbs.
+  // Blocked → RETAINED even though the close row is landed and the work row is `merged`.
   expect(
     mergeEscalationFailuresToClear(
       rows,
       new Set(["fn-4-thing"]),
       new Set(["fn-4-thing"]),
+      new Map([["fn-4-thing.1", "merged"]]),
     ),
   ).toEqual([]);
-  // Landed and NOT blocked → both clear (epic resolved for the close row, epic-of-task
-  // resolved for the work row).
+  // Not blocked → both clear (close on landed, work on its `merged` verdict).
   expect(
-    mergeEscalationFailuresToClear(rows, new Set(["fn-4-thing"]), new Set()),
+    mergeEscalationFailuresToClear(
+      rows,
+      new Set(["fn-4-thing"]),
+      new Set(),
+      new Map([["fn-4-thing.1", "merged"]]),
+    ),
   ).toEqual([
     { verb: "close", id: "fn-4-thing" },
     { verb: "work", id: "fn-4-thing.1" },
@@ -21812,6 +21869,154 @@ test("mergeEscalationFailuresToClear: an unparseable id is skipped (never cleare
       new Set(),
     ),
   ).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// probeWorkMergeIncidentResolutions — the per-`work::`-row incident probe: the parsed
+// source rib is an ancestor of the target base (a) AND the target checkout is clean of
+// merge residue (b) → `merged`; a missing source branch → `source-absent`; everything
+// else (not-yet-ancestor, MERGE_HEAD half-done, dirty target, unparseable, missing dir,
+// git error) → `defer`. Faked at the `run` boundary, mirroring the recover tests.
+// ---------------------------------------------------------------------------
+
+const MERGE_INCIDENT_BASE = "keeper/epic/fn-3-widget";
+const MERGE_INCIDENT_REASON = pendingIntegrationReason({
+  sourceBranch: "keeper/epic/fn-3-widget--fn-3-widget.1",
+  baseBranch: MERGE_INCIDENT_BASE,
+  laneDir: "/repo.worktrees/keeper-epic-fn-3-widget",
+});
+
+function mergeIncidentRun(opts: {
+  sourcePresent: boolean;
+  ancestor: boolean;
+  target: "ready" | "dirty" | "mid-merge";
+}): GitRunner {
+  return (async (args: string[]) => {
+    const cmd = args.join(" ");
+    // (my probe) source rib existence
+    if (args[0] === "rev-parse" && args.includes("--end-of-options")) {
+      return opts.sourcePresent
+        ? { code: 0, stdout: "sourcesha\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    // (a) ancestor-of-base
+    if (args[0] === "merge-base" && args.includes("--is-ancestor")) {
+      return opts.ancestor
+        ? { code: 0, stdout: "", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    // (b) mergeReadiness: MERGE_HEAD probe (mid-merge FIRST)
+    if (cmd === "rev-parse --verify --quiet MERGE_HEAD") {
+      return opts.target === "mid-merge"
+        ? { code: 0, stdout: "mergehead\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    // classifyMidMerge helpers (only reached when mid-merge)
+    if (args[0] === "for-each-ref") return { code: 0, stdout: "", stderr: "" };
+    if (cmd === "rev-parse --verify --quiet MERGE_AUTOSTASH") {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    // nameForeignInProgress: empty git-dir skips the on-disk rebase/lock probes
+    if (args.includes("--git-dir")) return { code: 1, stdout: "", stderr: "" };
+    if (cmd === "rev-parse --verify --quiet CHERRY_PICK_HEAD") {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (cmd === "rev-parse --verify --quiet REVERT_HEAD") {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    // dirty check
+    if (args[0] === "status") {
+      return opts.target === "dirty"
+        ? { code: 0, stdout: " M src/x.ts\n", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    // currentBranch — on the target base (so a clean tree reads `ready`)
+    if (cmd === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${MERGE_INCIDENT_BASE}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+}
+
+const mergeIncidentRow = (dir: string | null = "/lane") => ({
+  id: "fn-3-widget.1",
+  reason: MERGE_INCIDENT_REASON,
+  dir,
+});
+
+test("probeWorkMergeIncidentResolutions: source ancestor-of-base + clean target checkout → `merged`", async () => {
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [mergeIncidentRow()],
+    mergeIncidentRun({ sourcePresent: true, ancestor: true, target: "ready" }),
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("merged");
+});
+
+test("probeWorkMergeIncidentResolutions: a missing source rib branch → `source-absent`", async () => {
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [mergeIncidentRow()],
+    mergeIncidentRun({
+      sourcePresent: false,
+      ancestor: false,
+      target: "ready",
+    }),
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("source-absent");
+});
+
+test("probeWorkMergeIncidentResolutions: source not yet an ancestor of the base → `defer`", async () => {
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [mergeIncidentRow()],
+    mergeIncidentRun({ sourcePresent: true, ancestor: false, target: "ready" }),
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
+});
+
+test("probeWorkMergeIncidentResolutions: a half-done resolution (MERGE_HEAD present) → `defer`, never a false merged", async () => {
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [mergeIncidentRow()],
+    mergeIncidentRun({
+      sourcePresent: true,
+      ancestor: true,
+      target: "mid-merge",
+    }),
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
+});
+
+test("probeWorkMergeIncidentResolutions: a dirty target checkout → `defer`", async () => {
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [mergeIncidentRow()],
+    mergeIncidentRun({ sourcePresent: true, ancestor: true, target: "dirty" }),
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
+});
+
+test("probeWorkMergeIncidentResolutions: an unparseable reason or a missing dir → `defer` without touching git", async () => {
+  let ran = false;
+  const trap: GitRunner = (async () => {
+    ran = true;
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [
+      { id: "fn-3-widget.1", reason: "not a merge-conflict reason", dir: "/l" },
+      { id: "fn-3-widget.2", reason: MERGE_INCIDENT_REASON, dir: null },
+    ],
+    trap,
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
+  expect(verdicts.get("fn-3-widget.2")).toBe("defer");
+  expect(ran).toBe(false);
+});
+
+test("parseMergeConflictReason round-trips the pendingIntegrationReason builder — the source/target the incident probe reads", () => {
+  const parsed = parseMergeConflictReason(MERGE_INCIDENT_REASON);
+  expect(parsed).toEqual({
+    source: "keeper/epic/fn-3-widget--fn-3-widget.1",
+    base: MERGE_INCIDENT_BASE,
+    stderr: "pending owner integration",
+  });
 });
 
 // ---------------------------------------------------------------------------

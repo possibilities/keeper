@@ -115,6 +115,7 @@ import {
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_REASON,
   monitorSlotWedgeJobId,
+  parseMergeConflictReason,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
@@ -648,20 +649,45 @@ export function laneFailuresToClear(
 }
 
 /**
+ * A per-`work::`-row merge-incident resolution verdict from {@link
+ * probeWorkMergeIncidentResolutions}:
+ *   - `merged`        — the row's parsed SOURCE rib is an ancestor of its TARGET base
+ *                       AND the target checkout is clean of merge residue.
+ *   - `source-absent` — the source rib branch does not exist (proof only when
+ *                       corroborated by lane-merged / task-terminal evidence).
+ *   - `defer`         — every other state (not-yet-ancestor, dirty / mid-merge target,
+ *                       unparseable reason, missing dir, or an inconclusive git read).
+ */
+export type WorkMergeIncidentVerdict = "merged" | "source-absent" | "defer";
+
+/**
  * POSITIVE-EVIDENCE level-clear for the MERGE-ESCALATION stickies — a bare
- * `close::<epic>` conflict (recover pass-2 escalation / close-sink genuine conflict)
- * or a `work::<taskId>` fan-in `worktree-merge-conflict` row, the pre-minted
- * `pending owner integration` class included. A row clears ONLY when its epic is in
- * `landedEpicIds` — the per-epic MERGED evidence ({@link computeMergedLaneEntries}:
- * the epic base is an ancestor of local default, or definitively absent-and-torn-down
- * with its work done, conservative-degrading to NOT-merged on an inconclusive probe,
- * unioned with this cycle's recover pass-2 base→default resolutions) — AND its epic is
- * NOT in `blockedEpicIds` (a fresh conflict/degrade re-surfaced this cycle: never clear
- * what still conflicts). Absence from `landedEpicIds` RETAINS the row: a done-but-
- * unmerged epic or task is NOT merged evidence (done != merged), so reaching a terminal
- * status never clears the sticky — only the fan-in genuinely landing does. The epic of
- * a `close::<epic>` id is the id itself; a `work::<taskId>` id resolves through {@link
- * parsePlanRef}; an unparseable id is skipped. Emitted through the same
+ * `close::<epic>` conflict (recover pass-2 escalation / close-sink genuine conflict) or
+ * a `work::<taskId>` fan-in `worktree-merge-conflict` row, the pre-minted `pending
+ * owner integration` class included. NEVER on task/epic terminal status: done != merged
+ * is the incident defect this replaces. Two-tier by verb:
+ *
+ *   - `close::<epic>` clears on EPIC-LANDED evidence (`landedEpicIds` —
+ *     {@link computeMergedLaneEntries}: the epic base is an ancestor of local default,
+ *     or absent-and-torn-down with its work done; unioned with this cycle's recover
+ *     pass-2 base→default resolutions; conservative-degrades to NOT-merged on an
+ *     inconclusive probe). This is deliberately conservative: a resolved close sticky
+ *     lingers until the epic base actually LANDS, not at the earliest per-fan-in merge —
+ *     bounded by the existing attachment/page-once machinery, strictly safer than the
+ *     entity-terminal clear it replaces. Do NOT "optimize" this back to lane evidence.
+ *
+ *   - `work::<taskId>` clears on INCIDENT-SPECIFIC evidence FIRST — `workIncidentVerdicts`
+ *     `merged` (its own source rib landed in its target base + a clean target checkout),
+ *     so a resolved fan-in clears the SAME cycle even while its epic is still open. A
+ *     `source-absent` verdict clears ONLY when corroborated (epic-landed OR the task is
+ *     terminal in `taskTerminalIds`) — the source branch is the evidence carrier, so
+ *     bare absence is not proof. EPIC-LANDED remains the straggler FALLBACK (a row the
+ *     incident probe could only `defer`). A bare `defer` RETAINS.
+ *
+ * `blockedEpicIds` (a fresh conflict/degrade for the epic this cycle) blocks either
+ * verb's clear — never clear what still conflicts; the level-trigger re-mints stay
+ * legal. A `close::<epic>` id IS the epic; a `work::<taskId>` id resolves through
+ * {@link parsePlanRef}; an unparseable id is skipped. Emitted through the same
  * `emitDispatchCleared` gate as the recover/lane clears, so `handleDispatchClearedMint`'s
  * incident-only fence leaves a live claimant's attempt-owned state untouched. Pure — a
  * function of the inputs, no git, no clock.
@@ -670,16 +696,95 @@ export function mergeEscalationFailuresToClear(
   openRows: readonly { verb: Verb; id: string }[],
   landedEpicIds: ReadonlySet<string>,
   blockedEpicIds: ReadonlySet<string>,
+  workIncidentVerdicts: ReadonlyMap<
+    string,
+    WorkMergeIncidentVerdict
+  > = new Map(),
+  taskTerminalIds: ReadonlySet<string> = new Set(),
 ): { verb: Verb; id: string }[] {
   const cleared: { verb: Verb; id: string }[] = [];
   for (const row of openRows) {
     const epicId = parsePlanRef(row.id)?.epic_id ?? null;
     if (epicId === null) continue;
-    if (landedEpicIds.has(epicId) && !blockedEpicIds.has(epicId)) {
-      cleared.push({ verb: row.verb, id: row.id });
+    if (blockedEpicIds.has(epicId)) continue; // never clear what still conflicts
+    const landed = landedEpicIds.has(epicId);
+    if (row.verb === "work") {
+      const verdict = workIncidentVerdicts.get(row.id) ?? "defer";
+      if (
+        verdict === "merged" ||
+        landed ||
+        (verdict === "source-absent" && taskTerminalIds.has(row.id))
+      ) {
+        cleared.push({ verb: row.verb, id: row.id });
+      }
+      continue;
     }
+    if (landed) cleared.push({ verb: row.verb, id: row.id });
   }
   return cleared;
+}
+
+/**
+ * Probe each OPEN `work::<taskId>` merge-escalation row for INCIDENT-SPECIFIC positive
+ * resolution — the primary clear evidence per {@link mergeEscalationFailuresToClear},
+ * bounded to the open merge-incident rows (same git probe class the recover/lane passes
+ * already run). Per row, reusing the ONE fan-in reason parser {@link
+ * parseMergeConflictReason} the escalation brief reads:
+ *   (a) the parsed SOURCE rib is an ancestor of the TARGET base (`gitIsAncestorOf` —
+ *       `false` covers not-ancestor AND an errored/timed-out probe → `defer`), AND
+ *   (b) the TARGET checkout (`dir`) is clean, on the base branch, with NO merge residue
+ *       (`gitMergeReadiness` === `ready`; a half-done resolution reads `dirty`/`mid-merge`),
+ * → `merged`. A missing SOURCE branch → `source-absent` (the caller corroborates).
+ * Everything else — unparseable reason, missing `dir`, not-yet-ancestor, dirty/mid-merge
+ * target, or any thrown git error — → `defer` (never a false clear). Producer-only live
+ * git READS, never a fold; NEVER throws past here.
+ */
+export async function probeWorkMergeIncidentResolutions(
+  rows: readonly { id: string; reason: string; dir: string | null }[],
+  run: WorktreeGitRunner = gitExec,
+): Promise<Map<string, WorkMergeIncidentVerdict>> {
+  const out = new Map<string, WorkMergeIncidentVerdict>();
+  for (const row of rows) {
+    const parsed = parseMergeConflictReason(row.reason);
+    if (parsed === null || row.dir === null || row.dir === "") {
+      out.set(row.id, "defer");
+      continue;
+    }
+    const { source, base } = parsed;
+    try {
+      const srcRef = await run(
+        [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          "--end-of-options",
+          `refs/heads/${source}^{commit}`,
+        ],
+        { cwd: row.dir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (srcRef.code === 1) {
+        out.set(row.id, "source-absent");
+        continue;
+      }
+      if (srcRef.code !== 0) {
+        out.set(row.id, "defer"); // inconclusive existence probe
+        continue;
+      }
+      if (!(await gitIsAncestorOf(row.dir, source, base, run))) {
+        out.set(row.id, "defer"); // not-yet-ancestor OR inconclusive
+        continue;
+      }
+      const ready = await gitMergeReadiness(
+        row.dir,
+        shortBranchName(base),
+        run,
+      );
+      out.set(row.id, ready.kind === "ready" ? "merged" : "defer");
+    } catch {
+      out.set(row.id, "defer"); // a git failure is never positive merged evidence
+    }
+  }
+  return out;
 }
 
 /**
@@ -10556,11 +10661,18 @@ export async function loadReconcileSnapshot(
   // so the recover pass's level-clear reaches a `work::<taskId>` row the typed router
   // would short-circuit to `work-task` — cleared by lane path, never the dead arm.
   const laneFailures: { verb: Verb; id: string; dir: string }[] = [];
-  // The `(verb, id)` of every OPEN merge-escalation row — a bare `close::<epic>`
-  // conflict or a `work::<taskId>` fan-in `worktree-merge-conflict` (pre-minted
-  // `pending owner integration` included). Fed into the reconcile loop's positive-
-  // evidence level-clear keyed by the row's epic's merged-landed evidence.
-  const mergeEscalationFailures: { verb: Verb; id: string }[] = [];
+  // Every OPEN merge-escalation row — a bare `close::<epic>` conflict or a
+  // `work::<taskId>` fan-in `worktree-merge-conflict` (pre-minted `pending owner
+  // integration` included). `reason` + `dir` ride along so the reconcile loop can probe
+  // each `work::` row's own incident (source rib merged into its target base + clean
+  // target checkout); the level-clear then drops it on that evidence, epic-landed as a
+  // straggler fallback.
+  const mergeEscalationFailures: {
+    verb: Verb;
+    id: string;
+    reason: string;
+    dir: string | null;
+  }[] = [];
   // The lane PATHS with an OPEN per-lane wedge distress row — the level-clear set the
   // recover pass's lane grace tracker clears against (a lane ready/gone this cycle).
   const laneWedgeDistressDirs = new Set<string>();
@@ -10774,9 +10886,16 @@ export async function loadReconcileSnapshot(
         // fan-in genuinely LANDS (merged into local default / torn down), never on
         // task/epic terminal status. A `retry_dispatch` still drops one early.
         case "work-merge-conflict":
-        case "merge-escalation":
-          mergeEscalationFailures.push({ verb: verb as Verb, id });
+        case "merge-escalation": {
+          const dir = (row as { dir?: unknown }).dir;
+          mergeEscalationFailures.push({
+            verb: verb as Verb,
+            id,
+            reason: reasonStr,
+            dir: typeof dir === "string" ? dir : null,
+          });
           break;
+        }
         case "close-plain":
         case "unknown":
           break;
@@ -12246,19 +12365,28 @@ function main(): void {
                 ),
               );
             }
-            // POSITIVE-EVIDENCE level-clear for the MERGE-ESCALATION stickies: a bare
-            // `close::<epic>` conflict or a `work::<taskId>` fan-in
-            // `worktree-merge-conflict` (the pre-minted `pending owner integration`
-            // class included) clears ONLY when its epic's fan-in genuinely LANDED —
-            // the epic base is an ancestor of local default or was torn down after
-            // merging (`snapshot.landedLaneEntries`, conservative-degrading to
-            // NOT-merged on an inconclusive probe), UNIONED with this cycle's recover
-            // pass-2 base→default resolutions so a same-cycle recover merge clears
-            // without a cycle's lag. NEVER on task/epic terminal status (done !=
-            // merged, the incident-defect this replaces). A fresh conflict/degrade for
-            // the epic this cycle blocks its clear. Routed through the SAME
-            // `emitDispatchCleared` gate, so `handleDispatchClearedMint`'s incident-only
-            // fence leaves a live claimant's attempt-owned state untouched.
+            // POSITIVE-EVIDENCE level-clear for the MERGE-ESCALATION stickies (bare
+            // `close::<epic>` conflicts + `work::<taskId>` fan-in
+            // `worktree-merge-conflict` rows, the pre-minted `pending owner integration`
+            // class included). NEVER on task/epic terminal status — done != merged is the
+            // incident-defect this replaces. Two tiers:
+            //  - EPIC-LANDED evidence (`landedEpicIds`): the epic base is an ancestor of
+            //    local default or was torn down after merging (`landedLaneEntries`,
+            //    conservative-degrading to NOT-merged on inconclusive), UNIONED with this
+            //    cycle's recover pass-2 base→default resolutions. This is the `close::`
+            //    clear and the `work::` straggler FALLBACK; a close sticky deliberately
+            //    lingers until the base LANDS, not at the earliest per-fan-in merge —
+            //    bounded by attachment/page-once, and never re-optimized to lane evidence.
+            //  - INCIDENT-SPECIFIC evidence (`workVerdicts`, PRIMARY for `work::`): the
+            //    row's own source rib merged into its target base + a clean target
+            //    checkout, so a resolved fan-in clears the SAME cycle while its epic is
+            //    still open. Bounded to the OPEN work merge rows (the same probe class the
+            //    recover/lane passes run). A `source-absent` verdict needs the epic-landed
+            //    or task-terminal corroboration the helper applies.
+            // A fresh conflict/degrade for the epic this cycle blocks either verb's clear.
+            // Routed through the SAME `emitDispatchCleared` gate, so
+            // `handleDispatchClearedMint`'s incident-only fence leaves a live claimant's
+            // attempt-owned state untouched.
             const landedEpicIds = new Set<string>(
               (snapshot.landedLaneEntries ?? []).map((e) => e.epic_id),
             );
@@ -12270,10 +12398,27 @@ function main(): void {
             for (const f of failures) {
               if (f.epicId !== null) blockedEpicIds.add(f.epicId);
             }
+            // Task-terminal corroboration for a `source-absent` verdict — the task's own
+            // administrative completion (`worker_phase === "done"`, or its epic done).
+            const taskTerminalIds = new Set<string>();
+            for (const epic of snapshot.epics) {
+              const epicDone = epic.status === "done";
+              for (const task of epic.tasks) {
+                if (epicDone || task.worker_phase === "done") {
+                  taskTerminalIds.add(task.task_id);
+                }
+              }
+            }
+            const mergeRows = snapshot.mergeEscalationFailures ?? [];
+            const workVerdicts = await probeWorkMergeIncidentResolutions(
+              mergeRows.filter((r) => r.verb === "work"),
+            );
             for (const c of mergeEscalationFailuresToClear(
-              snapshot.mergeEscalationFailures ?? [],
+              mergeRows,
               landedEpicIds,
               blockedEpicIds,
+              workVerdicts,
+              taskTerminalIds,
             )) {
               deps.emitDispatchCleared(
                 dispatchClearedPayload(

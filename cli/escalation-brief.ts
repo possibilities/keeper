@@ -56,7 +56,10 @@ import { roleJobIds } from "../src/bus-identity";
 import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb, resolveDbPath } from "../src/db";
 import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
-import { isMergeEscalationReason } from "../src/dispatch-failure-key";
+import {
+  isMergeEscalationReason,
+  parseMergeConflictReason,
+} from "../src/dispatch-failure-key";
 import { escalationRoleFor } from "../src/grant-leaf";
 import { keeperStateDir } from "../src/keeper-state-dir";
 import { repoToken as deriveRepoToken } from "../src/worktree-plan";
@@ -497,25 +500,6 @@ function resolveLineage(
 interface IncidentResult<D> {
   data: D;
   degraded: string[];
-}
-
-/** Split a `worktree-merge-conflict: merging <source> into <base> — <stderr>`
- *  reason into its branches + stderr tail. Splits on the FIRST em-dash so a
- *  stderr containing one can't poison the branch parse. Returns null on a
- *  structural miss. */
-function parseMergeConflictReason(
-  reason: string,
-): { source: string; base: string; stderr: string | null } | null {
-  const dash = reason.indexOf(" — ");
-  const head = dash >= 0 ? reason.slice(0, dash) : reason;
-  const stderr = dash >= 0 ? reason.slice(dash + 3) : null;
-  const m = head.match(
-    /^\s*worktree-merge-conflict:\s*merging\s+(\S.*?)\s+into\s+(\S.*?)\s*$/,
-  );
-  if (m == null) {
-    return null;
-  }
-  return { source: m[1], base: m[2], stderr };
 }
 
 /** Assemble the deconflict incident: the sticky `close::<epic>` (or, for a

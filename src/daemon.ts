@@ -278,6 +278,7 @@ import {
   type GrantReapCursor,
   listGrantLeaves,
   listTrunkLeaseLeaves,
+  readGrantLeaf,
   readTrunkLeaseLeaf,
   readTrunkLeaseRequests,
   reapGrantLeaves,
@@ -3734,11 +3735,15 @@ export interface IncidentClaimSweepDeps {
   /** Mint `IncidentReleased`; explicit false means the write failed and the
    *  request/expiry remains retryable. */
   mintReleased: (p: IncidentReleaseMint) => unknown;
-  /** A live owner re-issued a claim it already holds (same session, same process
-   *  generation) — the in-session decline-receipt transport that rotates the
-   *  escalation grant from the resolve leg to the deconflict leg. Optional so a
-   *  release-only / diagnostic caller need not wire grant rotation. */
-  onOwnerReClaim?: (
+  /** Consume an explicit `rotate` request — the owner's typed decline-receipt
+   *  transport. The sweep invokes this ONLY for a `rotate` action fenced to the
+   *  incident instance AND the exact live owner, so an ordinary claim (duplicate
+   *  spool delivery, CLI retry, owner reorientation) NEVER rotates authority. It
+   *  rotates the escalation grant from the resolve leg to the deconflict leg;
+   *  duplicate rotate requests are idempotent (the rotation itself short-circuits
+   *  on a live deconflict leaf). Optional so a release-only / diagnostic caller need
+   *  not wire grant rotation. */
+  rotateGrant?: (
     verb: string,
     id: string,
     instanceEventId: number,
@@ -3759,6 +3764,7 @@ export interface IncidentClaimSweepResult {
   refused: number;
   stale: number;
   expired: number;
+  rotated: number;
 }
 
 /**
@@ -3770,9 +3776,12 @@ export interface IncidentClaimSweepResult {
  *     `IncidentClaimed` ONLY when the claimant verifies live AND the row is not
  *     already held by a DIFFERENT live or unverifiable claimant (a positively
  *     dead prior holder is taken over); an unverifiable / dead new claimant is
- *     REFUSED. A RELEASE mints only for the recorded holder. Duplicate claims and
- *     releases are consumed without growing the event log. A failed mint leaves
- *     its request spooled for retry.
+ *     REFUSED. A RELEASE mints only for the recorded holder. A ROTATE — the owner's
+ *     explicit typed decline-receipt intent — rotates the escalation grant from the
+ *     resolve leg to the deconflict leg ONLY for the exact live recorded holder, and
+ *     never mints an event; a claim never rotates. Duplicate claims, releases, and
+ *     rotates are consumed without growing the event log. A failed mint leaves its
+ *     request spooled for retry.
  *
  *  2. EXPIRY — for each currently-claimed row, re-probe the RECORDED claimant
  *     `(pid, start_time)`; on positive evidence of death, mint `IncidentReleased`
@@ -3792,6 +3801,7 @@ export function runIncidentClaimSweep(
     refused: 0,
     stale: 0,
     expired: 0,
+    rotated: 0,
   };
   // A successful mint is immediately folded in production, but keep the
   // request contract idempotent even when a test/custom mint seam delays its
@@ -3883,24 +3893,41 @@ export function runIncidentClaimSweep(
         continue;
       }
 
-      // Same incident + same claimant + same process generation is already
-      // satisfied. A resumed claimant with a fresh generation re-stamps the
-      // claim below so expiry never releases it using the dead prior process.
-      if (
-        incident.claimSessionId === request.claimant_session_id &&
-        incident.claimPid === claimant.pid &&
-        incident.claimStartTime === claimant.startTime
-      ) {
-        // A live owner re-claiming an incident it already holds is the
-        // in-session decline-receipt transport: the resolve-leg merge-resolver
-        // declined, so rotate the escalation grant to the deconflict leg. No new
-        // claim event — the claim already folded — just the grant rotation.
-        deps.onOwnerReClaim?.(
+      if (request.action === "rotate") {
+        // The owner's EXPLICIT decline-receipt intent — fenced to the incident
+        // instance (checked above) AND the exact live owner. Only the recorded
+        // holder may rotate its own escalation grant; a rotate from a session that
+        // is not the current holder is an idempotent stale request, never a
+        // rotation. Grants are keyed on session identity, so rotation is
+        // generation-agnostic — a resumed owner still rotates its own leg.
+        if (incident.claimSessionId !== request.claimant_session_id) {
+          result.stale += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+        deps.rotateGrant?.(
           request.verb,
           request.id,
           incident.instanceEventId,
           request.claimant_session_id,
         );
+        fulfilledRequests.add(requestKey);
+        result.rotated += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Same incident + same claimant + same process generation is already
+      // satisfied — a duplicate claim delivery or a CLI retry. Consume it as an
+      // idempotent no-op; a claim NEVER rotates the escalation grant (the explicit
+      // `rotate` action is the sole decline-receipt transport). A resumed claimant
+      // with a fresh generation re-stamps the claim below so expiry never releases
+      // it using the dead prior process.
+      if (
+        incident.claimSessionId === request.claimant_session_id &&
+        incident.claimPid === claimant.pid &&
+        incident.claimStartTime === claimant.startTime
+      ) {
         result.stale += 1;
         deps.removeRequest(path);
         continue;
@@ -4064,6 +4091,11 @@ export interface IncidentGrantDeps {
   ) => { dir: string; attemptId: string } | null;
   now: () => number;
   noteLine?: (line: string) => void;
+  /** Grant-leaf writer seam (defaults to {@link writeGrantLeaf}). Its boolean
+   *  return is AUTHORITATIVE — a `false` means the leaf was NOT persisted, so a
+   *  rotation must NOT proceed to publish deconflict while a live resolve leaf
+   *  remains un-retired. Injected so a fixture can force a retirement failure. */
+  writeLeaf?: (grantsDir: string, grant: GrantLeaf) => boolean;
 }
 
 /** Every live-or-expired incident escalation leaf for one (session, incident
@@ -4112,6 +4144,7 @@ export function publishIncidentResolveGrant(
   claimSessionId: string,
 ): void {
   const note = deps.noteLine ?? (() => {});
+  const writeLeaf = deps.writeLeaf ?? writeGrantLeaf;
   const key = `${verb}::${id}`;
   const nowMs = deps.now();
   if (
@@ -4144,7 +4177,7 @@ export function publishIncidentResolveGrant(
   });
   let published = false;
   try {
-    published = writeGrantLeaf(deps.grantsDir, grant);
+    published = writeLeaf(deps.grantsDir, grant);
   } catch (err) {
     note(
       `# incident-grant ${key} resolve publish threw (non-fatal): ${
@@ -4156,11 +4189,16 @@ export function publishIncidentResolveGrant(
 }
 
 /** Rotate the escalation grant from the resolve leg to the deconflict leg — the
- *  in-session decline-receipt handler. Expires the resolve leaf FIRST so the
- *  escalation brief's SINGULAR grant advertiser never sees two live leaves for
- *  one incident, then publishes the deconflict leaf at its sibling agent-type
- *  path. Idempotent (a live deconflict leaf short-circuits); a missing resolve
- *  leg recovers by (re)publishing resolve rather than skipping a stage. */
+ *  handler for the owner's EXPLICIT decline-receipt intent (the spool `rotate`
+ *  action). POSITIVE-RETIREMENT INVARIANT: every LIVE resolve leaf is retired with
+ *  confirmation — a `true` writer return, or a re-read proving the leaf expired /
+ *  gone — BEFORE the deconflict leaf is published, so the escalation brief's
+ *  SINGULAR grant advertiser never sees two live leaves for one incident. When a
+ *  live resolve leaf cannot be positively retired, the rotation STOPS visibly with
+ *  one bounded reason line, leaves the incident resolve-only, and defers to the
+ *  next fenced rotation intent. Idempotent (a live deconflict leaf short-circuits).
+ *  A missing / already-expired resolve leg publishes deconflict directly — the
+ *  fenced rotation intent is authority for the transition. */
 export function rotateIncidentGrantToDeconflict(
   deps: IncidentGrantDeps,
   verb: string,
@@ -4169,6 +4207,7 @@ export function rotateIncidentGrantToDeconflict(
   claimSessionId: string,
 ): void {
   const note = deps.noteLine ?? (() => {});
+  const writeLeaf = deps.writeLeaf ?? writeGrantLeaf;
   const key = `${verb}::${id}`;
   const nowMs = deps.now();
   const leaves = incidentGrantLeaves(
@@ -4183,25 +4222,43 @@ export function rotateIncidentGrantToDeconflict(
   ) {
     return;
   }
-  const resolveLeaves = leaves.filter((leaf) => leaf.role === "resolve");
-  if (resolveLeaves.length === 0) {
-    publishIncidentResolveGrant(
-      deps,
-      verb,
-      id,
-      instanceEventId,
-      claimSessionId,
-    );
-    return;
-  }
-  for (const leaf of resolveLeaves) {
+  // Retire EVERY LIVE resolve leaf with POSITIVE confirmation before publishing
+  // deconflict. An already-expired resolve leaf is retired by TTL (the reaper
+  // collects it) and never blocks the transition.
+  const liveResolveLeaves = leaves.filter(
+    (leaf) => leaf.role === "resolve" && nowMs < leaf.expires_at,
+  );
+  for (const leaf of liveResolveLeaves) {
+    let retired = false;
     try {
-      writeGrantLeaf(deps.grantsDir, {
+      retired = writeLeaf(deps.grantsDir, {
         ...leaf,
         expires_at: Math.min(leaf.expires_at, nowMs),
       });
     } catch {
-      // A failed retire leaves an expired-by-TTL leaf the reaper still collects.
+      retired = false;
+    }
+    if (!retired) {
+      // The write did not confirm — re-read the leaf's own tuple. Only a verified
+      // expired/absent leaf counts as retired; a still-live one blocks the publish
+      // so the two legs are never simultaneously live.
+      const verdict = readGrantLeaf(
+        deps.grantsDir,
+        {
+          parentJobId: claimSessionId,
+          agentType: INCIDENT_RESOLVE_AGENT_TYPE,
+          incidentId: key,
+          fencingToken: leaf.fencing_token,
+        },
+        nowMs,
+      );
+      retired = verdict.kind === "expired" || verdict.kind === "absent";
+    }
+    if (!retired) {
+      note(
+        `# incident-grant ${key}: could not retire the live resolve leaf — leaving resolve-only, deconflict deferred to the next rotation intent`,
+      );
+      return;
     }
   }
   const facts = deps.rowFacts(verb, id);
@@ -4223,7 +4280,7 @@ export function rotateIncidentGrantToDeconflict(
   });
   let published = false;
   try {
-    published = writeGrantLeaf(deps.grantsDir, grant);
+    published = writeLeaf(deps.grantsDir, grant);
   } catch (err) {
     note(
       `# incident-grant ${key} deconflict publish threw (non-fatal): ${
@@ -4233,7 +4290,7 @@ export function rotateIncidentGrantToDeconflict(
   }
   if (!published) {
     note(
-      `# incident-grant ${key}: rotated resolve→deconflict but deconflict leaf publish failed`,
+      `# incident-grant ${key}: retired resolve, deconflict leaf publish failed`,
     );
   }
 }
@@ -4246,6 +4303,7 @@ export function expireIncidentGrants(
   id: string,
   claimSessionId: string,
 ): void {
+  const writeLeaf = deps.writeLeaf ?? writeGrantLeaf;
   const nowMs = deps.now();
   // Expire by (session, incident) identity regardless of instance — a release
   // retires every leg this session may have opened for the incident.
@@ -4256,7 +4314,7 @@ export function expireIncidentGrants(
       (leaf.role === "resolve" || leaf.role === "deconflict")
     ) {
       try {
-        writeGrantLeaf(deps.grantsDir, {
+        writeLeaf(deps.grantsDir, {
           ...leaf,
           expires_at: Math.min(leaf.expires_at, nowMs),
         });
@@ -15764,7 +15822,7 @@ function startDaemonWithExitAttribution(
         }
         return ok;
       },
-      onOwnerReClaim: (verb, id, instanceEventId, claimSessionId) =>
+      rotateGrant: (verb, id, instanceEventId, claimSessionId) =>
         rotateIncidentGrantToDeconflict(
           incidentGrantDeps,
           verb,

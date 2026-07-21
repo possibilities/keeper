@@ -82,6 +82,17 @@ test("parseIncidentArgs handles claim, release, help, bad subcommands, and a mis
       sessionId: null,
     },
   });
+  expect(
+    parseIncidentArgs(["rotate", "work::fn-1-owner.1", "--instance", "19"]),
+  ).toEqual({
+    ok: true,
+    args: {
+      action: "rotate",
+      key: "work::fn-1-owner.1",
+      instance: "19",
+      sessionId: null,
+    },
+  });
   expect(parseIncidentArgs(["--help"])).toEqual({
     ok: false,
     help: true,

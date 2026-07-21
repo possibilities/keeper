@@ -77,10 +77,10 @@ PRIMARY_REPO=<primary_repo>
 </incident-data>
 ```
 
-Accept only the complete one-line receipt `receipt=<resolved|declined_clean|declined_residue|stale_base> reason=<JSON string>`, with a reason no longer than 240 UTF-8 bytes. Only `declined_clean` may spawn one `plan:deconflicter`. The resolve leg's grant does NOT authorize the deconflicter: rotate the grant first by re-issuing the claim on the SAME incident fence — the daemon reads a live owner's re-claim as the decline receipt and retires the resolve leaf, then publishes the `deconflict` leaf for this session:
+Accept only the complete one-line receipt `receipt=<resolved|declined_clean|declined_residue|stale_base> reason=<JSON string>`, with a reason no longer than 240 UTF-8 bytes. Only `declined_clean` may spawn one `plan:deconflicter`. The resolve leg's grant does NOT authorize the deconflicter: having validated the `declined_clean` receipt, emit the EXPLICIT rotation intent on the SAME incident fence — the daemon rotates only on this typed intent, fenced to the incident instance and this live owner, retiring the resolve leaf and then publishing the `deconflict` leaf for this session; an ordinary re-claim never rotates authority:
 
 ```bash
-keeper incident claim <incident_id> --instance <instance_event_id>
+keeper incident rotate <incident_id> --instance <instance_event_id>
 keeper escalation-brief <incident.brief_ref>
 ```
 

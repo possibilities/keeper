@@ -868,3 +868,28 @@ export function isMergeEscalationReason(reason: string): boolean {
       return assertNever(route);
   }
 }
+
+/**
+ * Split a `worktree-merge-conflict: merging <source> into <base> — <tail>` reason
+ * into its source/base branches + trailing text (a git stderr for a genuine
+ * conflict, or `pending owner integration` for the pre-minted fan-in class). Splits
+ * on the FIRST em-dash so a tail containing one can't poison the branch parse.
+ * Returns null on a structural miss. The single reused inverse of the fan-in reason
+ * builder — the escalation brief's source/target derivation AND the autopilot
+ * merge-incident resolution probe both read branches through THIS parser, so the two
+ * can never diverge. Pure; NEVER throws.
+ */
+export function parseMergeConflictReason(
+  reason: string,
+): { source: string; base: string; stderr: string | null } | null {
+  const dash = reason.indexOf(" — ");
+  const head = dash >= 0 ? reason.slice(0, dash) : reason;
+  const stderr = dash >= 0 ? reason.slice(dash + 3) : null;
+  const m = head.match(
+    /^\s*worktree-merge-conflict:\s*merging\s+(\S.*?)\s+into\s+(\S.*?)\s*$/,
+  );
+  if (m == null) {
+    return null;
+  }
+  return { source: m[1], base: m[2], stderr };
+}

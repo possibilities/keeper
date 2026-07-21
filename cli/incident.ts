@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `keeper incident <claim|release> <work::<taskId> | close::<epicId>>
+ * `keeper incident <claim|release|rotate> <work::<taskId> | close::<epicId>>
  *  --instance <instance_event_id>` — the session-side writer of the
  * incident-claim spool.
  *
@@ -9,8 +9,13 @@
  * ownership on that incident. This verb writes ONE bounded request leaf into the
  * daemon-watched spool and returns — the daemon incident-claim producer validates
  * claimant liveness and mints the synthetic `IncidentClaimed` / `IncidentReleased`
- * event, the fold records the claim. There is NO socket, NO RPC, and NO session
- * DB write here: this verb never opens keeper.db.
+ * event, the fold records the claim. `rotate` carries the owner's EXPLICIT decline
+ * receipt: after the session validates a `declined_clean` return from its resolver
+ * subagent, it spools ONE rotate request and the producer — fenced to the incident
+ * instance and this live owner — rotates the escalation grant from resolve to
+ * deconflict (no event minted; an ordinary `claim` NEVER rotates authority). There
+ * is NO socket, NO RPC, and NO session DB write here: this verb never opens
+ * keeper.db.
  *
  * The incident is named by its dispatch key (`work::<taskId>` / `close::<epicId>`,
  * the sticky `dispatch_failures` row's `(verb, id)`); `--instance` carries the
@@ -41,16 +46,20 @@ export const EXIT_ERROR = 1;
 /** Usage / arg fault, or no resolvable claimant identity. */
 export const EXIT_USAGE = 2;
 
-export const HELP = `keeper incident — claim or release a merge incident from the owning session
+export const HELP = `keeper incident — claim, release, or rotate a merge incident from the owning session
 
 Usage:
   keeper incident claim   <work::<taskId> | close::<epicId>> --instance <n> [flags]
   keeper incident release <work::<taskId> | close::<epicId>> --instance <n> [flags]
+  keeper incident rotate  <work::<taskId> | close::<epicId>> --instance <n> [flags]
 
 Writes ONE bounded request into the daemon-watched incident-claim spool and
 returns. The daemon validates the calling session's liveness and mints the
 synthetic claim / release event; the fold records the owner identity and process
-generation. Never opens keeper.db, never mutates plan state.
+generation. \`rotate\` carries the owner's validated \`declined_clean\` receipt: the
+daemon rotates the escalation grant from resolve to deconflict, fenced to the
+incident instance and this live owner (no event minted). Never opens keeper.db,
+never mutates plan state.
 
 Arguments:
   <key>              The incident dispatch key: work::<taskId> or close::<epicId>
@@ -108,11 +117,11 @@ export function parseIncidentArgs(argv: string[]): ParseResult {
   if (action === "--help" || action === "-h" || action === undefined) {
     return { ok: false, help: true, message: null };
   }
-  if (action !== "claim" && action !== "release") {
+  if (action !== "claim" && action !== "release" && action !== "rotate") {
     return {
       ok: false,
       help: false,
-      message: `unknown subcommand '${action}' (expected claim | release)`,
+      message: `unknown subcommand '${action}' (expected claim | release | rotate)`,
     };
   }
   let values: Record<string, unknown>;

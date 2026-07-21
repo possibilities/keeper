@@ -866,17 +866,24 @@ export interface ReconcileSnapshot {
    */
   laneFailures?: { verb: Verb; id: string; dir: string }[];
   /**
-   * The `(verb, id)` of every OPEN MERGE-ESCALATION `dispatch_failures` row — a bare
-   * `close::<epic>` conflict (recover pass-2 escalation / close-sink genuine conflict)
-   * or a `work::<taskId>` fan-in `worktree-merge-conflict` row (a rib conflict or the
+   * Every OPEN MERGE-ESCALATION `dispatch_failures` row — a bare `close::<epic>`
+   * conflict (recover pass-2 escalation / close-sink genuine conflict) or a
+   * `work::<taskId>` fan-in `worktree-merge-conflict` row (a rib conflict or the
    * pre-minted `pending owner integration` class), collected off the router's
-   * `merge-escalation` / `work-merge-conflict` classes. The reconcile loop's
-   * positive-evidence level-clear ({@link mergeEscalationFailuresToClear}) drops any
-   * whose epic's fan-in genuinely LANDED this cycle (merged into local default / torn
-   * down) — never on task/epic terminal status. Optional for call-site back-compat; an
-   * absent field is empty.
+   * `merge-escalation` / `work-merge-conflict` classes. `reason` + `dir` are carried so
+   * the reconcile loop can run the per-`work::`-row incident-resolution probe (the
+   * parsed source rib merged into its target base + a clean target checkout). The
+   * positive-evidence level-clear ({@link mergeEscalationFailuresToClear}) drops a
+   * `work::` row on that incident evidence (epic-landed as a straggler fallback) and a
+   * `close::<epic>` row on epic-landed evidence — never on task/epic terminal status.
+   * Optional for call-site back-compat; an absent field is empty.
    */
-  mergeEscalationFailures?: { verb: Verb; id: string }[];
+  mergeEscalationFailures?: {
+    verb: Verb;
+    id: string;
+    reason: string;
+    dir: string | null;
+  }[];
   /**
    * The lane worktree PATHS that currently have an OPEN per-lane wedge distress row
    * (synthetic `daemon::worktree-lane-wedge:<laneHash>`, collected off the row's

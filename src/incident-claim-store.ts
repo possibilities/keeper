@@ -9,6 +9,9 @@
  * suite-baseline store (docs/adr/0005): the session writes ONE bounded request
  * leaf, the daemon producer validates claimant liveness and mints the synthetic
  * `IncidentClaimed` / `IncidentReleased` event, and the fold records the claim.
+ * A third `rotate` action carries the owner's EXPLICIT decline-receipt intent — the
+ * producer, fenced to the incident instance and the live owner identity, rotates the
+ * escalation grant from the resolve leg to the deconflict leg (no event is minted).
  * There is NO socket, NO RPC, and NO session DB write.
  *
  * DEPENDENCY POSTURE: `node:*` plus the pure `derivers` and dep-free
@@ -61,8 +64,12 @@ export const MAX_REQUESTS_PER_SWEEP = 256;
 
 // ── the request record ─────────────────────────────────────────────────────
 
-/** Whether a request claims an incident or releases a prior claim. */
-export type IncidentClaimAction = "claim" | "release";
+/** Whether a request claims an incident, releases a prior claim, or rotates the
+ *  owner's escalation grant from the resolve leg to the deconflict leg. `rotate`
+ *  is the EXPLICIT, typed decline-receipt transport: the owning session emits it
+ *  ONLY after validating a `declined_clean` receipt from its resolver subagent,
+ *  so an ordinary `claim` never carries rotation semantics. */
+export type IncidentClaimAction = "claim" | "release" | "rotate";
 
 /**
  * One incident-claim spool entry. Sanctioned writer: the `keeper incident`
@@ -179,7 +186,13 @@ export function parseRequest(raw: string): IncidentClaimRequest | null {
   if (parsed.schema_version !== INCIDENT_CLAIM_REQUEST_SCHEMA_VERSION) {
     return null;
   }
-  if (parsed.action !== "claim" && parsed.action !== "release") return null;
+  if (
+    parsed.action !== "claim" &&
+    parsed.action !== "release" &&
+    parsed.action !== "rotate"
+  ) {
+    return null;
+  }
   if (
     typeof parsed.verb !== "string" ||
     typeof parsed.id !== "string" ||
