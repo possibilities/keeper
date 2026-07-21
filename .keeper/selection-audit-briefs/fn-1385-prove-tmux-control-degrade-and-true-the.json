@@ -1,0 +1,23 @@
+{
+  "auditable_tasks": [],
+  "created_at": "2026-07-21T13:18:20.319000Z",
+  "epic_id": "fn-1385-prove-tmux-control-degrade-and-true-the",
+  "excluded_tasks": [
+    {
+      "reason": "degraded-default",
+      "task_id": "fn-1385-prove-tmux-control-degrade-and-true-the.1"
+    },
+    {
+      "reason": "degraded-default",
+      "task_id": "fn-1385-prove-tmux-control-degrade-and-true-the.2"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "d2aa2a1890bb3075a83d916a13332994c56c15245d50a3f33e8c77157acb5190",
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  }
+}
