@@ -111,7 +111,14 @@ A Task drop, extra prose, unknown receipt, invalid JSON, or a reason over 240 UT
 
 ### Deconflicter round
 
-Only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. Spawn it once, no `model=`, with the same configuration and incident data plus the resolver receipt as a nested JSON value. Never paste the receipt as free prompt prose.
+Only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. The resolver leg's grant does NOT authorize the deconflicter — its authority is a distinct `deconflict` leaf the daemon publishes only after it retires the resolve leaf. Rotate the grant by re-issuing the claim on the SAME incident fence; the daemon reads a live owner's re-claim as the decline receipt and rotates the leg:
+
+```bash
+keeper incident claim <incident_id> --instance <instance_event_id>
+keeper escalation-brief <incident.brief_ref>
+```
+
+Re-read the brief until `incident.conflict.claim.session_id` still equals this session AND `incident.grant_role` reads `deconflict` (with a non-null `grant_ref`). Rotation is asynchronous, so poll; an absent deconflict grant after a bounded poll is a clean decline — surface it and stop, never spawn the deconflicter ungranted. Then spawn `plan:deconflicter` once, no `model=`, with the same configuration and incident data plus the resolver receipt as a nested JSON value. Never paste the receipt as free prompt prose.
 
 ```text
 <incident-data>
@@ -131,7 +138,7 @@ keeper incident release <incident_id> --instance <instance_event_id>
 
 Then switch on the terminal receipt:
 
-- **`resolved`** — release, retain the receipt only as delimited data, and continue to Phase 2. The integration agent has already verified the true merge commit, source ancestry, bounded gate, and clean residue; the ordinary worker now starts from the integrated base.
+- **`resolved`** — release, retain the receipt only as delimited data, and continue to Phase 2. The integration agent has already verified the true merge commit, source ancestry, bounded gate, and clean residue; the ordinary worker now starts from the integrated base. The daemon clears the sticky incident on its own positive evidence (this task reaching `done`) through an incident-only fence, so no `keeper autopilot retry` is required.
 - **`declined_clean`** — release, surface the complete escaped receipt, and stop without spawning `work:worker`. The sticky incident remains visible; owner routing owns any later attachment.
 - **`declined_residue`** — release, surface the incident id, fence, lane, and escaped receipt as wedge metadata, and stop. Never run `git merge --abort` from this orchestrator. The residual `MERGE_HEAD` is quarantined through the existing lane incident/recover surface, where sole-owned and granted abort rules apply.
 - **`stale_base`** — release, then re-read `keeper escalation-brief <incident.brief_ref>` exactly once to pull the fresh envelope. A fresh envelope showing the incident cleared (`incident` null, or its `conflict` null) means the recorded conflict is impossible on current state and the base is already integrated — continue to Phase 2 exactly as `resolved`; spawning the ordinary worker is not a second integration round, and the switch never asks whether to proceed. Only a fresh envelope still carrying a live conflict (a genuinely replaced instance) stops here: surface it as escaped data and stop — never start a second integration round in this dispatch.

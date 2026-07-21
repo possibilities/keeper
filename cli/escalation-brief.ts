@@ -175,8 +175,15 @@ export interface DeconflictIncident {
     state: string | null;
     transcript_path: string | null;
   }>;
-  /** Path to a write grant leaf for this incident when one exists, else null. */
+  /** Path to the single live write grant leaf for this incident, else null. The
+   *  daemon keeps exactly one leg live at a time (resolve, then — after a typed
+   *  decline re-claim — deconflict), so this is never ambiguous. */
   grant_ref: string | null;
+  /** The advertised grant's role (`resolve` | `deconflict`), or null when there
+   *  is no live grant. A session polling after a resolver decline waits for this
+   *  to read `deconflict` before spawning the deconflicter — the daemon rotates
+   *  the leg asynchronously, so the role is the deterministic rotation signal. */
+  grant_role: string | null;
 }
 
 /** The unblock incident: the blocked task's reason + category + other blocked
@@ -601,8 +608,19 @@ function buildDeconflictIncident(
     nowMs,
     grantParentJobId,
   );
+  // The leg's role rides alongside the path so a post-decline poll can tell the
+  // resolve leaf from the rotated deconflict leaf (the guard re-validates the
+  // whole tuple at the mutation regardless).
+  const grantLeaf = grant_ref != null ? readGrantCandidate(grant_ref) : null;
+  const grant_role =
+    grantLeaf != null && typeof grantLeaf.role === "string"
+      ? grantLeaf.role
+      : null;
 
-  return { data: { conflict, resolver_jobs, grant_ref }, degraded };
+  return {
+    data: { conflict, resolver_jobs, grant_ref, grant_role },
+    degraded,
+  };
 }
 
 /** Read one owner-private grant leaf through a no-follow, size-bounded

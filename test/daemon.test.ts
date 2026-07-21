@@ -76,6 +76,7 @@ import {
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDispatchClearedData,
+  buildIncidentGrant,
   buildIncidentOwnerPageBody,
   buildMaintenanceScaffoldYaml,
   buildPendingDispatchSweepRecords,
@@ -112,6 +113,7 @@ import {
   type EscalationDispatchOutcome,
   type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
+  expireIncidentGrants,
   findOsMemoryKillEvidence,
   foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
@@ -119,7 +121,11 @@ import {
   gcUnretryableDispatchFailures,
   HARD_KILL_EXIT_ATTRIBUTION_REASON,
   INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
+  INCIDENT_DECONFLICT_AGENT_TYPE,
+  INCIDENT_GRANT_TTL_MS,
+  INCIDENT_RESOLVE_AGENT_TYPE,
   type IncidentClaimSweepDeps,
+  type IncidentGrantDeps,
   type IncidentOwnerPageSweepDeps,
   internalIncidentClearFences,
   isTransientBusyError,
@@ -132,6 +138,7 @@ import {
   maintenanceEpicTitle,
   matchCrashReportToBoot,
   matchOperatorReloadAttribution,
+  mergeIncidentEntityResolved,
   OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -157,6 +164,7 @@ import {
   probeSettleStep,
   pruneRecoveredDeadLetters,
   publishFableFocusProjection,
+  publishIncidentResolveGrant,
   publishNonFableFocusProjection,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
@@ -188,6 +196,7 @@ import {
   resolvePoisonDeadLetter,
   resolveProbeArming,
   resolveServeHealthHistoryPath,
+  rotateIncidentGrantToDeconflict,
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
@@ -254,6 +263,7 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_ID,
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
+  isMergeEscalationReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
@@ -275,11 +285,16 @@ import {
 } from "../src/fable-focus";
 import {
   decideTrunkIntegrationFence,
+  deriveGrantLeafPath,
   type GrantLeaf,
+  grantCoversWrite,
+  listGrantLeaves,
+  readGrantLeaf,
   type SpooledTrunkLeaseRequest,
   TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
   TRUNK_LEASE_SCHEMA_VERSION,
   type TrunkLeaseLeaf,
+  writeGrantLeaf,
 } from "../src/grant-leaf";
 import {
   classifyAgentbotPageOutcome,
@@ -7475,6 +7490,330 @@ test("incident claim sweep isolates a throwing request and continues processing 
 test("INCIDENT_CLAIM_SWEEP_INTERVAL_MS is a prompt positive cadence", () => {
   expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBe(3_000);
   expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Incident escalation grants — publish-on-claim, staged resolve→deconflict
+// rotation, expire-on-release, and the resolved positive-evidence clear.
+// ---------------------------------------------------------------------------
+
+function withGrantsDir(body: (grantsDir: string, root: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-incident-grant-"));
+  try {
+    // `root` is the incident's own lane/checkout; canonicalize it so it matches
+    // the writable_root `writeGrantLeaf` publishes (which realpaths its input).
+    body(join(dir, "grants"), realpathSync(dir));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function incidentGrantDepsFor(
+  grantsDir: string,
+  root: string,
+  now: () => number,
+): IncidentGrantDeps {
+  return { grantsDir, rowFacts: () => ({ dir: root, attemptId: "7" }), now };
+}
+
+test("buildIncidentGrant pins the resolve tuple to the incident's own lane and the grant guard authorizes only that lane", () => {
+  withGrantsDir((grantsDir, root) => {
+    const grant = buildIncidentGrant("resolve", {
+      verb: "work",
+      id: "fn-9-fan.2",
+      instanceEventId: 55,
+      parentJobId: "sess-owner",
+      writableRoot: root,
+      attemptId: "13",
+      fencingToken: 4,
+      nowMs: 1_000,
+    });
+    expect(grant).toMatchObject({
+      schema_version: 1,
+      parent_job_id: "sess-owner",
+      agent_type: INCIDENT_RESOLVE_AGENT_TYPE,
+      incident_id: "work::fn-9-fan.2",
+      attempt_id: "13",
+      instance_event_id: 55,
+      writable_root: root,
+      role: "resolve",
+      fencing_token: 4,
+    });
+    expect(grant.expires_at).toBe(1_000 + INCIDENT_GRANT_TTL_MS);
+
+    // Guard-validate the tuple through the grant-leaf seam: the in-session
+    // merge-resolver env (KEEPER_JOB_ID = the claiming session) may write inside
+    // the lane, but never outside it, on a protected path, or past the TTL.
+    expect(writeGrantLeaf(grantsDir, grant)).toBe(true);
+    const env = { KEEPER_GRANT_DIR: grantsDir, KEEPER_JOB_ID: "sess-owner" };
+    expect(
+      grantCoversWrite(
+        env,
+        INCIDENT_RESOLVE_AGENT_TYPE,
+        join(root, "src/x.ts"),
+        2_000,
+      ),
+    ).toBe(true);
+    expect(
+      grantCoversWrite(
+        env,
+        INCIDENT_RESOLVE_AGENT_TYPE,
+        "/elsewhere/x.ts",
+        2_000,
+      ),
+    ).toBe(false);
+    expect(
+      grantCoversWrite(
+        env,
+        INCIDENT_RESOLVE_AGENT_TYPE,
+        join(root, ".git/config"),
+        2_000,
+      ),
+    ).toBe(false);
+    expect(
+      grantCoversWrite(
+        env,
+        INCIDENT_RESOLVE_AGENT_TYPE,
+        join(root, "src/x.ts"),
+        grant.expires_at + 1,
+      ),
+    ).toBe(false);
+  });
+});
+
+test("incident claim sweep routes a live owner's re-claim to the grant-rotation seam with no new claim event", () => {
+  const entry = incidentSpoolEntry("claim", {
+    claimant_session_id: "session-owner",
+  });
+  const rotated: Array<[string, string, number, string]> = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      // The incident is already held by THIS live claimant at THIS generation —
+      // the in-session decline-receipt transport (re-claim → rotate).
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+      onOwnerReClaim: (verb, id, instanceEventId, claimSessionId) =>
+        rotated.push([verb, id, instanceEventId, claimSessionId]),
+    }),
+  );
+  expect(mints).toBe(0);
+  expect(result.stale).toBe(1);
+  expect(rotated).toEqual([["work", "fn-3-incident.1", 41, "session-owner"]]);
+});
+
+test("a stale-fenced claim publishes no grant: neither the claim mint nor the rotation seam fires", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  let rotations = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      // The live incident carries a DIFFERENT instance than the request's fence.
+      lookupIncident: () => ({
+        instanceEventId: 999,
+        claimSessionId: null,
+        claimPid: null,
+        claimStartTime: null,
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+      onOwnerReClaim: () => {
+        rotations += 1;
+      },
+    }),
+  );
+  expect(result.stale).toBe(1);
+  expect(mints).toBe(0);
+  expect(rotations).toBe(0);
+});
+
+test("incident grant publish then rotate: resolve retired, deconflict published, never two live", () => {
+  withGrantsDir((grantsDir, root) => {
+    let now = 10_000;
+    const deps = incidentGrantDepsFor(grantsDir, root, () => now);
+    publishIncidentResolveGrant(deps, "close", "fn-2-x", 88, "sess-c");
+
+    const liveFor = (t: number) =>
+      listGrantLeaves(grantsDir).filter(
+        (l) =>
+          l.incident_id === "close::fn-2-x" &&
+          l.instance_event_id === 88 &&
+          t < l.expires_at,
+      );
+    const stage1 = liveFor(now);
+    expect(stage1).toHaveLength(1);
+    expect(stage1[0]?.role).toBe("resolve");
+    expect(stage1[0]?.agent_type).toBe(INCIDENT_RESOLVE_AGENT_TYPE);
+    expect(stage1[0]?.writable_root).toBe(root);
+
+    now += 1;
+    rotateIncidentGrantToDeconflict(deps, "close", "fn-2-x", 88, "sess-c");
+    const stage2 = liveFor(now);
+    expect(stage2).toHaveLength(1);
+    expect(stage2[0]?.role).toBe("deconflict");
+    expect(stage2[0]?.agent_type).toBe(INCIDENT_DECONFLICT_AGENT_TYPE);
+    expect(stage2[0]?.writable_root).toBe(root);
+
+    // The resolve leaf is retired (expired), so the brief's SINGULAR advertiser
+    // never sees two live leaves for the incident.
+    const resolveLeaf = readGrantLeaf(
+      grantsDir,
+      {
+        parentJobId: "sess-c",
+        agentType: INCIDENT_RESOLVE_AGENT_TYPE,
+        incidentId: "close::fn-2-x",
+        fencingToken: stage1[0]?.fencing_token ?? 0,
+      },
+      now,
+    );
+    expect(resolveLeaf.kind).toBe("expired");
+    expect(stage2[0]?.fencing_token ?? 0).toBeGreaterThan(
+      stage1[0]?.fencing_token ?? 0,
+    );
+  });
+});
+
+test("incident grant rotation is idempotent — a second rotate keeps one live deconflict leaf", () => {
+  withGrantsDir((grantsDir, root) => {
+    let now = 500;
+    const deps = incidentGrantDepsFor(grantsDir, root, () => now);
+    publishIncidentResolveGrant(deps, "work", "fn-4-y.1", 12, "sess-w");
+    now += 1;
+    rotateIncidentGrantToDeconflict(deps, "work", "fn-4-y.1", 12, "sess-w");
+    const firstToken =
+      listGrantLeaves(grantsDir).find((l) => l.role === "deconflict")
+        ?.fencing_token ?? -1;
+    expect(firstToken).toBeGreaterThan(0);
+    now += 1;
+    rotateIncidentGrantToDeconflict(deps, "work", "fn-4-y.1", 12, "sess-w");
+    const live = listGrantLeaves(grantsDir).filter(
+      (l) => l.incident_id === "work::fn-4-y.1" && now < l.expires_at,
+    );
+    expect(live).toHaveLength(1);
+    expect(live[0]?.role).toBe("deconflict");
+    expect(live[0]?.fencing_token).toBe(firstToken);
+  });
+});
+
+test("expireIncidentGrants retires every leg for the incident on release", () => {
+  withGrantsDir((grantsDir, root) => {
+    let now = 1_000;
+    const deps = incidentGrantDepsFor(grantsDir, root, () => now);
+    publishIncidentResolveGrant(deps, "close", "fn-5-z", 3, "sess-z");
+    now += 1;
+    rotateIncidentGrantToDeconflict(deps, "close", "fn-5-z", 3, "sess-z");
+    now += 1;
+    expireIncidentGrants(deps, "close", "fn-5-z", "sess-z");
+    const live = listGrantLeaves(grantsDir).filter(
+      (l) => l.incident_id === "close::fn-5-z" && now < l.expires_at,
+    );
+    expect(live).toHaveLength(0);
+  });
+});
+
+test("incident grant publish leaves a sibling repair leaf untouched and publishes nothing without a merge row", () => {
+  withGrantsDir((grantsDir, root) => {
+    const repairLeaf: GrantLeaf = {
+      schema_version: 1,
+      parent_job_id: "sess-owner",
+      agent_type: "plan:repairer",
+      incident_id: "repair::keeper-abcdef",
+      owner_task_id: "fn-6-r.1",
+      attempt_id: "0:fp",
+      instance_event_id: 9,
+      writable_root: root,
+      role: "repair",
+      expires_at: 9_999_999_999,
+      fencing_token: 2,
+    };
+    expect(writeGrantLeaf(grantsDir, repairLeaf)).toBe(true);
+    const notes: string[] = [];
+    publishIncidentResolveGrant(
+      {
+        grantsDir,
+        rowFacts: () => null,
+        now: () => 1,
+        noteLine: (l) => notes.push(l),
+      },
+      "work",
+      "fn-6-r.1",
+      41,
+      "sess-owner",
+    );
+    const leaves = listGrantLeaves(grantsDir);
+    expect(leaves).toHaveLength(1);
+    expect(leaves[0]?.role).toBe("repair");
+    expect(leaves[0]?.fencing_token).toBe(2);
+    expect(notes.some((n) => n.includes("no-publisher-for-class"))).toBe(true);
+  });
+});
+
+test("the pending-owner-integration fan-in reason is the same merge-escalation class that receives a grant", () => {
+  const reason = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-7--fn-7.1 into keeper/epic/fn-7 — pending owner integration`;
+  expect(isMergeEscalationReason(reason)).toBe(true);
+  // The deconflict-brief advertiser derives the grant leaf path from parent +
+  // agent type; the resolve leg's path never collides with the deconflict leg's.
+  expect(
+    deriveGrantLeafPath("/g", "sess", INCIDENT_RESOLVE_AGENT_TYPE),
+  ).not.toBe(deriveGrantLeafPath("/g", "sess", INCIDENT_DECONFLICT_AGENT_TYPE));
+});
+
+test("mergeIncidentEntityResolved reads terminal entity state git-free (epic closed / task done)", () => {
+  const { db } = freshMemDb();
+  const cols =
+    "epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, last_validated_at";
+  const insert = db.query(
+    `INSERT INTO epics (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  insert.run(
+    "fn-8-done",
+    8,
+    "e",
+    "/repo",
+    "done",
+    0,
+    0,
+    JSON.stringify([
+      { task_id: "fn-8-done.1", runtime_status: "done" },
+      { task_id: "fn-8-done.2", runtime_status: "in_progress" },
+    ]),
+    "[]",
+    "[]",
+    "[]",
+    "2026-01-01T00:00:00Z",
+  );
+  insert.run(
+    "fn-8-open",
+    9,
+    "e",
+    "/repo",
+    "open",
+    0,
+    0,
+    "[]",
+    "[]",
+    "[]",
+    "[]",
+    "2026-01-01T00:00:00Z",
+  );
+
+  expect(mergeIncidentEntityResolved(db, "close", "fn-8-done")).toBe(true);
+  expect(mergeIncidentEntityResolved(db, "close", "fn-8-open")).toBe(false);
+  expect(mergeIncidentEntityResolved(db, "work", "fn-8-done.1")).toBe(true);
+  expect(mergeIncidentEntityResolved(db, "work", "fn-8-done.2")).toBe(false);
+  expect(mergeIncidentEntityResolved(db, "close", "fn-8-missing")).toBe(false);
+  expect(mergeIncidentEntityResolved(db, "block", "fn-8-done.1")).toBe(false);
+  db.close();
 });
 
 // ---------------------------------------------------------------------------

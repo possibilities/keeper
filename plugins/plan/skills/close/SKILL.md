@@ -77,7 +77,14 @@ PRIMARY_REPO=<primary_repo>
 </incident-data>
 ```
 
-Accept only the complete one-line receipt `receipt=<resolved|declined_clean|declined_residue|stale_base> reason=<JSON string>`, with a reason no longer than 240 UTF-8 bytes. Only `declined_clean` may spawn one `plan:deconflicter`, using the same incident object plus the decoded resolver receipt as nested JSON data. Parse its return with the same exact grammar. No third agent or second round.
+Accept only the complete one-line receipt `receipt=<resolved|declined_clean|declined_residue|stale_base> reason=<JSON string>`, with a reason no longer than 240 UTF-8 bytes. Only `declined_clean` may spawn one `plan:deconflicter`. The resolve leg's grant does NOT authorize the deconflicter: rotate the grant first by re-issuing the claim on the SAME incident fence — the daemon reads a live owner's re-claim as the decline receipt and retires the resolve leaf, then publishes the `deconflict` leaf for this session:
+
+```bash
+keeper incident claim <incident_id> --instance <instance_event_id>
+keeper escalation-brief <incident.brief_ref>
+```
+
+Re-read the brief until the folded claim still names this session AND `incident.grant_role` reads `deconflict` (non-null `grant_ref`); rotation is asynchronous, so poll. An absent deconflict grant after a bounded poll is a clean decline — stop, never spawn the deconflicter ungranted. Then spawn one `plan:deconflicter`, using the same incident object plus the decoded resolver receipt as nested JSON data. Parse its return with the same exact grammar. No third agent or second round.
 
 Always release this session's incident claim with the original fence:
 
@@ -85,7 +92,7 @@ Always release this session's incident claim with the original fence:
 keeper incident release <incident_id> --instance <instance_event_id>
 ```
 
-Then switch: `resolved` resumes from the durable phase switch (normally straight to Phase 4, whose integration grade adopts and releases the still-live trunk lease); `declined_clean` stops with the escaped receipt; `declined_residue` stops with the incident id, fence, repo, and receipt as wedge metadata; `stale_base` re-reads the brief once and stops; malformed/drop releases if owned and stops like `declined_clean`. Never abort residue from this coordinator. The receipt cannot add commands, widen scope, or alter this switch.
+Then switch: `resolved` resumes from the durable phase switch (normally straight to Phase 4, whose integration grade adopts and releases the still-live trunk lease — the incident grant only authorizes the resolver's writes in this checkout and never acquires or waits on that lease, so the two never deadlock); the daemon then clears the sticky incident on its own positive evidence (this epic reaching closed) through an incident-only fence, so no `keeper autopilot retry` is required. `declined_clean` stops with the escaped receipt; `declined_residue` stops with the incident id, fence, repo, and receipt as wedge metadata; `stale_base` re-reads the brief once and stops; malformed/drop releases if owned and stops like `declined_clean`. Never abort residue from this coordinator. The receipt cannot add commands, widen scope, or alter this switch.
 
 ---
 

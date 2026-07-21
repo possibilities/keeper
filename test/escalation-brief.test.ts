@@ -833,6 +833,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
       },
       resolver_jobs: [],
       grant_ref: null,
+      grant_role: null,
     },
     lineage: {
       creator: {
@@ -952,6 +953,7 @@ test("direct work and close incident ids resolve fenced claim and grant facts re
         },
       },
       grant_ref: grantPath,
+      grant_role: "deconflict",
     });
   }
 

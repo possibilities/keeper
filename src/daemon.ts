@@ -3734,6 +3734,16 @@ export interface IncidentClaimSweepDeps {
   /** Mint `IncidentReleased`; explicit false means the write failed and the
    *  request/expiry remains retryable. */
   mintReleased: (p: IncidentReleaseMint) => unknown;
+  /** A live owner re-issued a claim it already holds (same session, same process
+   *  generation) — the in-session decline-receipt transport that rotates the
+   *  escalation grant from the resolve leg to the deconflict leg. Optional so a
+   *  release-only / diagnostic caller need not wire grant rotation. */
+  onOwnerReClaim?: (
+    verb: string,
+    id: string,
+    instanceEventId: number,
+    claimSessionId: string,
+  ) => void;
   /** Every currently-claimed incident row (for the dead-claimant expiry pass). */
   selectClaimed: () => ClaimedIncidentRow[];
   /** Unix-seconds clock for the claim freshness stamp. */
@@ -3881,6 +3891,16 @@ export function runIncidentClaimSweep(
         incident.claimPid === claimant.pid &&
         incident.claimStartTime === claimant.startTime
       ) {
+        // A live owner re-claiming an incident it already holds is the
+        // in-session decline-receipt transport: the resolve-leg merge-resolver
+        // declined, so rotate the escalation grant to the deconflict leg. No new
+        // claim event — the claim already folded — just the grant rotation.
+        deps.onOwnerReClaim?.(
+          request.verb,
+          request.id,
+          incident.instanceEventId,
+          request.claimant_session_id,
+        );
         result.stale += 1;
         deps.removeRequest(path);
         continue;
@@ -3963,6 +3983,329 @@ export function runIncidentClaimSweep(
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Incident escalation grants — the owner-private write authority a claimed
+// merge incident's in-session escalation subagent validates before mutating
+// (ADR 0089). A validated claim publishes ONE grant leaf; a declined resolve
+// leg rotates it to a deconflict leg. Exactly one is ever live per incident.
+// ---------------------------------------------------------------------------
+
+/** TTL for an incident escalation grant leaf. Generous relative to a mechanical
+ *  merge + gate run: the leaf is expired on the owning session's release and
+ *  reaped once its owner dies, so a long ceiling only avoids a mid-merge expiry,
+ *  never a leak. Coherent with the close trunk lease (a separate concurrency
+ *  primitive): the grant only AUTHORIZES the resolver's writes in the incident's
+ *  own checkout, it never acquires or waits on the lease, so a close session
+ *  holding or awaiting a trunk lease can never deadlock against its grant. */
+export const INCIDENT_GRANT_TTL_MS = 15 * 60_000;
+
+/** The two staged in-session escalation legs for a merge incident. The resolve
+ *  leg (`plan:merge-resolver`) is published on the fenced claim; a typed decline
+ *  rotates to the deconflict leg (`plan:deconflicter`) IN THE SAME session. */
+export const INCIDENT_RESOLVE_AGENT_TYPE = "plan:merge-resolver";
+export const INCIDENT_DECONFLICT_AGENT_TYPE = "plan:deconflicter";
+
+/** The facts a grant leaf pins for a claimed merge incident: the owning session
+ *  (grant parent), the incident's OWN lane/repo checkout (writable root — NEVER
+ *  repair's shared-trunk scope), the incident fence, and a monotonic token. */
+export interface IncidentGrantFacts {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  parentJobId: string;
+  /** The incident's own `dispatch_failures.dir` — the lane/checkout the resolver
+   *  mutates. `writeGrantLeaf` canonicalizes it at publish. */
+  writableRoot: string;
+  /** Stringified `dispatch_failures.attempt_id` fence (the grant leaf's field is
+   *  a non-empty string; the escalation-brief advertiser requires it non-empty). */
+  attemptId: string;
+  fencingToken: number;
+  nowMs: number;
+}
+
+/** Build a resolve- or deconflict-leg grant leaf for a claimed merge incident.
+ *  Pure — the two legs differ only in agent type + role, so a rotation is a
+ *  fresh leaf at the sibling agent-type path, never a mutation of the resolve
+ *  leaf's authority. */
+export function buildIncidentGrant(
+  role: "resolve" | "deconflict",
+  facts: IncidentGrantFacts,
+): GrantLeaf {
+  return {
+    schema_version: GRANT_LEAF_SCHEMA_VERSION,
+    parent_job_id: facts.parentJobId,
+    agent_type:
+      role === "resolve"
+        ? (INCIDENT_RESOLVE_AGENT_TYPE as GrantLeaf["agent_type"])
+        : (INCIDENT_DECONFLICT_AGENT_TYPE as GrantLeaf["agent_type"]),
+    incident_id: `${facts.verb}::${facts.id}`,
+    attempt_id: facts.attemptId,
+    instance_event_id: facts.instanceEventId,
+    writable_root: facts.writableRoot,
+    role,
+    expires_at: facts.nowMs + INCIDENT_GRANT_TTL_MS,
+    fencing_token: facts.fencingToken,
+  };
+}
+
+/** The injected surface the incident-grant lifecycle needs: the shared
+ *  owner-private grants dir, the sticky row's writable-root + attempt fence, and
+ *  a clock. Pure over these so a fixture drives publish/rotate/expire against a
+ *  real temp grants dir with no daemon, socket, or worker. */
+export interface IncidentGrantDeps {
+  grantsDir: string;
+  /** `{dir, attemptId}` for a claimed merge incident, or null when the row is
+   *  gone / not a merge-escalation class / carries no dir. */
+  rowFacts: (
+    verb: string,
+    id: string,
+  ) => { dir: string; attemptId: string } | null;
+  now: () => number;
+  noteLine?: (line: string) => void;
+}
+
+/** Every live-or-expired incident escalation leaf for one (session, incident
+ *  instance) — the resolve and/or deconflict legs, never a repair leg. */
+function incidentGrantLeaves(
+  grantsDir: string,
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimSessionId: string,
+): GrantLeaf[] {
+  return listGrantLeaves(grantsDir).filter(
+    (leaf) =>
+      leaf.parent_job_id === claimSessionId &&
+      leaf.incident_id === `${verb}::${id}` &&
+      leaf.instance_event_id === instanceEventId &&
+      (leaf.role === "resolve" || leaf.role === "deconflict"),
+  );
+}
+
+/** Monotonic next fencing token across every grant leaf in the shared dir, so an
+ *  incident leg never reuses a repair leg's token and a resurrected older leaf
+ *  never validates. */
+function nextIncidentGrantToken(grantsDir: string): number {
+  try {
+    return (
+      listGrantLeaves(grantsDir).reduce(
+        (max, leaf) => Math.max(max, leaf.fencing_token),
+        0,
+      ) + 1
+    );
+  } catch {
+    return 1;
+  }
+}
+
+/** Publish the resolve-leg grant on a freshly-minted claim. Idempotent: an
+ *  already-live leaf for this incident instance means the stage is established.
+ *  Emits ONE producer-visible reason line on any skip/failure so an unpublished
+ *  grant can never masquerade as "nothing to do" (no-publisher-for-class). */
+export function publishIncidentResolveGrant(
+  deps: IncidentGrantDeps,
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimSessionId: string,
+): void {
+  const note = deps.noteLine ?? (() => {});
+  const key = `${verb}::${id}`;
+  const nowMs = deps.now();
+  if (
+    incidentGrantLeaves(
+      deps.grantsDir,
+      verb,
+      id,
+      instanceEventId,
+      claimSessionId,
+    ).some((leaf) => nowMs < leaf.expires_at)
+  ) {
+    return;
+  }
+  const facts = deps.rowFacts(verb, id);
+  if (facts == null) {
+    note(
+      `# incident-grant ${key}: no merge-escalation row/dir — no-publisher-for-class, no grant published`,
+    );
+    return;
+  }
+  const grant = buildIncidentGrant("resolve", {
+    verb,
+    id,
+    instanceEventId,
+    parentJobId: claimSessionId,
+    writableRoot: facts.dir,
+    attemptId: facts.attemptId,
+    fencingToken: nextIncidentGrantToken(deps.grantsDir),
+    nowMs,
+  });
+  let published = false;
+  try {
+    published = writeGrantLeaf(deps.grantsDir, grant);
+  } catch (err) {
+    note(
+      `# incident-grant ${key} resolve publish threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (!published) note(`# incident-grant ${key}: resolve leaf publish failed`);
+}
+
+/** Rotate the escalation grant from the resolve leg to the deconflict leg — the
+ *  in-session decline-receipt handler. Expires the resolve leaf FIRST so the
+ *  escalation brief's SINGULAR grant advertiser never sees two live leaves for
+ *  one incident, then publishes the deconflict leaf at its sibling agent-type
+ *  path. Idempotent (a live deconflict leaf short-circuits); a missing resolve
+ *  leg recovers by (re)publishing resolve rather than skipping a stage. */
+export function rotateIncidentGrantToDeconflict(
+  deps: IncidentGrantDeps,
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimSessionId: string,
+): void {
+  const note = deps.noteLine ?? (() => {});
+  const key = `${verb}::${id}`;
+  const nowMs = deps.now();
+  const leaves = incidentGrantLeaves(
+    deps.grantsDir,
+    verb,
+    id,
+    instanceEventId,
+    claimSessionId,
+  );
+  if (
+    leaves.some((leaf) => leaf.role === "deconflict" && nowMs < leaf.expires_at)
+  ) {
+    return;
+  }
+  const resolveLeaves = leaves.filter((leaf) => leaf.role === "resolve");
+  if (resolveLeaves.length === 0) {
+    publishIncidentResolveGrant(
+      deps,
+      verb,
+      id,
+      instanceEventId,
+      claimSessionId,
+    );
+    return;
+  }
+  for (const leaf of resolveLeaves) {
+    try {
+      writeGrantLeaf(deps.grantsDir, {
+        ...leaf,
+        expires_at: Math.min(leaf.expires_at, nowMs),
+      });
+    } catch {
+      // A failed retire leaves an expired-by-TTL leaf the reaper still collects.
+    }
+  }
+  const facts = deps.rowFacts(verb, id);
+  if (facts == null) {
+    note(
+      `# incident-grant ${key}: rotate found no merge-escalation row/dir — resolve retired, no deconflict grant`,
+    );
+    return;
+  }
+  const grant = buildIncidentGrant("deconflict", {
+    verb,
+    id,
+    instanceEventId,
+    parentJobId: claimSessionId,
+    writableRoot: facts.dir,
+    attemptId: facts.attemptId,
+    fencingToken: nextIncidentGrantToken(deps.grantsDir),
+    nowMs,
+  });
+  let published = false;
+  try {
+    published = writeGrantLeaf(deps.grantsDir, grant);
+  } catch (err) {
+    note(
+      `# incident-grant ${key} deconflict publish threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (!published) {
+    note(
+      `# incident-grant ${key}: rotated resolve→deconflict but deconflict leaf publish failed`,
+    );
+  }
+}
+
+/** Expire both escalation legs for one incident on the owning session's release,
+ *  so a resolved/declined incident leaves no live grant behind its own flow. */
+export function expireIncidentGrants(
+  deps: IncidentGrantDeps,
+  verb: string,
+  id: string,
+  claimSessionId: string,
+): void {
+  const nowMs = deps.now();
+  // Expire by (session, incident) identity regardless of instance — a release
+  // retires every leg this session may have opened for the incident.
+  for (const leaf of listGrantLeaves(deps.grantsDir)) {
+    if (
+      leaf.parent_job_id === claimSessionId &&
+      leaf.incident_id === `${verb}::${id}` &&
+      (leaf.role === "resolve" || leaf.role === "deconflict")
+    ) {
+      try {
+        writeGrantLeaf(deps.grantsDir, {
+          ...leaf,
+          expires_at: Math.min(leaf.expires_at, nowMs),
+        });
+      } catch {
+        // Best-effort hygiene — the reaper collects the leaf on TTL regardless.
+      }
+    }
+  }
+}
+
+/** Whether a claimed merge incident's owning entity has reached its resolved
+ *  terminal state, observed WITHOUT git from the deterministic projections: a
+ *  `close::<epic>` whose epic is closed (`status === "done"`) or a `work::<task>`
+ *  whose task is `runtime_status === "done"`. Both are positive evidence the
+ *  fan-in/close integration landed (finalize gates the close on it; the worker
+ *  runs on the integrated base), so the sticky can clear on its own — no operator
+ *  `retry_dispatch`. Any parse miss or unknown verb answers false (leave sticky). */
+export function mergeIncidentEntityResolved(
+  db: Database,
+  verb: string,
+  id: string,
+): boolean {
+  try {
+    if (verb === "close") {
+      const row = db
+        .query("SELECT status FROM epics WHERE epic_id = ?")
+        .get(id) as { status: string | null } | null;
+      return row?.status === "done";
+    }
+    if (verb === "work") {
+      const epicId = parsePlanRef(id)?.epic_id ?? "";
+      if (epicId === "") return false;
+      const row = db
+        .query("SELECT tasks FROM epics WHERE epic_id = ?")
+        .get(epicId) as { tasks: string } | null;
+      if (row == null) return false;
+      const tasks = JSON.parse(row.tasks) as {
+        task_id?: unknown;
+        runtime_status?: unknown;
+      }[];
+      const el = tasks.find((t) => t.task_id === id);
+      return el != null && el.runtime_status === "done";
+    }
+  } catch {
+    // A foreign-process `tasks` blob that will not parse, or an unreadable row,
+    // is not positive evidence — leave the sticky for its existing clear path.
+    return false;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -15370,6 +15713,78 @@ function startDaemonWithExitAttribution(
     }
     return true;
   }
+
+  // Incident escalation grants share the ONE owner-private grants dir with repair
+  // grants — the leaf path is keyed on (parent job, agent type), so the incident
+  // legs (`plan:merge-resolver` / `plan:deconflicter`) never collide with a
+  // repair leg (`plan:repairer`) on the same parent, and the existing repair
+  // reap (expired AND holder-dead) reaps every role's stale leaf uniformly.
+  const incidentGrantDeps: IncidentGrantDeps = {
+    grantsDir: repairGrantsDir,
+    // The sticky row's writable-root + attempt fence, or null when the row is
+    // gone / not a merge-escalation class / carries no dir.
+    rowFacts: (verb, id) => {
+      const row = db
+        .query(
+          "SELECT reason, dir, attempt_id FROM dispatch_failures WHERE verb = ? AND id = ?",
+        )
+        .get(verb, id) as {
+        reason: string;
+        dir: string | null;
+        attempt_id: number | null;
+      } | null;
+      if (
+        row == null ||
+        !isMergeEscalationReason(row.reason) ||
+        row.dir == null
+      ) {
+        return null;
+      }
+      return { dir: row.dir, attemptId: String(row.attempt_id ?? 0) };
+    },
+    now: () => Date.now(),
+    noteLine: (line) => console.error(`[keeperd] ${line}`),
+  };
+
+  /** Positive-evidence, git-free clear of a resolved merge incident: a closed
+   *  `close::<epic>` or a done `work::<task>` clears its own sticky through an
+   *  INCIDENT-ONLY fence (attempt fence null), so it can never release a live
+   *  worker's attempt-owned state and never depends on operator `retry_dispatch`. */
+  function clearResolvedMergeIncidents(): void {
+    let rows: Array<{
+      verb: string;
+      id: string;
+      reason: string;
+      instance_event_id: number;
+    }>;
+    try {
+      rows = db
+        .query(
+          `SELECT verb, id, reason, instance_event_id FROM dispatch_failures
+            WHERE verb IN ('work','close') AND instance_event_id IS NOT NULL`,
+        )
+        .all() as typeof rows;
+    } catch {
+      return;
+    }
+    for (const row of rows) {
+      if (!isMergeEscalationReason(row.reason)) continue;
+      if (!mergeIncidentEntityResolved(db, row.verb, row.id)) continue;
+      try {
+        mintDispatchClearedEvent(row.verb, row.id, {
+          expected_attempt_id: null,
+          expected_instance_event_id: row.instance_event_id,
+        });
+      } catch (err) {
+        console.error(
+          `[keeperd] resolved merge-incident clear ${row.verb}::${row.id} threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+
   function runIncidentClaimSweepTick(): void {
     if (shuttingDown) return;
     runIncidentClaimSweep({
@@ -15401,8 +15816,42 @@ function startDaemonWithExitAttribution(
         verifyIncidentClaimant(sessionId, verb, id),
       probeClaimantLive: (pid, startTime) =>
         probeIncidentClaimantLive(pid, startTime),
-      mintClaimed: (p) => mintIncidentClaimedEvent(p),
-      mintReleased: (p) => mintIncidentReleasedEvent(p),
+      mintClaimed: (p) => {
+        const ok = mintIncidentClaimedEvent(p);
+        // The fenced claim succeeded and bound this owner — publish its resolve
+        // leg grant so the in-session merge-resolver may mutate. Only on real
+        // mint success (false leaves the request spooled for retry, no grant).
+        if (ok !== false) {
+          publishIncidentResolveGrant(
+            incidentGrantDeps,
+            p.verb,
+            p.id,
+            p.instanceEventId,
+            p.claimSessionId,
+          );
+        }
+        return ok;
+      },
+      mintReleased: (p) => {
+        const ok = mintIncidentReleasedEvent(p);
+        if (ok !== false) {
+          expireIncidentGrants(
+            incidentGrantDeps,
+            p.verb,
+            p.id,
+            p.claimSessionId,
+          );
+        }
+        return ok;
+      },
+      onOwnerReClaim: (verb, id, instanceEventId, claimSessionId) =>
+        rotateIncidentGrantToDeconflict(
+          incidentGrantDeps,
+          verb,
+          id,
+          instanceEventId,
+          claimSessionId,
+        ),
       selectClaimed: () => {
         const rows = db
           .query(
@@ -15432,6 +15881,10 @@ function startDaemonWithExitAttribution(
       now: () => Date.now() / 1000,
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
+    // Positive-evidence clear of any resolved merge incident (epic closed / task
+    // done) rides the same 3s tick — git-free, incident-only fenced, so a
+    // resolved-then-idle incident clears on its own without operator retry.
+    clearResolvedMergeIncidents();
   }
   // Main owns this spool producer regardless of the optional worker selector:
   // claim/release is a daemon data surface, not an autopilot-worker actuation.
