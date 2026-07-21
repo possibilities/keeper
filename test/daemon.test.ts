@@ -78,6 +78,7 @@ import {
   buildDeconflictHumanNotifyBody,
   buildDispatchClearedData,
   buildIncidentOwnerPageBody,
+  buildMaintenanceScaffoldYaml,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildRetryDispatchResultMessage,
@@ -126,11 +127,14 @@ import {
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
+  MAINTENANCE_TASK_TITLE_PREFIX,
   MAX_LIVE_ESCALATION_SESSIONS,
+  type MaintenanceMintOutcome,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
+  maintenanceEpicTitle,
   matchCrashReportToBoot,
   mergeConflictBaseCheckout,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
@@ -168,6 +172,7 @@ import {
   type RepairCandidateDropClass,
   type RepairEscalationSweepDeps,
   type RepairHumanNotifiedOutcome,
+  type RepairNotifyVerdict,
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
@@ -8452,10 +8457,13 @@ function fakeRepairSweepDeps(opts: {
   publish?: (grant: GrantLeaf) => boolean;
   notify?: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
   candidatesThrow?: boolean;
   rowsThrow?: boolean;
+  maintenanceOpen?: boolean;
+  maintenanceOutcome?: MaintenanceMintOutcome;
+  maintenanceThrows?: boolean;
 }): {
   deps: RepairEscalationSweepDeps;
   mints: RepairMint[];
@@ -8463,16 +8471,20 @@ function fakeRepairSweepDeps(opts: {
   published: GrantLeaf[];
   expired: GrantLeaf[];
   unblocked: string[];
-  notifies: { token: string; verdict: "declined" | "died" }[];
+  notifies: { token: string; verdict: RepairNotifyVerdict }[];
   notes: string[];
+  maintenanceProbed: string[];
+  maintenanceMinted: string[];
 } {
   const mints: RepairMint[] = [];
   const grants = [...(opts.grants ?? [])];
   const published: GrantLeaf[] = [];
   const expired: GrantLeaf[] = [];
   const unblocked: string[] = [];
-  const notifies: { token: string; verdict: "declined" | "died" }[] = [];
+  const notifies: { token: string; verdict: RepairNotifyVerdict }[] = [];
   const notes: string[] = [];
+  const maintenanceProbed: string[] = [];
+  const maintenanceMinted: string[] = [];
   const deps: RepairEscalationSweepDeps = {
     noteLine: (line) => notes.push(line),
     selectCandidates: () => {
@@ -8536,6 +8548,15 @@ function fakeRepairSweepDeps(opts: {
     mintNotified: (token, outcome) =>
       mints.push({ kind: "notified", token, outcome }),
     clearRow: (row) => mints.push({ kind: "clear", token: row.id }),
+    hasOpenMaintenanceTask: (group) => {
+      maintenanceProbed.push(group.repo_token);
+      return opts.maintenanceOpen ?? false;
+    },
+    mintMaintenanceTask: async (group) => {
+      maintenanceMinted.push(group.repo_token);
+      if (opts.maintenanceThrows) throw new Error("maintenance mint boom");
+      return opts.maintenanceOutcome ?? "minted";
+    },
   };
   return {
     deps,
@@ -8546,6 +8567,8 @@ function fakeRepairSweepDeps(opts: {
     unblocked,
     notifies,
     notes,
+    maintenanceProbed,
+    maintenanceMinted,
   };
 }
 
@@ -8863,6 +8886,121 @@ test("runRepairEscalationSweep: owners without a shared-checkout session park vi
     "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
     "# repair-park task=fn-2-bar.1 token=repo-abc class=shared_checkout_owner_unavailable",
   ]);
+});
+
+test("runRepairEscalationSweep: trunk red with NO blocked consumer mints a maintenance task instead of parking", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes, published } =
+    fakeRepairSweepDeps({
+      candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+      rows: [repairRow()],
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual(["repo-abc"]);
+  expect(published).toEqual([]);
+  expect(notes.some((line) => line.startsWith("# repair-park"))).toBe(false);
+});
+
+test("runRepairEscalationSweep: an already-open maintenance task suppresses re-mint", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOpen: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a failed maintenance mint pages exactly once", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+  expect(mints).toContainEqual({
+    kind: "notified",
+    token: "repo-abc",
+    outcome: "notified",
+  });
+
+  // A second sweep against the marker the fold would have stamped never re-pages.
+  const resweep = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow({ human_notified_at: 100 })],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(resweep.deps);
+  expect(resweep.notifies).toEqual([]);
+  // The mint keeps retrying silently — only the PAGE is once.
+  expect(resweep.maintenanceMinted).toEqual(["repo-abc"]);
+});
+
+test("runRepairEscalationSweep: a throwing maintenance mint degrades to mint_failed (non-fatal)", async () => {
+  const { deps, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceThrows: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+});
+
+test("runRepairEscalationSweep: a MIXED group (a real candidate plus a task-less one) still parks — has a live task row to elect from", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes } =
+    fakeRepairSweepDeps({
+      candidates: [
+        repairCandidate("fn-1-foo", "fn-1-foo.2"),
+        repairCandidate("", "baseline-tip::repo-abc"),
+      ],
+      rows: [repairRow()],
+      ownerTask: null,
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual([]);
+  expect(maintenanceMinted).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
+  ]);
+});
+
+test("maintenanceEpicTitle: deterministic per (repo, fingerprint) — the daemon's own re-probe key", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+  };
+  expect(maintenanceEpicTitle(group)).toBe(
+    `${MAINTENANCE_TASK_TITLE_PREFIX}: repo-abc fp1`,
+  );
+  // A different fingerprint (a distinct defect) yields a distinct title.
+  expect(maintenanceEpicTitle({ ...group, fingerprint: "fp2" })).not.toBe(
+    maintenanceEpicTitle(group),
+  );
+});
+
+test("buildMaintenanceScaffoldYaml: carries the failing-tests digest and baseline leaf key in the task spec", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+    baseline_diagnosis: {
+      baseline_leaf_key: "k-deadbee",
+      failing_tests_digest: "alpha_fail; beta_fail",
+    },
+  };
+  const yamlDoc = buildMaintenanceScaffoldYaml(group);
+  expect(yamlDoc).toContain(JSON.stringify(maintenanceEpicTitle(group)));
+  expect(yamlDoc).toContain("k-deadbee");
+  expect(yamlDoc).toContain("alpha_fail; beta_fail");
+  expect(yamlDoc).toContain("tier: xhigh");
+  expect(yamlDoc).toContain("model: opus");
+  expect(yamlDoc).toContain("## Description");
+  expect(yamlDoc).toContain("## Acceptance");
+  expect(yamlDoc).toContain("## Done summary");
+  expect(yamlDoc).toContain("## Evidence");
 });
 
 test("runRepairEscalationSweep: empty candidates + empty rows is a no-op", async () => {

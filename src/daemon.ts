@@ -2376,13 +2376,23 @@ export function buildBlockHumanNotifyBody(args: {
 export function buildRepairHumanNotifyBody(args: {
   repoToken: string;
   repoDir: string | null;
-  verdict: "declined" | "died";
+  verdict: RepairNotifyVerdict;
 }): string {
+  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+  if (args.verdict === "mint_failed") {
+    return [
+      `🔴 keeper: repair::${args.repoToken} needs you — the shared base at repo`,
+      `${repo} is confirmed red at the default tip with no blocked task to own`,
+      `the fix, and the daemon's maintenance-task mint failed.`,
+      ``,
+      `Fix the shared base by hand, or scaffold the maintenance task yourself:`,
+      `  keeper autopilot retry repair::${args.repoToken}`,
+    ].join("\n");
+  }
   const verdictLine =
     args.verdict === "died"
       ? `the granted work owner DIED before landing a fix`
       : `the in-session repairer DECLINED the repair`;
-  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
   return [
     `🔴 keeper: repair::${args.repoToken} needs you — the granted shared-base`,
     `repair did not land (${verdictLine}); repo ${repo}`,
@@ -2961,6 +2971,19 @@ export interface RepairGrantOwner {
 
 export type RepairGrantHolderLiveness = "live" | "dead" | "inconclusive";
 
+/** The page-once verdict a granted owner's decline/death carries, plus
+ *  `mint_failed` for a maintenance-task mint that could not land — the SAME
+ *  `PendingRepairRow.human_notified_at` marker gates all three, so a page never
+ *  repeats regardless of which arm fired it. */
+export type RepairNotifyVerdict = "declined" | "died" | "mint_failed";
+
+/** The maintenance-task mint outcome for a trunk-red group with NO live blocked
+ *  consumer to elect an owner from ({@link RepairGroup}'s candidates are all
+ *  task-less `baseline-tip::` entries). `minted` means the plan CLI scaffolded
+ *  and armed a fresh single-task epic; `mint_failed` covers a spawn error, a
+ *  non-zero exit, an unparseable envelope, or an arm failure. */
+export type MaintenanceMintOutcome = "minted" | "mint_failed";
+
 export interface RepairEscalationSweepDeps {
   readonly selectCandidates: () => RepairCandidate[];
   readonly selectRepairRows: () => PendingRepairRow[];
@@ -2981,7 +3004,7 @@ export interface RepairEscalationSweepDeps {
   readonly unblockTask: (candidate: RepairCandidate) => Promise<boolean>;
   readonly notifyHuman: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
   readonly mintRow: (group: RepairGroup) => void;
   readonly mintDispatched: (
@@ -2993,7 +3016,92 @@ export interface RepairEscalationSweepDeps {
     outcome: RepairHumanNotifiedOutcome,
   ) => void;
   readonly clearRow: (row: PendingRepairRow) => void;
+  /** Re-probed before every mint attempt — true when an OPEN epic already
+   *  carries this (repo, fingerprint)'s deterministic maintenance-task title, so
+   *  a still-open mint from an earlier tick is never duplicated. */
+  readonly hasOpenMaintenanceTask: (group: RepairGroup) => boolean;
+  /** Scaffold + arm the single-task maintenance epic via the plan CLI. The
+   *  producer only spawns it — the plan CLI is the sole writer of plan state. */
+  readonly mintMaintenanceTask: (
+    group: RepairGroup,
+  ) => Promise<MaintenanceMintOutcome>;
   readonly noteLine?: (line: string) => void;
+}
+
+/** The fixed leading token every maintenance-task title carries — greppable, and
+ *  the stable half of the (repo, fingerprint) idempotence key {@link
+ *  maintenanceEpicTitle} embeds the other half into. */
+export const MAINTENANCE_TASK_TITLE_PREFIX = "keeper trunk repair";
+
+/** The deterministic maintenance-epic/task title for a (repo, fingerprint) pair —
+ *  the ONE key both the daemon's own re-probe ({@link hasOpenMaintenanceTask} at
+ *  the wiring site) and the minted YAML ({@link buildMaintenanceScaffoldYaml}) key
+ *  on, so a still-open mint from an earlier tick is found by exact title match.
+ *  Pure; total. */
+export function maintenanceEpicTitle(group: RepairGroup): string {
+  return `${MAINTENANCE_TASK_TITLE_PREFIX}: ${group.repo_token} ${group.fingerprint}`;
+}
+
+/**
+ * Build the single-task scaffold YAML the maintenance-task mint pipes to
+ * `keeper plan scaffold --file -` — the mechanical default cell (`tier: xhigh`,
+ * `model: opus`; the post-scaffold selector beat does not run for a producer-mint)
+ * carrying the confirmed-red baseline leaf key and failing-tests digest in the
+ * task spec, per {@link RepairGroup.baseline_diagnosis}. Every free-text scalar
+ * rides as a JSON-quoted YAML flow scalar (valid YAML 1.1 double-quoting) so a
+ * test name with a colon or quote can never corrupt the document shape. Pure.
+ */
+export function buildMaintenanceScaffoldYaml(group: RepairGroup): string {
+  const title = JSON.stringify(maintenanceEpicTitle(group));
+  const leafKey = JSON.stringify(
+    group.baseline_diagnosis?.baseline_leaf_key ?? "",
+  );
+  const digest = JSON.stringify(
+    group.baseline_diagnosis?.failing_tests_digest ?? "",
+  );
+  return `epic:
+  title: ${title}
+  spec: |
+    ## Overview
+
+    The shared base at ${group.repo_token} is confirmed red at the default tip
+    with no blocked task to own the fix (a trunk-only regression). Repair it in
+    an ordinary work lane — no repair grant is involved.
+
+    ## Acceptance
+
+    - [ ] The default tip's baseline leaf ${leafKey} reads green after the fix lands
+tasks:
+  - title: ${title}
+    tier: xhigh
+    model: opus
+    spec: |
+      ## Description
+
+      **Size:** M
+      **Files:** (unknown — trunk-wide regression; investigate before touching)
+
+      ### Approach
+
+      Diagnose and fix the trunk regression the daemon's baseline sweep confirmed
+      red at the default tip. Reproduce it locally at HEAD before changing
+      anything, then land the smallest correct fix.
+
+      ### Investigation targets
+
+      **Required** (read before coding):
+      - The confirmed-red baseline leaf ${leafKey} — the diagnosed run this task was minted from
+      - Failing tests: ${digest}
+
+      ## Acceptance
+
+      - [ ] The failing tests named in Investigation targets pass
+      - [ ] The full suite is green via named gates
+
+      ## Done summary
+
+      ## Evidence
+`;
 }
 
 /** Deterministic `(epic_id, task_id)` order — the stable total sort the coalesced
@@ -3205,6 +3313,49 @@ export async function runRepairEscalationSweep(
     }
     if (existing.instance_event_id == null) {
       note(`# repair-grant-hold token=${token} class=incident_unfolded`);
+      continue;
+    }
+
+    // Trunk red with NO live blocked consumer at all — every candidate in this
+    // group is a task-less `baseline-tip::` entry, so `selectOwner` has no task
+    // row to elect from and would return null unconditionally. Holding the
+    // incident ownerless would starve forever (no worker will ever go blocked
+    // for a defect nobody hit yet); mint a real maintenance plan task instead —
+    // ordinary work dispatch fixes trunk in its own lane, no grant involved.
+    const hasLiveConsumer = groupMembers.some(
+      (candidate) => !candidate.task_id.startsWith("baseline-tip::"),
+    );
+    if (!hasLiveConsumer) {
+      if (!deps.hasOpenMaintenanceTask(group)) {
+        let mintOutcome: MaintenanceMintOutcome;
+        try {
+          mintOutcome = await deps.mintMaintenanceTask(group);
+        } catch (err) {
+          note(
+            `# warn: maintenance-task mint threw for ${token} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          mintOutcome = "mint_failed";
+        }
+        if (
+          mintOutcome === "mint_failed" &&
+          existing.human_notified_at == null
+        ) {
+          let result: RepairHumanNotifiedOutcome;
+          try {
+            result = await deps.notifyHuman(existing, "mint_failed");
+          } catch (err) {
+            note(
+              `# warn: repair human-notify threw for ${token} (non-fatal): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            result = "notify_failed";
+          }
+          deps.mintNotified(token, result);
+        }
+      }
       continue;
     }
 
@@ -16478,14 +16629,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Send the ONE agentbot page about a declined/dead granted owner. Sibling of
-  // `notifyHumanOfBlock`: ASYNC spawn, array form so the body rides as a literal argv
-  // element. A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal,
-  // so the marker stays NULL and the row re-sweeps: the page is never lost, and the sticky
-  // repair row stays operator-visible on the board throughout.
+  // Send the ONE agentbot page about a declined/dead granted owner, or a failed
+  // maintenance-task mint. Sibling of `notifyHumanOfBlock`: ASYNC spawn, array form
+  // so the body rides as a literal argv element. A non-zero exit OR a missing
+  // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and
+  // the row re-sweeps: the page is never lost, and the sticky repair row stays
+  // operator-visible on the board throughout.
   async function notifyHumanOfRepair(
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ): Promise<RepairHumanNotifiedOutcome> {
     const body = buildRepairHumanNotifyBody({
       repoToken: row.id,
@@ -16493,6 +16645,79 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       verdict,
     });
     return notifyHuman(body);
+  }
+
+  // The daemon-side maintenance-task idempotence probe: an OPEN (non-`done`) epic
+  // in this repo already carrying the deterministic (repo, fingerprint) title —
+  // re-run before every mint attempt so a still-open mint from an earlier tick is
+  // never duplicated. A read failure defers (treated as "cannot confirm absent"):
+  // the next tick re-probes rather than risking a double mint on a DB hiccup.
+  function hasOpenMaintenanceTask(group: RepairGroup): boolean {
+    try {
+      const row = db
+        .query(
+          `SELECT 1 FROM epics WHERE project_dir = ? AND title = ? AND status IS NOT 'done' LIMIT 1`,
+        )
+        .get(group.repo_dir, maintenanceEpicTitle(group));
+      return row != null;
+    } catch {
+      return true;
+    }
+  }
+
+  // Mint the maintenance plan task for a trunk-red group with no live blocked
+  // consumer: a bounded `keeper plan scaffold --file -` subprocess piped the YAML
+  // on stdin, then `keeper plan validate --epic` arms it so autopilot's readiness
+  // gate can dispatch it as ordinary work. The plan CLI writes the plan; this
+  // producer only spawns it (sole-writer discipline holds). Fail-open — any spawn
+  // error, non-zero exit, unparseable envelope, or arm failure maps to
+  // `mint_failed`, never a throw.
+  async function mintMaintenanceTask(
+    group: RepairGroup,
+  ): Promise<MaintenanceMintOutcome> {
+    try {
+      const scaffoldProc = Bun.spawn(
+        [...launcherArgvPrefix.slice(0, -1), "plan", "scaffold", "--file", "-"],
+        {
+          cwd: group.repo_dir,
+          stdin: Buffer.from(buildMaintenanceScaffoldYaml(group)),
+          stdout: "pipe",
+          stderr: "ignore",
+        },
+      );
+      const [exitCode, stdout] = await Promise.all([
+        scaffoldProc.exited,
+        new Response(scaffoldProc.stdout).text(),
+      ]);
+      if (exitCode !== 0) return "mint_failed";
+      let epicId: string | null = null;
+      try {
+        const parsed = JSON.parse(stdout) as {
+          success?: unknown;
+          epic_id?: unknown;
+        };
+        epicId =
+          parsed.success === true && typeof parsed.epic_id === "string"
+            ? parsed.epic_id
+            : null;
+      } catch {
+        epicId = null;
+      }
+      if (epicId == null || epicId === "") return "mint_failed";
+      const armProc = Bun.spawn(
+        [
+          ...launcherArgvPrefix.slice(0, -1),
+          "plan",
+          "validate",
+          "--epic",
+          epicId,
+        ],
+        { cwd: group.repo_dir, stdout: "ignore", stderr: "ignore" },
+      );
+      return (await armProc.exited) === 0 ? "minted" : "mint_failed";
+    } catch {
+      return "mint_failed";
+    }
   }
 
   async function runRepairEscalationSweepTick(): Promise<void> {
@@ -16606,6 +16831,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           expected_attempt_id: row.attempt_id,
           expected_instance_event_id: row.instance_event_id,
         }),
+      hasOpenMaintenanceTask: (group) => hasOpenMaintenanceTask(group),
+      mintMaintenanceTask: (group) => mintMaintenanceTask(group),
       noteLine: note,
     });
 
