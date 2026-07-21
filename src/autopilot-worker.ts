@@ -1270,6 +1270,21 @@ export interface ConfirmRunningDeps {
     plan_ref: string,
     last_event_id_gt: number,
   ): FoundJob | null;
+  /**
+   * Read-side claim-acquire observation against the reconciler's OWN read-only
+   * connection: the reducer cursor (`reducer_state.last_event_id`) plus the
+   * folded `dispatch_claims` + `pending_dispatches` rows for `(verb, id)`.
+   * `confirmRunning` calls this AFTER the durable mint ack and BEFORE `launch`,
+   * so it crosses the launch side-effect ONLY once THIS attempt's acquired claim
+   * (and its pending row) is POSITIVELY observed — an `INSERT OR IGNORE` no-op
+   * (a predecessor's un-released claim still holds the pair) folds with no row
+   * for this attempt and must never read as launch success, or the wrapper
+   * launches ungrantable (perpetual-`wait` provider legs, three burned legs).
+   * The cursor read distinguishes FOLD-LAG (cursor still behind the mint event —
+   * transient, keep polling) from a real LOSS (cursor past the mint, claim owned
+   * by another attempt). A PRODUCER read by contract — never a fold.
+   */
+  observeClaimAcquire(verb: Verb, id: string): ClaimAcquireObservation;
   /** Producer-side wall-clock for the reconcile-time `ts` stamp. */
   now(): number;
   /**
@@ -1367,6 +1382,13 @@ export interface ConfirmRunningDeps {
    */
   pollIntervalMs?: number;
   ceilingMs?: number;
+  /**
+   * Tuning knobs for the pre-launch claim-acquire verification poll. Default to
+   * {@link CLAIM_VERIFY_POLL_MS} / {@link CLAIM_VERIFY_CEILING_MS} when undefined
+   * so tests drive a tight cadence.
+   */
+  claimVerifyPollMs?: number;
+  claimVerifyCeilingMs?: number;
 }
 
 /**
@@ -3857,6 +3879,31 @@ export interface DispatchedAck {
 }
 
 /**
+ * Read-side claim-acquire observation {@link ConfirmRunningDeps.observeClaimAcquire}
+ * returns — the folded projection state `confirmRunning` needs to POSITIVELY
+ * confirm a mint won its `(verb, id)` claim before launching. The mint event id
+ * IS the attempt fence, so `cursor >= attemptId` means the mint has folded; the
+ * claim/pending rows read on the SAME connection are then guaranteed post-fold
+ * (SQLite single-connection reads are monotonic forward).
+ */
+export interface ClaimAcquireObservation {
+  /** `reducer_state.last_event_id` — the fold cursor. Once it passes the attempt
+   *  id (== the immutable mint event id) the mint is folded. */
+  cursor: number;
+  /** The current folded `dispatch_claims` row for `(verb, id)`, or null when
+   *  none has folded yet. `attemptId` names the HOLDER on a loss. */
+  claim: {
+    attemptId: number | null;
+    state: string;
+    sessionId: string | null;
+    legacyUnfenced: number;
+  } | null;
+  /** `pending_dispatches.attempt_id` for `(verb, id)`, or null when no pending
+   *  row exists — the second half of the acquired-AND-bound-pending gate. */
+  pendingAttemptId: number | null;
+}
+
+/**
  * Payload shape for the producer-side TTL sweep's `DispatchExpired`
  * mint (schema v50). Mirrors `src/reducer.ts`'s
  * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
@@ -3899,6 +3946,14 @@ export interface DispatchExpiredPayload {
  *    `"aborted-prelaunch"` this is a benign dedup — the cycle glue RE-STAMPS the
  *    cooldown (damp, do NOT re-arm) and does NOT set `failedKeys` (the work is
  *    not failed). No `DispatchFailed`.
+ *  - `"no-claim"` — the mint's `Dispatched` FOLDED but its claim acquire LOST to
+ *    a predecessor's un-released `(verb, id)` claim (cursor past the mint, claim
+ *    owned by another attempt). Terminal for this attempt — the launch never
+ *    happened. Producer-visible (a loud log naming the holder). Like
+ *    `"suppressed-dup"` the cycle glue RE-STAMPS the cooldown (damp, no blind
+ *    relaunch loop; the level-triggered reconciler re-derives next cycle, the
+ *    claim reaper clears a genuinely-dead holder) and does NOT set `failedKeys`
+ *    (contention, not failure). No `DispatchFailed`.
  */
 export type ConfirmOutcome =
   | "ok"
@@ -3906,7 +3961,8 @@ export type ConfirmOutcome =
   | "indoubt"
   | "aborted-prelaunch"
   | "aborted-postlaunch"
-  | "suppressed-dup";
+  | "suppressed-dup"
+  | "no-claim";
 
 /**
  * Default poll cadence — every 1s. Spec says ~1-2s; we pick 1000ms so a
@@ -3932,6 +3988,21 @@ export const DEFAULT_CEILING_MS = 60_000;
  * self-clears via the TTL sweep.
  */
 export const DISPATCHED_ACK_TIMEOUT_MS = 10_000;
+
+/**
+ * Bounded poll budget for the pre-launch claim-acquire verification. The mint
+ * ack means only "Dispatched event durably inserted"; the fold that acquires the
+ * claim runs on main right after (its pump is triggered on the same ack), so the
+ * cursor normally passes the mint within a drain tick and the very first poll
+ * confirms the acquire. The ceiling bounds the wait so a genuinely wedged
+ * reducer degrades to `indoubt` (keep the slot, TTL sweep + re-derive) instead
+ * of blocking the dispatch loop; it is comfortably under `DISPATCHED_ACK_TIMEOUT_MS`.
+ */
+export const CLAIM_VERIFY_CEILING_MS = 3_000;
+
+/** Poll cadence for the claim-acquire verification. Short so a same-tick fold is
+ *  observed almost immediately; the happy path breaks on poll 0 with no sleep. */
+export const CLAIM_VERIFY_POLL_MS = 50;
 
 /**
  * Worker shell wrapping. Mirrors the CLI autopilot's launch body so the
@@ -5238,6 +5309,55 @@ function worktreeEpicGrandfathered(epicId: string, repoDir: string): boolean {
 }
 
 /**
+ * PRODUCER read-side {@link ClaimAcquireObservation} loader — the concrete query
+ * behind {@link ConfirmRunningDeps.observeClaimAcquire}. Reads the reducer cursor
+ * FIRST, then the folded `dispatch_claims` + `pending_dispatches` rows for
+ * `(verb, id)` on the SAME read-only connection. Ordering is load-bearing: a
+ * single SQLite connection's reads move only forward in time, so once the cursor
+ * read observes `cursor >= attemptId` (the mint event folded), the later claim /
+ * pending reads see at-least-that-committed state — a not-yet-folded mint can
+ * never masquerade as a lost claim. A PRODUCER read; never called from a fold.
+ */
+export function readClaimAcquireObservation(
+  db: Parameters<typeof runQuery>[0],
+  verb: Verb,
+  id: string,
+): ClaimAcquireObservation {
+  const cursorRow = db
+    .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+    .get() as { last_event_id: number } | null;
+  const cursor = cursorRow?.last_event_id ?? 0;
+  const claimRow = db
+    .query(
+      "SELECT attempt_id, state, session_id, legacy_unfenced FROM dispatch_claims WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as {
+    attempt_id: number | null;
+    state: string;
+    session_id: string | null;
+    legacy_unfenced: number;
+  } | null;
+  const pendingRow = db
+    .query(
+      "SELECT attempt_id FROM pending_dispatches WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { attempt_id: number | null } | null;
+  return {
+    cursor,
+    claim:
+      claimRow === null
+        ? null
+        : {
+            attemptId: claimRow.attempt_id,
+            state: claimRow.state,
+            sessionId: claimRow.session_id,
+            legacyUnfenced: claimRow.legacy_unfenced,
+          },
+    pendingAttemptId: pendingRow?.attempt_id ?? null,
+  };
+}
+
+/**
  * The confirm-runner. Captures the `events.id` watermark, mints a `Dispatched`
  * event (outbox-ordered intent), fires `launch`, then polls `deps.findJob` until
  * it resolves truthy (`"ok"`) or `ceilingMs` elapses. Launch failure
@@ -5321,12 +5441,74 @@ export async function confirmRunning(
     // resulting SessionStart would be indistinguishable from unfenced evidence.
     return "aborted-prelaunch";
   }
-  // 3. Launch — ONLY after the durable ack returned the admitted attempt. The
-  // generic metadata rides the structured spec; prompts, names, cells, and the
-  // pre-wrapped command remain unchanged.
+  // 2b. VERIFY the acquired claim before crossing the launch side-effect. The
+  // durable ack proves only "Dispatched event inserted" — the claim acquisition
+  // is the FOLD of that event (`acquireDispatchClaim`'s `INSERT OR IGNORE`),
+  // which no-ops when a predecessor's bound-never-released claim still holds
+  // `(verb, id)`. Launching then would strand an ungrantable wrapper: no
+  // `dispatch_claims` row for this attempt → `providerLegGrantStatus` returns a
+  // perpetual silent `wait` → every provider leg dies at the fixed grant hold.
+  // So poll the folded projection for THIS attempt's acquired claim + pending
+  // row. The cursor separates fold-lag (keep polling) from a real loss (loud,
+  // terminal). Bounded — a wedged reducer degrades to `indoubt`, never a hang.
+  const attemptId = ack.attemptId;
+  const verifyPollMs = deps.claimVerifyPollMs ?? CLAIM_VERIFY_POLL_MS;
+  const verifyCeilingMs = deps.claimVerifyCeilingMs ?? CLAIM_VERIFY_CEILING_MS;
+  let verifyElapsedMs = 0;
+  for (;;) {
+    if (signal.aborted) {
+      // Shutdown raced the verify — nothing launched, so pre-launch abort.
+      return "aborted-prelaunch";
+    }
+    const obs = deps.observeClaimAcquire(verb, id);
+    const ownsClaim =
+      obs.claim != null &&
+      obs.claim.attemptId === attemptId &&
+      obs.claim.state === "acquired" &&
+      obs.claim.legacyUnfenced === 0;
+    if (ownsClaim && obs.pendingAttemptId === attemptId) {
+      // POSITIVELY observed the acquired claim AND its pending row — fall
+      // through to launch. Both move together in the one fold, so this is the
+      // exact "won the claim" signal.
+      break;
+    }
+    if (obs.cursor >= attemptId) {
+      // The mint event is folded (cursor passed it) yet THIS attempt does NOT
+      // own the claim: a predecessor's un-released claim won the acquire. This
+      // is a STRUCTURAL loss — terminal for this attempt, loud + producer-
+      // visible naming the holder. No launch, no blind relaunch loop: the
+      // level-triggered reconciler re-derives next cycle and the claim reaper
+      // clears a genuinely-dead holder.
+      console.warn(
+        `[autopilot-worker] dispatch ${verb}::${id} lost the claim acquire ` +
+          `(attempt ${attemptId}); claim held by attempt=${
+            obs.claim?.attemptId ?? "none"
+          } session=${obs.claim?.sessionId ?? "none"} state=${
+            obs.claim?.state ?? "none"
+          } — not launching`,
+      );
+      return "no-claim";
+    }
+    if (verifyElapsedMs >= verifyCeilingMs) {
+      // Cursor never passed the mint within the bound — a TRANSIENT reducer lag,
+      // NOT a loss (never positively observed either way). Don't launch; keep
+      // the durable mint for the TTL sweep + next-cycle re-derive. Same
+      // operational contract as the ceiling `indoubt` (KEEP the slot, no sticky
+      // failure) — but no `recordTimeoutBackstop` (this is fold-lag, not a
+      // ceiling rescue of a launched worker).
+      return "indoubt";
+    }
+    const sleepMs = Math.min(verifyPollMs, verifyCeilingMs - verifyElapsedMs);
+    await deps.sleep(sleepMs, signal);
+    verifyElapsedMs += sleepMs;
+  }
+  // 3. Launch — ONLY after the durable ack returned the admitted attempt AND the
+  // acquired claim was positively observed. The generic metadata rides the
+  // structured spec; prompts, names, cells, and the pre-wrapped command remain
+  // unchanged.
   const admittedSpec = withDispatchAttempt(
     { ...spec, claudeName: launchWindow },
-    ack.attemptId,
+    attemptId,
   );
   const launchResult: LaunchResult = await deps
     .launch(argv, key, cwd, admittedSpec)
@@ -5357,7 +5539,7 @@ export async function confirmRunning(
       dir: cwd === "" ? null : cwd,
       conflictedFiles: null,
       ts: deps.now(),
-      attempt_id: ack.attemptId,
+      attempt_id: attemptId,
     });
     return "failed";
   }
@@ -6197,15 +6379,17 @@ export async function runReconcileCycle(
         if (plan.isEpicFinalizer) {
           state.finalizerGuard.set(plan.id, deps.now());
         }
-      } else if (outcome === "suppressed-dup") {
-        // The durable mint gate suppressed this re-mint (a live attempt is in
-        // flight / freshly minted). RE-STAMP the cooldown rather than CLEAR it:
-        // a pre-launch abort clears (nothing launched, so re-dispatch freely),
-        // but suppression must DAMP — clearing here re-arms the very loop the
-        // gate exists to break (suppress→clear→re-dispatch→suppress…). `failedKeys`
-        // is left untouched (the work is not failed) and no live entry is
-        // recorded (this attempt did not launch). Keep the finalizer guard
-        // lockstep with the cooldown, as the indoubt arm does.
+      } else if (outcome === "suppressed-dup" || outcome === "no-claim") {
+        // Both DAMP rather than CLEAR the cooldown (a live attempt already holds
+        // the slot): `suppressed-dup` is the durable mint gate suppressing a
+        // re-mint of a live/freshly-minted attempt; `no-claim` is this mint's
+        // acquire losing to a predecessor's un-released claim. A pre-launch abort
+        // clears (nothing launched, so re-dispatch freely), but here re-dispatch
+        // must NOT re-arm — clearing re-arms the very loop the damp exists to
+        // break (contend→clear→re-dispatch→contend…). `failedKeys` is left
+        // untouched (contention, not failure) and no live entry is recorded
+        // (this attempt did not launch). Keep the finalizer guard lockstep with
+        // the cooldown, as the indoubt arm does.
         state.redispatchCooldown.set(plan.key, deps.now());
         if (plan.isEpicFinalizer) {
           state.finalizerGuard.set(plan.id, deps.now());
@@ -11898,6 +12082,11 @@ function main(): void {
         | undefined;
       return row ?? null;
     },
+    // Read-side claim-acquire verification against the reconciler's own
+    // read-only connection — the `confirmRunning` launch gate. Reads the cursor
+    // + folded claim/pending rows; never a fold.
+    observeClaimAcquire: (verb, id) =>
+      readClaimAcquireObservation(db, verb, id),
     now: () => Math.floor(Date.now() / 1000),
     // Producer-side cwd existence probe — fail-loud on a renamed-away launch
     // dir (`cwd-missing` DispatchFailed) instead of a silent skip. Runs on the

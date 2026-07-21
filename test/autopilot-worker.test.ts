@@ -60,7 +60,10 @@ import {
   buildWorkerCommand,
   buildWorktreeStatusEntries,
   type CheckoutDesyncProbe,
+  CLAIM_VERIFY_CEILING_MS,
+  CLAIM_VERIFY_POLL_MS,
   CLOSE_RECOVERY_MARKER,
+  type ClaimAcquireObservation,
   type CloseRecoveryStampResult,
   type ConfirmRunningDeps,
   classifyCloseRecoveryStampExit,
@@ -92,6 +95,7 @@ import {
   DEFAULT_CEILING_MS,
   type DeadWriterCheckoutSweepOutcome,
   DISPATCH_FAILED_WATERMARK_SEC,
+  DISPATCHED_ACK_TIMEOUT_MS,
   type DispatchClearedPayload,
   type DispatchedAck,
   type DispatchedPayload,
@@ -158,6 +162,7 @@ import {
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
+  readClaimAcquireObservation,
   reconcile,
   recordPushTimeout,
   recoverFailureDispatchId,
@@ -807,6 +812,7 @@ interface FakeDepsLog {
   clears: DispatchClearedPayload[];
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
+  observeClaimCalls: Array<{ verb: string; id: string }>;
   maxEventIdCalls: number;
   // fn-720: every `recordTimeoutBackstop` call from confirmRunning — a
   // pre-ceiling confirm posts `{rescued:false, stalenessMs:null}`, a
@@ -842,6 +848,19 @@ interface FakeDepsOptions {
    *   never-resolving ack (the ack-timeout abort) or a deferred resolve.
    */
   dispatchedAck?: DispatchedAck | (() => Promise<DispatchedAck>);
+  /**
+   * The read-side claim-acquire observation `confirmRunning` verifies before
+   * launching. Omitted → the happy ACQUIRED path for attempt 101 (matching the
+   * default `dispatchedAck`): cursor past the mint, claim owned by 101, pending
+   * row present, so every legacy `ok:true` confirm launches exactly as before.
+   * A fixed observation drives the lost path; a function (called per poll with a
+   * 0-based poll index) models fold-lag (a later poll flips to acquired).
+   */
+  claimObservation?:
+    | ClaimAcquireObservation
+    | ((verb: string, id: string, poll: number) => ClaimAcquireObservation);
+  claimVerifyPollMs?: number;
+  claimVerifyCeilingMs?: number;
   /**
    * Producer-side cwd existence probe. Tests use fixture paths like `/epic/dir`
    * that never exist on disk, so the default is `() => true` (every cwd present)
@@ -894,12 +913,16 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     clears: [],
     dispatchedEmissions: [],
     findJobCalls: [],
+    observeClaimCalls: [],
     maxEventIdCalls: 0,
     timeoutBackstops: [],
     closeRecoveryStamps: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
+  // Per-(verb,id) poll counter so a `claimObservation` function can model
+  // fold-lag (a later poll flips from not-yet-folded to acquired).
+  const observeClaimPolls = new Map<string, number>();
   const nowFn: () => number =
     typeof opts.now === "function"
       ? opts.now
@@ -944,6 +967,28 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       }
       return null;
     },
+    observeClaimAcquire(verb, id) {
+      const poll = observeClaimPolls.get(`${verb}::${id}`) ?? 0;
+      observeClaimPolls.set(`${verb}::${id}`, poll + 1);
+      log.observeClaimCalls.push({ verb, id });
+      if (typeof opts.claimObservation === "function") {
+        return opts.claimObservation(verb, id, poll);
+      }
+      // Default: the happy ACQUIRED path for attempt 101 (the default ack's
+      // attemptId) — cursor past the mint, claim owned, pending present.
+      return (
+        opts.claimObservation ?? {
+          cursor: 101,
+          claim: {
+            attemptId: 101,
+            state: "acquired",
+            sessionId: null,
+            legacyUnfenced: 0,
+          },
+          pendingAttemptId: 101,
+        }
+      );
+    },
     now: nowFn,
     dirExists: opts.dirExists ?? (() => true),
     sleep:
@@ -979,6 +1024,8 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
+    claimVerifyPollMs: opts.claimVerifyPollMs,
+    claimVerifyCeilingMs: opts.claimVerifyCeilingMs,
   };
 
   return {
@@ -5409,6 +5456,228 @@ test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signa
   expect(outcome).toBe("aborted-prelaunch");
   expect(log.launches.length).toBe(0); // never launched
   expect(log.emissions).toEqual([]); // no DispatchFailed
+});
+
+// ---------------------------------------------------------------------------
+// confirmRunning — launch ONLY on a positively observed acquired claim.
+// The durable mint ack means only "Dispatched event inserted"; the claim
+// acquisition is the FOLD of that event, whose `INSERT OR IGNORE` no-ops behind
+// a predecessor's un-released claim. Launching on the bare ack strands an
+// ungrantable wrapper (perpetual-`wait` provider legs). confirmRunning must
+// POSITIVELY observe THIS attempt's acquired claim + pending row before
+// launching, distinguishing fold-lag from a real loss via the reducer cursor.
+// ---------------------------------------------------------------------------
+
+test("confirmRunning launches only on a positively observed acquired claim (P0): a losing acquire against a bound predecessor folds no row for the new attempt AND performs zero launch side-effects, returning no-claim", async () => {
+  await withSeededDb(async (db) => {
+    const verb = "work";
+    const id = "fn-claim-loss.1";
+
+    // --- Seed a predecessor's BOUND, un-released claim on (verb, id). ---
+    // Predecessor mint: attempt P == its own immutable event id.
+    const pMint = db
+      .query(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+         VALUES (?, 'reconciler', 'Dispatched', 'pending_dispatches', ?)`,
+      )
+      .run(
+        1800,
+        JSON.stringify({
+          verb,
+          id,
+          dir: "/repo",
+          ts: 1800,
+          attempt_from_event_id: true,
+          expected_attempt_id: null,
+        }),
+      );
+    const predecessorAttempt = Number(pMint.lastInsertRowid);
+    expect(drain(db)).toBe(1);
+    // Bind it to a live session — the un-released hold that makes a re-mint's
+    // acquire LOSE.
+    db.query(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, 'reconciler', 'DispatchClaimBound', 'dispatch_claims', ?)`,
+    ).run(
+      1801,
+      JSON.stringify({
+        verb,
+        id,
+        expected_attempt_id: predecessorAttempt,
+        session_id: "pred-session",
+      }),
+    );
+    expect(drain(db)).toBe(1);
+    expect(
+      db
+        .query(
+          "SELECT attempt_id, state, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+        )
+        .get(verb, id),
+    ).toMatchObject({
+      attempt_id: predecessorAttempt,
+      state: "bound",
+      session_id: "pred-session",
+    });
+
+    // --- confirmRunning mints a NEW attempt whose acquire will LOSE. ---
+    const { deps: baseDeps, log } = makeFakeDeps({ maxEventId: 100 });
+    let mintedAttempt = 0;
+    const deps: ConfirmRunningDeps = {
+      ...baseDeps,
+      // Mirror `admitDispatched`: fence the mint on the CURRENT claim's attempt
+      // id, durably insert the Dispatched, fold it, and ack the inserted event
+      // id as the attempt — exactly the production mint shape the fold sees.
+      emitDispatched: async (payload) => {
+        const cur = db
+          .query(
+            "SELECT attempt_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+          )
+          .get(payload.verb, payload.id) as {
+          attempt_id: number | null;
+        } | null;
+        const res = db
+          .query(
+            `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+             VALUES (?, 'reconciler', 'Dispatched', 'pending_dispatches', ?)`,
+          )
+          .run(
+            payload.ts,
+            JSON.stringify({
+              verb: payload.verb,
+              id: payload.id,
+              dir: payload.dir,
+              ts: payload.ts,
+              attempt_from_event_id: true,
+              expected_attempt_id: cur?.attempt_id ?? null,
+              launch: payload.launch,
+            }),
+          );
+        mintedAttempt = Number(res.lastInsertRowid);
+        drain(db);
+        return { ok: true, attemptId: mintedAttempt };
+      },
+      // The REAL read-side verification path against the folded projection.
+      observeClaimAcquire: (v, i) => readClaimAcquireObservation(db, v, i),
+    };
+
+    const ctrl = new AbortController();
+    const outcome = await confirmRunning(
+      verb,
+      id,
+      "/repo",
+      ["sh", "-c", "true"],
+      { prompt: `/plan:work ${id}`, claudeName: `${verb}::${id}` },
+      ctrl.signal,
+      deps,
+    );
+
+    // PRODUCER: ZERO launch side-effects, typed loud terminal outcome.
+    expect(outcome).toBe("no-claim");
+    expect(log.launches.length).toBe(0);
+    expect(log.emissions).toEqual([]); // no sticky DispatchFailed
+
+    // REDUCER: the losing acquire was IGNORED — the claim still belongs to the
+    // bound predecessor and NO pending row exists for the new attempt.
+    expect(mintedAttempt).toBeGreaterThan(predecessorAttempt);
+    expect(
+      db
+        .query(
+          "SELECT attempt_id, state, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+        )
+        .get(verb, id),
+    ).toMatchObject({
+      attempt_id: predecessorAttempt,
+      state: "bound",
+      session_id: "pred-session",
+    });
+    expect(
+      db
+        .query(
+          "SELECT 1 FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+        )
+        .get(verb, id, mintedAttempt),
+    ).toBeNull();
+  });
+});
+
+test("confirmRunning normal path: a positively observed acquired claim launches exactly as before", async () => {
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 100,
+    // The acquired claim + pending row for the default ack's attempt (101),
+    // cursor past the mint — the exact "won the claim" signal.
+    claimObservation: {
+      cursor: 101,
+      claim: {
+        attemptId: 101,
+        state: "acquired",
+        sessionId: null,
+        legacyUnfenced: 0,
+      },
+      pendingAttemptId: 101,
+    },
+  });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 150 });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("ok");
+  expect(log.launches.length).toBe(1);
+  // One poll — the acquire was already folded, so no fold-lag wait.
+  expect(log.observeClaimCalls.length).toBe(1);
+});
+
+test("confirmRunning fold-lag: the acquired claim row appears after a bounded verify wait → launches (transient cursor-behind is NOT a loss)", async () => {
+  const attempt = 101; // the default ack attemptId
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 100,
+    // Poll 0: cursor still BEHIND the mint (fold-lag — keep polling, do NOT
+    // classify as a loss). Poll 1+: the claim + pending rows have folded.
+    claimObservation: (_v, _i, poll) =>
+      poll === 0
+        ? { cursor: attempt - 1, claim: null, pendingAttemptId: null }
+        : {
+            cursor: attempt,
+            claim: {
+              attemptId: attempt,
+              state: "acquired",
+              sessionId: null,
+              legacyUnfenced: 0,
+            },
+            pendingAttemptId: attempt,
+          },
+  });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 150 });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("ok");
+  expect(log.launches.length).toBe(1);
+  // The verify polled at least twice — once fold-lagged, once acquired.
+  expect(log.observeClaimCalls.length).toBeGreaterThanOrEqual(2);
+});
+
+test("CLAIM_VERIFY knobs bound the pre-launch verification (poll < ceiling, ceiling < ack timeout)", () => {
+  expect(CLAIM_VERIFY_POLL_MS).toBeLessThan(CLAIM_VERIFY_CEILING_MS);
+  expect(CLAIM_VERIFY_CEILING_MS).toBeLessThan(DISPATCHED_ACK_TIMEOUT_MS);
 });
 
 test("pending launch ordering keeps confirm < parked grace < TTL < cooldown", () => {
