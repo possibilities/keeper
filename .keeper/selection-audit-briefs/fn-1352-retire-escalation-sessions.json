@@ -1,0 +1,64 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 58,
+        "files_changed": 12,
+        "insertions": 66
+      },
+      "done_summary": "Reshaped CLAUDE.md, README.md, CONTEXT.md, plugin-composition-map.md, and problem-codes.md to describe only the landed in-session incident/grant model; moved the four fully superseded ADRs (0007, both 0017s, 0039) to superseded/ with pointers to ADR 0089 and amended 0049/0070. Discovered task 2's collapse commit had landed on its own unmerged lane; fast-forwarded it in before writing docs so the glossary reflects actual code, not stale plan-state claims.",
+      "input_hash": "ebbd8cc4169b1d6bbaa6d50c21e607c7b06ace439f1a712e76f3d37ece4f4eb6",
+      "model": "sonnet",
+      "spec_chars": 3055,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** CLAUDE.md, README.md, CONTEXT.md, docs/plugin-composition-map.md, docs/problem-codes.md, docs/adr/\n\n### Approach\n\nReshape every doc surface to state the in-session model, pruning as much as adding: CLAUDE.md's hook list and autopilot worktree paragraph collapse to the incident/claim/grant model with a net size reduction; README's composition summary re-counts; the plugin-composition-map's escalation-dispatch block rewrites around confined subagents and grants; problem-codes examples that cite escalation dispatch rows update. CONTEXT.md retires or redefines the escalation-session vocabulary \u2014 Escalation dispatch, Unblock session, Deconflict session, Repair session, Resolver, Board-work session, Block instance, and the dispatch-table avoid-list \u2014 and adds Incident, Grant, Trunk lease, Fencing token, Typed receipt, and Attachment lease in the fixed term-definition-avoid shape. Fully superseded ADRs (autonomous escalation dispatch, both escalation-lifecycle and trunk-repair records, the work-verb escalation record) move to superseded/ with pointers to the in-session record; partially affected records gain amendment notes. Every statement is forward-facing present tense.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- CLAUDE.md hook-list and autopilot sections \u2014 the collapse targets, already partially updated by the groundwork epic\n- CONTEXT.md:51-83 and :113 \u2014 every term being reshaped\n- docs/plugin-composition-map.md:153-191 \u2014 the escalation block\n- docs/adr/superseded/ \u2014 the move convention (existing precedent in the tree)\n\n**Optional** (reference as needed):\n- docs/problem-codes.md \u2014 the example rows citing dispatch.unblock\n\n### Risks\n\n- The glossary must describe landed behavior only \u2014 this task lands after both retirement tasks, and any statement about machinery that still exists in code is a defect\n\n### Test notes\n\nBoth lint gates green; a grep sweep proving no doc surface names the retired session kinds outside ADR history and superseded records.\n\n## Acceptance\n\n- [ ] Every non-ADR doc surface describes only the in-session escalation model, in present tense, with CLAUDE.md net smaller and both lint gates green\n- [ ] CONTEXT.md carries the new vocabulary and none of the retired session definitions\n- [ ] Fully superseded ADRs live under superseded/ with pointers; amended records carry notes\n- [ ] No doc surface outside docs/adr names the retired session kinds\n\n## Done summary\nReshaped CLAUDE.md, README.md, CONTEXT.md, plugin-composition-map.md, and problem-codes.md to describe only the landed in-session incident/grant model; moved the four fully superseded ADRs (0007, both 0017s, 0039) to superseded/ with pointers to ADR 0089 and amended 0049/0070. Discovered task 2's collapse commit had landed on its own unmerged lane; fast-forwarded it in before writing docs so the glossary reflects actual code, not stale plan-state claims.\n## Evidence\n",
+      "task_id": "fn-1352-retire-escalation-sessions.3",
+      "tier": "high",
+      "title": "Docs and glossary reshape"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 3,
+        "insertions": 206
+      },
+      "done_summary": "Landed an additive schema step adding blocked_since, block_status, block_outcome, and owner_redispatch_attempts to dispatch_failures so the escalation-retirement collapse can carry block_escalations state forward into the per-key incident projection. Zero behavior change: no producer writes or consumer reads them yet; re-fold stays byte-identical and the page-once human_notified_at + (verb,id) key already exist, so a live block_escalations row is losslessly representable.",
+      "input_hash": "ebbd8cc4169b1d6bbaa6d50c21e607c7b06ace439f1a712e76f3d37ece4f4eb6",
+      "model": "opus",
+      "spec_chars": 3680,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/db.ts, src/reducer.ts, test/reducer-projections.test.ts, test/refold-equivalence.test.ts\n\n### Approach\n\nDirection (human-ratified 07-21): UNIFY - escalation state collapses INTO\nthe dispatch_failures incident projection and block_escalations retires\n(sibling task 2 does the collapse). This task lands ONLY the additive\nschema groundwork task 2 re-points onto, with zero behavior change: one\nforward-only SCHEMA_STEPS entry adding the incident columns to\ndispatch_failures that the collapse needs and that do not exist today -\nan incident owner reference plus generation, a durable attempt count\n(the block_escalations owner_redispatch_attempts analogue), an\nassignment/blocked-since timestamp, a bounded reason ref, and any\nrow-kind/key discriminator needed so per-task block incidents key into\nthe verb::id space alongside today's rows. Live shapes at authoring\ntime: dispatch_failures carries merge_escalated_at,\nresolver_dispatched_at, human_notified_at, instance_event_id,\nrepair_dispatched_at, conflicted_files, attempt_id, claim_session_id,\nclaim_pid, claim_start_time, claimed_at; block_escalations carries\nepic_id, task_id, blocked_since, status, outcome, human_notified_at,\nowner_redispatch_attempts. Fold defaults for the new columns match the\nzero-event projection; no producer writes them and no consumer reads\nthem yet (task 2 does both). SCHEMA_VERSION derives from the ladder\ntail, SCHEMA_FINGERPRINT re-pins, and the version stays provisional\nuntil landed.\n\n### Investigation targets\n\n*Verify before relying - these refs are planner-verified at authoring\ntime, but the repo moves.*\n\n**Required** (read before coding):\n- src/db.ts SCHEMA_STEPS tail + fingerprint pin - ladder discipline\n  (docs/adr/0020)\n- src/db.ts:5773-5784 - the dispatch_failures shape today\n- block_escalations folds (src/reducer.ts:6208-6484) - the state whose\n  carry-forward task 2 must express; choose column types that represent\n  it losslessly\n- docs/adr/0089-in-session-escalation-subagents.md - the retirement\n  contract (human_notified_at carry-forward requirement)\n\n### Risks\n\n- Over-designing here starves task 2: land columns additive-only; if\n  task 2 discovers a missing column it appends its own ladder entry -\n  do not attempt the collapse migration, fold replacement, or any\n  consumer edit here\n- A column choice that cannot express block_escalations' page-once\n  state per epic/task key would force task 2 into a second reshape -\n  verify representability against the live shape before pinning types\n\n### Test notes\n\nMigration test proving a fresh DB and a migrated DB agree on the new\ncolumn defaults; refold-equivalence stays green (no fold behavior\nchange). Named gates.\n\n## Acceptance\n\n- [ ] One additive SCHEMA_STEPS entry lands the incident columns;\n      SCHEMA_FINGERPRINT re-pinned; no hand-typed version\n- [ ] Zero behavior change: no producer writes and no consumer reads\n      the new columns; all existing suites green via named gates\n- [ ] The new columns can losslessly represent every live\n      block_escalations row (key, blocked_since, status, outcome,\n      human_notified_at, owner_redispatch_attempts)\n\n## Done summary\nLanded an additive schema step adding blocked_since, block_status, block_outcome, and owner_redispatch_attempts to dispatch_failures so the escalation-retirement collapse can carry block_escalations state forward into the per-key incident projection. Zero behavior change: no producer writes or consumer reads them yet; re-fold stays byte-identical and the page-once human_notified_at + (verb,id) key already exist, so a live block_escalations row is losslessly representable.\n## Evidence\n",
+      "task_id": "fn-1352-retire-escalation-sessions.4",
+      "tier": "xhigh",
+      "title": "Land additive incident-column schema on dispatch_failures"
+    }
+  ],
+  "created_at": "2026-07-21T17:31:30.710000Z",
+  "epic_id": "fn-1352-retire-escalation-sessions",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1352-retire-escalation-sessions.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1352-retire-escalation-sessions.2"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "ebbd8cc4169b1d6bbaa6d50c21e607c7b06ace439f1a712e76f3d37ece4f4eb6",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
