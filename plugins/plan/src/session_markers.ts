@@ -51,7 +51,7 @@ function readProcessStartTime(pid: number): string | null {
       const result = spawnSync(
         "ps",
         ["-ww", "-p", String(pid), "-o", "lstart=,args="],
-        { encoding: "utf8", timeout: 500, maxBuffer: 4096 },
+        { encoding: "utf8", timeout: 500 },
       );
       if (result.error !== undefined || result.status !== 0) {
         return null;
