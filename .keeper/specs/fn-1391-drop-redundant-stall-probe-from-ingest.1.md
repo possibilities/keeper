@@ -21,5 +21,5 @@ Files: src/daemon.ts (onmessage handler and stall-distress step).
 - [ ] Existing stall-distress and ingest tests stay green (add coverage if the removal is not otherwise exercised).
 
 ## Done summary
-
+Removed the redundant stall-distress probe invocation from the events-ingest worker's onmessage hot path; only the 3s fallback timer now mints/clears the stall, per the audited feature's existing behavior.
 ## Evidence

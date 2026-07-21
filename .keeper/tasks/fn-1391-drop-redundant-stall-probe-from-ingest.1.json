@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Remove onmessage stall probe",
-  "updated_at": "2026-07-20T21:05:09.279000Z"
+  "updated_at": "2026-07-21T07:11:30.426000Z",
+  "worker_done_at": "2026-07-21T07:11:30.426000Z"
 }
