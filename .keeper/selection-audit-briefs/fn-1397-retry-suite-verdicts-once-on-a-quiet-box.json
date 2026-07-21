@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 83,
+        "files_changed": 4,
+        "insertions": 421
+      },
+      "done_summary": "Classify deadline-kill/empty-digest crashes as load-suspect and retry the finalize/recover merge-suite gate once per (row, merged commit) before minting the visible suite-red row; a second consecutive load-suspect or a named failure still parks immediately, and the per-key retry memo is bounded and resets on green/named-red.",
+      "input_hash": "b2303d0d8dc2878f62d22c9ff6026810f1e3491256939fb9ee266446dab2262c",
+      "model": "opus",
+      "spec_chars": 1994,
+      "spec_md": "## Description\n\nIn the finalize/recover suite verification path (runPackageSuiteGate\nsrc/autopilot-worker.ts:7600-7671 and its mint sites \u2014 recover :8653,\nfinalize :6603-6605/:6740-6747 \u2014 plus the baseline analogue classifyRun\nsrc/baseline-worker.ts:246-252):\n\n- Classify a \"load-suspect\" verdict: deadline-kill (raw.timedOut) OR\n  non-zero-exit-with-no-failing-test-output (crashed, empty digest). A\n  named failing test is NEVER load-suspect.\n- On the FIRST load-suspect verdict for a given (row key, merged commit),\n  schedule exactly one bounded retry of the suite instead of minting the\n  dispatch-failure row; the retry runs on the next producer cycle\n  (optionally gated on a cheap load probe such as 1-minute loadavg vs\n  core count \u2014 producer-only, never in a fold).\n- The SECOND consecutive load-suspect verdict for the same key mints the\n  existing row exactly as today (no infinite retry; the retry state is a\n  per-key memo, bounded, and resets on a green or named-red verdict).\n- A named-red verdict keeps today's immediate visible park; green stays\n  green. Fold determinism rules: all probing and retry state live in\n  producers/workers, never folds.\n\nFiles: src/autopilot-worker.ts, src/baseline-worker.ts, tests beside the\nexisting suite-gate classifier tests.\n\n## Acceptance\n\n- [ ] A deadline-kill or empty-digest crash triggers one retry, minting\n      no row on the first occurrence (tests through the producer seam).\n- [ ] A second consecutive load-suspect verdict mints today's row.\n- [ ] A named failing test never retries and parks immediately.\n- [ ] Retry state is bounded per key and resets on green/named-red.\n\n## Done summary\nClassify deadline-kill/empty-digest crashes as load-suspect and retry the finalize/recover merge-suite gate once per (row, merged commit) before minting the visible suite-red row; a second consecutive load-suspect or a named failure still parks immediately, and the per-key retry memo is bounded and resets on green/named-red.\n## Evidence\n",
+      "task_id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box.1",
+      "tier": "xhigh",
+      "title": "Add one bounded retry for load-suspect suite verdicts"
+    }
+  ],
+  "created_at": "2026-07-21T18:50:20.911000Z",
+  "epic_id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "b2303d0d8dc2878f62d22c9ff6026810f1e3491256939fb9ee266446dab2262c",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
