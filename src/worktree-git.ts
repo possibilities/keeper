@@ -1583,6 +1583,11 @@ export interface WorktreeDepLinkFs {
   realpath(path: string): Promise<string>;
   symlink(target: string, path: string, type: "dir"): Promise<void>;
   unlink(path: string): Promise<void>;
+  readdir(
+    path: string,
+  ): Promise<
+    Array<{ name: string; isDirectory(): boolean; isSymbolicLink(): boolean }>
+  >;
 }
 
 const worktreeDepLinkFs: WorktreeDepLinkFs = {
@@ -1590,13 +1595,24 @@ const worktreeDepLinkFs: WorktreeDepLinkFs = {
   realpath,
   symlink,
   unlink,
+  readdir: (path) => readdir(path, { withFileTypes: true }),
 };
 
 /**
- * The basename of the one dependency artifact the universal provisioning seam
- * (docs/adr/0074) plants into every keeper-created worktree.
+ * The basename of the dependency artifact the universal provisioning seam
+ * (docs/adr/0074) plants into every keeper-created worktree — at the checkout
+ * root and inside each nested package directory that carries its own install.
  */
 export const WORKTREE_DEP_LINK_NAME = "node_modules";
+
+/**
+ * How deep below the checkout root the provisioning seam scans for nested
+ * package directories (a dir carrying its own `package.json`). Depth 2 covers
+ * the `<group>/<package>` layout (`plugins/prompt`, `integrations/…`); the
+ * scan skips hidden dirs, `node_modules`, and symlinked dirs, so it stays
+ * cheap and cycle-free.
+ */
+const WORKTREE_DEP_SCAN_DEPTH = 2;
 
 /**
  * The exact symlink target {@link ensureWorktreeDepLink} plants at
@@ -1612,21 +1628,19 @@ export function worktreeDepLinkTarget(sourceCheckout: string): string {
 }
 
 /**
- * Universal dependency-symlink provisioning (docs/adr/0074): plant a
- * `node_modules` symlink at `worktreePath` pointing at `sourceCheckout`'s real
- * store, so every keeper-created worktree — task lane, epic base,
- * baseline/recovery scratch checkout — shares one host's install instead of a
- * slow, per-worktree install. Idempotent + safe: a no-op when the link is
- * already correct, silently skipped when the source has no `node_modules`
- * (nothing to share), and a real (non-symlink) `node_modules` at the target is
- * left untouched (never clobbers real work).
+ * Plant one `node_modules` symlink at `worktreeDir` pointing at `sourceDir`'s
+ * real store. Idempotent + safe: a no-op when the link is already correct,
+ * silently skipped when the source dir has no `node_modules` (nothing to
+ * share) or the worktree lacks the dir entirely (a historical commit from
+ * before the package existed), and a real (non-symlink) `node_modules` at the
+ * target is left untouched (never clobbers real work).
  */
-export async function ensureWorktreeDepLink(
-  sourceCheckout: string,
-  worktreePath: string,
-  fs: WorktreeDepLinkFs = worktreeDepLinkFs,
+async function ensureDepLinkAt(
+  sourceDir: string,
+  worktreeDir: string,
+  fs: WorktreeDepLinkFs,
 ): Promise<void> {
-  const sourceNodeModules = worktreeDepLinkTarget(sourceCheckout);
+  const sourceNodeModules = resolve(sourceDir, WORKTREE_DEP_LINK_NAME);
   let sourceRealPath: string;
   try {
     sourceRealPath = await fs.realpath(sourceNodeModules);
@@ -1637,7 +1651,7 @@ export async function ensureWorktreeDepLink(
     throw err;
   }
 
-  const worktreeNodeModules = resolve(worktreePath, WORKTREE_DEP_LINK_NAME);
+  const worktreeNodeModules = resolve(worktreeDir, WORKTREE_DEP_LINK_NAME);
   let entry: { isSymbolicLink(): boolean } | null;
   try {
     entry = await fs.lstat(worktreeNodeModules);
@@ -1659,20 +1673,90 @@ export async function ensureWorktreeDepLink(
     }
     await fs.unlink(worktreeNodeModules);
   }
-  await fs.symlink(sourceNodeModules, worktreeNodeModules, "dir");
+  try {
+    await fs.symlink(sourceNodeModules, worktreeNodeModules, "dir");
+  } catch (err) {
+    if (!isEnoent(err) && !isEnotdir(err)) throw err;
+  }
+}
+
+/**
+ * Enumerate the nested package directories of `sourceCheckout` — every
+ * non-hidden dir within {@link WORKTREE_DEP_SCAN_DEPTH} that carries its own
+ * `package.json` — in stable sorted order. Unreadable dirs are skipped, and
+ * symlinked dirs are never descended (cycle safety).
+ */
+async function discoverNestedPackageDirs(
+  sourceCheckout: string,
+  fs: WorktreeDepLinkFs,
+): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (rel: string, depth: number): Promise<void> => {
+    if (depth > WORKTREE_DEP_SCAN_DEPTH) return;
+    let entries: Awaited<ReturnType<WorktreeDepLinkFs["readdir"]>>;
+    try {
+      entries = await fs.readdir(
+        rel === "" ? sourceCheckout : resolve(sourceCheckout, rel),
+      );
+    } catch {
+      return;
+    }
+    const names = entries
+      .filter((e) => e.isDirectory() && !e.isSymbolicLink())
+      .map((e) => e.name)
+      .filter((n) => !n.startsWith(".") && n !== WORKTREE_DEP_LINK_NAME)
+      .sort();
+    for (const name of names) {
+      const childRel = rel === "" ? name : `${rel}/${name}`;
+      try {
+        await fs.lstat(resolve(sourceCheckout, childRel, "package.json"));
+        found.push(childRel);
+      } catch {
+        // not a package dir
+      }
+      await walk(childRel, depth + 1);
+    }
+  };
+  await walk("", 1);
+  return found;
+}
+
+/**
+ * Universal dependency-symlink provisioning (docs/adr/0074): plant
+ * `node_modules` symlinks into `worktreePath` pointing at `sourceCheckout`'s
+ * real stores — at the checkout root and inside each nested package directory
+ * that has its own install — so every keeper-created worktree — task lane,
+ * epic base, baseline/recovery scratch checkout — shares one host's installs
+ * instead of a slow, per-worktree install. Each plant is idempotent + safe
+ * per {@link ensureDepLinkAt}; a nested package with no source-side install
+ * contributes nothing.
+ */
+export async function ensureWorktreeDepLink(
+  sourceCheckout: string,
+  worktreePath: string,
+  fs: WorktreeDepLinkFs = worktreeDepLinkFs,
+): Promise<void> {
+  await ensureDepLinkAt(sourceCheckout, worktreePath, fs);
+  for (const rel of await discoverNestedPackageDirs(sourceCheckout, fs)) {
+    await ensureDepLinkAt(
+      resolve(sourceCheckout, rel),
+      resolve(worktreePath, rel),
+      fs,
+    );
+  }
 }
 
 /**
  * The teardown residue classifier (docs/adr/0074): true iff an untracked entry at
  * `relativePath` is EXACTLY what {@link ensureWorktreeDepLink} plants for
- * `sourceCheckout` — the top-level {@link WORKTREE_DEP_LINK_NAME} symlink whose RAW
- * link target is {@link worktreeDepLinkTarget}. Such a match is keeper's own residue:
- * teardown deletes it freely, never spooling it as work product. Classification is by
- * byte-identity, never by name: a replaced plant — a link retargeted elsewhere, or a
- * real file/dir at the path (`linkTarget === undefined`) — is NOT identical and stays
- * work product that spools. This is the SOLE definition of "what keeper plants" the
- * teardown side reads; it shares the provisioning seam's constants so the two cannot
- * drift.
+ * `sourceCheckout` — a {@link WORKTREE_DEP_LINK_NAME} symlink (top-level, or inside
+ * a nested package dir) whose RAW link target is the same relative path joined onto
+ * the source checkout. Such a match is keeper's own residue: teardown deletes it
+ * freely, never spooling it as work product. Classification is by byte-identity,
+ * never by name: a replaced plant — a link retargeted elsewhere, or a real file/dir
+ * at the path (`linkTarget === undefined`) — is NOT identical and stays work product
+ * that spools. This is the SOLE definition of "what keeper plants" the teardown side
+ * reads; it shares the provisioning seam's constants so the two cannot drift.
  */
 export function isWorktreeDepPlant(
   sourceCheckout: string,
@@ -1680,9 +1764,15 @@ export function isWorktreeDepPlant(
   linkTarget: string | undefined,
 ): boolean {
   if (linkTarget === undefined) return false;
-  if (relativePath.replaceAll("\\", "/") !== WORKTREE_DEP_LINK_NAME)
+  const rel = relativePath.replaceAll("\\", "/");
+  if (
+    rel !== WORKTREE_DEP_LINK_NAME &&
+    !rel.endsWith(`/${WORKTREE_DEP_LINK_NAME}`)
+  )
     return false;
-  return linkTarget === worktreeDepLinkTarget(sourceCheckout);
+  if (rel.split("/").some((seg) => seg === "" || seg === "." || seg === ".."))
+    return false;
+  return linkTarget === resolve(sourceCheckout, rel);
 }
 
 /**
@@ -2397,17 +2487,22 @@ async function safeUntrackedNode(
 
 /**
  * Read one untracked entry's raw link target and hand it to {@link isWorktreeDepPlant}
- * — the fs side of the teardown residue classifier (docs/adr/0074). Only the top-level
- * {@link WORKTREE_DEP_LINK_NAME} entry can be a plant, so anything else skips the fs
- * probe. A vanished / unreadable / non-symlink entry is NOT a plant: it falls through
- * to the normal spool path. `isWorktreeDepPlant` stays the single identity definition.
+ * — the fs side of the teardown residue classifier (docs/adr/0074). Only a
+ * {@link WORKTREE_DEP_LINK_NAME} entry (top-level or nested) can be a plant, so
+ * anything else skips the fs probe. A vanished / unreadable / non-symlink entry is
+ * NOT a plant: it falls through to the normal spool path. `isWorktreeDepPlant` stays
+ * the single identity definition.
  */
 async function untrackedIsDepPlant(
   checkoutPath: string,
   depLinkSource: string,
   relativePath: string,
 ): Promise<boolean> {
-  if (relativePath.replaceAll("\\", "/") !== WORKTREE_DEP_LINK_NAME)
+  const rel = relativePath.replaceAll("\\", "/");
+  if (
+    rel !== WORKTREE_DEP_LINK_NAME &&
+    !rel.endsWith(`/${WORKTREE_DEP_LINK_NAME}`)
+  )
     return false;
   const candidate = resolve(checkoutPath, relativePath);
   let linkTarget: string;

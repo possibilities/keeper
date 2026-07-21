@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   GIT_SPAWN_TIMEOUT_CODE,
   type GitRunner,
@@ -716,53 +716,108 @@ type WorktreeDepEntry =
   | { kind: "symlink"; resolvesTo: string | null }
   | null;
 
-function fakeWorktreeDepLinkFs(
-  sourcePresent: boolean,
-  initialEntry: WorktreeDepEntry,
-) {
-  const source = "/repo/node_modules";
-  const worktree = "/repo.worktrees/lane/node_modules";
-  const sourceReal = "/private/repo/node_modules";
-  let entry = initialEntry;
+function fakeWorktreeDepLinkFs(opts: {
+  sourceStores?: string[];
+  packageDirs?: string[];
+  tree?: Record<string, string[]>;
+  entries?: Record<string, WorktreeDepEntry>;
+  missingWorktreeDirs?: string[];
+}) {
+  const SOURCE = "/repo";
+  const LANE = "/repo.worktrees/lane";
+  const stores = new Set(opts.sourceStores ?? []);
+  const pkgs = new Set(opts.packageDirs ?? []);
+  const tree = opts.tree ?? {};
+  const entries: Record<string, WorktreeDepEntry> = { ...(opts.entries ?? {}) };
+  const missingDirs = new Set(opts.missingWorktreeDirs ?? []);
   const symlinks: Array<[string, string, string]> = [];
   let unlinks = 0;
   const missing = () => Object.assign(new Error("missing"), { code: "ENOENT" });
+  const relUnder = (root: string, path: string): string | null =>
+    path === root
+      ? ""
+      : path.startsWith(`${root}/`)
+        ? path.slice(root.length + 1)
+        : null;
+  const storeDir = (rel: string): string | null =>
+    rel === "node_modules"
+      ? ""
+      : rel.endsWith("/node_modules")
+        ? rel.slice(0, -"/node_modules".length)
+        : null;
+  const realStore = (dir: string) =>
+    `/private/repo${dir === "" ? "" : `/${dir}`}/node_modules`;
   return {
     fs: {
       async lstat(path: string) {
-        expect(path).toBe(worktree);
-        if (entry === null) throw missing();
-        return { isSymbolicLink: () => entry?.kind === "symlink" };
-      },
-      async realpath(path: string) {
-        if (path === source) {
-          if (!sourcePresent) throw missing();
-          return sourceReal;
-        }
-        expect(path).toBe(worktree);
-        if (entry?.kind !== "symlink" || entry.resolvesTo === null) {
+        const s = relUnder(SOURCE, path);
+        if (s !== null && s.endsWith("/package.json")) {
+          if (pkgs.has(s.slice(0, -"/package.json".length))) {
+            return { isSymbolicLink: () => false };
+          }
           throw missing();
         }
-        return entry.resolvesTo;
+        const l = relUnder(LANE, path);
+        const dir = l === null ? null : storeDir(l);
+        if (dir !== null) {
+          const entry = entries[dir] ?? null;
+          if (entry === null) throw missing();
+          return { isSymbolicLink: () => entry.kind === "symlink" };
+        }
+        throw missing();
+      },
+      async realpath(path: string) {
+        const s = relUnder(SOURCE, path);
+        const sDir = s === null ? null : storeDir(s);
+        if (sDir !== null) {
+          if (stores.has(sDir)) return realStore(sDir);
+          throw missing();
+        }
+        const l = relUnder(LANE, path);
+        const lDir = l === null ? null : storeDir(l);
+        if (lDir !== null) {
+          const entry = entries[lDir] ?? null;
+          if (entry?.kind !== "symlink" || entry.resolvesTo === null) {
+            throw missing();
+          }
+          return entry.resolvesTo;
+        }
+        throw missing();
       },
       async symlink(target: string, path: string, type: "dir") {
+        const l = relUnder(LANE, path);
+        const dir = l === null ? null : storeDir(l);
+        if (dir === null) throw new Error(`unexpected symlink at ${path}`);
+        if (missingDirs.has(dir)) throw missing();
         symlinks.push([target, path, type]);
-        entry = { kind: "symlink", resolvesTo: sourceReal };
+        entries[dir] = { kind: "symlink", resolvesTo: realStore(dir) };
       },
       async unlink(path: string) {
-        expect(path).toBe(worktree);
+        const l = relUnder(LANE, path);
+        const dir = l === null ? null : storeDir(l);
+        if (dir === null) throw new Error(`unexpected unlink at ${path}`);
         unlinks += 1;
-        entry = null;
+        entries[dir] = null;
+      },
+      async readdir(path: string) {
+        const s = relUnder(SOURCE, path);
+        const names = s === null ? undefined : tree[s];
+        if (names === undefined) throw missing();
+        return names.map((name) => ({
+          name,
+          isDirectory: () => true,
+          isSymbolicLink: () => false,
+        }));
       },
     },
-    entry: () => entry,
+    entry: (dir = "") => entries[dir] ?? null,
     symlinks,
     unlinks: () => unlinks,
   };
 }
 
 test("ensureWorktreeDepLink: a bare worktree links to its source dependency store", async () => {
-  const fake = fakeWorktreeDepLinkFs(true, null);
+  const fake = fakeWorktreeDepLinkFs({ sourceStores: [""] });
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([
     ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
@@ -774,9 +829,11 @@ test("ensureWorktreeDepLink: a bare worktree links to its source dependency stor
 });
 
 test("ensureWorktreeDepLink: a correct link is an idempotent no-op", async () => {
-  const fake = fakeWorktreeDepLinkFs(true, {
-    kind: "symlink",
-    resolvesTo: "/private/repo/node_modules",
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: [""],
+    entries: {
+      "": { kind: "symlink", resolvesTo: "/private/repo/node_modules" },
+    },
   });
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([]);
@@ -784,23 +841,26 @@ test("ensureWorktreeDepLink: a correct link is an idempotent no-op", async () =>
 });
 
 test("ensureWorktreeDepLink: a real worktree directory is left untouched", async () => {
-  const fake = fakeWorktreeDepLinkFs(true, { kind: "dir" });
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: [""],
+    entries: { "": { kind: "dir" } },
+  });
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.entry()).toEqual({ kind: "dir" });
   expect(fake.symlinks).toEqual([]);
 });
 
 test("ensureWorktreeDepLink: a missing source dependency store is skipped", async () => {
-  const fake = fakeWorktreeDepLinkFs(false, null);
+  const fake = fakeWorktreeDepLinkFs({});
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([]);
   expect(fake.entry()).toBeNull();
 });
 
 test("ensureWorktreeDepLink: a broken link is replaced", async () => {
-  const fake = fakeWorktreeDepLinkFs(true, {
-    kind: "symlink",
-    resolvesTo: null,
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: [""],
+    entries: { "": { kind: "symlink", resolvesTo: null } },
   });
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.unlinks()).toBe(1);
@@ -810,9 +870,9 @@ test("ensureWorktreeDepLink: a broken link is replaced", async () => {
 });
 
 test("ensureWorktreeDepLink: a stale link is replaced", async () => {
-  const fake = fakeWorktreeDepLinkFs(true, {
-    kind: "symlink",
-    resolvesTo: "/other/node_modules",
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: [""],
+    entries: { "": { kind: "symlink", resolvesTo: "/other/node_modules" } },
   });
   await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.unlinks()).toBe(1);
@@ -820,6 +880,61 @@ test("ensureWorktreeDepLink: a stale link is replaced", async () => {
     kind: "symlink",
     resolvesTo: "/private/repo/node_modules",
   });
+});
+
+test("ensureWorktreeDepLink: nested package dirs with source installs are planted too", async () => {
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: ["", "plugins/prompt"],
+    packageDirs: ["plugins/prompt", "integrations/pi-codex-pool"],
+    tree: {
+      "": ["integrations", "plugins"],
+      plugins: ["prompt"],
+      integrations: ["pi-codex-pool"],
+      "plugins/prompt": [],
+      "integrations/pi-codex-pool": [],
+    },
+  });
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
+  // Root first, then discovery order; a package with no source store plants nothing.
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+    [
+      "/repo/plugins/prompt/node_modules",
+      "/repo.worktrees/lane/plugins/prompt/node_modules",
+      "dir",
+    ],
+  ]);
+  expect(fake.entry("plugins/prompt")).toEqual({
+    kind: "symlink",
+    resolvesTo: "/private/repo/plugins/prompt/node_modules",
+  });
+  expect(fake.entry("integrations/pi-codex-pool")).toBeNull();
+});
+
+test("ensureWorktreeDepLink: discovery stops at the depth bound", async () => {
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: ["", "a/b/c"],
+    packageDirs: ["a/b/c"],
+    tree: { "": ["a"], a: ["b"], "a/b": ["c"] },
+  });
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+});
+
+test("ensureWorktreeDepLink: a worktree lacking the nested dir (historical commit) is skipped, not fatal", async () => {
+  const fake = fakeWorktreeDepLinkFs({
+    sourceStores: ["", "plugins/prompt"],
+    packageDirs: ["plugins/prompt"],
+    tree: { "": ["plugins"], plugins: ["prompt"], "plugins/prompt": [] },
+    missingWorktreeDirs: ["plugins/prompt"],
+  });
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+  expect(fake.entry("plugins/prompt")).toBeNull();
 });
 
 test("worktreeDepLinkTarget: the planted-artifact definition — WORKTREE_DEP_LINK_NAME joined onto the source checkout", () => {
@@ -851,10 +966,35 @@ test("isWorktreeDepPlant: byte-identity against the seam's plant, never by name"
   expect(isWorktreeDepPlant("/repo", WORKTREE_DEP_LINK_NAME, undefined)).toBe(
     false,
   );
-  // The seam's target under a different name, or nested, is not the one plant.
+  // The seam's target under a different name is not a plant.
   expect(isWorktreeDepPlant("/repo", "vendor", target)).toBe(false);
+  // A nested entry whose target is the ROOT store is a retargeted link, not a plant.
   expect(
     isWorktreeDepPlant("/repo", `sub/${WORKTREE_DEP_LINK_NAME}`, target),
+  ).toBe(false);
+  // A nested plant matches on ITS OWN byte-identical nested target.
+  expect(
+    isWorktreeDepPlant(
+      "/repo",
+      `plugins/prompt/${WORKTREE_DEP_LINK_NAME}`,
+      "/repo/plugins/prompt/node_modules",
+    ),
+  ).toBe(true);
+  // A nested name with a foreign target stays work product.
+  expect(
+    isWorktreeDepPlant(
+      "/repo",
+      `plugins/prompt/${WORKTREE_DEP_LINK_NAME}`,
+      "/other/plugins/prompt/node_modules",
+    ),
+  ).toBe(false);
+  // Path traversal never classifies as a plant.
+  expect(
+    isWorktreeDepPlant(
+      "/repo",
+      `../escape/${WORKTREE_DEP_LINK_NAME}`,
+      resolve("/repo", `../escape/${WORKTREE_DEP_LINK_NAME}`),
+    ),
   ).toBe(false);
 });
 
