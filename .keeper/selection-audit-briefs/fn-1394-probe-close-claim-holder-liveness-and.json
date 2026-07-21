@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 100,
+        "files_changed": 6,
+        "insertions": 322
+      },
+      "done_summary": "Made close-claim arbitration in session_markers.ts liveness-aware: markers now record pid + process start-time, readRivalCloseClaims probes rival holders via a pid/start-time recycle check (injected pure seam), a provably dead holder's marker is treated as abandoned and removed with bounded logging while inconclusive probes defer to the stale bound, claimCloseExclusive wins against abandoned markers in the same pass, and CLOSE_CLAIM_STALE_MS shrank from 7d to 24h as the un-probeable-marker backstop.",
+      "input_hash": "b244bf5b23d56a90246f044133fc8a0c3ac2e8b6cf7fd2c963bbe9631ad10d81",
+      "model": "opus",
+      "spec_chars": 2324,
+      "spec_md": "## Description\n\nMake close-claim arbitration liveness-aware in\nplugins/plan/src/session_markers.ts:\n\n- Extend the marker schema so a writer records its own pid + process\n  start-time alongside session_id/created_at (schema_version bump; readers\n  tolerate old markers by falling back to today's stale-bound behavior).\n- readRivalCloseClaims (:150-189) probes each rival marker's holder with a\n  pid + start-time recycle check (the dep-free src/proc-starttime.ts\n  pattern); a provably-dead holder's marker is treated as abandoned \u2014\n  ignored for arbitration and removed with one bounded log line. An\n  inconclusive probe (no pid fields, probe error) defers to the stale\n  bound, never treats the holder as dead.\n- claimCloseExclusive (:206-233) wins against abandoned markers in the same\n  pass; a live holder still wins by (created_at, session_id) exactly as now.\n- Shrink CLOSE_CLAIM_STALE_MS (:37) from 7 days to a bound that only\n  backstops un-probeable markers (24h), and name the constant's role in a\n  short comment stating the constraint.\n\nKeep tests deterministic and in-process: inject the liveness probe as a\npure seam (function parameter or module seam consistent with existing\nsession_markers tests); never probe real processes in correctness tests.\n\nFiles: plugins/plan/src/session_markers.ts,\nplugins/plan/test/ (session-marker arbitration tests).\n\n## Acceptance\n\n- [ ] A dead holder's marker loses arbitration in the same pass (test via\n      injected probe) and is removed with bounded logging.\n- [ ] A live holder still wins oldest-first; ties break on session_id.\n- [ ] Old-schema markers (no pid fields) degrade to stale-bound behavior.\n- [ ] Inconclusive probes never classify a holder dead.\n- [ ] CLOSE_CLAIM_STALE_MS shrunk to the backstop bound with tests updated.\n\n## Done summary\nMade close-claim arbitration in session_markers.ts liveness-aware: markers now record pid + process start-time, readRivalCloseClaims probes rival holders via a pid/start-time recycle check (injected pure seam), a provably dead holder's marker is treated as abandoned and removed with bounded logging while inconclusive probes defer to the stale bound, claimCloseExclusive wins against abandoned markers in the same pass, and CLOSE_CLAIM_STALE_MS shrank from 7d to 24h as the un-probeable-marker backstop.\n## Evidence\n",
+      "task_id": "fn-1394-probe-close-claim-holder-liveness-and.1",
+      "tier": "xhigh",
+      "title": "Arbitrate close claims on holder liveness"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 11,
+        "files_changed": 8,
+        "insertions": 502
+      },
+      "done_summary": "Cleared dead close-claim markers on kill paths and made close-claim arbitration probe holder liveness; operator-adopted from terminal leg b0fca477 after a TOOLING_FAILURE attribution park.",
+      "input_hash": "b244bf5b23d56a90246f044133fc8a0c3ac2e8b6cf7fd2c963bbe9631ad10d81",
+      "model": "sonnet",
+      "spec_chars": 1641,
+      "spec_md": "## Description\n\nEvery path that positively terminates a session must clear that session's\nplan marker (~/.local/state/keeper/sessions/<sid>.json):\n\n- keeper session terminate's kill path (locate the CLI/daemon\n  implementation) clears the target session's marker once death is\n  positively confirmed \u2014 never on refusal paths\n  (session_identity_unproven / session_command_unowned leave the marker).\n- The daemon reap paths that confirm a session terminal from folded\n  evidence (the reaper sweeps in src/autopilot-worker.ts and the leg\n  cascade's owner-terminal handling) clear the dead session's marker as\n  part of claim release.\n- Export one small marker-clear helper from\n  plugins/plan/src/session_markers.ts and reuse it; hooks must NOT import\n  it (hook import rules stay untouched).\n- A marker-clear failure is non-fatal and bounded-logged; the task-1\n  liveness probe remains the correctness backstop.\n\nFiles: plugins/plan/src/session_markers.ts, src/autopilot-worker.ts, the\nsession-terminate implementation (cli/ or src/daemon.ts \u2014 locate), tests\nbeside each touched surface.\n\n## Acceptance\n\n- [ ] Confirmed-death terminate clears the marker; refusals do not.\n- [ ] Reaper/cascade terminal confirmation clears the dead session's marker.\n- [ ] Marker-clear failures are non-fatal, bounded-logged.\n- [ ] No hook imports the marker helper; lint gates stay green.\n\n## Done summary\nCleared dead close-claim markers on kill paths and made close-claim arbitration probe holder liveness; operator-adopted from terminal leg b0fca477 after a TOOLING_FAILURE attribution park.\n## Evidence\n- Commits: df078d9f7cb96d3709af66a5a57f46cc608a6f59",
+      "task_id": "fn-1394-probe-close-claim-holder-liveness-and.2",
+      "tier": "high",
+      "title": "Clear plan session markers on kill paths"
+    }
+  ],
+  "created_at": "2026-07-21T19:06:03.530000Z",
+  "epic_id": "fn-1394-probe-close-claim-holder-liveness-and",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "b244bf5b23d56a90246f044133fc8a0c3ac2e8b6cf7fd2c963bbe9631ad10d81",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
