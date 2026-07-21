@@ -39,6 +39,7 @@ import {
   type GrantVerdict,
   grantCoversWrite,
   isGrantProtectedPath,
+  listGrantLeaves,
   readGrantLeaf,
   writableRootCovers,
   writeGrantLeaf,
@@ -1082,6 +1083,76 @@ describe("readGrantLeaf / writeGrantLeaf verdicts", () => {
 // ---------------------------------------------------------------------------
 // grantCoversWrite — the shared sibling-guard override, env-driven
 // ---------------------------------------------------------------------------
+
+function withGrantTmp(run: (dir: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+  try {
+    run(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("grant enumeration and in-session owner discovery", () => {
+  test("listGrantLeaves counts valid owner-private grants in fencing order", () => {
+    withGrantTmp((dir) => {
+      expect(
+        writeGrantLeaf(
+          dir,
+          makeGrant({ parent_job_id: "job-2", fencing_token: 9 }),
+        ),
+      ).toBe(true);
+      expect(
+        writeGrantLeaf(
+          dir,
+          makeGrant({ parent_job_id: "job-1", fencing_token: 7 }),
+        ),
+      ).toBe(true);
+      expect(
+        listGrantLeaves(dir).map((grant) => [
+          grant.parent_job_id,
+          grant.fencing_token,
+        ]),
+      ).toEqual([
+        ["job-1", 7],
+        ["job-2", 9],
+      ]);
+    });
+  });
+
+  test("a running owner discovers only its own repairer leaf", () => {
+    withGrantTmp((dir) => {
+      const root = join(dir, "repo");
+      mkdirSync(root);
+      expect(
+        writeGrantLeaf(
+          dir,
+          makeGrant({
+            agent_type: "plan:repairer",
+            role: "repair",
+            writable_root: root,
+            incident_id: "repair::repo-abc",
+            owner_task_id: "fn-1-x.1",
+          }),
+        ),
+      ).toBe(true);
+      const env = {
+        KEEPER_GRANT_DIR: dir,
+        CLAUDE_CODE_SESSION_ID: "job-1",
+      };
+      const target = join(realpathSync(root), "fix.ts");
+      expect(grantCoversWrite(env, "plan:repairer", target, 5_000)).toBe(true);
+      expect(
+        grantCoversWrite(
+          { ...env, CLAUDE_CODE_SESSION_ID: "job-other" },
+          "plan:repairer",
+          target,
+          5_000,
+        ),
+      ).toBe(false);
+    });
+  });
+});
 
 describe("grantCoversWrite (env + real leaf)", () => {
   function grantEnv(dir: string) {
