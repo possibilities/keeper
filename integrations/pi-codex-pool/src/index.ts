@@ -398,12 +398,14 @@ class ProofEvidence {
         route.aliases.length === 2 &&
         route.aliases[0] !== route.aliases[1],
     );
-    const rootAlias = this.routes
-      .find((route) => route.sessionRole === "root")
-      ?.aliases.at(-1);
-    const childAlias = this.routes
-      .find((route) => route.sessionRole === "child")
-      ?.aliases.at(-1);
+    const rootAliases = this.routes
+      .filter((route) => route.sessionRole === "root")
+      .map((route) => route.aliases.at(-1))
+      .filter((alias): alias is string => alias !== undefined);
+    const childAliases = this.routes
+      .filter((route) => route.sessionRole === "child")
+      .map((route) => route.aliases.at(-1))
+      .filter((alias): alias is string => alias !== undefined);
     const primary = aliasRoles.find((entry) => entry.role === "primary")?.alias;
     const alternates = aliasRoles
       .filter((entry) => entry.role === "alternate")
@@ -514,9 +516,9 @@ class ProofEvidence {
     );
     add(
       "transport_isolation",
-      rootAlias !== undefined &&
-        childAlias !== undefined &&
-        rootAlias !== childAlias,
+      rootAliases.some((rootAlias) =>
+        childAliases.some((childAlias) => childAlias !== rootAlias),
+      ),
       "root-child-distinct-aliases",
     );
     return observed;

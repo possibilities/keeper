@@ -121,19 +121,19 @@ function credentials(now: number) {
   };
 }
 
-function scopedUsage() {
+function scopedUsage(usedPercent = 20) {
   const resetAt = Math.floor((Date.now() + 900_000) / 1000);
   return {
     rate_limit: {
       allowed: true,
       limit_reached: false,
       primary_window: {
-        used_percent: 20,
+        used_percent: usedPercent,
         reset_at: resetAt,
         limit_window_seconds: 18_000,
       },
       secondary_window: {
-        used_percent: 10,
+        used_percent: usedPercent,
         reset_at: resetAt,
         limit_window_seconds: 604_800,
       },
@@ -143,7 +143,7 @@ function scopedUsage() {
         limit_name: "GPT-5.3-Codex-Spark",
         rate_limit: {
           primary_window: {
-            used_percent: 10,
+            used_percent: usedPercent,
             reset_at: resetAt,
             limit_window_seconds: 18_000,
           },
@@ -185,6 +185,7 @@ const ENV_KEYS = [
   "KEEPER_PI_CODEX_POOL_ALIASES",
   "KEEPER_PI_CODEX_POOL_MODE",
   "KEEPER_PI_CODEX_POOL_CONFIG_BINDING",
+  "KEEPER_PI_CODEX_POOL_INITIAL_ALIAS",
   "KEEPER_PI_CODEX_POOL_INITIAL_SCOPE",
   "KEEPER_PI_CODEX_POOL_ALIAS_POLICY",
   "KEEPER_PI_CODEX_POOL_POLICY_BINDING",
@@ -229,6 +230,10 @@ async function installProof(
     parsedPolicy,
   );
   process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = binding;
+  process.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = ALIASES[0];
+  process.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE = sparkProof
+    ? CODEX_SPARK_QUOTA_SCOPE
+    : CODEX_GENERIC_QUOTA_SCOPE;
   process.env.KEEPER_PI_CODEX_POOL_REVISION = REVISION;
   process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
     schema_version: 1,
@@ -238,37 +243,35 @@ async function installProof(
     seams: { forced_refresh: true, fault_injection: true },
   });
   writePrivateJsonAtomic(join(sandbox, "auth.json"), credentials(now));
-  if (sparkProof) {
-    writePrivateJsonAtomic(join(sandbox, "keeper-codex-pool-state.json"), {
-      schema_version: 2,
-      config_binding: binding,
-      accounts: ALIASES.map((alias) => ({
-        alias,
-        quota_scopes: [
-          {
-            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
-            used_percent: 50,
-            usage_expires_at_ms: 0,
-            cooldown_until_ms: 0,
-            observed_at_ms: now,
-            exhausted: false,
-          },
-          {
-            quota_scope: CODEX_SPARK_QUOTA_SCOPE,
-            used_percent: 10,
-            usage_expires_at_ms: now + 60_000,
-            cooldown_until_ms: 0,
-            observed_at_ms: now,
-            exhausted: false,
-          },
-        ],
-        pressure: 0,
-        pressure_expires_at_ms: 0,
-        cooldown_until_ms: 0,
-        last_selected_at_ms: 0,
-      })),
-    });
-  }
+  writePrivateJsonAtomic(join(sandbox, "keeper-codex-pool-state.json"), {
+    schema_version: 2,
+    config_binding: binding,
+    accounts: ALIASES.map((alias, index) => ({
+      alias,
+      quota_scopes: [
+        {
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          used_percent: index * 10,
+          usage_expires_at_ms: now + 60_000,
+          cooldown_until_ms: 0,
+          observed_at_ms: now,
+          exhausted: false,
+        },
+        {
+          quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          used_percent: index * 10,
+          usage_expires_at_ms: now + 60_000,
+          cooldown_until_ms: 0,
+          observed_at_ms: now,
+          exhausted: false,
+        },
+      ],
+      pressure: index,
+      pressure_expires_at_ms: index === 0 ? 0 : now + 30_000,
+      cooldown_until_ms: 0,
+      last_selected_at_ms: 0,
+    })),
+  });
 
   let openaiStream: any;
   let tool: any;
@@ -289,7 +292,8 @@ async function installProof(
     {
       nativeDelegate: nativeStream as never,
       oauth: TEST_OAUTH as never,
-      requestUsage: async () => scopedUsage(),
+      requestUsage: async ({ accountId }) =>
+        scopedUsage(accountId === "account-private-a" ? 0 : 10),
     },
   );
   sessionStart(
@@ -352,6 +356,20 @@ describe("atomic Codex pool proof tool", () => {
         ),
       ).toBe(true);
       expect(report.verdict).toBe("proven");
+      const firstRootAlias = report.routes
+        .find((route: any) => route.session_role === "root")
+        ?.aliases.at(-1);
+      const firstChildAlias = report.routes
+        .find((route: any) => route.session_role === "child")
+        ?.aliases.at(-1);
+      expect(firstRootAlias).toBe(firstChildAlias);
+      expect(
+        report.routes.some(
+          (route: any) =>
+            route.session_role === "child" &&
+            route.aliases.at(-1) !== firstRootAlias,
+        ),
+      ).toBe(true);
       expect(report.transcript).toHaveLength(13);
       expect(
         report.transcript.every(
