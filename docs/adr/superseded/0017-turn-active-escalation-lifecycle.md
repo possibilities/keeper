@@ -2,9 +2,12 @@
 
 ## Status
 
-Accepted. Amends 0007 (autonomous escalation dispatch): 0007's dispatch-once
-latching and paging stages stand; this record replaces its implicit
-session-liveness occupancy model.
+Superseded by [ADR 0089](../0089-in-session-escalation-subagents.md): incident lifecycle
+and page-once state collapsed into the bounded `dispatch_failures` per-key projection, and
+the turn-active occupancy model this record introduced has no successor — an in-session
+subagent has no separate occupancy to track. The rest of this record describes the
+dispatched-session machinery it replaced. Amended 0007 (autonomous escalation dispatch),
+also superseded.
 
 ## Context
 

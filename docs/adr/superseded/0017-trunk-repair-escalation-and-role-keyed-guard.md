@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0089](../0089-in-session-escalation-subagents.md): repair moved from a
+dispatched `repair::<repo>` session to a daemon-elected write grant an in-session repairer
+subagent uses, and the env-keyed `KEEPER_ESCALATION_ROLE` allowlist this record introduced
+retired in favor of the grant-guard hook's subagent-identity jurisdiction. The rest of this
+record describes the dispatched-session machinery it replaced.
 
 ## Context
 

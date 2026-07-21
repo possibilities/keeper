@@ -1,6 +1,6 @@
 # 0089 — In-session escalation subagents over out-of-band sessions
 
-Status: accepted. Progressively supersedes 0007 (autonomous escalation dispatch), 0017 (turn-active escalation lifecycle), 0017 (trunk-repair escalation and role-keyed guard), and 0039 (work-verb merge-conflict escalation); amends 0049 and 0070 in part. The superseded records move to `superseded/` when the retirement epic lands — until then they describe the still-running legacy machinery.
+Status: accepted. Supersedes [0007](superseded/0007-autonomous-escalation-dispatch.md) (autonomous escalation dispatch), [0017](superseded/0017-turn-active-escalation-lifecycle.md) (turn-active escalation lifecycle), [0017](superseded/0017-trunk-repair-escalation-and-role-keyed-guard.md) (trunk-repair escalation and role-keyed guard), and [0039](superseded/0039-work-verb-merge-conflict-escalation.md) (work-verb merge-conflict escalation), all moved to `superseded/`; amends [0049](0049-shared-checkout-jam-promotion-and-repair-retry.md) and [0070](0070-attempt-and-incident-fenced-dispatch-clears.md) in part.
 
 ## Context
 

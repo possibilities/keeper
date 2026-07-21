@@ -4,7 +4,11 @@
 
 Accepted. Provisional number — fan-in renumbering per ADR 0020/0022. Amends
 [ADR 0055](0055-harness-activity-dispatch-claims-and-resource-holds.md) and
-[ADR 0024](0024-stuck-sentinel-orphan-reconciliation.md).
+[ADR 0024](0024-stuck-sentinel-orphan-reconciliation.md). Partially amended by
+[ADR 0089](0089-in-session-escalation-subagents.md): the incident-fencing discipline this
+record establishes carries forward unchanged onto the collapsed `dispatch_failures`
+incident-claim columns; the dispatched escalation sessions it fenced alongside merge/work
+attempts are gone.
 
 ## Context
 
