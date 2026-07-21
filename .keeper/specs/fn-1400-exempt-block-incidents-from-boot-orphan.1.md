@@ -35,6 +35,16 @@ regression test, alongside the crash-loop / paging-channel / bus-degraded
 exemption cases at ~613-716), `src/db.ts` (the `CREATE_BLOCK_ESCALATIONS`
 comment).
 
+- **F3 (live witness, post-v142 boot acbd9d03).** The first v142 boot showed
+  `needs_human.block_escalations: 1` with ZERO `('block', *)` rows in
+  dispatch_failures and zero runtime-blocked tasks - consistent with F1
+  having already GC'd a carried-forward block row at boot while a separate
+  needs-human counter surface still reports it (or with the counter reading
+  a column/surface the collapse left stale). While fixing F1, locate the
+  needs-human block count's read path and add a regression asserting the
+  count equals the live `('block', *)` row set - a phantom count on the
+  needs-human surface is silent operator-facing drift in both directions.
+
 ## Acceptance
 
 - [ ] `gcUnretryableDispatchFailures` skips `verb='block'` rows; a seeded
@@ -43,6 +53,8 @@ comment).
       and asserts it is NOT swept.
 - [ ] The `CREATE_BLOCK_ESCALATIONS` comment states the literal exists only
       for fresh-DB migration ordering, not as a live projection.
+- [ ] The needs-human block count provably equals the live ('block', *)
+      row set (regression covering the F3 phantom-count witness).
 
 ## Done summary
 
