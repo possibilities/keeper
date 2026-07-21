@@ -121,7 +121,7 @@ describe("repo-adaptive Python checks", () => {
     };
   }
 
-  test("an untyped repository checks only staged Python paths", async () => {
+  test("an untyped repository runs no ambient Python policy", async () => {
     const repo = tempPyproject(
       '[project]\nname = "plain-python-project"\ndependencies = ["requests"]\n',
     );
@@ -130,15 +130,7 @@ describe("repo-adaptive Python checks", () => {
       await runScopedLint(["src/one.py", "tests/test_one.py"], repo.dir, {
         runTool,
       });
-      const ty = calls.find((call) => call.cmd[1] === "ty");
-      expect(ty?.cmd).toEqual([
-        "uvx",
-        "ty",
-        "check",
-        "--",
-        "src/one.py",
-        "tests/test_one.py",
-      ]);
+      expect(calls.filter((call) => call.cmd.includes("ty"))).toEqual([]);
       expect(calls.filter((call) => call.cmd.includes("ruff"))).toEqual([]);
     } finally {
       repo.cleanup();
@@ -164,6 +156,7 @@ describe("repo-adaptive Python checks", () => {
           ["uv", "run", "ruff", "check", "--", "src/one.py"],
           ["uv", "run", "ruff", "format", "--check", "--", "src/one.py"],
         ]);
+        expect(calls.filter((call) => call.cmd.includes("ty"))).toEqual([]);
       } finally {
         repo.cleanup();
       }
@@ -258,6 +251,19 @@ describe("repo-adaptive Python checks", () => {
     }
   });
 
+  test("a standalone ty config opts into project-wide checking", async () => {
+    const repo = tempPyproject('[project]\nname = "typed-project"\n');
+    try {
+      writeFileSync(join(repo.dir, "ty.toml"), '[src]\ninclude = ["src"]\n');
+      const { runTool, calls } = fakeRunTool();
+      await runScopedLint(["src/one.py"], repo.dir, { runTool });
+      const ty = calls.find((call) => call.cmd[1] === "ty");
+      expect(ty?.cmd).toEqual(["uvx", "ty", "check"]);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
   test("common dependency tables opt into project-wide checking", async () => {
     const manifests = [
       '[project]\nname = "typed"\ndependencies = ["ty(>=0.0.1)"]\n',
@@ -340,21 +346,13 @@ describe("repo-adaptive Python checks", () => {
     }
   });
 
-  test("scoped paths are option-delimited", async () => {
+  test("Ruff paths are option-delimited", async () => {
     const repo = tempPyproject(
       '[project]\nname = "plain-python-project"\n[tool.ruff]\n',
     );
     try {
       const { runTool, calls } = fakeRunTool();
       await runScopedLint(["--config-file=other.py"], repo.dir, { runTool });
-      const ty = calls.find((call) => call.cmd[1] === "ty");
-      expect(ty?.cmd).toEqual([
-        "uvx",
-        "ty",
-        "check",
-        "--",
-        "--config-file=other.py",
-      ]);
       expect(
         calls
           .filter((call) => call.cmd.includes("ruff"))
@@ -376,8 +374,10 @@ describe("repo-adaptive Python checks", () => {
     }
   });
 
-  test("scoped ty errors still fail the staged Python files", async () => {
-    const repo = tempPyproject('[project]\nname = "plain-python-project"\n');
+  test("declared ty errors still fail the staged Python files", async () => {
+    const repo = tempPyproject(
+      '[project]\nname = "plain-python-project"\n[tool.ty]\n',
+    );
     try {
       const { runTool } = fakeRunTool((cmd) =>
         cmd[1] === "ty"

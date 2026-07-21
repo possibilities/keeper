@@ -24,9 +24,8 @@
  * **Python project checks** (only when any `.py` is staged):
  *  - Ruff check + format for repositories that explicitly configure or depend
  *    on Ruff; an undeclared ambient executable never imposes formatter churn.
- *  - `uvx ty check` for repositories that explicitly configure or depend on
- *    ty; otherwise `uvx ty check <staged.py...>` keeps an untyped repository's
- *    unrelated baseline from masking errors in the edited files.
+ *  - `uvx ty check` only for repositories that explicitly configure or depend
+ *    on ty; an undeclared ambient type checker never imposes a foreign policy.
  *  - `./scripts/lint-cli-boundaries.py` — fast regardless of repo size.
  *
  * **Staged-path-conditional drift gates** (fire on a staged-PATH match, independent
@@ -329,12 +328,10 @@ function pyprojectDeclaresPythonTool(
   }
 }
 
-/**
- * Whether this repository requires project-wide ty checking. An explicit
- * `[tool.ty]` table or ty dependency opts in; repositories without either get
- * staged-path checking so unrelated untyped baselines cannot suppress errors
- * in the files being committed.
- */
+/** Whether pyproject declares a project-wide ty contract. `[tool.ty]` or a
+ * supported dependency entry opts in; unreadable supported containers choose
+ * checking conservatively. The caller also recognizes root `ty.toml`; a repo
+ * declaring neither receives no ambient type-check policy. */
 export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
   return pyprojectDeclaresPythonTool(pyprojectPath, "ty");
 }
@@ -418,8 +415,9 @@ export async function runScopedLint(
 
   const pyprojectPath = join(cwd, "pyproject.toml");
   const hasPyproject = existsSync(pyprojectPath);
-  const projectWideTy =
-    hasPyproject && pyprojectRequiresProjectWideTy(pyprojectPath);
+  const useTy =
+    existsSync(join(cwd, "ty.toml")) ||
+    (hasPyproject && pyprojectRequiresProjectWideTy(pyprojectPath));
   const useRuff =
     existsSync(join(cwd, "ruff.toml")) ||
     existsSync(join(cwd, ".ruff.toml")) ||
@@ -480,15 +478,12 @@ export async function runScopedLint(
     });
   }
 
-  // 2 --- ty (repo-owned project scope, staged-path scope otherwise) ---
-  if (hasPyproject && pyFiles.length > 0) {
+  // 2 --- ty (only when the repository declares a type-check contract) ---
+  if (useTy && pyFiles.length > 0) {
     tasks.push({
       order: 2,
       run: async () => {
-        const r = await runTool(
-          ["uvx", "ty", "check", ...(projectWideTy ? [] : ["--", ...pyFiles])],
-          cwd,
-        );
+        const r = await runTool(["uvx", "ty", "check"], cwd);
         return r.code !== 0
           ? { linter: "ty", files: pyFiles, stderr: failureStderr("ty", r) }
           : null;
