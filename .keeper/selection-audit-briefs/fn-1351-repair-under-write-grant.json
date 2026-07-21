@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 496,
+        "files_changed": 6,
+        "insertions": 798
+      },
+      "done_summary": "Replaced the repair sweep's top-level session dispatch with a single write-grant election per (repo, fingerprint): elects one blocked owner, publishes a fenced grant leaf, and the work skill spawns plan:repairer in-session under that grant while ungranted owners park visibly; objective baseline-green clear unblocks and expires the grant for all parked owners.",
+      "input_hash": "a5c088801072e2e52f57ba463ba178f44cf1517d5c1f7fbc3bd2d6e36a4001c8",
+      "model": "opus",
+      "spec_chars": 3678,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/daemon.ts, plugins/plan/template/skills/work.md.tmpl, plugins/plan/skills/work/SKILL.md, plugins/prompt/test/oracle/fixtures/render-plugin-templates.json, plugins/prompt/test/oracle/fixtures/check-generated.json, test/daemon.test.ts\n\n### Approach\n\nThe repair sweep's actuator changes from session dispatch to grant election: grouping by (canonical repo, fingerprint) exactly as today, it elects one affected blocked task's owner, publishes the single write grant leaf (writable root = the shared checkout, fencing token, expiry, the incident's fenced identities), and records the grant ref on the incident so the owner's claim envelope carries it. The work skill's SHARED_BASE_BROKEN branch forks on that ref: with a grant, spawn plan:repairer under it \u2014 reproduce at HEAD, land the gated fix or green no-op through keeper commit-work, then re-probe \u2014 and with no grant, park visibly as owned-elsewhere and stop; the daemon's objective baseline-green clear unblocks every parked owner, preserving today's fan-out unblock semantics, the bounded failing-tests digest, the dirty-checkout defer, and the page-once path on terminal failure. Grant release follows claim rules: voluntary on receipt, or by positive claimant-death evidence plus expiry \u2014 never silent reassignment while the holder may live.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:2587 \u2014 runRepairEscalationSweep grouping, dirty-checkout defer, and terminal-grace classification being re-actuated\n- src/daemon.ts:1682-1693 \u2014 the SHARED_BASE_BROKEN routing arm that defers to the repair sweep\n- src/grant-leaf.ts \u2014 the leaf writer/reader this election publishes through\n- plugins/plan/template/skills/work.md.tmpl \u2014 where the SHARED_BASE_BROKEN fork lands relative to the blocked phase\n- plugins/plan/skills/repair/SKILL.md \u2014 the repro-at-HEAD, full-gate-verify, file-non-overlap contract the repairer agent enforces (ported in the agents epic)\n\n**Optional** (reference as needed):\n- src/daemon.ts:14011-14027 \u2014 legacy dispatchRepair + notifyHumanOfRepair, the page path that survives re-pointed\n\n### Risks\n\n- Election liveness: electing a dead or never-arriving owner strands the repair \u2014 the election must re-run on claimant-death evidence, and the attachment bound plus page-once still backstop it\n- Two sweeps (legacy session-dispatch and grant election) must never both fire: this epic replaces the actuator wholesale, leaving no dispatch arm behind\n\n### Test notes\n\nIn-process: one grant per (repo, fingerprint) under concurrent candidates; parked owners unblock on baseline-green; dead-holder re-election by positive evidence; page-once on terminal repair failure; no session dispatch from the sweep. Render + goldens re-captured.\n\n## Acceptance\n\n- [ ] The repair sweep issues at most one grant per (repo, fingerprint), never dispatches a session, and re-elects only on positive holder-death evidence\n- [ ] A granted owner lands the trunk fix in-session through the repairer agent and the objective clear unblocks all parked owners\n- [ ] Parked owners surface visibly and never write the trunk\n- [ ] All suites green via named gates\n\n## Done summary\nReplaced the repair sweep's top-level session dispatch with a single write-grant election per (repo, fingerprint): elects one blocked owner, publishes a fenced grant leaf, and the work skill spawns plan:repairer in-session under that grant while ungranted owners park visibly; objective baseline-green clear unblocks and expires the grant for all parked owners.\n## Evidence\n",
+      "task_id": "fn-1351-repair-under-write-grant.1",
+      "tier": "xhigh",
+      "title": "Granted in-session repairer"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 12,
+        "files_changed": 2,
+        "insertions": 377
+      },
+      "done_summary": "The repair sweep now mints an idempotent, arm-and-dispatch maintenance plan task (via a bounded scaffold/validate subprocess pair) for a trunk-red group with no live blocked consumer, instead of holding the incident ownerless; a failed mint pages once through the existing decline/death notify path.",
+      "input_hash": "a5c088801072e2e52f57ba463ba178f44cf1517d5c1f7fbc3bd2d6e36a4001c8",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2364,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nWhen the baseline is red at the default tip with no live blocked consumer (no task rows to elect from), the daemon mints a real maintenance plan task instead of holding an ownerless incident: a producer invokes a bounded plan-CLI subprocess to scaffold a single-task maintenance epic carrying the failing-tests digest and baseline leaf key in its spec, idempotent per (repo, fingerprint) \u2014 at most one open maintenance task, re-probed before mint. Autopilot then dispatches it as ordinary work; the worker fixes trunk in its own lane with no grant machinery involved. A failed mint pages once through the existing path. Sole-writer discipline holds: the plan CLI writes the plan, the producer only spawns it.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- The repair sweep's candidate selection \u2014 the no-consumer condition this branch keys on\n- The baseline result leaf shape and keying \u2014 the digest and key the maintenance spec embeds\n- keeper plan scaffold --agent-help \u2014 the YAML the producer-built subprocess pipes\n\n**Optional** (reference as needed):\n- The scaffold duplicate-epic guard \u2014 the idempotence backstop for the one-open-task rule\n\n### Risks\n\n- A red baseline that flaps mints repeatedly unless the open-task probe is checked before every mint and the fingerprint stays stable across attempts\n\n### Test notes\n\nIn-process with an injected subprocess seam: no-consumer red mints once; existing open maintenance task suppresses re-mint; mint failure pages once. Named gates.\n\n## Acceptance\n\n- [ ] Trunk red with no blocked consumer yields exactly one open maintenance task per (repo, fingerprint), scaffolded through the plan CLI with the digest and baseline key in its spec\n- [ ] Re-probes never duplicate an open maintenance task and a failed mint pages exactly once\n- [ ] All suites green via named gates\n\n## Done summary\nThe repair sweep now mints an idempotent, arm-and-dispatch maintenance plan task (via a bounded scaffold/validate subprocess pair) for a trunk-red group with no live blocked consumer, instead of holding the incident ownerless; a failed mint pages once through the existing decline/death notify path.\n## Evidence\n",
+      "task_id": "fn-1351-repair-under-write-grant.2",
+      "tier": "high",
+      "title": "Maintenance task fallback"
+    }
+  ],
+  "created_at": "2026-07-21T06:19:18.532000Z",
+  "epic_id": "fn-1351-repair-under-write-grant",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "a5c088801072e2e52f57ba463ba178f44cf1517d5c1f7fbc3bd2d6e36a4001c8",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
