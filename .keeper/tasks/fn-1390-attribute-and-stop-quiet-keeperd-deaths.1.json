@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Log every daemon exit path with flushed attribution",
-  "updated_at": "2026-07-20T20:26:03.020000Z"
+  "updated_at": "2026-07-21T00:07:54.225000Z",
+  "worker_done_at": "2026-07-21T00:07:54.225000Z"
 }

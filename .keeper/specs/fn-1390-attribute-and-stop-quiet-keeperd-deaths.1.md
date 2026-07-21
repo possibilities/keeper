@@ -19,5 +19,5 @@ and records its verdict.
   crash report > empty) is test-pinned.
 
 ## Done summary
-
+Instrumented every keeperd main exit path (fatalExit, uncaught/unhandled hooks, TERM/INT/HUP signals) to synchronously write one bounded attribution record to a dedicated exit-attribution leaf before process end. The boot-time enrich pass reads that leaf first for the prior boot, falls back to native-crash-report matching, then a typed hard-kill-or-SIGKILL verdict when neither is available (never empty), writing at most once per un-attributed prior boot. Deterministic tests pin each soft exit path's leaf record shape and the leaf-over-crash-report-over-empty enrich precedence.
 ## Evidence
