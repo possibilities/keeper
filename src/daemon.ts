@@ -2970,9 +2970,82 @@ export type RepairNotifyVerdict = "declined" | "died" | "mint_failed";
 /** The maintenance-task mint outcome for a trunk-red group with NO live blocked
  *  consumer to elect an owner from ({@link RepairGroup}'s candidates are all
  *  task-less `baseline-tip::` entries). `minted` means the plan CLI scaffolded
- *  and armed a fresh single-task epic; `mint_failed` covers a spawn error, a
- *  non-zero exit, an unparseable envelope, or an arm failure. */
+ *  and armed a fresh single-task epic or that the identical producer mint is
+ *  already pending; `mint_failed` covers a spawn error, a non-zero exit, an
+ *  unparseable envelope, or an arm failure. */
 export type MaintenanceMintOutcome = "minted" | "mint_failed";
+
+export interface MaintenanceEpicObservation {
+  readonly epicId: string;
+  readonly open: boolean;
+}
+
+export type MaintenanceProjectionObservation =
+  readonly MaintenanceEpicObservation[];
+
+export interface MaintenanceMintGate {
+  hasOpen: (
+    group: RepairGroup,
+    projection: MaintenanceProjectionObservation | null,
+  ) => boolean;
+  mint: (
+    group: RepairGroup,
+    run: (
+      recordEpicId: (epicId: string) => void,
+    ) => Promise<MaintenanceMintOutcome>,
+  ) => Promise<MaintenanceMintOutcome>;
+}
+
+export function createMaintenanceMintGate(): MaintenanceMintGate {
+  const pendingEpicIds = new Map<string, string | null>();
+  return {
+    hasOpen: (group, projection) => {
+      const title = maintenanceEpicTitle(group);
+      if (projection == null) return true;
+      if (pendingEpicIds.has(title)) {
+        const pendingEpicId = pendingEpicIds.get(title);
+        if (
+          pendingEpicId == null ||
+          !projection.some((epic) => epic.epicId === pendingEpicId)
+        ) {
+          return true;
+        }
+        pendingEpicIds.delete(title);
+      }
+      return projection.some((epic) => epic.open);
+    },
+    mint: async (group, run) => {
+      const title = maintenanceEpicTitle(group);
+      if (pendingEpicIds.has(title)) return "minted";
+      pendingEpicIds.set(title, null);
+      try {
+        const outcome = await run((epicId) => {
+          if (pendingEpicIds.has(title)) pendingEpicIds.set(title, epicId);
+        });
+        if (outcome === "mint_failed") pendingEpicIds.delete(title);
+        return outcome;
+      } catch (err) {
+        pendingEpicIds.delete(title);
+        throw err;
+      }
+    },
+  };
+}
+
+export function createNonReentrantRepairSweepTick(
+  run: () => Promise<void>,
+): () => Promise<void> {
+  let inFlight = false;
+  return async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      await run();
+    } finally {
+      inFlight = false;
+    }
+  };
+}
 
 export interface RepairEscalationSweepDeps {
   readonly selectCandidates: () => RepairCandidate[];
@@ -14859,22 +14932,29 @@ function startDaemonWithExitAttribution(
     return notifyHuman(body);
   }
 
-  // The daemon-side maintenance-task idempotence probe: an OPEN (non-`done`) epic
-  // in this repo already carrying the deterministic (repo, fingerprint) title —
-  // re-run before every mint attempt so a still-open mint from an earlier tick is
-  // never duplicated. A read failure defers (treated as "cannot confirm absent"):
-  // the next tick re-probes rather than risking a double mint on a DB hiccup.
+  const maintenanceMintGate = createMaintenanceMintGate();
+
+  // The producer memo is released only after its exact minted epic is visible;
+  // historical done epics with the same deterministic title cannot release it.
   function hasOpenMaintenanceTask(group: RepairGroup): boolean {
+    let projection: MaintenanceProjectionObservation | null;
     try {
-      const row = db
+      const rows = db
         .query(
-          `SELECT 1 FROM epics WHERE project_dir = ? AND title = ? AND status IS NOT 'done' LIMIT 1`,
+          `SELECT epic_id, status FROM epics WHERE project_dir = ? AND title = ?`,
         )
-        .get(group.repo_dir, maintenanceEpicTitle(group));
-      return row != null;
+        .all(group.repo_dir, maintenanceEpicTitle(group)) as {
+        epic_id: string;
+        status: string | null;
+      }[];
+      projection = rows.map((row) => ({
+        epicId: row.epic_id,
+        open: row.status !== "done",
+      }));
     } catch {
-      return true;
+      projection = null;
     }
+    return maintenanceMintGate.hasOpen(group, projection);
   }
 
   // Mint the maintenance plan task for a trunk-red group with no live blocked
@@ -14884,8 +14964,9 @@ function startDaemonWithExitAttribution(
   // producer only spawns it (sole-writer discipline holds). Fail-open — any spawn
   // error, non-zero exit, unparseable envelope, or arm failure maps to
   // `mint_failed`, never a throw.
-  async function mintMaintenanceTask(
+  async function mintMaintenanceTaskAttempt(
     group: RepairGroup,
+    recordEpicId: (epicId: string) => void,
   ): Promise<MaintenanceMintOutcome> {
     try {
       const scaffoldProc = Bun.spawn(
@@ -14916,6 +14997,7 @@ function startDaemonWithExitAttribution(
         epicId = null;
       }
       if (epicId == null || epicId === "") return "mint_failed";
+      recordEpicId(epicId);
       const armProc = Bun.spawn(
         [
           ...launcherArgvPrefix.slice(0, -1),
@@ -14932,7 +15014,15 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  async function runRepairEscalationSweepTick(): Promise<void> {
+  function mintMaintenanceTask(
+    group: RepairGroup,
+  ): Promise<MaintenanceMintOutcome> {
+    return maintenanceMintGate.mint(group, (recordEpicId) =>
+      mintMaintenanceTaskAttempt(group, recordEpicId),
+    );
+  }
+
+  async function runRepairEscalationSweepTickImpl(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control; a paused board never auto-dispatches a NEW
     // escalation session (mirrors the block/deconflict/resolver pause gate). So a fresh
@@ -15107,6 +15197,9 @@ function startDaemonWithExitAttribution(
       noteLine: note,
     });
   }
+  const runRepairEscalationSweepTick = createNonReentrantRepairSweepTick(
+    runRepairEscalationSweepTickImpl,
+  );
   // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
   // launcher is reachable. Rides the same 60s heartbeat as the block-escalation sweep.
   const repairEscalationSweepTimer = want("autopilot")
