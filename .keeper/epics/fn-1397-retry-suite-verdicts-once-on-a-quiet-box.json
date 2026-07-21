@@ -6,7 +6,7 @@
     "fn-1393-treat-a-missing-suite-gate-as-pass-with"
   ],
   "id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T07:26:05.202000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T07:26:04.737000Z"
+  "updated_at": "2026-07-21T07:26:05.202000Z"
 }
