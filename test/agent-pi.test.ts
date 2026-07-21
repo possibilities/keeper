@@ -166,18 +166,14 @@ describe("Pi command assembly", () => {
   });
 
   test("--fork gets a fresh display name but not a wrapper session id", async () => {
-    const h = piHarness(["--fork", "abc"], {
-      env: { PWD: process.cwd() },
-    });
+    const h = piHarness(["--fork", "abc"]);
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--session-id")).toEqual([]);
     expect(flagValues(cmd, "--name")).toEqual(["proj-001"]);
   });
 
   test("--no-session suppresses wrapper session id and name", async () => {
-    const h = piHarness(["--no-session", "hello"], {
-      env: { PWD: process.cwd() },
-    });
+    const h = piHarness(["--no-session", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--session-id")).toEqual([]);
     expect(flagValues(cmd, "--name")).toEqual([]);

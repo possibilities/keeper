@@ -305,12 +305,12 @@ export function checkEpicTree(
   }
 
   // --- Cross-task dep existence ----------------------------------------
-  // Iterate in taskGraph INSERTION order (the caller's task-load order) with
-  // raw adjacency — Python walks task_graph.items() unsorted and the
-  // golden-pinned error/cycle order encodes that raw glob order. Sorting here
-  // would diverge from the captured Python catalog.
-  for (const [tid, tdata] of Object.entries(taskGraph)) {
-    for (const depTid of (tdata.depends_on as string[] | undefined) ?? []) {
+  // Canonical task and dependency order keeps the error catalog stable for
+  // both filesystem-loaded and in-memory callers.
+  for (const tid of Object.keys(taskGraph).sort()) {
+    const tdata = taskGraph[tid] as Record<string, unknown>;
+    const deps = [...((tdata.depends_on as string[] | undefined) ?? [])].sort();
+    for (const depTid of deps) {
       if (!epicTaskIds.has(depTid)) {
         errors.push(`Task ${tid}: dependency ${depTid} does not exist`);
       }
@@ -318,10 +318,8 @@ export function checkEpicTree(
   }
 
   // --- Cycle detection across the task graph ---------------------------
-  // Walk the graph in insertion order with raw adjacency — Python passes
-  // task_graph straight to detect_cycles (no node-id or adjacency sort), so the
-  // surfaced cycle's starting node follows the raw task-load order. Reproducing
-  // that order is what keeps the cycle string byte-identical to the golden.
+  // Preserve the dependency values; detectCycles owns canonical node and edge
+  // traversal, so the surfaced path is deterministic independently of loading.
   const rawTaskGraph: DepGraph = {};
   for (const [tid, tdata] of Object.entries(taskGraph)) {
     rawTaskGraph[tid] = {
@@ -473,11 +471,9 @@ export function validateEpicIntegrityWithWarnings(
   const prefix = `${epicId}.`;
   const tasksDir = join(dataDir, "tasks");
   if (existsSync(tasksDir)) {
-    // RAW readdir order (no sort) — Python loads via tasks_dir.glob(...) which
-    // is unsorted, and the task-load order is the insertion order checkEpicTree
-    // walks for the cross-task existence + cycle catalog. The golden corpus
-    // encodes that raw OS order, so sorting here would diverge the cycle string.
-    for (const entry of readdirSync(tasksDir)) {
+    // Canonical loading stabilizes all task-scoped diagnostics, not only the
+    // cycle path normalized by detectCycles.
+    for (const entry of readdirSync(tasksDir).sort()) {
       if (!entry.startsWith(prefix) || !entry.endsWith(".json")) {
         continue;
       }

@@ -1,11 +1,8 @@
 // Dependency-graph operations — the byte-parity port of planctl/deps.py.
 //
-// detectCycles / findDependents reproduce the Python DFS exactly so the cycle
-// strings the integrity-gate + add-dep verbs surface match across engines. Python's
-// dict iteration is insertion-ordered; readdir / object-key order is arbitrary
-// across engines, so callers that build the graph from a directory listing MUST
-// sort the node ids AND each adjacency list at the construction site (see the
-// epic-dep walkers) — these functions then walk a deterministic structure.
+// detectCycles / findDependents retain the Python DFS path shape. detectCycles
+// owns a stable lexicographic traversal so cycle strings do not depend on object
+// insertion order, directory enumeration order, or the host platform.
 
 /** A node's record in the dependency graph: only `depends_on` is consulted. */
 export interface DepNode {
@@ -27,7 +24,7 @@ export function hasCycle(
   visited.add(taskId);
   recStack.add(taskId);
 
-  for (const dep of graph[taskId]?.depends_on ?? []) {
+  for (const dep of [...(graph[taskId]?.depends_on ?? [])].sort()) {
     if (!visited.has(dep)) {
       const cycle = hasCycle(graph, dep, visited, recStack);
       if (cycle.length > 0) {
@@ -43,12 +40,11 @@ export function hasCycle(
 }
 
 /** Run hasCycle from each unvisited node, returning the first cycle path or
- * null when the graph is acyclic. Mirrors deps.detect_cycles — iteration order
- * over `graph` keys decides which cycle surfaces first, so the caller pre-sorts
- * the node ids (and each adjacency list) for cross-engine determinism. */
+ * null when the graph is acyclic. Nodes and adjacency lists use one canonical
+ * lexicographic order, making the surfaced cycle stable for every caller. */
 export function detectCycles(graph: DepGraph): string[] | null {
   const visited = new Set<string>();
-  for (const taskId of Object.keys(graph)) {
+  for (const taskId of Object.keys(graph).sort()) {
     if (!visited.has(taskId)) {
       const cycle = hasCycle(graph, taskId, visited, new Set<string>());
       if (cycle.length > 0) {

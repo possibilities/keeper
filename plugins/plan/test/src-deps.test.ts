@@ -39,6 +39,15 @@ describe("detectCycles", () => {
     expect(detectCycles(g)).toEqual(["a", "b", "c", "a"]);
   });
 
+  test("node and adjacency insertion order do not change the cycle path", () => {
+    const g: DepGraph = {
+      c: { depends_on: ["a"] },
+      b: { depends_on: ["a"] },
+      a: { depends_on: ["c", "b"] },
+    };
+    expect(detectCycles(g)).toEqual(["a", "b", "a"]);
+  });
+
   test("missing depends_on key is treated as no edges", () => {
     const g: DepGraph = { a: {}, b: {} };
     expect(detectCycles(g)).toBeNull();
