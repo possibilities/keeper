@@ -26,6 +26,7 @@ export const HARD_KILL_EXIT_ATTRIBUTION_REASON =
 export const CRASH_LOOP_YOUNG_RUNTIME_MS = 2 * 60_000;
 export const REPEATED_NATIVE_CRASH_THRESHOLD = 2;
 export const KEEPERD_LAUNCHD_LABEL = "arthack.keeperd";
+export const SERVE_HEALTH_HISTORY_MAX_REPORTS = 40;
 
 export type RestartProvenance = "launchd" | "unknown" | "foreign";
 
@@ -50,6 +51,50 @@ export interface ExitAttributionRecorder {
   readonly bootId: string;
   readonly path: string;
   record(attribution: Omit<ExitAttributionRecord, "boot_id" | "ts">): void;
+}
+
+/**
+ * The forensic classification an enrich row settles on. `watchdog` and
+ * `signal` mean the daemon (or a native crash report) explains its own end;
+ * `operator` means an external reload (install.sh) bounced it; `os-memory-kill`
+ * means the unified log shows OS-level jetsam/memory-pressure evidence for the
+ * dead pid; `soft-exit-leaf` is a recorded soft exit that matched none of the
+ * named triggers; `no-evidence` is the last-resort hard-kill-or-SIGKILL verdict.
+ */
+export type ExitVerdictKind =
+  | "watchdog"
+  | "operator"
+  | "soft-exit-leaf"
+  | "os-memory-kill"
+  | "signal"
+  | "no-evidence";
+
+export interface ExitVerdict {
+  kind: ExitVerdictKind;
+  /** Bounded (`boundRestartReason`) supporting probe output for the verdict. */
+  evidence: string;
+}
+
+/** The install.sh attribution leaf: a bounced-by-tooling explanation for a quiet end. */
+export interface OperatorReloadAttribution {
+  source: string;
+  action: string;
+  ts: number;
+}
+
+export interface OsMemoryKillEvidence {
+  reason: string;
+}
+
+export interface ServeHealthReportSample {
+  ts: number;
+  rss_bytes: number;
+}
+
+/** Bounded ring buffer of recent serve-health RSS samples, durable across a crash. */
+export interface ServeHealthHistory {
+  boot_id: string;
+  reports: ServeHealthReportSample[];
 }
 
 export interface RestartBootIdentity {
@@ -82,6 +127,8 @@ export interface RestartEnrichLine extends RestartNativeCrashFields {
   boot_id: string;
   ts: number;
   reason?: string;
+  verdict?: ExitVerdictKind;
+  verdict_evidence?: string;
 }
 
 export type RestartLedgerLine = RestartBootLine | RestartEnrichLine;
@@ -94,6 +141,8 @@ export interface RestartBoot extends RestartNativeCrashFields {
   provenance: RestartProvenance;
   prev_runtime_ms: number | null;
   reason?: string;
+  verdict?: ExitVerdictKind;
+  verdict_evidence?: string;
 }
 
 export type RestartLedgerSnapshot =
@@ -141,6 +190,17 @@ function isExitAttributionSignal(
   value: unknown,
 ): value is ExitAttributionSignal {
   return value === "SIGTERM" || value === "SIGINT" || value === "SIGHUP";
+}
+
+function isExitVerdictKind(value: unknown): value is ExitVerdictKind {
+  return (
+    value === "watchdog" ||
+    value === "operator" ||
+    value === "soft-exit-leaf" ||
+    value === "os-memory-kill" ||
+    value === "signal" ||
+    value === "no-evidence"
+  );
 }
 
 function normalizeExitAttribution(
@@ -263,6 +323,14 @@ export function parseRestartLedgerLine(line: string): RestartLedgerLine | null {
         ? boundRestartReason(object.reason)
         : undefined;
     const crashFields = nativeCrashFields(object);
+    const verdict = isExitVerdictKind(object.verdict)
+      ? object.verdict
+      : undefined;
+    const verdictEvidence =
+      typeof object.verdict_evidence === "string" &&
+      object.verdict_evidence.length > 0
+        ? boundRestartReason(object.verdict_evidence)
+        : undefined;
     if (reason === undefined && !hasNativeCrashFields(crashFields)) return null;
     return {
       kind: "enrich",
@@ -270,6 +338,10 @@ export function parseRestartLedgerLine(line: string): RestartLedgerLine | null {
       ts,
       ...(reason !== undefined ? { reason } : {}),
       ...crashFields,
+      ...(verdict !== undefined ? { verdict } : {}),
+      ...(verdictEvidence !== undefined
+        ? { verdict_evidence: verdictEvidence }
+        : {}),
     };
   }
   if (object.kind !== "boot") return null;
@@ -370,6 +442,8 @@ export function collapseRestartLedger(
       native_crash_report_id: existing?.native_crash_report_id,
       native_crash_no_report: existing?.native_crash_no_report,
       died_at_ms: existing?.died_at_ms,
+      verdict: existing?.verdict,
+      verdict_evidence: existing?.verdict_evidence,
     });
   }
   for (const line of lines) {
@@ -380,6 +454,10 @@ export function collapseRestartLedger(
     );
     if (existing) {
       if (line.reason !== undefined) existing.reason = line.reason;
+      if (line.verdict !== undefined) existing.verdict = line.verdict;
+      if (line.verdict_evidence !== undefined) {
+        existing.verdict_evidence = line.verdict_evidence;
+      }
       if (enrichFields.native_crash_signal !== undefined) {
         existing.native_crash_signal = enrichFields.native_crash_signal;
       }
@@ -414,6 +492,10 @@ export function collapseRestartLedger(
         prev_runtime_ms: null,
         ...(line.reason !== undefined ? { reason: line.reason } : {}),
         ...enrichFields,
+        ...(line.verdict !== undefined ? { verdict: line.verdict } : {}),
+        ...(line.verdict_evidence !== undefined
+          ? { verdict_evidence: line.verdict_evidence }
+          : {}),
         ...(enrichFields.died_at_ms === undefined && line.reason !== undefined
           ? { died_at_ms: line.ts }
           : {}),
@@ -471,13 +553,21 @@ export function compactRestartLedger(
         : {}),
       ...(boot.died_at_ms !== undefined ? { died_at_ms: boot.died_at_ms } : {}),
     };
-    if (boot.reason !== undefined || hasNativeCrashFields(crashFields)) {
+    if (
+      boot.reason !== undefined ||
+      hasNativeCrashFields(crashFields) ||
+      boot.verdict !== undefined
+    ) {
       projected.push({
         kind: "enrich",
         boot_id: boot.boot_id,
         ts: boot.died_at_ms ?? boot.ts,
         ...(boot.reason !== undefined ? { reason: boot.reason } : {}),
         ...crashFields,
+        ...(boot.verdict !== undefined ? { verdict: boot.verdict } : {}),
+        ...(boot.verdict_evidence !== undefined
+          ? { verdict_evidence: boot.verdict_evidence }
+          : {}),
       });
     }
   }
@@ -552,24 +642,55 @@ export function shouldEnrichPriorExitAttribution(inputs: {
   return inputs.exitAttribution !== null || inputs.allowHardKillFallback;
 }
 
-export function decideExitAttribution(inputs: {
-  bootId: string;
-  ts: number;
+/**
+ * Named `fatalExit` reasons a live watchdog trigger writes (see daemon.ts's
+ * serve-liveness/git-seed/tmux-control watchdogs) — distinct from a generic
+ * soft-exit leaf whose reason names none of them.
+ */
+const WATCHDOG_REASON_PATTERN =
+  /^(serve-liveness-watchdog|git-seed-watchdog|tmux-control-watchdog):/;
+
+/**
+ * Pure forensic classifier: settles the ONE {@link ExitVerdictKind} a dead
+ * boot's enrich row carries, in order of certainty — an external operator
+ * reload (install.sh) outranks even a leaf/native-crash match (a bounced
+ * process's own leaf can lag the bounce), then the recorded soft-exit leaf
+ * (named watchdog trigger vs. a generic soft exit), then a matched native
+ * crash report, then OS-level jetsam/memory-pressure evidence, and finally
+ * the last-resort hard-kill-or-SIGKILL verdict when nothing else explains it.
+ */
+export function classifyExitVerdict(inputs: {
   exitAttribution: ExitAttributionRecord | null;
   nativeCrash: RestartNativeCrashFields | null;
-}): RestartEnrichLine {
+  operatorReload: OperatorReloadAttribution | null;
+  osMemoryKill: OsMemoryKillEvidence | null;
+}): ExitVerdict {
+  if (inputs.operatorReload !== null) {
+    const { source, action } = inputs.operatorReload;
+    return {
+      kind: "operator",
+      evidence: boundRestartReason(`${source} ${action}`),
+    };
+  }
   if (inputs.exitAttribution !== null) {
     const attribution = inputs.exitAttribution;
-    const reason =
-      attribution.reason ??
-      (attribution.signal !== undefined
-        ? `signal: ${attribution.signal}`
-        : `exit attribution: ${attribution.kind}`);
+    if (attribution.kind === "signal") {
+      return {
+        kind: "signal",
+        evidence: boundRestartReason(
+          attribution.reason ?? `signal: ${attribution.signal}`,
+        ),
+      };
+    }
+    const reason = attribution.reason;
+    if (reason !== undefined && WATCHDOG_REASON_PATTERN.test(reason)) {
+      return { kind: "watchdog", evidence: boundRestartReason(reason) };
+    }
     return {
-      kind: "enrich",
-      boot_id: inputs.bootId,
-      ts: inputs.ts,
-      reason: boundRestartReason(reason),
+      kind: "soft-exit-leaf",
+      evidence: boundRestartReason(
+        reason ?? `exit attribution: ${attribution.kind}`,
+      ),
     };
   }
   const nativeCrash =
@@ -579,19 +700,74 @@ export function decideExitAttribution(inputs: {
           inputs.nativeCrash as unknown as Record<string, unknown>,
         );
   if (hasNativeCrashMatch(nativeCrash)) {
+    const detail =
+      nativeCrash.native_crash_signal ??
+      nativeCrash.native_crash_exception ??
+      nativeCrash.native_crash_report_id ??
+      "native crash report matched";
     return {
-      kind: "enrich",
-      boot_id: inputs.bootId,
-      ts: inputs.ts,
-      ...nativeCrash,
+      kind: "signal",
+      evidence: boundRestartReason(`native crash: ${detail}`),
     };
   }
-  return {
-    kind: "enrich",
+  if (inputs.osMemoryKill !== null) {
+    return {
+      kind: "os-memory-kill",
+      evidence: boundRestartReason(inputs.osMemoryKill.reason),
+    };
+  }
+  return { kind: "no-evidence", evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON };
+}
+
+export function decideExitAttribution(inputs: {
+  bootId: string;
+  ts: number;
+  exitAttribution: ExitAttributionRecord | null;
+  nativeCrash: RestartNativeCrashFields | null;
+  operatorReload?: OperatorReloadAttribution | null;
+  osMemoryKill?: OsMemoryKillEvidence | null;
+}): RestartEnrichLine {
+  const operatorReload = inputs.operatorReload ?? null;
+  const osMemoryKill = inputs.osMemoryKill ?? null;
+  const verdict = classifyExitVerdict({
+    exitAttribution: inputs.exitAttribution,
+    nativeCrash: inputs.nativeCrash,
+    operatorReload,
+    osMemoryKill,
+  });
+  const base = {
+    kind: "enrich" as const,
     boot_id: inputs.bootId,
     ts: inputs.ts,
-    reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+    verdict: verdict.kind,
+    verdict_evidence: verdict.evidence,
   };
+
+  if (operatorReload !== null) {
+    return { ...base, reason: verdict.evidence };
+  }
+  if (inputs.exitAttribution !== null) {
+    const attribution = inputs.exitAttribution;
+    const reason =
+      attribution.reason ??
+      (attribution.signal !== undefined
+        ? `signal: ${attribution.signal}`
+        : `exit attribution: ${attribution.kind}`);
+    return { ...base, reason: boundRestartReason(reason) };
+  }
+  const nativeCrash =
+    inputs.nativeCrash === null
+      ? {}
+      : nativeCrashFields(
+          inputs.nativeCrash as unknown as Record<string, unknown>,
+        );
+  if (hasNativeCrashMatch(nativeCrash)) {
+    return { ...base, ...nativeCrash };
+  }
+  if (osMemoryKill !== null) {
+    return { ...base, reason: verdict.evidence };
+  }
+  return { ...base, reason: HARD_KILL_EXIT_ATTRIBUTION_REASON };
 }
 
 export function planNativeCrashEnrichLines(inputs: {
@@ -719,6 +895,74 @@ export function removeExitAttribution(path: string): void {
   }
 }
 
+/**
+ * `install.sh` writes this leaf right before it bounces a loaded keeperd
+ * (relink + `launchctl bootout`/`bootstrap`) — an external reload otherwise
+ * invisible to keeper, reading as an unattributed quiet death. Sole writer is
+ * `scripts/install.sh`; the daemon only ever reads it.
+ */
+export function resolveOperatorReloadAttributionPath(
+  restartLedgerPath: string,
+): string {
+  return join(dirname(restartLedgerPath), "install-reload-attribution.json");
+}
+
+function normalizeOperatorReloadAttribution(
+  value: unknown,
+): OperatorReloadAttribution | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const object = value as Record<string, unknown>;
+  if (
+    typeof object.source !== "string" ||
+    object.source.length === 0 ||
+    typeof object.action !== "string" ||
+    object.action.length === 0 ||
+    typeof object.ts_ms !== "number" ||
+    !Number.isFinite(object.ts_ms)
+  ) {
+    return null;
+  }
+  return {
+    source: boundNativeCrashField(object.source),
+    action: boundNativeCrashField(object.action),
+    ts: object.ts_ms,
+  };
+}
+
+export function readOperatorReloadAttribution(
+  path: string,
+): OperatorReloadAttribution | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    return normalizeOperatorReloadAttribution(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * An operator-reload leaf only explains a death when its stamp falls inside
+ * the dying boot's OWN lifetime — otherwise it is a stale leaf from an
+ * earlier or later reload and must not be misattributed to this boot.
+ */
+export function matchOperatorReloadAttribution(
+  attribution: OperatorReloadAttribution | null,
+  window: { startedAtMs: number; diedAtMs: number },
+): OperatorReloadAttribution | null {
+  if (attribution === null) return null;
+  return attribution.ts >= window.startedAtMs &&
+    attribution.ts <= window.diedAtMs
+    ? attribution
+    : null;
+}
+
 function writeAll(fd: number, content: string): void {
   const bytes = Buffer.from(content);
   let offset = 0;
@@ -795,6 +1039,94 @@ export function createExitAttributionRecorder(inputs: {
         written = true;
       } catch {}
     },
+  };
+}
+
+export function resolveServeHealthHistoryPath(
+  restartLedgerPath: string,
+): string {
+  return join(dirname(restartLedgerPath), "serve-health-history.json");
+}
+
+function normalizeServeHealthReportSample(
+  value: unknown,
+): ServeHealthReportSample | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const object = value as Record<string, unknown>;
+  if (
+    typeof object.ts !== "number" ||
+    !Number.isFinite(object.ts) ||
+    typeof object.rss_bytes !== "number" ||
+    !Number.isFinite(object.rss_bytes) ||
+    object.rss_bytes < 0
+  ) {
+    return null;
+  }
+  return { ts: object.ts, rss_bytes: object.rss_bytes };
+}
+
+function normalizeServeHealthHistory(
+  value: unknown,
+): ServeHealthHistory | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const object = value as Record<string, unknown>;
+  if (typeof object.boot_id !== "string" || object.boot_id.length === 0) {
+    return null;
+  }
+  const reports = Array.isArray(object.reports)
+    ? object.reports
+        .map(normalizeServeHealthReportSample)
+        .filter((sample): sample is ServeHealthReportSample => sample !== null)
+    : [];
+  return { boot_id: object.boot_id, reports };
+}
+
+/**
+ * Durable ring buffer of the last {@link SERVE_HEALTH_HISTORY_MAX_REPORTS}
+ * serve-health ticks' main RSS, so a memory-growth death leaves a visible
+ * ramp for the NEXT boot's enrich pass — a hard kill gives zero warning at
+ * death time, so this is persisted PERIODICALLY, never only on exit.
+ */
+export function readServeHealthHistory(
+  path: string,
+): ServeHealthHistory | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    return normalizeServeHealthHistory(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function writeServeHealthHistory(
+  path: string,
+  history: ServeHealthHistory,
+): void {
+  const persisted = normalizeServeHealthHistory(history);
+  if (persisted === null) throw new Error("invalid serve-health history");
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  atomicWrite(path, `${JSON.stringify(persisted)}\n`);
+}
+
+/** Pure ring-buffer append, bounded to `maxReports` (oldest samples drop first). */
+export function appendServeHealthReportSample(
+  history: ServeHealthHistory,
+  sample: ServeHealthReportSample,
+  maxReports = SERVE_HEALTH_HISTORY_MAX_REPORTS,
+): ServeHealthHistory {
+  const reports = [...history.reports, sample];
+  return {
+    boot_id: history.boot_id,
+    reports: reports.length > maxReports ? reports.slice(-maxReports) : reports,
   };
 }
 
