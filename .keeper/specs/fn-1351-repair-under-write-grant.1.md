@@ -38,5 +38,5 @@ In-process: one grant per (repo, fingerprint) under concurrent candidates; parke
 - [ ] All suites green via named gates
 
 ## Done summary
-
+Replaced the repair sweep's top-level session dispatch with a single write-grant election per (repo, fingerprint): elects one blocked owner, publishes a fenced grant leaf, and the work skill spawns plan:repairer in-session under that grant while ungranted owners park visibly; objective baseline-green clear unblocks and expires the grant for all parked owners.
 ## Evidence
