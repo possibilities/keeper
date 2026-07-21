@@ -46,9 +46,11 @@
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -57,6 +59,11 @@ import { join, resolve as resolveAbs } from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
 
+import {
+  classifyRun,
+  parseGateOutput,
+  readTestGateCommand,
+} from "../../../../src/baseline-worker.ts";
 import { CommitWorkLock } from "../../../../src/commit-work/flock.ts";
 import {
   decideTrunkIntegrationFence,
@@ -67,6 +74,7 @@ import {
   writeTrunkLeaseRequest,
 } from "../../../../src/grant-leaf.ts";
 import { keeperStateDir } from "../../../../src/keeper-state-dir.ts";
+import { WORKTREE_DEP_LINK_NAME } from "../../../../src/worktree-git.ts";
 
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
@@ -630,16 +638,22 @@ export interface TrunkIntegrationDeps {
   ): TrunkLeaseRequestResult;
   releaseLease(stateDir: string, lease: TrunkLeaseLeaf): boolean;
   readLeaseLeaf(stateDir: string, repoRoot: string): TrunkLeaseLeaf | null;
-  /** OPTIONAL merge-suite gate probe (ADR 0102) run against the merged tree in
-   * the private scratch worktree BEFORE the epic lands. `worktreePath` is the
-   * scratch checkout holding the merge; `mergedCommit` is its HEAD. Undefined →
-   * the plan CLI skips the gate: the AUTHORITATIVE merge-suite gate stays
-   * daemon-owned (it re-runs against the same integrated commit the closer
-   * produces), so `realTrunkIntegrationDeps` leaves this unset and the saga tests
-   * inject a fake to drive the green / red / cannot-run decision deterministically. */
+  /** Merge-suite gate probe (ADR 0102) run against the merged tree in the private
+   * scratch worktree BEFORE the epic lands the trunk CAS. `worktreePath` is the
+   * scratch checkout holding the merge; `mergedCommit` is its HEAD (the EXACT commit
+   * that will be published — no re-compose after the gate); `repoRoot` is the source
+   * checkout whose installed stores the gate shares into the scratch; `baseTip` is the
+   * local default tip the scratch was cut from (the diff base that decides which
+   * package suites the merge introduces). Production wires {@link runRealMergeSuite}
+   * (the SAME composed gate the daemon's post-merge verify runs, now run PRE-publish
+   * so a red result aborts the land before it publishes); the daemon's verify stays as
+   * defense-in-depth. Optional only so the saga tests inject a fake to drive the
+   * green / red / cannot-run decision deterministically without a real suite. */
   runMergeSuite?(args: {
+    repoRoot: string;
     worktreePath: string;
     mergedCommit: string;
+    baseTip: string;
   }): MergeSuiteVerdict;
 }
 
@@ -770,20 +784,336 @@ function releaseTrunkLease(stateDir: string, lease: TrunkLeaseLeaf): boolean {
   return false;
 }
 
+// The composed merge-suite gate command set (ADR 0102) — a FAITHFUL replica of the
+// daemon's `runMergeSuiteGate` / `runPackageSuiteGate` composition in
+// `src/autopilot-worker.ts`, duplicated here because that assembly lives in the
+// db-tainted worker module the plan plugin must never import. The pure output
+// parse/classify core is IMPORTED from `src/baseline-worker.ts` (single source of
+// truth); only the command set and its deadlines are mirrored. Keep in step with the
+// daemon's constants.
+const MERGE_GATE_PLAN_PKG_DIR = "plugins/plan";
+const MERGE_GATE_SMOKE_COMMAND = "bun run test:slow-daemon";
+const MERGE_GATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
+const MERGE_GATE_SUITE_DEADLINE_MS = 15 * 60_000;
+const MERGE_GATE_MAX_FAILING_NAMES = 8;
+const MERGE_GATE_DEP_SCAN_DEPTH = 2;
+const DAEMON_LOAD_ROOTS_MANIFEST_REL = "scripts/daemon-load-roots.txt";
+
+interface GateSpawnResult {
+  exitCode: number;
+  output: string;
+  timedOut: boolean;
+}
+
+/** Run one gate subprocess synchronously (the trunk-integration path is fully
+ * synchronous — see {@link trunkGit}), capturing combined stdout+stderr and the
+ * deadline-kill flag. GIT_* env is scrubbed so a suite that shells git resolves from
+ * `cwd`, never an inherited worktree pointer. */
+function runGateProcess(
+  cmd: string[],
+  cwd: string,
+  timeoutMs: number,
+): GateSpawnResult {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+  ]) {
+    delete env[key];
+  }
+  try {
+    const proc = Bun.spawnSync(cmd, { cwd, env, timeout: timeoutMs });
+    const timedOut =
+      (proc as { exitedDueToTimeout?: boolean }).exitedDueToTimeout === true;
+    const output = proc.stdout.toString() + proc.stderr.toString();
+    return {
+      exitCode: proc.exitCode ?? (timedOut ? 124 : 1),
+      output,
+      timedOut,
+    };
+  } catch (err) {
+    return {
+      exitCode: 127,
+      output: err instanceof Error ? err.message : String(err),
+      timedOut: false,
+    };
+  }
+}
+
+/** Run ONE package's fast gate suite in `pkgDir`, mapping the daemon's five-kind
+ * verdict onto the plan seam's three: a clean suite is `green`; failing tests are
+ * `red` (bounded failing names in the detail); a no-gate-script package is `green`
+ * (nothing to run); an install failure/timeout or a deadline-kill/crash with no
+ * failing-test signal is `cannot-run` (defer, never a false red — the daemon folds
+ * the latter to a retry-once, which the plan seam expresses as a deferral). Mirrors
+ * `runPackageSuiteGate`. */
+function runPackageGate(
+  pkgDir: string,
+  opts: { install: boolean; command?: string },
+): MergeSuiteVerdict {
+  const gateCmd = opts.command ?? readTestGateCommand(pkgDir);
+  if (gateCmd === null) {
+    return { kind: "green" };
+  }
+  if (opts.install) {
+    const install = runGateProcess(
+      ["bun", "install", "--frozen-lockfile"],
+      pkgDir,
+      MERGE_GATE_INSTALL_TIMEOUT_MS,
+    );
+    if (install.timedOut) {
+      return {
+        kind: "cannot-run",
+        detail: `frozen-lockfile install timed out in ${pkgDir}`,
+      };
+    }
+    if (install.exitCode !== 0) {
+      return {
+        kind: "cannot-run",
+        detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
+      };
+    }
+  }
+  const raw = runGateProcess(
+    ["/bin/sh", "-c", gateCmd],
+    pkgDir,
+    MERGE_GATE_SUITE_DEADLINE_MS,
+  );
+  const parsed = parseGateOutput(raw.output);
+  const cls = classifyRun(raw.exitCode, parsed, raw.timedOut);
+  if (cls === "clean") {
+    return { kind: "green" };
+  }
+  if (cls === "failed") {
+    const names = parsed.failingTests.slice(0, MERGE_GATE_MAX_FAILING_NAMES);
+    const more =
+      parsed.failingTests.length > names.length
+        ? ` (+${parsed.failingTests.length - names.length} more)`
+        : "";
+    const detail =
+      names.length > 0
+        ? `${names.join("; ")}${more}`
+        : `${parsed.failCount ?? 1} failing test(s)`;
+    return { kind: "red", detail: `${pkgDir}: ${detail}` };
+  }
+  return {
+    kind: "cannot-run",
+    detail: raw.timedOut
+      ? `suite timed out in ${pkgDir}`
+      : `${pkgDir}: suite crashed (non-zero exit, no failing-test output)`,
+  };
+}
+
+/** True when the merge INTRODUCES a change under any of `paths` relative to
+ * `baseTip` — the diff that decides whether a package suite must run. An unclear
+ * (non-zero) diff conservatively covers the suite, mirroring the daemon's
+ * `mergeIntroducesPlanChange` / `mergeIntroducesLoadSurfaceChange`. */
+function mergeIntroducesPathChange(
+  cwd: string,
+  baseTip: string,
+  mergedCommit: string,
+  paths: string[],
+): boolean {
+  const diff = trunkGit(
+    [
+      "diff",
+      "--name-only",
+      "--end-of-options",
+      baseTip,
+      mergedCommit,
+      "--",
+      ...paths,
+    ],
+    cwd,
+  );
+  if (diff.code !== 0) {
+    return true;
+  }
+  return diff.stdout.trim().length > 0;
+}
+
+/** The daemon Load-surface roots (ADR 0073) read from the merged tree's own copy of
+ * the manifest — one path per line, `#` comments and blanks skipped. Mirrors the
+ * daemon's `loadDaemonLoadRoots`; a repo with no manifest has no Load-surface concept
+ * and never gates the smoke suite. */
+function loadDaemonLoadRoots(repoDir: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(join(repoDir, DAEMON_LOAD_ROOTS_MANIFEST_REL), "utf8");
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    roots.push(line);
+  }
+  return roots;
+}
+
+/** Plant one `node_modules` symlink at `worktreeDir` pointing at `sourceDir`'s real
+ * store. Idempotent + safe: a no-op when already correct or when the source has no
+ * store; a real (non-symlink) `node_modules` is never clobbered. The SYNCHRONOUS
+ * mirror of `ensureDepLinkAt` in `src/worktree-git.ts` (that async planter cannot run
+ * in this synchronous path). */
+function plantOneDepLink(sourceDir: string, worktreeDir: string): void {
+  const sourceNodeModules = join(sourceDir, WORKTREE_DEP_LINK_NAME);
+  let sourceReal: string;
+  try {
+    sourceReal = realpathSync(sourceNodeModules);
+  } catch {
+    return;
+  }
+  const worktreeNodeModules = join(worktreeDir, WORKTREE_DEP_LINK_NAME);
+  let entry: { isSymbolicLink(): boolean } | null;
+  try {
+    entry = lstatSync(worktreeNodeModules);
+  } catch {
+    entry = null;
+  }
+  if (entry !== null && !entry.isSymbolicLink()) {
+    return;
+  }
+  if (entry !== null) {
+    try {
+      if (realpathSync(worktreeNodeModules) === sourceReal) {
+        return;
+      }
+    } catch {
+      // dangling link — replace it below.
+    }
+    try {
+      unlinkSync(worktreeNodeModules);
+    } catch {
+      // best-effort.
+    }
+  }
+  try {
+    symlinkSync(sourceNodeModules, worktreeNodeModules, "dir");
+  } catch {
+    // best-effort: a worktree missing the dir entirely just gets no coverage there.
+  }
+}
+
+/** Enumerate `sourceCheckout`'s nested package dirs (a dir carrying its own
+ * package.json within {@link MERGE_GATE_DEP_SCAN_DEPTH}), skipping hidden dirs,
+ * `node_modules`, and symlinks. Synchronous mirror of `discoverNestedPackageDirs`. */
+function discoverNestedPackageDirsSync(sourceCheckout: string): string[] {
+  const found: string[] = [];
+  const walk = (rel: string, depth: number): void => {
+    if (depth > MERGE_GATE_DEP_SCAN_DEPTH) return;
+    let entries: {
+      name: string;
+      isDirectory(): boolean;
+      isSymbolicLink(): boolean;
+    }[];
+    try {
+      entries = readdirSync(
+        rel === "" ? sourceCheckout : join(sourceCheckout, rel),
+        {
+          withFileTypes: true,
+        },
+      );
+    } catch {
+      return;
+    }
+    const names = entries
+      .filter((e) => e.isDirectory() && !e.isSymbolicLink())
+      .map((e) => e.name)
+      .filter((n) => !n.startsWith(".") && n !== WORKTREE_DEP_LINK_NAME)
+      .sort();
+    for (const name of names) {
+      const childRel = rel === "" ? name : `${rel}/${name}`;
+      if (existsSync(join(sourceCheckout, childRel, "package.json"))) {
+        found.push(childRel);
+      }
+      walk(childRel, depth + 1);
+    }
+  };
+  walk("", 1);
+  return found;
+}
+
+/** Share `sourceCheckout`'s installed stores into `worktreePath` — top-level plus
+ * each nested package dir (ADR 0074) — so every gated package's test files resolve
+ * their deps. Without the nested links the ~liquidjs-importing plan/prompt suites
+ * crash at module resolution and read as an empty-digest red. */
+function plantScratchDepLinks(
+  sourceCheckout: string,
+  worktreePath: string,
+): void {
+  plantOneDepLink(sourceCheckout, worktreePath);
+  for (const rel of discoverNestedPackageDirsSync(sourceCheckout)) {
+    plantOneDepLink(join(sourceCheckout, rel), join(worktreePath, rel));
+  }
+}
+
+/** The production {@link TrunkIntegrationDeps.runMergeSuite}: run the SAME composed
+ * gate the daemon's finalize verify runs — root fast `test:gate` ALWAYS, the named
+ * `test:slow-daemon` smoke gate when the merge touches the daemon Load surface, and
+ * the plan `test:gate` when it touches `plugins/plan` — against the EXACT merged tree
+ * in the scratch worktree, BEFORE the trunk CAS. A red short-circuits the whole gate;
+ * `cannot-run` defers. Plants the dep-link family first so the nested suites resolve
+ * (the closer's scratch provisioning is git-only). NEVER throws — any unexpected
+ * error would surface as a spawn failure the classifier reads, never a silent land. */
+function runRealMergeSuite(args: {
+  repoRoot: string;
+  worktreePath: string;
+  mergedCommit: string;
+  baseTip: string;
+}): MergeSuiteVerdict {
+  const { repoRoot, worktreePath, mergedCommit, baseTip } = args;
+  plantScratchDepLinks(repoRoot, worktreePath);
+
+  const runsPlanSuite = mergeIntroducesPathChange(
+    worktreePath,
+    baseTip,
+    mergedCommit,
+    [MERGE_GATE_PLAN_PKG_DIR],
+  );
+  const loadRoots = loadDaemonLoadRoots(worktreePath);
+  const runsSmokeGate =
+    loadRoots.length > 0 &&
+    mergeIntroducesPathChange(worktreePath, baseTip, mergedCommit, loadRoots);
+
+  const root = runPackageGate(worktreePath, { install: true });
+  if (root.kind !== "green") return root;
+  if (runsSmokeGate) {
+    // The merge touched the daemon Load surface — chain the named smoke gate in the
+    // SAME scratch checkout (no second install), before the plan suite.
+    const smoke = runPackageGate(worktreePath, {
+      install: false,
+      command: MERGE_GATE_SMOKE_COMMAND,
+    });
+    if (smoke.kind !== "green") return smoke;
+  }
+  if (runsPlanSuite) {
+    const plan = runPackageGate(join(worktreePath, MERGE_GATE_PLAN_PKG_DIR), {
+      install: true,
+    });
+    if (plan.kind !== "green") return plan;
+  }
+  return { kind: "green" };
+}
+
 /** Production wiring for {@link TrunkIntegrationDeps} — verbatim git spawns,
- * the real flock-backed commit-work lock, and the real daemon-mediated lease
- * request/release round-trip. Every trunk-merge call site defaults to this;
- * a saga test overrides it with a fake bundle. `runMergeSuite` is deliberately
- * unset: the AUTHORITATIVE merge-suite gate stays daemon-owned (it re-runs
- * against the same integrated commit the closer publishes), so the plan CLI
- * relocates the merge into a private worktree without shelling a heavyweight
- * suite of its own — the saga tests inject a fake gate to drive the decision. */
-const realTrunkIntegrationDeps: TrunkIntegrationDeps = {
+ * the real flock-backed commit-work lock, the real daemon-mediated lease
+ * request/release round-trip, and the composed merge-suite gate
+ * ({@link runRealMergeSuite}) run against the private scratch worktree's merged tree
+ * BEFORE the trunk CAS. Every trunk-merge call site defaults to this; a saga test
+ * overrides it with a fake bundle (injecting a fake `runMergeSuite` to drive the
+ * green / red / cannot-run decision without a real suite). Exported so a wiring test
+ * pins that `runMergeSuite` stays SET — an unset gate is the P0 defect this fixes. */
+export const realTrunkIntegrationDeps: TrunkIntegrationDeps = {
   git: trunkGit,
   acquireLock: acquireTrunkLock,
   requestLease: requestTrunkLease,
   releaseLease: releaseTrunkLease,
   readLeaseLeaf: readTrunkLeaseLeaf,
+  runMergeSuite: runRealMergeSuite,
 };
 
 function ancestryProbe(
@@ -1110,13 +1440,17 @@ export function integrateRepoUnderLease(
       );
     }
 
-    // Merge-suite gate (ADR 0102): run the injected gate against the MERGED tree in
-    // the scratch worktree. red aborts the land visibly; cannot-run DEFERS; a
-    // missing probe means the authoritative gate is daemon-owned (see the dep doc).
+    // Merge-suite gate (ADR 0102): run the gate against the MERGED tree in the
+    // scratch worktree, BEFORE the trunk publish below — the tested commit identity
+    // IS the published one. red aborts the land visibly; cannot-run DEFERS. `baseTip`
+    // is the leased default tip the scratch was cut from (the diff base for suite
+    // selection); `repoRoot` is the source checkout the gate shares its stores from.
     if (deps.runMergeSuite !== undefined) {
       const verdict = deps.runMergeSuite({
+        repoRoot,
         worktreePath: scratch.path,
         mergedCommit,
+        baseTip: liveOid,
       });
       if (verdict.kind === "red") {
         reapTrunkScratch(deps, repoRoot, scratch);

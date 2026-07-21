@@ -45,6 +45,7 @@ import {
   type CloseOutcome,
   integrateEpicBases,
   integrateRepoUnderLease,
+  realTrunkIntegrationDeps,
   type TrunkGitResult,
   type TrunkIntegrationDeps,
   type TrunkLeaseRequestResult,
@@ -2270,6 +2271,79 @@ describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
     expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DEFERRED");
     expect(reapedScratch(gitCalls)).toBe(true);
     expect(releasedLeases.length).toBe(1);
+  });
+
+  test("realTrunkIntegrationDeps wires the production merge-suite gate (the defect: it was unset for weeks)", () => {
+    // The P0 regression that matters: the seam existed but `runMergeSuite` was left
+    // unset, so production closes landed the merge with NO pre-publish suite gate.
+    // Pin that the production dep bundle SETS it.
+    expect(realTrunkIntegrationDeps.runMergeSuite).toBeDefined();
+    expect(typeof realTrunkIntegrationDeps.runMergeSuite).toBe("function");
+  });
+
+  test("green gate publishes identically: the merge lands and the gate saw the full merged-tree args", () => {
+    // A green verdict is transparent to the publish — the clean on-branch shared
+    // checkout still fast-forwards to the exact merged commit — and the gate is
+    // handed the source checkout, the scratch worktree, the merged commit, and the
+    // leased base tip so it can share stores and select which suites the merge runs.
+    const gateCalls: {
+      repoRoot: string;
+      worktreePath: string;
+      mergedCommit: string;
+      baseTip: string;
+    }[] = [];
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: (args) => {
+        gateCalls.push(args);
+        return { kind: "green" };
+      },
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(gateCalls).toHaveLength(1);
+    expect(gateCalls[0].repoRoot).toBe(TRUNK_REPO_ROOT);
+    expect(gateCalls[0].worktreePath).toBe(scratchWorktreePath(gitCalls));
+    expect(gateCalls[0].mergedCommit).toBe("merged12345678");
+    expect(gateCalls[0].baseTip).toBe("base000");
+    // Publish proceeds exactly as with no gate: the shared checkout fast-forwards to
+    // the merged commit (the gate ran BEFORE the CAS, not instead of it).
+    const ff = gitCalls.find(
+      (c) => c.args[0] === "merge" && c.args.includes("--ff-only"),
+    );
+    expect(ff?.cwd).toBe(TRUNK_REPO_ROOT);
+    expect(ff?.args.at(-1)).toBe("merged12345678");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("red gate surfaces the failing-gate detail and merged commit in the typed abort", () => {
+    // The abort carries the failing-gate names (bounded upstream) and the merged
+    // commit identity, so an operator sees WHAT failed and against which tree.
+    const { deps } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      runMergeSuite: () => ({
+        kind: "red",
+        detail: "plugins/plan: t/a.test.ts; t/b.test.ts",
+      }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    const payload = parseCliOutput(result.stdout) as {
+      error: {
+        code: string;
+        message: string;
+        details: { merged_commit: string };
+      };
+    };
+    expect(payload.error.code).toBe("TRUNK_INTEGRATION_SUITE_RED");
+    expect(payload.error.message).toContain(
+      "plugins/plan: t/a.test.ts; t/b.test.ts",
+    );
+    expect(payload.error.details.merged_commit).toBe("merged12345678");
   });
 
   test("conflict in the scratch worktree keeps TRUNK_INTEGRATION_CONFLICT, retains the lease, reaps, and never touches the shared checkout", () => {
