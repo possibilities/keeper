@@ -14,7 +14,7 @@
  *
  * | Suffix / basename | Tools |
  * |---|---|
- * | `.py` | `uv run ruff check` + `uv run ruff format --check` |
+ * | `.py` | repo-declared `uv run ruff check` + `uv run ruff format --check` |
  * | `.ts`/`.tsx` | `tsc --noEmit --project <tsconfig>` (NEW arm) |
  * | `.sh` | `shellcheck` |
  * | `.zig` | `ziglint` + `zlint` |
@@ -22,6 +22,8 @@
  * | `.{js,jsx,ts,tsx,mjs,cjs}` | `npm run lint` per nearest package.json |
  *
  * **Python project checks** (only when any `.py` is staged):
+ *  - Ruff check + format for repositories that explicitly configure or depend
+ *    on Ruff; an undeclared ambient executable never imposes formatter churn.
  *  - `uvx ty check` for repositories that explicitly configure or depend on
  *    ty; otherwise `uvx ty check <staged.py...>` keeps an untyped repository's
  *    unrelated baseline from masking errors in the edited files.
@@ -196,30 +198,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function requirementNamesTy(value: string): boolean {
-  return /^ty(?:\[[^\]]*\])?(?=$|\s|[<>=!~@;(])/iu.test(value.trim());
+function requirementNamesPackage(value: string, packageName: string): boolean {
+  const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(
+    `^${escaped}(?:\\[[^\\]]*\\])?(?=$|\\s|[<>=!~@;(])`,
+    "iu",
+  ).test(value.trim());
 }
 
-function requirementListNamesTy(value: unknown): boolean {
+function requirementListNamesPackage(
+  value: unknown,
+  packageName: string,
+): boolean {
   return (
     Array.isArray(value) &&
     value.some(
-      (entry) => typeof entry === "string" && requirementNamesTy(entry),
+      (entry) =>
+        typeof entry === "string" &&
+        requirementNamesPackage(entry, packageName),
     )
   );
 }
 
-function dependencyMapNamesTy(value: unknown): boolean {
+function dependencyMapNamesPackage(
+  value: unknown,
+  packageName: string,
+): boolean {
   if (!isRecord(value)) return false;
   return Object.keys(value).some(
-    (name) => name.split("[", 1)[0]?.toLowerCase() === "ty",
+    (name) => name.split("[", 1)[0]?.toLowerCase() === packageName,
   );
 }
 
-function groupedRequirementListsNameTy(value: unknown): boolean {
+function groupedRequirementListsNamePackage(
+  value: unknown,
+  packageName: string,
+): boolean {
   return (
     isRecord(value) &&
-    Object.values(value).some((entries) => requirementListNamesTy(entries))
+    Object.values(value).some((entries) =>
+      requirementListNamesPackage(entries, packageName),
+    )
   );
 }
 
@@ -236,22 +255,21 @@ function poetryGroupsHaveValidShape(value: unknown): boolean {
   );
 }
 
-function poetryGroupsNameTy(value: unknown): boolean {
+function poetryGroupsNamePackage(value: unknown, packageName: string): boolean {
   if (!isRecord(value)) return false;
   return Object.values(value).some((group) => {
     if (!isRecord(group)) return false;
-    return dependencyMapNamesTy(group.dependencies);
+    return dependencyMapNamesPackage(group.dependencies, packageName);
   });
 }
 
-/**
- * Whether this repository requires project-wide ty checking. An explicit
- * `[tool.ty]` table or ty dependency opts in; repositories without either get
- * staged-path checking so unrelated untyped baselines cannot suppress errors
- * in the files being committed. An unreadable or malformed manifest chooses
- * project-wide scope conservatively instead of weakening a possible contract.
- */
-export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
+/** Whether a pyproject explicitly configures or depends on a Python tool.
+ * Malformed manifests conservatively count as declared so an unreadable
+ * repository contract is never weakened by the fallback. */
+function pyprojectDeclaresPythonTool(
+  pyprojectPath: string,
+  toolName: string,
+): boolean {
   try {
     const parsed = Bun.TOML.parse(
       readFileSync(pyprojectPath, "utf8"),
@@ -261,7 +279,7 @@ export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
       return true;
     }
     const tool = isRecord(parsed.tool) ? parsed.tool : {};
-    if (Object.hasOwn(tool, "ty")) return true;
+    if (Object.hasOwn(tool, toolName)) return true;
 
     const project = isRecord(parsed.project) ? parsed.project : {};
     for (const owner of ["poetry", "pdm", "uv"]) {
@@ -291,18 +309,39 @@ export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
       return true;
     }
     return (
-      requirementListNamesTy(project.dependencies) ||
-      groupedRequirementListsNameTy(project["optional-dependencies"]) ||
-      groupedRequirementListsNameTy(parsed["dependency-groups"]) ||
-      dependencyMapNamesTy(poetry.dependencies) ||
-      dependencyMapNamesTy(poetry["dev-dependencies"]) ||
-      poetryGroupsNameTy(poetry.group) ||
-      groupedRequirementListsNameTy(pdm["dev-dependencies"]) ||
-      requirementListNamesTy(uv["dev-dependencies"])
+      requirementListNamesPackage(project.dependencies, toolName) ||
+      groupedRequirementListsNamePackage(
+        project["optional-dependencies"],
+        toolName,
+      ) ||
+      groupedRequirementListsNamePackage(
+        parsed["dependency-groups"],
+        toolName,
+      ) ||
+      dependencyMapNamesPackage(poetry.dependencies, toolName) ||
+      dependencyMapNamesPackage(poetry["dev-dependencies"], toolName) ||
+      poetryGroupsNamePackage(poetry.group, toolName) ||
+      groupedRequirementListsNamePackage(pdm["dev-dependencies"], toolName) ||
+      requirementListNamesPackage(uv["dev-dependencies"], toolName)
     );
   } catch {
     return true;
   }
+}
+
+/**
+ * Whether this repository requires project-wide ty checking. An explicit
+ * `[tool.ty]` table or ty dependency opts in; repositories without either get
+ * staged-path checking so unrelated untyped baselines cannot suppress errors
+ * in the files being committed.
+ */
+export function pyprojectRequiresProjectWideTy(pyprojectPath: string): boolean {
+  return pyprojectDeclaresPythonTool(pyprojectPath, "ty");
+}
+
+/** Whether this repository owns a Ruff formatter/linter contract. */
+export function pyprojectUsesRuff(pyprojectPath: string): boolean {
+  return pyprojectDeclaresPythonTool(pyprojectPath, "ruff");
 }
 
 /**
@@ -381,6 +420,10 @@ export async function runScopedLint(
   const hasPyproject = existsSync(pyprojectPath);
   const projectWideTy =
     hasPyproject && pyprojectRequiresProjectWideTy(pyprojectPath);
+  const useRuff =
+    existsSync(join(cwd, "ruff.toml")) ||
+    existsSync(join(cwd, ".ruff.toml")) ||
+    (hasPyproject && pyprojectUsesRuff(pyprojectPath));
   const cliBoundariesScript = join(cwd, "scripts", "lint-cli-boundaries.py");
   const tsconfigPath = join(cwd, "tsconfig.json");
   const vendorCorpusScript = join(cwd, "scripts", "vendor-corpus.ts");
@@ -402,12 +445,12 @@ export async function runScopedLint(
   }> = [];
 
   // 0 --- ruff check (Python, per-file) ---
-  if (hasPyproject && pyFiles.length > 0) {
+  if (useRuff && pyFiles.length > 0) {
     tasks.push({
       order: 0,
       run: async () => {
         const r = await runTool(
-          ["uv", "run", "ruff", "check", ...pyFiles],
+          ["uv", "run", "ruff", "check", "--", ...pyFiles],
           cwd,
         );
         return r.code !== 0
@@ -418,12 +461,12 @@ export async function runScopedLint(
   }
 
   // 1 --- ruff format --check (Python, per-file) ---
-  if (hasPyproject && pyFiles.length > 0) {
+  if (useRuff && pyFiles.length > 0) {
     tasks.push({
       order: 1,
       run: async () => {
         const r = await runTool(
-          ["uv", "run", "ruff", "format", "--check", ...pyFiles],
+          ["uv", "run", "ruff", "format", "--check", "--", ...pyFiles],
           cwd,
         );
         return r.code !== 0

@@ -1,5 +1,5 @@
 /**
- * Dispatch coverage for `runScopedLint`'s repo-adaptive Python typecheck and
+ * Dispatch coverage for `runScopedLint`'s repo-adaptive Python checks and
  * staged-path-conditional drift gates. The injectable `deps.runTool` seam
  * proves command scope and failure aggregation without spawning subprocesses.
  */
@@ -14,6 +14,7 @@ import {
   isVendorCorpusPath,
   LintFailure,
   pyprojectRequiresProjectWideTy,
+  pyprojectUsesRuff,
   runScopedLint,
   type ToolRunner,
 } from "../src/commit-work/lint-matrix";
@@ -104,7 +105,7 @@ describe("trigger-set predicates", () => {
   });
 });
 
-describe("repo-adaptive Python typecheck scope", () => {
+describe("repo-adaptive Python checks", () => {
   function tempPyproject(contents: string): {
     dir: string;
     path: string;
@@ -138,8 +139,107 @@ describe("repo-adaptive Python typecheck scope", () => {
         "src/one.py",
         "tests/test_one.py",
       ]);
+      expect(calls.filter((call) => call.cmd.includes("ruff"))).toEqual([]);
     } finally {
       repo.cleanup();
+    }
+  });
+
+  test("an explicit Ruff contract runs check and format on staged paths", async () => {
+    const manifests = [
+      '[project]\nname = "linted-project"\n[tool.ruff]\n',
+      '[project]\nname = "linted-project"\n[dependency-groups]\ndev = ["ruff>=0.9"]\n',
+    ];
+    for (const manifest of manifests) {
+      const repo = tempPyproject(manifest);
+      try {
+        expect(pyprojectUsesRuff(repo.path)).toBe(true);
+        const { runTool, calls } = fakeRunTool();
+        await runScopedLint(["src/one.py"], repo.dir, { runTool });
+        expect(
+          calls
+            .filter((call) => call.cmd.includes("ruff"))
+            .map((call) => call.cmd),
+        ).toEqual([
+          ["uv", "run", "ruff", "check", "--", "src/one.py"],
+          ["uv", "run", "ruff", "format", "--check", "--", "src/one.py"],
+        ]);
+      } finally {
+        repo.cleanup();
+      }
+    }
+  });
+
+  test("standalone Ruff config files opt in", async () => {
+    for (const configName of ["ruff.toml", ".ruff.toml"]) {
+      const repo = tempPyproject('[project]\nname = "linted-project"\n');
+      try {
+        writeFileSync(join(repo.dir, configName), "line-length = 88\n");
+        const { runTool, calls } = fakeRunTool();
+        await runScopedLint(["src/one.py"], repo.dir, { runTool });
+        expect(calls.filter((call) => call.cmd.includes("ruff"))).toHaveLength(
+          2,
+        );
+      } finally {
+        repo.cleanup();
+      }
+    }
+  });
+
+  test("common dependency tables declare Ruff", () => {
+    const manifests = [
+      '[project]\nname = "linted"\ndependencies = ["ruff(>=0.9)"]\n',
+      `[project]\nname = "linted"\ndependencies = ["RuFf[toml]>=0.9; python_version >= '3.11'"]\n`,
+      '[project]\nname = "linted"\ndependencies = ["ruff @ https://example.test/ruff.whl"]\n',
+      '[project]\nname = "linted"\n[project.optional-dependencies]\ndev = ["ruff"]\n',
+      '[project]\nname = "linted"\n[dependency-groups]\ndev = ["ruff>=0.9"]\n',
+      '[tool.poetry.dependencies]\nruff = ">=0.9"\n',
+      '[tool.poetry.dev-dependencies]\nruff = ">=0.9"\n',
+      '[tool.poetry.group.dev.dependencies]\nruff = ">=0.9"\n',
+      '[tool.pdm.dev-dependencies]\ndev = ["ruff"]\n',
+      '[tool.uv]\ndev-dependencies = ["ruff"]\n',
+    ];
+    for (const manifest of manifests) {
+      const repo = tempPyproject(manifest);
+      try {
+        expect(pyprojectUsesRuff(repo.path)).toBe(true);
+      } finally {
+        repo.cleanup();
+      }
+    }
+  });
+
+  test("valid PEP 735 groups resolve includes and near names stay distinct", () => {
+    const included = tempPyproject(
+      '[dependency-groups]\nbase = ["ruff"]\ndev = [{ include-group = "BASE" }]\n',
+    );
+    const plain = tempPyproject(
+      '[dependency-groups]\nbase = ["ruff-lsp", "ruff_extra"]\ndev = [{ include-group = "base" }]\n',
+    );
+    try {
+      expect(pyprojectUsesRuff(included.path)).toBe(true);
+      expect(pyprojectUsesRuff(plain.path)).toBe(false);
+    } finally {
+      included.cleanup();
+      plain.cleanup();
+    }
+  });
+
+  test("metadata, group names, and path values named Ruff are not opt-ins", () => {
+    const manifests = [
+      '[project]\nname = "ruff"\ndependencies = ["pytest"]\n',
+      '[project]\nname = "plain"\n[project.optional-dependencies]\nruff = ["pytest"]\n',
+      '[project]\nname = "plain"\n[dependency-groups]\nruff = ["pytest"]\n',
+      '[tool.poetry.group.ruff.dependencies]\npytest = "*"\n',
+      '[tool.poetry.dependencies]\nother = { path = "ruff" }\n',
+    ];
+    for (const manifest of manifests) {
+      const repo = tempPyproject(manifest);
+      try {
+        expect(pyprojectUsesRuff(repo.path)).toBe(false);
+      } finally {
+        repo.cleanup();
+      }
     }
   });
 
@@ -207,16 +307,17 @@ describe("repo-adaptive Python typecheck scope", () => {
     }
   });
 
-  test("an unreadable manifest conservatively keeps project-wide checking", () => {
+  test("an unreadable manifest conservatively keeps declared checks", () => {
     const repo = tempPyproject("not = [valid");
     try {
       expect(pyprojectRequiresProjectWideTy(repo.path)).toBe(true);
+      expect(pyprojectUsesRuff(repo.path)).toBe(true);
     } finally {
       repo.cleanup();
     }
   });
 
-  test("invalid dependency table shapes conservatively keep project-wide checking", () => {
+  test("invalid dependency table containers conservatively keep declared checks", () => {
     const manifests = [
       'project = "broken"\n',
       'tool = "broken"\n',
@@ -232,6 +333,7 @@ describe("repo-adaptive Python typecheck scope", () => {
       const repo = tempPyproject(manifest);
       try {
         expect(pyprojectRequiresProjectWideTy(repo.path)).toBe(true);
+        expect(pyprojectUsesRuff(repo.path)).toBe(true);
       } finally {
         repo.cleanup();
       }
@@ -239,7 +341,9 @@ describe("repo-adaptive Python typecheck scope", () => {
   });
 
   test("scoped paths are option-delimited", async () => {
-    const repo = tempPyproject('[project]\nname = "plain-python-project"\n');
+    const repo = tempPyproject(
+      '[project]\nname = "plain-python-project"\n[tool.ruff]\n',
+    );
     try {
       const { runTool, calls } = fakeRunTool();
       await runScopedLint(["--config-file=other.py"], repo.dir, { runTool });
@@ -250,6 +354,22 @@ describe("repo-adaptive Python typecheck scope", () => {
         "check",
         "--",
         "--config-file=other.py",
+      ]);
+      expect(
+        calls
+          .filter((call) => call.cmd.includes("ruff"))
+          .map((call) => call.cmd),
+      ).toEqual([
+        ["uv", "run", "ruff", "check", "--", "--config-file=other.py"],
+        [
+          "uv",
+          "run",
+          "ruff",
+          "format",
+          "--check",
+          "--",
+          "--config-file=other.py",
+        ],
       ]);
     } finally {
       repo.cleanup();
