@@ -2138,14 +2138,14 @@ describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
     expect(releasedLeases.length).toBe(1);
   });
 
-  test("unrelated dirt in the shared checkout still lands the epic, deferring only the ff", () => {
-    // Acceptance: tracked AND untracked unrelated dirt present in the shared
+  test("dirty-tracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): an unrelated TRACKED modification in the shared
     // checkout — integration completes (the merge happens in the scratch worktree),
     // the default ref advances via update-ref (compare-and-swap against the leased
     // tip), and ONLY the fast-forward defers (the trailing checkout is the daemon's
     // shared-checkout-desync producer's job). The old any-dirt refusal is gone.
     const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
-      git: trunkFlowGit({ sharedStatus: " M unrelated.ts\n?? scratch.txt\n" }),
+      git: trunkFlowGit({ sharedStatus: " M unrelated.ts\n" }),
     });
 
     const result = runIntegrate(deps);
@@ -2165,6 +2165,28 @@ describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
       "base000",
     ]);
     // No fast-forward merge ran in the shared checkout.
+    expect(
+      gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
+    ).toBe(false);
+    expect(reapedScratch(gitCalls)).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("untracked-only shared checkout still lands the epic, deferring only the ff", () => {
+    // Acceptance (ADR 0102): a bare UNTRACKED path (no tracked modification at
+    // all) trips the same `--untracked-files=all` "not clean" read as a tracked
+    // edit, so the merge still lands and only the fast-forward defers.
+    const { deps, releasedLeases, gitCalls } = makeFakeTrunkDeps({
+      git: trunkFlowGit({ sharedStatus: "?? scratch.txt\n" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBeNull();
+    expect(mergedInScratch(gitCalls)).toBe(true);
+    const advance = findGitCall(gitCalls, "update-ref");
+    expect(advance).toBeDefined();
+    expect(advance?.cwd).toBe(TRUNK_REPO_ROOT);
     expect(
       gitCalls.some((c) => c.args[0] === "merge" && c.cwd === TRUNK_REPO_ROOT),
     ).toBe(false);
@@ -2312,7 +2334,9 @@ describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
   });
 
   test("a lost update-ref compare-and-swap reaps + retries on a fresh tip, then lands", () => {
-    // The deferred-ff advance loses its CAS on the first attempt (a concurrent
+    // Racing-origin edge path: the deferred-ff publish is a compare-and-swap ref
+    // advance (ADR 0102's "push" — this single-repo model has no separate remote
+    // to push to). The advance loses its CAS on the first attempt (a concurrent
     // local advance moved the default under the fence); that attempt reaps its
     // scratch worktree and retries, and the second attempt's CAS wins.
     let updateRefCalls = 0;

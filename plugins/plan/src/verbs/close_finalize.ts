@@ -953,12 +953,11 @@ export function integrateRepoUnderLease(
       );
     }
     // ADR 0102: the epic base merges in a PRIVATE scratch worktree cut from the
-    // leased default tip, never in the shared checkout. Unrelated dirt or an
-    // off-branch shared checkout no longer BLOCKS integration — the any-dirt
-    // TRUNK_INTEGRATION_DIRTY refusal, the off-branch refusal, and the shared-
-    // checkout MERGE_HEAD residue check all retire — and no MERGE_HEAD is ever
-    // visible in the shared checkout. The shared checkout is only ever
-    // fast-forwarded, and only when it is clean AND on the default branch.
+    // leased default tip, never in the shared checkout. Unrelated dirt in the
+    // shared checkout, or the shared checkout sitting on another branch, does
+    // not block integration, and no MERGE_HEAD is ever visible in the shared
+    // checkout. The shared checkout is only ever fast-forwarded, and only when
+    // it is clean AND on the default branch.
     const sourceTip = deps.git(
       ["rev-parse", "--verify", `refs/heads/${sourceBranch}^{commit}`],
       repoRoot,
