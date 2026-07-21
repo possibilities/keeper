@@ -152,12 +152,14 @@ describe("runPassthrough", () => {
 
 describe("agent run proof-window forwarding", () => {
   test("documents one run-wrapper proof-window form in install and CLI help", () => {
-    const canonical = "keeper agent run pi --x-codex-pool-proof-window=arm";
+    const canonicalRun = "keeper agent run pi --x-codex-pool-proof-window=arm";
+    const canonicalHelp =
+      "keeper agent run pi [--model <codex-model>] --x-codex-pool-proof-window=arm";
     expect(
       readFileSync(join(import.meta.dir, "..", "docs", "install.md"), "utf8"),
-    ).toContain(canonical);
-    expect(USAGE.replace(/\s+/g, " ")).toContain(canonical);
-    expect(KEEPER_AGENT_HELP.replace(/\s+/g, " ")).toContain(canonical);
+    ).toContain(canonicalRun);
+    expect(USAGE.replace(/\s+/g, " ")).toContain(canonicalHelp);
+    expect(KEEPER_AGENT_HELP.replace(/\s+/g, " ")).toContain(canonicalHelp);
   });
 
   test("forwards the documented proof-window flag into the managed Pi argv", async () => {
