@@ -856,7 +856,9 @@ export function buildRetryDispatchResultMessage(args: {
  * `row.verb === "repair"` guard below stays as a defensive belt for a malformed/pre-slug
  * repair id that somehow fails the wire's id-shape check despite the verb match: the
  * repair sweep's own level-trigger (re-minting from live evidence, clearing on the base
- * observed green) owns that row too, so the orphan sweep must not reap it either.
+ * observed green) owns that row too, so the orphan sweep must not reap it either. A
+ * `block::<task>` incident is likewise producer-owned: TaskSnapshot arm and clear folds
+ * own its lifecycle, never the retry wire.
  *
  * The per-repo shared-checkout-WEDGE (mid-merge) distress row is DELIBERATELY NOT exempt:
  * a mid-merge shared checkout no longer blocks the working-tree-free base merge, so that
@@ -964,6 +966,11 @@ export function gcUnretryableDispatchFailures(
     // re-dispatch a declined repair after every daemon restart, the same as reaping the
     // well-formed case would.
     if (row.verb === "repair") {
+      continue;
+    }
+    // Block incidents arm and clear with TaskSnapshot transitions; the retry wire
+    // cannot address them, so boot GC must preserve their page-once lifecycle.
+    if (row.verb === "block") {
       continue;
     }
     mintClear(row.verb, row.id, {

@@ -885,6 +885,7 @@ export const BLOCK_ESCALATIONS_DESCRIPTOR: CollectionDescriptor = {
   filters: {
     id: "id",
     status: "block_status",
+    verb: "verb",
   },
   jsonColumns: new Set(),
 };

@@ -6270,25 +6270,7 @@ const CREATE_PROVIDER_LEG_CASCADES_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_provider_leg_cascades_attempt ON provider_leg_cascades(wrapper_dispatch_attempt_id)",
 ];
 
-/**
- * `block_escalations` projection table — the escalate-once LATCH for the daemon
- * block-escalation producer. A row exists for as long as a plan task is in
- * `runtime_status='blocked'`: the `TaskSnapshot` fold INSERTs the latch
- * (`status='pending'`, `blocked_since=event.id`) on the transition INTO blocked
- * and DELETEs it on the transition OUT, so an unblock→re-block re-arms the latch
- * exactly once — the `dispatch_never_bound` bind/clear reset analog. The producer
- * walks `pending` rows and mints `BlockEscalationRequested` followed by
- * `BlockEscalationAttempted`. Owning-work outcomes return the latch to pending and
- * increment the bounded attachment count; the legacy fallback advances it to
- * attempted. The whole row is reset only when the task leaves blocked.
- *
- * Category-AGNOSTIC: the fold tracks only the blocked transition + the escalation
- * events; the `TOOLING_FAILURE`-skip category gate lives in the PRODUCER, never
- * here. A reducer projection (DETERMINISTIC-replayed — in every rewind-and-redrain
- * DELETE list; NOT live-only, so a plain `DELETE`, never `rewindLiveProjection`).
- * `blocked_since` / `last_event_id` are event ids, never wall-clock, so the fold
- * is re-fold-deterministic.
- */
+/** Retained solely for fresh-DB migration ordering; not a live projection. */
 const CREATE_BLOCK_ESCALATIONS = `
 CREATE TABLE IF NOT EXISTS block_escalations (
     epic_id TEXT NOT NULL,
