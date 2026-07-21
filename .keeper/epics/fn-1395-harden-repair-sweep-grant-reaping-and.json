@@ -8,7 +8,7 @@
     "fn-1352-retire-escalation-sessions"
   ],
   "id": "fn-1395-harden-repair-sweep-grant-reaping-and",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T06:56:43.355000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T06:31:55.739000Z"
+  "updated_at": "2026-07-21T06:56:43.355000Z"
 }
