@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting runtime publication must preserve subtle identity, provenance, routing, and credential-boundary invariants across the CLI, telemetry, and Pi companion.",
+      "spark_exclusion": "contract-or-security-design",
+      "spark_fit": false,
+      "task_id": "fn-1402-expose-agent-runtime-diagnostics.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is substantial but well-specified multi-file implementation of explicit JSON, routing-authority, compatibility, and side-effect-free inspection contracts.",
+      "spark_exclusion": "fixed-shape-too-large",
+      "spark_fit": false,
+      "task_id": "fn-1402-expose-agent-runtime-diagnostics.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Durable intent freezing, transition semantics, idle re-evaluation, and firing/cancellation races require preserving subtle lifecycle correctness invariants across many protocol surfaces.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1402-expose-agent-runtime-diagnostics.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.92,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Consolidating user-facing documentation and sharpening skill trigger boundaries requires wording judgment and careful semantic alignment with the landed interfaces.",
+      "spark_exclusion": "ambiguous-or-judgment-heavy",
+      "spark_fit": false,
+      "task_id": "fn-1402-expose-agent-runtime-diagnostics.4",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T21:31:19.817000Z",
+  "epic_id": "fn-1402-expose-agent-runtime-diagnostics",
+  "input_hash": "d6cf77263bfbd89f8a36cc56e87b61a67e68c5846e1f11fb35d5881266e90129",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3603920678,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1402-expose-agent-runtime-diagnostics.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting runtime publication must preserve subtle identity, provenance, routing, and credential-boundary invariants across the CLI, telemetry, and Pi companion.\",\"confidence\":0.94,\"spark_fit\":false,\"spark_exclusion\":\"contract-or-security-design\"},{\"task_id\":\"fn-1402-expose-agent-runtime-diagnostics.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"This is substantial but well-specified multi-file implementation of explicit JSON, routing-authority, compatibility, and side-effect-free inspection contracts.\",\"confidence\":0.9,\"spark_fit\":false,\"spark_exclusion\":\"fixed-shape-too-large\"},{\"task_id\":\"fn-1402-expose-agent-runtime-diagnostics.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Durable intent freezing, transition semantics, idle re-evaluation, and firing/cancellation races require preserving subtle lifecycle correctness invariants across many protocol surfaces.\",\"confidence\":0.96,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"},{\"task_id\":\"fn-1402-expose-agent-runtime-diagnostics.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Consolidating user-facing documentation and sharpening skill trigger boundaries requires wording judgment and careful semantic alignment with the landed interfaces.\",\"confidence\":0.92,\"spark_fit\":false,\"spark_exclusion\":\"ambiguous-or-judgment-heavy\"}]}\n"
+}
