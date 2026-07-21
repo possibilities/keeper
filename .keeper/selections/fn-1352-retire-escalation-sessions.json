@@ -8,38 +8,34 @@
     {
       "confidence": 0.78,
       "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Cross-cutting multi-file removal cascade with ordering constraints where mistakenly deleting a shared selector silently breaks the page-once safety invariant, a nameable correctness-bound reason for opus at the contract-touching xhigh band.",
-      "task_id": "fn-1352-retire-escalation-sessions.1",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.8,
-      "label_source": "heuristic-guided",
-      "model": "opus",
-      "rationale": "Schema-ladder migration plus re-fold-deterministic incident folds with a subtle no-re-page carry-forward invariant and silent double-counting risk \u2014 a hard correctness/contract gate warranting opus at xhigh.",
-      "task_id": "fn-1352-retire-escalation-sessions.2",
-      "tier": "xhigh"
-    },
-    {
-      "confidence": 0.72,
-      "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Judgment- and taste-heavy docs/glossary reshape with user-facing wording and present-tense-only precision but no intelligence-bound reason, routing to the sonnet workhorse at the default high band.",
+      "rationale": "Glossary vocabulary redefinition, present-tense doc reshaping, and taste-driven pruning across several surfaces is judgment- and wording-heavy work that fits the sonnet workhorse at the model-default multi-file band.",
+      "spark_exclusion": "ambiguous-or-judgment-heavy",
+      "spark_fit": false,
       "task_id": "fn-1352-retire-escalation-sessions.3",
       "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A forward-only schema migration whose incident columns must losslessly represent live block_escalations page-once state, with a wrong type/key choice cascading into sibling task 2, is a subtle contract-invariant validation warranting opus at the contract-touching xhigh band.",
+      "spark_exclusion": "contract-or-security-design",
+      "spark_fit": false,
+      "task_id": "fn-1352-retire-escalation-sessions.4",
+      "tier": "xhigh"
     }
   ],
-  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
-  "created_at": "2026-07-19T23:09:17.916000Z",
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T14:05:20.132000Z",
   "epic_id": "fn-1352-retire-escalation-sessions",
-  "input_hash": "a1f186e426b8bc5df4aa48318c06d88dfdc0832b08b7a4d72bbc7ab54ba58a87",
+  "input_hash": "ebbd8cc4169b1d6bbaa6d50c21e607c7b06ace439f1a712e76f3d37ece4f4eb6",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 2716960484,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1352-retire-escalation-sessions.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file removal cascade with ordering constraints where mistakenly deleting a shared selector silently breaks the page-once safety invariant, a nameable correctness-bound reason for opus at the contract-touching xhigh band.\",\"confidence\":0.78},{\"task_id\":\"fn-1352-retire-escalation-sessions.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Schema-ladder migration plus re-fold-deterministic incident folds with a subtle no-re-page carry-forward invariant and silent double-counting risk \u2014 a hard correctness/contract gate warranting opus at xhigh.\",\"confidence\":0.8},{\"task_id\":\"fn-1352-retire-escalation-sessions.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment- and taste-heavy docs/glossary reshape with user-facing wording and present-tense-only precision but no intelligence-bound reason, routing to the sonnet workhorse at the default high band.\",\"confidence\":0.72}]}\n"
+  "shuffle_seed": 3955068100,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1352-retire-escalation-sessions.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Glossary vocabulary redefinition, present-tense doc reshaping, and taste-driven pruning across several surfaces is judgment- and wording-heavy work that fits the sonnet workhorse at the model-default multi-file band.\",\"confidence\":0.78,\"spark_fit\":false,\"spark_exclusion\":\"ambiguous-or-judgment-heavy\"},{\"task_id\":\"fn-1352-retire-escalation-sessions.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A forward-only schema migration whose incident columns must losslessly represent live block_escalations page-once state, with a wrong type/key choice cascading into sibling task 2, is a subtle contract-invariant validation warranting opus at the contract-touching xhigh band.\",\"confidence\":0.66,\"spark_fit\":false,\"spark_exclusion\":\"contract-or-security-design\"}]}\n"
 }
