@@ -6,9 +6,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  CODEX_OBSERVATION_SCHEMA_VERSION,
+  codexPressureLedgerPath,
+} from "../src/account-routing-config";
 import { parseArgsForAgent } from "../src/agent/args";
 import type { PresetCatalog } from "../src/agent/config";
 import {
@@ -16,12 +20,24 @@ import {
   PI_CODEX_POOL_PACKAGE_VERSION,
   resolvePiCodexPoolExtension,
 } from "../src/agent/launch-config";
-import { main } from "../src/agent/main";
+import { main, productionCodexPoolLaunchContext } from "../src/agent/main";
 import {
   KEEPER_AGENT_PI_PROMPT_CLI_ENV,
   KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV,
   PiPromptArtifactsError,
 } from "../src/agent/pi-prompt-artifacts";
+import { publishCodexObservation } from "../src/codex-account-observation-refresh";
+import {
+  codexPoolBindings,
+  FileCodexPoolActivationStore,
+  poolAliasPolicyBinding,
+  resolveCodexPoolWorkflowPaths,
+  resolveKeeperRevision,
+} from "../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
 import {
   expectExit,
   flagValues,
@@ -44,6 +60,46 @@ function piHarness(
 // fresh pi launch (see DEFAULT_PRESET_CATALOG).
 const DEFAULT_THINKING = ["--thinking", "high"];
 const DEFAULT_MODEL = ["--model", "glm"];
+const CODEX_ALIASES = ["keeper-codex-a", "keeper-codex-b"];
+
+function aliasPolicy(generic: string[], spark: string[]) {
+  return {
+    [CODEX_GENERIC_QUOTA_SCOPE]: generic,
+    [CODEX_SPARK_QUOTA_SCOPE]: spark,
+  };
+}
+
+function aliasPolicyEnv(generic: string[], spark: string[]): string {
+  return JSON.stringify(aliasPolicy(generic, spark));
+}
+
+function aliasPolicyBindingEnv(generic: string[], spark: string[]): string {
+  return poolAliasPolicyBinding(CODEX_ALIASES, aliasPolicy(generic, spark));
+}
+
+function quotaWindow(
+  quotaScope: typeof CODEX_GENERIC_QUOTA_SCOPE | typeof CODEX_SPARK_QUOTA_SCOPE,
+  usedPercent: number,
+  exhausted: boolean,
+  resetAtMs: number,
+) {
+  return {
+    role:
+      quotaScope === CODEX_GENERIC_QUOTA_SCOPE
+        ? ("primary" as const)
+        : ("additional" as const),
+    quota_scope: quotaScope,
+    key: quotaScope === CODEX_GENERIC_QUOTA_SCOPE ? "session" : "spark",
+    label:
+      quotaScope === CODEX_GENERIC_QUOTA_SCOPE
+        ? "session"
+        : "GPT-5.3-Codex-Spark",
+    window_seconds: 18_000,
+    used_percent: usedPercent,
+    exhausted,
+    reset_at_ms: resetAtMs,
+  };
+}
 
 /** A catalog whose pi_default triple pins the given model + thinking. The triple's
  *  effort segment carries the keeper effort that maps onto pi's thinking band. */
@@ -188,7 +244,8 @@ describe("Pi command assembly", () => {
   });
 
   test("loads the tracked extension and Codex companion as separate explicit sources", async () => {
-    const reservations: Array<boolean | undefined> = [];
+    const launches: Array<[boolean | undefined, string | null | undefined]> =
+      [];
     const h = piHarness(["--x-no-confirm", "hello"], {
       presetCatalog: piDefaultCatalog("openai-codex/gpt-5.2-codex", "high"),
       resolvePiExtensionArgs: () => ["-e", "/fake/keeper-events.ts"],
@@ -197,11 +254,18 @@ describe("Pi command assembly", () => {
         health: "ready",
         problem_code: null,
       }),
-      codexPoolLaunchContext: (reserve?: boolean) => {
-        reservations.push(reserve);
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
+        launches.push([reserve, modelId]);
         return {
           mode: "active",
-          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          activation_mode: "active",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
           config_binding: "b".repeat(64),
           initial_alias: "keeper-codex-b",
           problem_code: null,
@@ -217,12 +281,335 @@ describe("Pi command assembly", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
       '["keeper-codex-a","keeper-codex-b"]',
     );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBe(
       "keeper-codex-b",
     );
-    expect(reservations).toEqual([true]);
+    expect(launches).toEqual([[true, "openai-codex/gpt-5.2-codex"]]);
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBeUndefined();
+  });
+
+  test("active-degraded launch emits the pinned generic policy", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog("openai-codex/gpt-5.2-codex", "high"),
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "active",
+        activation_mode: "active-degraded",
+        degraded: true,
+        aliases: CODEX_ALIASES,
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-b"],
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+        initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
+        config_binding: "e".repeat(64),
+        initial_alias: "keeper-codex-b",
+        problem_code: null,
+      }),
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("active");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(["keeper-codex-b"], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(["keeper-codex-b"], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBe(
+      "keeper-codex-b",
+    );
+  });
+
+  test("generic active Spark startup stays active without an initial alias", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog(
+        "openai-codex/gpt-5.3-codex-spark",
+        "high",
+      ),
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "active",
+        activation_mode: "active",
+        aliases: CODEX_ALIASES,
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+        config_binding: "f".repeat(64),
+        initial_alias: null,
+        problem_code: null,
+      }),
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("active");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
+  });
+
+  test("Spark-only active-scoped launch emits only Spark aliases", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog(
+        "openai-codex/gpt-5.3-codex-spark",
+        "high",
+      ),
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "active",
+        activation_mode: "active-scoped",
+        aliases: CODEX_ALIASES,
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: [],
+          [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
+        },
+        requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+        config_binding: "0".repeat(64),
+        initial_alias: "keeper-codex-b",
+        problem_code: null,
+      }),
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], ["keeper-codex-b"]),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], ["keeper-codex-b"]),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBe(
+      "keeper-codex-b",
+    );
+  });
+
+  test("active-scoped launch preserves generic and Spark policy", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog(
+        "openai-codex/gpt-5.3-codex-spark",
+        "high",
+      ),
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "active",
+        activation_mode: "active-scoped",
+        aliases: CODEX_ALIASES,
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a"],
+          [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
+        },
+        requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+        config_binding: "1".repeat(64),
+        initial_alias: "keeper-codex-b",
+        problem_code: null,
+      }),
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(["keeper-codex-a"], ["keeper-codex-b"]),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(["keeper-codex-a"], ["keeper-codex-b"]),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBe(
+      "keeper-codex-b",
+    );
+  });
+
+  test("production launch keeps runtime switching active when only one scope verifies", () => {
+    const previousRoutingRoot = process.env.KEEPER_CODEX_ACCOUNT_ROUTING_ROOT;
+    const previousConfigRoot = process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT;
+    const previousAliases = process.env.KEEPER_PI_CODEX_POOL_ALIASES;
+    const root = mkdtempSync(join(tmpdir(), "codex-pool-launch-scope-"));
+    try {
+      const routingRoot = join(root, "routing");
+      const configRoot = join(root, "config");
+      process.env.KEEPER_CODEX_ACCOUNT_ROUTING_ROOT = routingRoot;
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = configRoot;
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(CODEX_ALIASES);
+      const now = Date.now();
+      const bindings = codexPoolBindings(
+        resolveKeeperRevision(),
+        CODEX_ALIASES,
+      );
+      new FileCodexPoolActivationStore(
+        resolveCodexPoolWorkflowPaths({
+          KEEPER_PI_CODEX_POOL_CONFIG_ROOT: configRoot,
+        }),
+      ).writeActivation({
+        schema_version: 1,
+        mode: "active-scoped",
+        revision: bindings.revision,
+        config_binding: bindings.config_binding,
+        alias_binding: bindings.alias_binding,
+        aliases: CODEX_ALIASES,
+        degraded: null,
+        scoped: {
+          proof_scope: CODEX_SPARK_QUOTA_SCOPE,
+          authorized_aliases: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+        },
+        updated_at_ms: now,
+      });
+      const publish = (
+        genericExhausted: boolean,
+        spark: "healthy" | "missing",
+      ) =>
+        publishCodexObservation(routingRoot, {
+          schema_version: CODEX_OBSERVATION_SCHEMA_VERSION,
+          provider: "openai-codex",
+          config_binding: bindings.config_binding,
+          observed_at_ms: now,
+          aliases: CODEX_ALIASES.map((alias) => ({
+            alias,
+            status: "healthy" as const,
+            observed_at_ms: now,
+            expires_at_ms: now + 60_000,
+            windows: [
+              quotaWindow(
+                CODEX_GENERIC_QUOTA_SCOPE,
+                genericExhausted ? 100 : 20,
+                genericExhausted,
+                now + 60_000,
+              ),
+              ...(spark === "healthy"
+                ? [
+                    quotaWindow(
+                      CODEX_SPARK_QUOTA_SCOPE,
+                      20,
+                      false,
+                      now + 60_000,
+                    ),
+                  ]
+                : []),
+            ],
+          })),
+        });
+
+      publish(false, "missing");
+      const sparkContext = productionCodexPoolLaunchContext(
+        process.env,
+        true,
+        "openai-codex/gpt-5.3-codex-spark",
+      );
+      expect(sparkContext).toMatchObject({
+        mode: "active",
+        activation_mode: "active-scoped",
+        alias_policy: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+        initial_alias: null,
+        problem_code: "pool-unavailable",
+      });
+      expect(existsSync(codexPressureLedgerPath(routingRoot))).toBe(false);
+      expect(
+        productionCodexPoolLaunchContext(
+          process.env,
+          true,
+          "openai-codex/gpt-5.4-mini",
+        ).initial_alias,
+      ).toMatch(/^keeper-codex-/);
+
+      publish(true, "healthy");
+      const genericContext = productionCodexPoolLaunchContext(
+        process.env,
+        true,
+        "openai-codex/gpt-5.4-mini",
+      );
+      expect(genericContext).toMatchObject({
+        mode: "active",
+        activation_mode: "active-scoped",
+        alias_policy: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+        initial_alias: null,
+        problem_code: "pool-unavailable",
+      });
+      expect(
+        productionCodexPoolLaunchContext(
+          process.env,
+          true,
+          "openai-codex/gpt-5.3-codex-spark",
+        ).initial_alias,
+      ).toMatch(/^keeper-codex-/);
+
+      publish(true, "missing");
+      expect(
+        productionCodexPoolLaunchContext(
+          process.env,
+          true,
+          "openai-codex/gpt-5.4-mini",
+        ),
+      ).toMatchObject({
+        mode: "native",
+        alias_policy: aliasPolicy([], []),
+        initial_alias: null,
+      });
+    } finally {
+      if (previousRoutingRoot === undefined) {
+        delete process.env.KEEPER_CODEX_ACCOUNT_ROUTING_ROOT;
+      } else {
+        process.env.KEEPER_CODEX_ACCOUNT_ROUTING_ROOT = previousRoutingRoot;
+      }
+      if (previousConfigRoot === undefined) {
+        delete process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT;
+      } else {
+        process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = previousConfigRoot;
+      }
+      if (previousAliases === undefined) {
+        delete process.env.KEEPER_PI_CODEX_POOL_ALIASES;
+      } else {
+        process.env.KEEPER_PI_CODEX_POOL_ALIASES = previousAliases;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("missing or incompatible companion stays native with a bounded warning", async () => {
@@ -240,7 +627,14 @@ describe("Pi command assembly", () => {
         resolvePiCodexPoolExtension: () => ({ args: [], ...unavailable }),
         codexPoolLaunchContext: () => ({
           mode: "active",
-          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          activation_mode: "active",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
           config_binding: "c".repeat(64),
           initial_alias: "keeper-codex-a",
           problem_code: null,
@@ -249,6 +643,12 @@ describe("Pi command assembly", () => {
       const cmd = await runAndCapture(h, main);
       expect(cmd).not.toContain("/fake/pi-codex-pool.ts");
       expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+      expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+        aliasPolicyEnv([], []),
+      );
+      expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+        aliasPolicyBindingEnv([], []),
+      );
       expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
       expect(h.err.join("")).toBe(
         `Warning: [${unavailable.problem_code}] [keeper-codex-pool] pool-unavailable; using native openai-codex\n`,
@@ -265,11 +665,19 @@ describe("Pi command assembly", () => {
         health: "ready",
         problem_code: null,
       }),
-      codexPoolLaunchContext: (reserve?: boolean) => {
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
         reservations.push(reserve);
+        expect(modelId).toBe("anthropic/claude-sonnet");
         return {
           mode: "active",
-          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          activation_mode: "active",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
           config_binding: "d".repeat(64),
           initial_alias: null,
           problem_code: null,
@@ -280,6 +688,15 @@ describe("Pi command assembly", () => {
     expect(flagValues(cmd, "--model")).toEqual(["anthropic/claude-sonnet"]);
     expect(flagValues(cmd, "-e")).toEqual(["/fake/pi-codex-pool.ts"]);
     expect(reservations).toEqual([false]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
   });
 
@@ -294,6 +711,15 @@ describe("Pi command assembly", () => {
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "-e")).toEqual(["/fake/pi-codex-pool.ts"]);
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
       "activation-pending",
     );

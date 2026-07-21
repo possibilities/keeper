@@ -30,6 +30,7 @@ describe("Pi Codex companion installation contract", () => {
     expect(SOURCE).toContain("openAICodexResponsesApi");
     expect(SOURCE).toContain("KEEPER_PI_CODEX_POOL_MODE");
     expect(SOURCE).toContain("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS");
+    expect(SOURCE).toContain("KEEPER_PI_CODEX_POOL_POLICY_BINDING");
     expect(SOURCE).toContain("KEEPER_JOB_ID");
   });
 
@@ -44,6 +45,9 @@ describe("Pi Codex companion installation contract", () => {
     expect(INSTALL).toContain('source.includes("KEEPER_PI_CODEX_POOL_MODE")');
     expect(INSTALL).toContain(
       'source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS")',
+    );
+    expect(INSTALL).toContain(
+      'source.includes("KEEPER_PI_CODEX_POOL_POLICY_BINDING")',
     );
     expect(INSTALL).not.toContain("next.push(process.env.PI_CODEX_POOL_ROOT)");
   });

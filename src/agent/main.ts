@@ -98,17 +98,28 @@ import {
   type CodexPoolWorkflowResult,
   captureCodexPoolProof,
   codexPoolAliasesFromEnvironment,
+  codexPoolAliasPolicyForActivation,
   codexPoolBindings,
   codexPoolObservationVerifies,
   codexPoolStatus,
+  codexPoolVerificationScopeForActivation,
   effectiveCodexPoolActivation,
   FileCodexPoolActivationStore,
+  poolAliasPolicyBinding,
   recoverCodexPool,
+  resolveCodexPoolWorkflowPaths,
   resolveKeeperRevision,
   rollbackCodexPool,
   verdictCodexPoolProof,
   verifyCodexPool,
 } from "../codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_QUOTA_SCOPES,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+  codexQuotaScopeForModelId,
+} from "../codex-quota-scope";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import { normalizeUtcTimestamp } from "../fable-focus";
@@ -266,8 +277,11 @@ import {
 } from "./triple";
 import { readSingleChar } from "./tty";
 
+export type CodexPoolAliasPolicy = Record<CodexQuotaScope, string[]>;
+
 export interface CodexPoolLaunchContext {
   mode: "native" | "active";
+  activation_mode: "native" | "active" | "active-degraded" | "active-scoped";
   /**
    * The pool is active but pinned to a single healthy alias while the other is
    * quota-dead — launched as `active` routing, surfaced as `active-degraded` to
@@ -275,6 +289,9 @@ export interface CodexPoolLaunchContext {
    */
   degraded?: boolean;
   aliases: string[];
+  alias_policy: CodexPoolAliasPolicy;
+  requested_quota_scope: CodexQuotaScope;
+  initial_scope: CodexQuotaScope;
   config_binding: string;
   revision?: string;
   initial_alias: string | null;
@@ -283,7 +300,7 @@ export interface CodexPoolLaunchContext {
 
 export interface CodexSessionRoutingInspection {
   activation: {
-    mode: "native" | "active" | "active-degraded";
+    mode: "native" | "active" | "active-degraded" | "active-scoped";
     problem_code: CodexPoolProblemCode | null;
   };
   companion: {
@@ -427,7 +444,10 @@ export interface MainDeps {
    */
   resolvePiExtensionArgsFn: () => string[];
   resolvePiCodexPoolExtensionFn: () => PiCodexPoolExtensionResolution;
-  codexPoolLaunchContextFn: (reserve?: boolean) => CodexPoolLaunchContext;
+  codexPoolLaunchContextFn: (
+    reserve?: boolean,
+    modelId?: string | null,
+  ) => CodexPoolLaunchContext;
   inspectCodexSessionRoutingFn: () => CodexSessionRoutingInspection;
   runCodexPoolWorkflowFn: (
     operation: CodexPoolOperatorOperation,
@@ -530,17 +550,84 @@ function readYamlFileIfPresent(path: string): unknown {
   return parseYaml(readFileSync(path, "utf8"));
 }
 
+function emptyCodexPoolAliasPolicy(): CodexPoolAliasPolicy {
+  return {
+    [CODEX_GENERIC_QUOTA_SCOPE]: [],
+    [CODEX_SPARK_QUOTA_SCOPE]: [],
+  };
+}
+
+function codexPoolProofAliasPolicy(
+  aliases: readonly string[],
+  scope: CodexQuotaScope,
+): CodexPoolAliasPolicy {
+  const policy = emptyCodexPoolAliasPolicy();
+  policy[scope] = [...aliases];
+  return policy;
+}
+
+function codexPoolAliasPolicyEnv(
+  policy: CodexPoolAliasPolicy | undefined,
+): string {
+  const source = policy ?? emptyCodexPoolAliasPolicy();
+  return JSON.stringify({
+    [CODEX_GENERIC_QUOTA_SCOPE]: [...(source[CODEX_GENERIC_QUOTA_SCOPE] ?? [])],
+    [CODEX_SPARK_QUOTA_SCOPE]: [...(source[CODEX_SPARK_QUOTA_SCOPE] ?? [])],
+  });
+}
+
+function codexPoolInitialAliasAuthorized(
+  context: CodexPoolLaunchContext,
+): boolean {
+  return (
+    context.initial_alias !== null &&
+    (context.alias_policy?.[context.initial_scope] ?? []).includes(
+      context.initial_alias,
+    )
+  );
+}
+
+function piStartupModelId(
+  args: string[],
+  defaultModel: string | null,
+): string | null {
+  const explicit = modelArgValue(args);
+  if (explicit === null) return defaultModel;
+  const thinking = piModelColonThinking(args);
+  if (thinking === null) return explicit;
+  const suffix = `:${thinking}`;
+  return explicit.endsWith(suffix)
+    ? explicit.slice(0, -suffix.length) || explicit
+    : explicit;
+}
+
 function productionCodexPoolActivationDeps(
   env: NodeJS.ProcessEnv,
 ): CodexPoolActivationDeps {
   const aliases = codexPoolAliasesFromEnvironment(env);
   const bindings = codexPoolBindings(resolveKeeperRevision(), aliases);
-  const store = new FileCodexPoolActivationStore();
+  const store = new FileCodexPoolActivationStore(
+    resolveCodexPoolWorkflowPaths(env),
+  );
   const verifies = (
     candidate: Parameters<CodexPoolActivationDeps["verify"]>[0],
-  ) =>
-    resolvePiCodexPoolExtension().health === "ready" &&
-    codexPoolObservationVerifies(candidate, inspectCodexRouting());
+  ) => {
+    const quotaScope = codexPoolVerificationScopeForActivation(candidate);
+    if (
+      quotaScope === null ||
+      resolvePiCodexPoolExtension().health !== "ready"
+    ) {
+      return false;
+    }
+    const policy = codexPoolAliasPolicyForActivation(candidate);
+    return codexPoolObservationVerifies(
+      candidate,
+      inspectCodexRouting({
+        quotaScope,
+        authorizedAliases: policy[quotaScope],
+      }),
+    );
+  };
   return {
     store,
     bindings,
@@ -595,48 +682,112 @@ function productionCodexPoolWorkflow(
   }
 }
 
-function productionCodexPoolLaunchContext(
+function problemFromCodexInspection(
+  inspection: CodexRoutingInspection,
+): CodexPoolProblemCode {
+  if (inspection.health === "missing") return "observation-missing";
+  if (inspection.health === "stale") return "observation-stale";
+  if (inspection.verdict.kind === "native-fallback") {
+    return inspection.verdict.reason;
+  }
+  return "pool-unavailable";
+}
+
+export function productionCodexPoolLaunchContext(
   env: NodeJS.ProcessEnv,
   reserve = false,
+  modelId?: string | null,
 ): CodexPoolLaunchContext {
+  const requestedScope = codexQuotaScopeForModelId(modelId);
   try {
     const deps = productionCodexPoolActivationDeps(env);
     const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
-    const inspection = inspectCodexRouting();
-    const degraded = effective.mode === "active-degraded";
-    const ready =
-      (effective.mode === "active" || degraded) &&
-      effective.state !== null &&
-      codexPoolObservationVerifies(effective.state, inspection);
-    const route = ready && reserve ? selectCodexRoute() : null;
-    const routed = route === null || route.kind === "pooled";
-    const pinnedAlias = degraded
-      ? (effective.state?.degraded?.pinned_alias ?? null)
-      : null;
-    return {
-      mode: ready && routed ? "active" : "native",
-      degraded: ready && routed && degraded,
-      aliases: [...deps.bindings.aliases],
+    const aliases = [...deps.bindings.aliases];
+    const base = {
+      aliases,
+      requested_quota_scope: requestedScope,
+      initial_scope: requestedScope,
       config_binding: deps.bindings.config_binding,
       revision: deps.bindings.revision,
-      initial_alias:
-        route?.kind === "pooled" ? route.alias : degraded ? pinnedAlias : null,
+      initial_alias: null as string | null,
+    };
+    if (
+      (effective.mode !== "active" &&
+        effective.mode !== "active-degraded" &&
+        effective.mode !== "active-scoped") ||
+      effective.state === null
+    ) {
+      return {
+        ...base,
+        mode: "native",
+        activation_mode: "native",
+        alias_policy: emptyCodexPoolAliasPolicy(),
+        problem_code: effective.problem_code ?? "activation-pending",
+      };
+    }
+
+    const policy = codexPoolAliasPolicyForActivation(effective.state);
+    const inspections = new Map<CodexQuotaScope, CodexRoutingInspection>();
+    const verifiedScopes = new Set<CodexQuotaScope>();
+    for (const scope of CODEX_QUOTA_SCOPES) {
+      const authorizedAliases = policy[scope];
+      if (authorizedAliases.length === 0) continue;
+      const inspection = inspectCodexRouting({
+        quotaScope: scope,
+        authorizedAliases,
+      });
+      inspections.set(scope, inspection);
+      if (codexPoolObservationVerifies(effective.state, inspection, scope)) {
+        verifiedScopes.add(scope);
+      }
+    }
+    const requestedInspection = inspections.get(requestedScope);
+    const requestedVerified = verifiedScopes.has(requestedScope);
+    if (verifiedScopes.size === 0) {
+      return {
+        ...base,
+        mode: "native",
+        activation_mode: "native",
+        alias_policy: emptyCodexPoolAliasPolicy(),
+        problem_code:
+          requestedInspection === undefined
+            ? "verification-failed"
+            : problemFromCodexInspection(requestedInspection),
+      };
+    }
+
+    const authorizedAliases = policy[requestedScope];
+    const route =
+      requestedVerified && reserve && authorizedAliases.length > 0
+        ? selectCodexRoute({
+            quotaScope: requestedScope,
+            authorizedAliases,
+          })
+        : null;
+    return {
+      ...base,
+      mode: "active",
+      activation_mode: effective.mode,
+      degraded: effective.mode === "active-degraded",
+      alias_policy: policy,
+      initial_alias: route?.kind === "pooled" ? route.alias : null,
       problem_code:
-        ready && routed
-          ? null
-          : (effective.problem_code ??
-            (route?.kind === "native-fallback"
-              ? route.reason
-              : inspection.health === "missing"
-                ? "observation-missing"
-                : inspection.health === "stale"
-                  ? "observation-stale"
-                  : "pool-unavailable")),
+        route?.kind === "native-fallback"
+          ? route.reason
+          : requestedVerified
+            ? null
+            : requestedInspection === undefined
+              ? "pool-unavailable"
+              : problemFromCodexInspection(requestedInspection),
     };
   } catch {
     return {
       mode: "native",
+      activation_mode: "native",
       aliases: ["keeper-codex-a", "keeper-codex-b"],
+      alias_policy: emptyCodexPoolAliasPolicy(),
+      requested_quota_scope: requestedScope,
+      initial_scope: requestedScope,
       config_binding: "0".repeat(64),
       initial_alias: null,
       problem_code: "activation-config-invalid",
@@ -648,29 +799,85 @@ function productionCodexSessionInspection(
   env: NodeJS.ProcessEnv,
 ): CodexSessionRoutingInspection {
   const companion = resolvePiCodexPoolExtension();
-  const capacity = {
-    ...inspectCodexRouting(),
-    refresh_failure_state: readCodexObservationRefreshFailureState(
-      resolveCodexAccountRoutingRoot(),
-    ),
-  };
-  const launch = productionCodexPoolLaunchContext(env);
-  return {
-    activation: {
-      mode:
-        companion.health !== "ready"
-          ? "native"
-          : launch.degraded === true
-            ? "active-degraded"
-            : launch.mode,
-      problem_code: companion.problem_code ?? launch.problem_code,
-    },
-    companion: {
-      health: companion.health,
-      problem_code: companion.problem_code,
-    },
-    capacity,
-  };
+  const refresh_failure_state = readCodexObservationRefreshFailureState(
+    resolveCodexAccountRoutingRoot(),
+  );
+  try {
+    const deps = productionCodexPoolActivationDeps(env);
+    const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
+    const activationState = effective.state;
+    const hasEffectiveActivation =
+      companion.health === "ready" &&
+      (effective.mode === "active" ||
+        effective.mode === "active-degraded" ||
+        effective.mode === "active-scoped") &&
+      activationState !== null;
+    if (hasEffectiveActivation && activationState !== null) {
+      const verificationScope =
+        codexPoolVerificationScopeForActivation(activationState);
+      const policy = codexPoolAliasPolicyForActivation(activationState);
+      const capacity = {
+        ...inspectCodexRouting({
+          quotaScope: verificationScope ?? CODEX_GENERIC_QUOTA_SCOPE,
+          authorizedAliases:
+            verificationScope === null ? [] : policy[verificationScope],
+        }),
+        refresh_failure_state,
+      };
+      return {
+        activation: {
+          mode: effective.mode,
+          problem_code:
+            companion.problem_code ??
+            (verificationScope !== null &&
+            codexPoolObservationVerifies(activationState, capacity)
+              ? null
+              : "verification-failed"),
+        },
+        companion: {
+          health: companion.health,
+          problem_code: companion.problem_code,
+        },
+        capacity,
+      };
+    }
+    const capacity = {
+      ...inspectCodexRouting({
+        quotaScope: CODEX_GENERIC_QUOTA_SCOPE,
+        authorizedAliases: [],
+      }),
+      refresh_failure_state,
+    };
+    return {
+      activation: {
+        mode: "native",
+        problem_code: companion.problem_code ?? effective.problem_code,
+      },
+      companion: {
+        health: companion.health,
+        problem_code: companion.problem_code,
+      },
+      capacity,
+    };
+  } catch {
+    return {
+      activation: {
+        mode: "native",
+        problem_code: "activation-config-invalid",
+      },
+      companion: {
+        health: companion.health,
+        problem_code: companion.problem_code,
+      },
+      capacity: {
+        ...inspectCodexRouting({
+          quotaScope: CODEX_GENERIC_QUOTA_SCOPE,
+          authorizedAliases: [],
+        }),
+        refresh_failure_state,
+      },
+    };
+  }
 }
 
 /** Production deps — the real collaborators. */
@@ -747,8 +954,8 @@ export function realDeps(): MainDeps {
     resolveStatuslineSettingsPathFn: resolveKeeperPluginStatuslineSettingsPath,
     resolvePiExtensionArgsFn: () => piExtensionArgs(),
     resolvePiCodexPoolExtensionFn: () => resolvePiCodexPoolExtension(),
-    codexPoolLaunchContextFn: (reserve) =>
-      productionCodexPoolLaunchContext(process.env, reserve),
+    codexPoolLaunchContextFn: (reserve, modelId) =>
+      productionCodexPoolLaunchContext(process.env, reserve, modelId),
     inspectCodexSessionRoutingFn: () =>
       productionCodexSessionInspection(process.env),
     runCodexPoolWorkflowFn: (operation, source, authorization) =>
@@ -3256,7 +3463,8 @@ async function runCodexPoolCommand(
   const args = rawArgs.filter((arg) => arg !== "--json");
   if (operation === "enroll") {
     const alias = args[0];
-    const context = deps.codexPoolLaunchContextFn();
+    const enrollmentModel = "openai-codex/gpt-5.4-mini";
+    const context = deps.codexPoolLaunchContextFn(false, enrollmentModel);
     const companion = deps.resolvePiCodexPoolExtensionFn();
     if (
       json ||
@@ -3279,7 +3487,16 @@ async function runCodexPoolCommand(
       (deps.env.KEEPER_JOB_ID ?? "").trim() || "codex-pool-enrollment";
     deps.env.KEEPER_PI_CODEX_POOL_MODE = "native";
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(context.aliases);
+    const enrollmentPolicy = emptyCodexPoolAliasPolicy();
+    deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY =
+      codexPoolAliasPolicyEnv(enrollmentPolicy);
+    deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING = poolAliasPolicyBinding(
+      context.aliases,
+      enrollmentPolicy,
+    );
+    deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE = context.initial_scope;
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = context.config_binding;
+    delete deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS;
     delete deps.env.KEEPER_PI_CODEX_POOL_REVISION;
     deps.writeErr(
       "Warning: enrolling this alias revokes that account's other live grants " +
@@ -3289,7 +3506,7 @@ async function runCodexPoolCommand(
       `Codex pool enrollment is interactive; in Pi run /login ${alias}, then exit.\n`,
     );
     return runPassthrough(
-      [deps.piBin, ...companion.args, "--model", "openai-codex/gpt-5.4-mini"],
+      [deps.piBin, ...companion.args, "--model", enrollmentModel],
       deps.spawn,
       deps.exit,
       { env: deps.env, cwd: deps.cwd },
@@ -4244,7 +4461,8 @@ export async function main(deps: MainDeps): Promise<never> {
       remainingArgs,
       defaultThinking,
     );
-    const startupModel = resolveStartupModelOverride(
+    const startupModel = piStartupModelId(remainingArgs, defaultModel);
+    const startupModelOverride = resolveStartupModelOverride(
       remainingArgs,
       defaultModel,
     );
@@ -4256,10 +4474,12 @@ export async function main(deps: MainDeps): Promise<never> {
       actionLog.push(`Added Pi thinking override: --thinking ${band}`);
       note(`thinking: ${band}`);
     }
-    if (startupModel !== null) {
-      runCmd.push("--model", startupModel);
-      actionLog.push(`Added startup model override: --model ${startupModel}`);
-      note(`model: ${startupModel}`);
+    if (startupModelOverride !== null) {
+      runCmd.push("--model", startupModelOverride);
+      actionLog.push(
+        `Added startup model override: --model ${startupModelOverride}`,
+      );
+      note(`model: ${startupModelOverride}`);
     }
 
     const piExtArgs = deps.resolvePiExtensionArgsFn();
@@ -4274,7 +4494,10 @@ export async function main(deps: MainDeps): Promise<never> {
       startupModel === "openai-codex" ||
       startupModel.startsWith("openai-codex/");
     const codexContext = deps.codexPoolLaunchContextFn(
-      companion.health === "ready" && codexWorkload,
+      companion.health === "ready" &&
+        codexWorkload &&
+        codexProofWindow === null,
+      startupModel,
     );
     if (codexProofWindow !== null) {
       if (!codexWorkload) {
@@ -4297,17 +4520,37 @@ export async function main(deps: MainDeps): Promise<never> {
     const codexMode =
       companion.health !== "ready"
         ? "native"
-        : codexProofWindow !== null && codexContext.mode !== "active"
+        : codexProofWindow !== null
           ? "proof"
           : codexContext.mode;
     const codexProblem =
       codexMode === "proof"
         ? null
         : (companion.problem_code ?? codexContext.problem_code);
+    const requestedScope =
+      codexContext.requested_quota_scope ??
+      codexQuotaScopeForModelId(startupModel);
+    const aliasPolicy =
+      codexMode === "proof"
+        ? codexPoolProofAliasPolicy(codexContext.aliases, requestedScope)
+        : codexMode === "active"
+          ? codexContext.alias_policy
+          : emptyCodexPoolAliasPolicy();
+    const initialScope =
+      codexMode === "proof"
+        ? requestedScope
+        : (codexContext.initial_scope ?? requestedScope);
     deps.env.KEEPER_PI_CODEX_POOL_MODE = codexMode;
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(
       codexContext.aliases,
     );
+    deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY =
+      codexPoolAliasPolicyEnv(aliasPolicy);
+    deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING = poolAliasPolicyBinding(
+      codexContext.aliases,
+      aliasPolicy,
+    );
+    deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE = initialScope;
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = codexContext.config_binding;
     if (codexMode === "proof" && codexProofWindow !== null) {
       deps.env[CODEX_POOL_PROOF_WINDOW_ENV] = JSON.stringify(codexProofWindow);
@@ -4320,7 +4563,11 @@ export async function main(deps: MainDeps): Promise<never> {
       delete deps.env[CODEX_POOL_PROOF_WINDOW_ENV];
       delete deps.env.KEEPER_PI_CODEX_POOL_REVISION;
     }
-    if (codexMode === "active" && codexContext.initial_alias !== null) {
+    if (
+      codexMode === "active" &&
+      codexContext.initial_alias !== null &&
+      codexPoolInitialAliasAuthorized(codexContext)
+    ) {
       deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = codexContext.initial_alias;
     } else {
       delete deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS;

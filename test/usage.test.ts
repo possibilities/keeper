@@ -16,6 +16,10 @@ import {
   writeCodexObservationSidecar,
 } from "../src/codex-account-observation";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
+import {
   createUsagePoller,
   loadUsageSnapshot,
   renderUsageLines,
@@ -123,18 +127,22 @@ function codexObservation(): CodexCapacityObservation {
         windows: [
           {
             role: "primary",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
             key: "week",
             label: "weekly",
             window_seconds: 604_800,
             used_percent: 38,
+            exhausted: false,
             reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
           },
           {
             role: "additional",
+            quota_scope: CODEX_SPARK_QUOTA_SCOPE,
             key: "meter:95e633c373a9cdcf6cdc5e63:primary",
             label: "GPT-5.3-Codex-Spark",
             window_seconds: 604_800,
             used_percent: 5,
+            exhausted: false,
             reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
           },
         ],

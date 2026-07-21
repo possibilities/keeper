@@ -157,10 +157,9 @@ export async function observePool(options: {
   const requestUsage = options.requestUsage ?? requestCodexUsage;
   for (const alias of options.aliases) {
     if (options.signal?.aborted) {
-      aliases.push({
-        alias,
-        usage: unavailableUsage(alias, now(), "network"),
-      });
+      const usage = unavailableUsage(alias, now(), "network");
+      options.routes.applyUsage(usage);
+      aliases.push({ alias, usage });
       continue;
     }
     const remainingMs = Math.max(1, observedAt + OBSERVER_TIMEOUT_MS - now());
@@ -179,10 +178,9 @@ export async function observePool(options: {
       options.routes.applyUsage(usage);
       aliases.push({ alias, usage });
     } catch (error) {
-      aliases.push({
-        alias,
-        usage: unavailableUsage(alias, now(), failureClass(error)),
-      });
+      const usage = unavailableUsage(alias, now(), failureClass(error));
+      options.routes.applyUsage(usage);
+      aliases.push({ alias, usage });
     } finally {
       combined.cleanup();
     }
@@ -260,7 +258,10 @@ function pushPackageManagerCatalogCandidates(
   candidates: string[],
   packageManagerRoot: string,
 ): void {
-  pushUnique(candidates, join(packageManagerRoot, ...PI_AI_CATALOG_RELATIVE_PATH));
+  pushUnique(
+    candidates,
+    join(packageManagerRoot, ...PI_AI_CATALOG_RELATIVE_PATH),
+  );
   pushUnique(
     candidates,
     join(packageManagerRoot, ...PI_CODING_AGENT_CATALOG_RELATIVE_PATH),

@@ -3,6 +3,7 @@ import type {
   LiveProofReport,
   ProofTranscriptEntry,
 } from "../integrations/pi-codex-pool/src/proof";
+import type { CodexRoutingInspection } from "../src/codex-account-router";
 import {
   activateCodexPool,
   armCodexPoolProofWindow,
@@ -10,14 +11,22 @@ import {
   type CodexPoolActivationState,
   type CodexPoolActivationStore,
   captureCodexPoolProof,
+  codexPoolAliasPolicyForActivation,
+  codexPoolObservationVerifies,
   codexPoolProofWindowActive,
   codexPoolStatus,
   effectiveCodexPoolActivation,
+  parseCodexPoolActivationState,
   recoverCodexPool,
   rollbackCodexPool,
   verdictCodexPoolProof,
   verifyCodexPool,
 } from "../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+} from "../src/codex-quota-scope";
 
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
 const CONFIG_BINDING =
@@ -109,10 +118,11 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
 
 function passingReport(): LiveProofReport {
   return {
-    schema_version: 1,
+    schema_version: 2,
     revision: REVISION,
     config_binding: CONFIG_BINDING,
     alias_binding: ALIAS_BINDING,
+    quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
     started_at_ms: 990_000,
     completed_at_ms: 999_000,
     interrupted: false,
@@ -139,6 +149,7 @@ function passingReport(): LiveProofReport {
     routes: [
       {
         session_role: "root",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         aliases: ["keeper-codex-a", "keeper-codex-b"],
         attempts: 2,
         failure_class: "quota",
@@ -147,6 +158,7 @@ function passingReport(): LiveProofReport {
       },
       {
         session_role: "child",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         aliases: ["keeper-codex-b"],
         attempts: 1,
         failure_class: "none",
@@ -185,6 +197,39 @@ function degradedReport(): LiveProofReport {
   };
   report.verdict = "proven-degraded-single-alias";
   return report;
+}
+
+function reportForScope(
+  report: LiveProofReport,
+  quotaScope: CodexQuotaScope,
+): LiveProofReport {
+  const scoped = clone(report);
+  scoped.quota_scope = quotaScope;
+  for (const route of scoped.routes) route.quota_scope = quotaScope;
+  return scoped;
+}
+
+function scopedState(
+  proofScope: CodexQuotaScope,
+  authorizedAliases: {
+    [CODEX_GENERIC_QUOTA_SCOPE]: string[];
+    [CODEX_SPARK_QUOTA_SCOPE]: string[];
+  },
+): CodexPoolActivationState {
+  return {
+    schema_version: 1,
+    mode: "active-scoped",
+    revision: REVISION,
+    config_binding: CONFIG_BINDING,
+    alias_binding: ALIAS_BINDING,
+    aliases: ["keeper-codex-a", "keeper-codex-b"],
+    degraded: null,
+    scoped: {
+      proof_scope: proofScope,
+      authorized_aliases: authorizedAliases,
+    },
+    updated_at_ms: NOW,
+  };
 }
 
 function degradedState(): CodexPoolActivationState {
@@ -271,6 +316,40 @@ function deps(
     reload: () => true,
     verify: () => true,
     ...overrides,
+  };
+}
+
+function inspectionFor(
+  quotaScope: CodexQuotaScope,
+  authorizedAliases: readonly string[],
+  selectedAlias = authorizedAliases[0] ?? "keeper-codex-a",
+): CodexRoutingInspection {
+  return {
+    provider: "openai-codex",
+    health: "ready",
+    config_binding: CONFIG_BINDING,
+    observed_at_ms: NOW,
+    fresh: true,
+    quota_scope: quotaScope,
+    verdict: {
+      kind: "pooled",
+      provider: "openai-codex",
+      alias: selectedAlias,
+      reason: "selected",
+    },
+    candidates: BINDINGS.aliases.map((alias) => ({
+      alias,
+      quota_scope: quotaScope,
+      used_percent: 50,
+      worst_used_percent: 50,
+      pressure: 0,
+      cooldown_until_ms: 0,
+      shared_cooldown_until_ms: 0,
+      quota_cooldown_until_ms: 0,
+      capacity_cooldown_until_ms: 0,
+      authorized: authorizedAliases.includes(alias),
+      eligible: authorizedAliases.includes(alias),
+    })),
   };
 }
 
@@ -540,6 +619,318 @@ describe("Codex pool degraded single-alias activation", () => {
     expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
       mode: "native",
       problem_code: "activation-config-invalid",
+    });
+  });
+});
+
+describe("Codex pool scoped activation", () => {
+  const DEGRADED_AUTH = {
+    degraded_verdict: "proven-degraded-single-alias" as const,
+  };
+
+  test("legacy active/degraded states parse and stay effective unchanged", () => {
+    const legacyActive = {
+      schema_version: 1,
+      mode: "active",
+      revision: REVISION,
+      config_binding: CONFIG_BINDING,
+      alias_binding: ALIAS_BINDING,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      updated_at_ms: NOW,
+    };
+    expect(parseCodexPoolActivationState(legacyActive)).toMatchObject({
+      mode: "active",
+      degraded: null,
+    });
+    const store = new MemoryStore();
+    store.activation = legacyActive;
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active",
+      problem_code: null,
+    });
+
+    const legacyDegraded = degradedState();
+    delete legacyDegraded.scoped;
+    expect(parseCodexPoolActivationState(legacyDegraded)).toMatchObject({
+      mode: "active-degraded",
+      degraded: {
+        pinned_alias: "keeper-codex-a",
+      },
+    });
+    store.activation = legacyDegraded;
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active-degraded",
+      problem_code: null,
+    });
+  });
+
+  test("malformed scoped states are rejected while valid scoped is effective", () => {
+    const valid = scopedState(CODEX_SPARK_QUOTA_SCOPE, {
+      [CODEX_GENERIC_QUOTA_SCOPE]: [],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+    const store = new MemoryStore();
+    store.activation = valid;
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active-scoped",
+      problem_code: null,
+    });
+
+    const missingMarker = clone(valid);
+    delete missingMarker.scoped;
+    const duplicateAlias = clone(valid);
+    duplicateAlias.scoped!.authorized_aliases[CODEX_SPARK_QUOTA_SCOPE] = [
+      "keeper-codex-a",
+      "keeper-codex-a",
+    ];
+    const wrongMode = { ...clone(valid), mode: "active" };
+    const missingScope = clone(valid) as unknown as Record<string, unknown>;
+    missingScope.scoped = {
+      proof_scope: CODEX_SPARK_QUOTA_SCOPE,
+      authorized_aliases: {
+        [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a"],
+      },
+    };
+    const sparklessScoped = scopedState(CODEX_GENERIC_QUOTA_SCOPE, {
+      [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a"],
+      [CODEX_SPARK_QUOTA_SCOPE]: [],
+    });
+
+    for (const malformed of [
+      missingMarker,
+      duplicateAlias,
+      wrongMode,
+      missingScope,
+      sparklessScoped,
+    ]) {
+      expect(parseCodexPoolActivationState(malformed)).toBeNull();
+    }
+  });
+
+  test("Spark full proof activates scoped Spark aliases only", () => {
+    const store = new MemoryStore();
+    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    const outcome = activateCodexPool(deps(store));
+    expect(outcome).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+      problem_code: null,
+      proof: { verdict: "proven" },
+    });
+    const written = store.writes.at(-1);
+    expect(written?.scoped).toEqual({
+      proof_scope: CODEX_SPARK_QUOTA_SCOPE,
+      authorized_aliases: {
+        [CODEX_GENERIC_QUOTA_SCOPE]: [],
+        [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      },
+    });
+    expect(codexPoolAliasPolicyForActivation(written!)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: [],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+    expect(codexPoolStatus(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+      problem_code: null,
+    });
+    expect(verifyCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+    });
+  });
+
+  test("Spark degraded proof activates scoped pinned Spark alias", () => {
+    const store = new MemoryStore();
+    store.report = reportForScope(degradedReport(), CODEX_SPARK_QUOTA_SCOPE);
+    const outcome = activateCodexPool(deps(store), undefined, DEGRADED_AUTH);
+    expect(outcome).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+      problem_code: null,
+      proof: { verdict: "proven-degraded-single-alias" },
+    });
+    expect(store.writes.at(-1)?.scoped).toEqual({
+      proof_scope: CODEX_SPARK_QUOTA_SCOPE,
+      authorized_aliases: {
+        [CODEX_GENERIC_QUOTA_SCOPE]: [],
+        [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a"],
+      },
+    });
+  });
+
+  test("activating one scope preserves only other effective bound scopes", () => {
+    const store = new MemoryStore();
+    store.activation = {
+      schema_version: 1,
+      mode: "active",
+      revision: REVISION,
+      config_binding: CONFIG_BINDING,
+      alias_binding: ALIAS_BINDING,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      updated_at_ms: NOW,
+    };
+    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    expect(activateCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+    });
+    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+
+    store.report = passingReport();
+    expect(activateCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+    });
+    expect(store.writes.at(-1)?.scoped?.proof_scope).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
+    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+
+    store.report = reportForScope(degradedReport(), CODEX_SPARK_QUOTA_SCOPE);
+    expect(
+      activateCodexPool(deps(store), undefined, DEGRADED_AUTH),
+    ).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+    });
+    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a"],
+    });
+  });
+
+  test("binding-mismatched prior state is not preserved", () => {
+    const store = new MemoryStore();
+    store.activation = {
+      schema_version: 1,
+      mode: "active",
+      revision: REVISION,
+      config_binding: "f".repeat(64),
+      alias_binding: ALIAS_BINDING,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      updated_at_ms: NOW,
+    };
+    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    expect(activateCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-scoped",
+    });
+    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: [],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+  });
+
+  test("observation verification is scope and authorization exact", () => {
+    const active = parseCodexPoolActivationState({
+      schema_version: 1,
+      mode: "active",
+      revision: REVISION,
+      config_binding: CONFIG_BINDING,
+      alias_binding: ALIAS_BINDING,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      updated_at_ms: NOW,
+    })!;
+    expect(
+      codexPoolObservationVerifies(
+        active,
+        inspectionFor(CODEX_GENERIC_QUOTA_SCOPE, BINDINGS.aliases),
+      ),
+    ).toBe(true);
+    expect(
+      codexPoolObservationVerifies(
+        active,
+        inspectionFor(CODEX_SPARK_QUOTA_SCOPE, BINDINGS.aliases),
+      ),
+    ).toBe(false);
+
+    const degraded = degradedState();
+    expect(
+      codexPoolObservationVerifies(
+        degraded,
+        inspectionFor(CODEX_GENERIC_QUOTA_SCOPE, ["keeper-codex-a"]),
+      ),
+    ).toBe(true);
+    expect(
+      codexPoolObservationVerifies(
+        degraded,
+        inspectionFor(CODEX_GENERIC_QUOTA_SCOPE, BINDINGS.aliases),
+      ),
+    ).toBe(false);
+
+    const scoped = scopedState(CODEX_SPARK_QUOTA_SCOPE, {
+      [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+    });
+    expect(
+      codexPoolObservationVerifies(
+        scoped,
+        inspectionFor(
+          CODEX_SPARK_QUOTA_SCOPE,
+          BINDINGS.aliases,
+          "keeper-codex-b",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      codexPoolObservationVerifies(
+        scoped,
+        inspectionFor(CODEX_GENERIC_QUOTA_SCOPE, ["keeper-codex-a"]),
+      ),
+    ).toBe(false);
+    expect(
+      codexPoolObservationVerifies(
+        scoped,
+        inspectionFor(CODEX_GENERIC_QUOTA_SCOPE, ["keeper-codex-a"]),
+        CODEX_GENERIC_QUOTA_SCOPE,
+      ),
+    ).toBe(true);
+    expect(
+      codexPoolObservationVerifies(
+        scoped,
+        inspectionFor(CODEX_SPARK_QUOTA_SCOPE, ["keeper-codex-a"]),
+      ),
+    ).toBe(false);
+
+    const capacityOnly = inspectionFor(CODEX_SPARK_QUOTA_SCOPE, []);
+    capacityOnly.health = "ready";
+    capacityOnly.verdict = {
+      kind: "pooled",
+      provider: "openai-codex",
+      alias: "keeper-codex-a",
+      reason: "selected",
+    };
+    capacityOnly.candidates = capacityOnly.candidates.map((candidate) => ({
+      ...candidate,
+      authorized: false,
+      eligible: true,
+    }));
+    expect(codexPoolObservationVerifies(scoped, capacityOnly)).toBe(false);
+  });
+
+  test("rollback clears scoped marker and policy", () => {
+    const store = new MemoryStore();
+    store.activation = scopedState(CODEX_SPARK_QUOTA_SCOPE, {
+      [CODEX_GENERIC_QUOTA_SCOPE]: [],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a"],
+    });
+    expect(rollbackCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "native",
+    });
+    const activation = store.activation as CodexPoolActivationState;
+    expect(activation.mode).toBe("native");
+    expect(activation.scoped ?? null).toBeNull();
+    expect(codexPoolAliasPolicyForActivation(activation)).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: [],
+      [CODEX_SPARK_QUOTA_SCOPE]: [],
     });
   });
 });

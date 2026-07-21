@@ -45,6 +45,10 @@ import type {
   CodexPoolActivationAuthorization,
   CodexPoolWorkflowResult,
 } from "../../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../../src/codex-quota-scope";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -186,7 +190,10 @@ export interface HarnessOptions {
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
   resolvePiCodexPoolExtension?: () => PiCodexPoolExtensionResolution;
-  codexPoolLaunchContext?: (reserve?: boolean) => CodexPoolLaunchContext;
+  codexPoolLaunchContext?: (
+    reserve?: boolean,
+    modelId?: string | null,
+  ) => CodexPoolLaunchContext;
   inspectCodexSessionRouting?: () => CodexSessionRoutingInspection;
   refreshCodexObservation?: () => Promise<void>;
   runCodexPoolWorkflow?: (
@@ -381,7 +388,14 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.codexPoolLaunchContext ??
       (() => ({
         mode: "native",
+        activation_mode: "native",
         aliases: ["keeper-codex-a", "keeper-codex-b"],
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: [],
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+        initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
         config_binding: "a".repeat(64),
         initial_alias: null,
         problem_code: "activation-pending",
@@ -403,6 +417,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
           config_binding: null,
           observed_at_ms: null,
           fresh: false,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
           verdict: {
             kind: "native-fallback",
             provider: "openai-codex",

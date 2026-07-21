@@ -19,6 +19,7 @@ import {
   CodexAccountObserver,
   type CodexAccountObserverClock,
 } from "../src/codex-account-observer-worker";
+import { CODEX_GENERIC_QUOTA_SCOPE } from "../src/codex-quota-scope";
 
 const NOW = Date.parse("2026-07-18T12:00:00Z");
 const BINDING = "e".repeat(64);
@@ -42,12 +43,23 @@ function envelope() {
         {
           alias: "keeper-codex-a",
           usage: {
-            schema_version: 1,
+            schema_version: 2,
             alias: "keeper-codex-a",
             status: "healthy",
             observed_at_ms: NOW,
             expires_at_ms: NOW + 60_000,
-            windows: [{ role: "primary", used_percent: 10, reset_at_ms: null }],
+            windows: [
+              {
+                role: "primary",
+                quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+                key: "session",
+                label: "session",
+                window_seconds: 18_000,
+                used_percent: 10,
+                exhausted: false,
+                reset_at_ms: null,
+              },
+            ],
           },
         },
       ],
@@ -68,7 +80,18 @@ function staleObservation(): CodexCapacityObservation {
         status: "healthy",
         observed_at_ms: NOW - 60_000,
         expires_at_ms: NOW + 60_000,
-        windows: [{ role: "primary", used_percent: 30, reset_at_ms: null }],
+        windows: [
+          {
+            role: "primary",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            key: "session",
+            label: "session",
+            window_seconds: 18_000,
+            used_percent: 30,
+            exhausted: false,
+            reset_at_ms: null,
+          },
+        ],
       },
     ],
   };

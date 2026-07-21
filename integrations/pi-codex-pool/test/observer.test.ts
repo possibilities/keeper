@@ -9,6 +9,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../../../src/codex-quota-scope.ts";
 import { CredentialVault, MemoryCredentialStorage } from "../src/auth.ts";
 import {
   loadInstalledCodexOAuth,
@@ -17,7 +21,7 @@ import {
   runObserverCommand,
 } from "../src/observer.ts";
 import { PoolRouteState } from "../src/state.ts";
-import { parseUsageResponse } from "../src/usage.ts";
+import { parseUsageResponse, usageScopeView } from "../src/usage.ts";
 
 function jwt(accountId: string, suffix: string): string {
   const encode = (value: unknown) =>
@@ -338,7 +342,17 @@ describe("Codex usage observer", () => {
 
   test("normalizes two independent aliases without crossing the observer boundary", async () => {
     const aliases = ["keeper-codex-a", "keeper-codex-b"];
-    const routes = new PoolRouteState(aliases, null, () => 100);
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => 100,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      {
+        [CODEX_GENERIC_QUOTA_SCOPE]: aliases,
+        [CODEX_SPARK_QUOTA_SCOPE]: [],
+      },
+    );
     const requests: Array<{
       access: string;
       accountId: string;
@@ -370,26 +384,32 @@ describe("Codex usage observer", () => {
     expect(envelope.aliases[0]?.usage.windows).toEqual([
       {
         role: "primary",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         key: "session",
         label: "session",
         window_seconds: 18_000,
         used_percent: 90,
+        exhausted: false,
         reset_at_ms: 200_000,
       },
       {
         role: "secondary",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         key: "week",
         label: "weekly",
         window_seconds: 604_800,
         used_percent: 80,
+        exhausted: false,
         reset_at_ms: 300_000,
       },
       {
         role: "additional",
+        quota_scope: CODEX_SPARK_QUOTA_SCOPE,
         key: "meter:95e633c373a9cdcf6cdc5e63:primary",
         label: "GPT-5.3-Codex-Spark",
         window_seconds: null,
         used_percent: 45,
+        exhausted: false,
         reset_at_ms: 250_000,
       },
     ]);
@@ -412,6 +432,229 @@ describe("Codex usage observer", () => {
     }
     expect(rendered).toContain("GPT-5.3-Codex-Spark");
     expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(16 * 1024);
+  });
+
+  test("equal-timestamp unavailable observations dominate prior Spark health", async () => {
+    const aliases = ["keeper-codex-a"];
+    const now = 100;
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => now,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      {
+        [CODEX_GENERIC_QUOTA_SCOPE]: aliases,
+        [CODEX_SPARK_QUOTA_SCOPE]: aliases,
+      },
+    );
+    await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      async requestUsage() {
+        return usage(20);
+      },
+    });
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(true);
+
+    const envelope = await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      async requestUsage() {
+        return { rate_limit: { primary_window: { used_percent: 101 } } };
+      },
+    });
+
+    expect(envelope.aliases[0]?.usage).toEqual(
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        status: "unavailable",
+        observed_at_ms: now,
+        failure_class: "schema",
+      }),
+    );
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(false);
+    const account = routes.snapshot().accounts[0];
+    expect(
+      account?.quota_scopes.find(
+        (scope) => scope.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
+      ),
+    ).toEqual(
+      expect.objectContaining({
+        used_percent: 100,
+        usage_expires_at_ms: 0,
+        observed_at_ms: now,
+        exhausted: false,
+      }),
+    );
+  });
+
+  test("malformed observations immediately overwrite prior Spark health", async () => {
+    const aliases = ["keeper-codex-a"];
+    let now = 100;
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => now,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      {
+        [CODEX_GENERIC_QUOTA_SCOPE]: aliases,
+        [CODEX_SPARK_QUOTA_SCOPE]: aliases,
+      },
+    );
+    await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      async requestUsage() {
+        return usage(20);
+      },
+    });
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(true);
+
+    now = 200;
+    const envelope = await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      async requestUsage() {
+        return { rate_limit: { primary_window: { used_percent: 101 } } };
+      },
+    });
+
+    expect(envelope.aliases[0]?.usage).toEqual(
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        status: "unavailable",
+        observed_at_ms: 200,
+        failure_class: "schema",
+      }),
+    );
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(false);
+    const account = routes.snapshot().accounts[0];
+    expect(
+      account?.quota_scopes.find(
+        (scope) => scope.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
+      ),
+    ).toEqual(
+      expect.objectContaining({
+        used_percent: 100,
+        usage_expires_at_ms: 0,
+        observed_at_ms: 200,
+        exhausted: false,
+      }),
+    );
+  });
+
+  test("aborted observations immediately overwrite prior Spark health", async () => {
+    const aliases = ["keeper-codex-a"];
+    let now = 100;
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => now,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      {
+        [CODEX_GENERIC_QUOTA_SCOPE]: aliases,
+        [CODEX_SPARK_QUOTA_SCOPE]: aliases,
+      },
+    );
+    await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      async requestUsage() {
+        return usage(20);
+      },
+    });
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(true);
+
+    now = 200;
+    const controller = new AbortController();
+    controller.abort();
+    const envelope = await observePool({
+      aliases,
+      vault: vault(),
+      routes,
+      now: () => now,
+      signal: controller.signal,
+      async requestUsage() {
+        throw new Error("request-should-not-run");
+      },
+    });
+
+    expect(envelope.aliases[0]?.usage).toEqual(
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        status: "unavailable",
+        observed_at_ms: 200,
+        failure_class: "network",
+      }),
+    );
+    expect(routes.hasEligibleRoute(CODEX_SPARK_QUOTA_SCOPE)).toBe(false);
+  });
+
+  test("keeps Spark meter exhaustion out of generic aggregate status", () => {
+    const sparkExhausted = parseUsageResponse("keeper-codex-a", usage(80), 100);
+    const sparkWindow = sparkExhausted.windows.find(
+      (window) => window.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
+    );
+    if (sparkWindow === undefined) throw new Error("missing spark fixture");
+    sparkWindow.exhausted = true;
+
+    expect(sparkExhausted.status).toBe("healthy");
+    expect(
+      usageScopeView(sparkExhausted, CODEX_GENERIC_QUOTA_SCOPE, 100).status,
+    ).toBe("healthy");
+    expect(
+      usageScopeView(sparkExhausted, CODEX_SPARK_QUOTA_SCOPE, 100).status,
+    ).toBe("exhausted");
+
+    const explicitSpark = parseUsageResponse(
+      "keeper-codex-a",
+      {
+        ...usage(80),
+        additional_rate_limits: [
+          {
+            limit_name: "GPT-5.3-Codex-Spark",
+            rate_limit: {
+              allowed: false,
+              limit_reached: true,
+              primary_window: { used_percent: 40, reset_at: 250 },
+            },
+          },
+        ],
+      },
+      100,
+    );
+    const explicitWindow = explicitSpark.windows.find(
+      (window) => window.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(explicitSpark.status).toBe("healthy");
+    expect(explicitWindow).toEqual(
+      expect.objectContaining({ used_percent: 40, exhausted: true }),
+    );
+    expect(usageScopeView(explicitSpark, CODEX_SPARK_QUOTA_SCOPE, 100)).toEqual(
+      expect.objectContaining({ status: "exhausted", used_percent: 40 }),
+    );
+
+    const missingSpark = parseUsageResponse(
+      "keeper-codex-a",
+      { rate_limit: { primary_window: { used_percent: 20 } } },
+      100,
+    );
+    expect(
+      usageScopeView(missingSpark, CODEX_SPARK_QUOTA_SCOPE, 100).status,
+    ).toBe("unavailable");
   });
 
   test("reduces raw failures to fixed classes", async () => {
@@ -500,10 +743,12 @@ describe("Codex usage observer", () => {
     expect(parsed.windows).toEqual([
       {
         role: "primary",
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         key: "window:primary",
         label: "primary",
         window_seconds: null,
         used_percent: 12.3,
+        exhausted: false,
         reset_at_ms: null,
       },
     ]);
@@ -536,14 +781,19 @@ describe("Codex usage observer", () => {
       aliases: Array.from({ length: 100 }, (_, index) => ({
         alias: `keeper-codex-${index}`,
         usage: {
-          schema_version: 1,
+          schema_version: 2,
           alias: `keeper-codex-${index}`,
           status: "healthy",
           observed_at_ms: 100,
           expires_at_ms: 200,
           windows: Array.from({ length: 100 }, () => ({
             role: "additional" as const,
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            key: "additional",
+            label: "additional",
+            window_seconds: null,
             used_percent: 10,
+            exhausted: false,
             reset_at_ms: 200,
           })),
         },

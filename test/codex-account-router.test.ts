@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   CODEX_FAILURE_COOLDOWN_MS,
   CODEX_OBSERVATION_SCHEMA_VERSION,
+  CODEX_PRESSURE_LEDGER_SCHEMA_VERSION,
   CODEX_PRESSURE_TTL_MS,
   codexObservationSidecarPath,
   codexPressureLedgerPath,
@@ -18,6 +19,7 @@ import {
 import {
   type CodexCapacityAlias,
   type CodexCapacityObservation,
+  type CodexCapacityWindow,
   writeCodexObservationSidecar,
 } from "../src/codex-account-observation";
 import {
@@ -26,6 +28,11 @@ import {
   recordCodexRouteOutcome,
   selectCodexRoute,
 } from "../src/codex-account-router";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+} from "../src/codex-quota-scope";
 
 const NOW = Date.parse("2026-07-18T12:00:00Z");
 const BINDING = "c".repeat(64);
@@ -43,12 +50,29 @@ function root(): string {
   return dir;
 }
 
+function windowFor(
+  quotaScope: CodexQuotaScope,
+  usedPercent: number,
+): CodexCapacityWindow {
+  return {
+    role: "primary",
+    quota_scope: quotaScope,
+    key: quotaScope === CODEX_GENERIC_QUOTA_SCOPE ? "session" : "model:spark",
+    label: quotaScope === CODEX_GENERIC_QUOTA_SCOPE ? "session" : "spark",
+    window_seconds: 18_000,
+    used_percent: usedPercent,
+    exhausted: usedPercent >= 100,
+    reset_at_ms: NOW + 180_000,
+  };
+}
+
 function alias(
   name: string,
   usedPercent: number,
   options: {
     status?: CodexCapacityAlias["status"];
     failureClass?: CodexCapacityAlias["failure_class"];
+    sparkUsedPercent?: number;
   } = {},
 ): CodexCapacityAlias {
   const status = options.status ?? "healthy";
@@ -61,11 +85,10 @@ function alias(
       status === "unavailable"
         ? []
         : [
-            {
-              role: "primary",
-              used_percent: usedPercent,
-              reset_at_ms: NOW + 180_000,
-            },
+            windowFor(CODEX_GENERIC_QUOTA_SCOPE, usedPercent),
+            ...(options.sparkUsedPercent === undefined
+              ? []
+              : [windowFor(CODEX_SPARK_QUOTA_SCOPE, options.sparkUsedPercent)]),
           ],
     ...(options.failureClass ? { failure_class: options.failureClass } : {}),
   };
@@ -146,7 +169,7 @@ describe("Codex route selection", () => {
     });
   });
 
-  test("chooses greatest worst-window headroom", () => {
+  test("chooses greatest scoped headroom", () => {
     const dir = root();
     publish(dir, [alias("keeper-codex-a", 70), alias("keeper-codex-b", 20)]);
     expect(
@@ -181,11 +204,19 @@ describe("Codex route selection", () => {
     const ledger = JSON.parse(
       readFileSync(codexPressureLedgerPath(dir), "utf8"),
     );
+    expect(ledger.schema_version).toBe(CODEX_PRESSURE_LEDGER_SCHEMA_VERSION);
     expect(ledger.provider).toBe("openai-codex");
     expect(Object.keys(ledger.aliases)).toEqual([
       "keeper-codex-a",
       "keeper-codex-b",
     ]);
+    expect(ledger.aliases["keeper-codex-a"]).toMatchObject({
+      shared_cooldown_until_ms: 0,
+      quota_cooldown_until_ms: {
+        [CODEX_GENERIC_QUOTA_SCOPE]: 0,
+        [CODEX_SPARK_QUOTA_SCOPE]: 0,
+      },
+    });
   });
 
   test("crashed-process pressure expires and is cleaned on the next choice", () => {
@@ -217,6 +248,101 @@ describe("Codex route selection", () => {
       NOW + CODEX_PRESSURE_TTL_MS + 2,
     ]);
     expect(ledger.aliases["keeper-codex-b"].reservations).toEqual([]);
+  });
+
+  test("uses exact quota scope so generic exhaustion does not hide Spark", () => {
+    const dir = root();
+    publish(dir, [
+      alias("keeper-codex-a", 100, { sparkUsedPercent: 0 }),
+      alias("keeper-codex-b", 80, { sparkUsedPercent: 6 }),
+    ]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-b" });
+  });
+
+  test("Spark exhaustion does not hide generic capacity", () => {
+    const dir = root();
+    publish(dir, [
+      alias("keeper-codex-a", 10, { sparkUsedPercent: 100 }),
+      alias("keeper-codex-b", 20, { sparkUsedPercent: 0 }),
+    ]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+  });
+
+  test("missing Spark evidence fails closed for Spark", () => {
+    const dir = root();
+    publish(dir, [alias("keeper-codex-a", 10)]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toEqual({
+      kind: "native-fallback",
+      provider: "openai-codex",
+      reason: "pool-unavailable",
+      warning: CODEX_NATIVE_FALLBACK_WARNING,
+    });
+  });
+
+  test("explicit authorization restricts candidates and empty disables pooling", () => {
+    const dir = root();
+    publish(dir, [alias("keeper-codex-a", 1), alias("keeper-codex-b", 90)]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        authorizedAliases: ["not-an-alias", "keeper-codex-b"],
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-b" });
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        authorizedAliases: ["keeper-codex-missing"],
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 2,
+        authorizedAliases: [],
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+    expect(
+      recordCodexRouteOutcome({
+        stateDir: dir,
+        nowMs: NOW + 3,
+        alias: "keeper-codex-a",
+        outcome: "quota",
+        authorizedAliases: ["keeper-codex-b"],
+        tryAcquireLock: injectedLock,
+      }),
+    ).toBe(false);
   });
 
   test("cooldowns exclude failures and recover half-open after expiry", () => {
@@ -275,6 +401,120 @@ describe("Codex route selection", () => {
     });
   });
 
+  test("quota cooldowns isolate requested scopes", () => {
+    const dir = root();
+    publish(dir, [alias("keeper-codex-a", 20, { sparkUsedPercent: 0 })]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+    expect(
+      recordCodexRouteOutcome({
+        stateDir: dir,
+        nowMs: NOW,
+        alias: "keeper-codex-a",
+        outcome: "quota",
+        tryAcquireLock: injectedLock,
+      }),
+    ).toBe(true);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 2,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+  });
+
+  test("shared failures block all scopes", () => {
+    const dir = root();
+    publish(dir, [alias("keeper-codex-a", 20, { sparkUsedPercent: 0 })]);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+    expect(
+      recordCodexRouteOutcome({
+        stateDir: dir,
+        nowMs: NOW,
+        alias: "keeper-codex-a",
+        outcome: "transport",
+        tryAcquireLock: injectedLock,
+      }),
+    ).toBe(true);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 2,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+  });
+
+  test("success releases one reservation and does not clear cooldown", () => {
+    const dir = root();
+    publish(dir, [alias("keeper-codex-a", 20)]);
+    selectCodexRoute({
+      stateDir: dir,
+      nowMs: NOW,
+      tryAcquireLock: injectedLock,
+    });
+    expect(
+      recordCodexRouteOutcome({
+        stateDir: dir,
+        nowMs: NOW,
+        alias: "keeper-codex-a",
+        outcome: "rate",
+        tryAcquireLock: injectedLock,
+      }),
+    ).toBe(true);
+    expect(
+      recordCodexRouteOutcome({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        alias: "keeper-codex-a",
+        outcome: "success",
+        tryAcquireLock: injectedLock,
+      }),
+    ).toBe(true);
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW + 2,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "native-fallback", reason: "pool-unavailable" });
+    const ledger = JSON.parse(
+      readFileSync(codexPressureLedgerPath(dir), "utf8"),
+    );
+    expect(ledger.aliases["keeper-codex-a"].reservations).toEqual([]);
+    expect(ledger.aliases["keeper-codex-a"].shared_cooldown_until_ms).toBe(
+      NOW + CODEX_FAILURE_COOLDOWN_MS,
+    );
+  });
+
   test("lock contention is a bounded native fallback", () => {
     const dir = root();
     publish(dir, [alias("keeper-codex-a", 10)]);
@@ -303,7 +543,7 @@ describe("Codex route selection", () => {
       JSON.stringify({
         schema_version: 1,
         provider: "openai-codex",
-        config_binding: "d".repeat(64),
+        config_binding: BINDING,
         aliases: {
           "keeper-codex-a": {
             reservations: [Number.MAX_SAFE_INTEGER],
@@ -320,6 +560,70 @@ describe("Codex route selection", () => {
         tryAcquireLock: injectedLock,
       }),
     ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+    const ledger = JSON.parse(
+      readFileSync(codexPressureLedgerPath(dir), "utf8"),
+    );
+    expect(ledger.schema_version).toBe(CODEX_PRESSURE_LEDGER_SCHEMA_VERSION);
+    expect(ledger.aliases["keeper-codex-a"].shared_cooldown_until_ms).toBe(0);
+  });
+
+  test("a valid v2 ledger with far-future cooldowns cannot starve routing", () => {
+    const dir = root();
+    publish(dir, [
+      alias("keeper-codex-a", 5, { sparkUsedPercent: 5 }),
+      alias("keeper-codex-b", 10, { sparkUsedPercent: 10 }),
+    ]);
+    writeFileSync(
+      codexPressureLedgerPath(dir),
+      JSON.stringify({
+        schema_version: CODEX_PRESSURE_LEDGER_SCHEMA_VERSION,
+        provider: "openai-codex",
+        config_binding: BINDING,
+        aliases: {
+          "keeper-codex-a": {
+            reservations: [NOW - 1, Number.MAX_SAFE_INTEGER],
+            shared_cooldown_until_ms: Number.MAX_SAFE_INTEGER,
+            quota_cooldown_until_ms: {
+              [CODEX_GENERIC_QUOTA_SCOPE]: Number.MAX_SAFE_INTEGER,
+              [CODEX_SPARK_QUOTA_SCOPE]: Number.MAX_SAFE_INTEGER,
+            },
+            last_selected_at_ms: Number.MAX_SAFE_INTEGER,
+          },
+          "keeper-codex-b": {
+            reservations: [],
+            shared_cooldown_until_ms: 0,
+            quota_cooldown_until_ms: {
+              [CODEX_GENERIC_QUOTA_SCOPE]: NOW + CODEX_FAILURE_COOLDOWN_MS,
+              [CODEX_SPARK_QUOTA_SCOPE]: 0,
+            },
+            last_selected_at_ms: NOW - 10,
+          },
+        },
+      }),
+    );
+    expect(
+      selectCodexRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        quotaScope: CODEX_GENERIC_QUOTA_SCOPE,
+        tryAcquireLock: injectedLock,
+      }),
+    ).toMatchObject({ kind: "pooled", alias: "keeper-codex-a" });
+    const ledger = JSON.parse(
+      readFileSync(codexPressureLedgerPath(dir), "utf8"),
+    );
+    expect(ledger.aliases["keeper-codex-a"]).toMatchObject({
+      shared_cooldown_until_ms: 0,
+      quota_cooldown_until_ms: {
+        [CODEX_GENERIC_QUOTA_SCOPE]: 0,
+        [CODEX_SPARK_QUOTA_SCOPE]: 0,
+      },
+      last_selected_at_ms: NOW,
+    });
+    expect(ledger.aliases["keeper-codex-b"].quota_cooldown_until_ms).toEqual({
+      [CODEX_GENERIC_QUOTA_SCOPE]: NOW + CODEX_FAILURE_COOLDOWN_MS,
+      [CODEX_SPARK_QUOTA_SCOPE]: 0,
+    });
   });
 });
 
@@ -332,12 +636,89 @@ describe("Codex routing inspection", () => {
       provider: "openai-codex",
       health: "ready",
       fresh: true,
+      quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
       verdict: { kind: "pooled", alias: "keeper-codex-b" },
     });
     expect(result.candidates.map((candidate) => candidate.alias)).toEqual([
       "keeper-codex-a",
       "keeper-codex-b",
     ]);
+    expect(result.candidates[0]).toMatchObject({
+      quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+      used_percent: 60,
+      worst_used_percent: 60,
+      pressure: 0,
+      shared_cooldown_until_ms: 0,
+      quota_cooldown_until_ms: 0,
+      capacity_cooldown_until_ms: 0,
+      authorized: true,
+      eligible: true,
+    });
     expect(existsSync(codexPressureLedgerPath(dir))).toBe(false);
+  });
+
+  test("reports scoped authorization and cooldown facts", () => {
+    const dir = root();
+    publish(dir, [
+      alias("keeper-codex-a", 10, { sparkUsedPercent: 5 }),
+      alias("keeper-codex-b", 20, { sparkUsedPercent: 1 }),
+    ]);
+    expect(
+      inspectCodexRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        authorizedAliases: [],
+      }),
+    ).toMatchObject({
+      health: "unavailable",
+      candidates: [],
+      verdict: { kind: "native-fallback", reason: "pool-unavailable" },
+    });
+    selectCodexRoute({
+      stateDir: dir,
+      nowMs: NOW,
+      quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+      authorizedAliases: ["keeper-codex-a"],
+      tryAcquireLock: injectedLock,
+    });
+    recordCodexRouteOutcome({
+      stateDir: dir,
+      nowMs: NOW,
+      alias: "keeper-codex-a",
+      quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+      outcome: "quota",
+      authorizedAliases: ["keeper-codex-a"],
+      tryAcquireLock: injectedLock,
+    });
+    const result = inspectCodexRouting({
+      stateDir: dir,
+      nowMs: NOW + 1,
+      quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+      authorizedAliases: ["keeper-codex-b"],
+    });
+    expect(result.quota_scope).toBe(CODEX_SPARK_QUOTA_SCOPE);
+    expect(result.verdict).toMatchObject({
+      kind: "pooled",
+      alias: "keeper-codex-b",
+    });
+    expect(result.candidates).toEqual([
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        used_percent: 5,
+        shared_cooldown_until_ms: 0,
+        quota_cooldown_until_ms: NOW + CODEX_FAILURE_COOLDOWN_MS,
+        authorized: false,
+        eligible: false,
+      }),
+      expect.objectContaining({
+        alias: "keeper-codex-b",
+        quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        used_percent: 1,
+        authorized: true,
+        eligible: true,
+      }),
+    ]);
   });
 });

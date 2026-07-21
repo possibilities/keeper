@@ -19,6 +19,7 @@ import {
   readCodexObservationRefreshFailureState,
   refreshCodexObservationIfStale,
 } from "../src/codex-account-observation-refresh";
+import { CODEX_GENERIC_QUOTA_SCOPE } from "../src/codex-quota-scope";
 
 const NOW = Date.parse("2026-07-18T12:00:00Z");
 const ARGV = ["keeper-pi-codex-observe"];
@@ -43,7 +44,18 @@ function observation(observedAtMs: number): CodexCapacityObservation {
         status: "healthy",
         observed_at_ms: observedAtMs,
         expires_at_ms: NOW + 120_000,
-        windows: [{ role: "primary", used_percent: 25, reset_at_ms: null }],
+        windows: [
+          {
+            role: "primary",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            key: "session",
+            label: "session",
+            window_seconds: 18_000,
+            used_percent: 25,
+            exhausted: false,
+            reset_at_ms: null,
+          },
+        ],
       },
     ],
   };
@@ -58,7 +70,7 @@ function outcome(observedAtMs = NOW) {
       observed_at_ms: observedAtMs,
       aliases: observation(observedAtMs).aliases.map((alias) => ({
         alias: alias.alias,
-        usage: { schema_version: 1, ...alias },
+        usage: { schema_version: CODEX_OBSERVATION_SCHEMA_VERSION, ...alias },
       })),
       truncated: false,
     }),

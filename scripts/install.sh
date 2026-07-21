@@ -100,7 +100,8 @@ PI_CODEX_POOL_ROOT="${repo_root}/integrations/pi-codex-pool" bun -e '
     && typeof manifest.peerDependencies?.["@earendil-works/pi-coding-agent"] === "string"
     && source.includes("openAICodexResponsesApi")
     && source.includes("KEEPER_PI_CODEX_POOL_MODE")
-    && source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS");
+    && source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS")
+    && source.includes("KEEPER_PI_CODEX_POOL_POLICY_BINDING");
   if (!exact) throw new Error("Pi Codex pool companion manifest/source contract is incompatible");
 '
 if command -v pi >/dev/null 2>&1; then

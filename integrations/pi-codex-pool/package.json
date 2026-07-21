@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Route Keeper-marked Pi Codex requests across opaque account aliases",
+  "description": "Route Keeper-marked Pi Codex requests across opaque aliases with quota-scoped routing",
   "keywords": [
     "pi-package"
   ],

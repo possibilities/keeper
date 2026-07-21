@@ -16,13 +16,21 @@ import {
   codexPoolProofWindowActive,
 } from "../../../src/codex-pool-proof-window.ts";
 import {
+  type CodexQuotaScope,
+  codexQuotaScopeForModelId,
+} from "../../../src/codex-quota-scope.ts";
+import {
   aliasesFromEnvironment,
   type CanonicalOAuth,
   CredentialVault,
   extensionOAuthFromCanonical,
   FileCredentialStorage,
 } from "./auth.ts";
-import { observePool, renderObserverEnvelope } from "./observer.ts";
+import {
+  observePool,
+  renderObserverEnvelope,
+  type UsageRequest,
+} from "./observer.ts";
 import {
   type CodexDelegate,
   type CodexPoolProofFaultOptions,
@@ -36,7 +44,14 @@ import type {
   LiveProofReport,
   ProofTranscriptEntry,
 } from "./proof.ts";
-import { PoolRouteState, PoolStateStore } from "./state.ts";
+import {
+  initialQuotaScopeFromEnvironment,
+  type PoolAliasPolicy,
+  PoolRouteState,
+  PoolStateStore,
+  poolAliasPolicyBinding,
+  poolAliasPolicyFromEnvironment,
+} from "./state.ts";
 
 type CompatPiAi = typeof import("@earendil-works/pi-ai/compat");
 const { openAICodexResponsesApi } = piAi as unknown as CompatPiAi;
@@ -45,7 +60,10 @@ const KEEPER_MARKER = "KEEPER_JOB_ID";
 const ALIASES_ENV = "KEEPER_PI_CODEX_POOL_ALIASES";
 const MODE_ENV = "KEEPER_PI_CODEX_POOL_MODE";
 const CONFIG_BINDING_ENV = "KEEPER_PI_CODEX_POOL_CONFIG_BINDING";
+const POLICY_BINDING_ENV = "KEEPER_PI_CODEX_POOL_POLICY_BINDING";
 const INITIAL_ALIAS_ENV = "KEEPER_PI_CODEX_POOL_INITIAL_ALIAS";
+const INITIAL_SCOPE_ENV = "KEEPER_PI_CODEX_POOL_INITIAL_SCOPE";
+const ALIAS_POLICY_ENV = "KEEPER_PI_CODEX_POOL_ALIAS_POLICY";
 const REVISION_ENV = "KEEPER_PI_CODEX_POOL_REVISION";
 const CONFIG_ROOT_ENV = "KEEPER_PI_CODEX_POOL_CONFIG_ROOT";
 const WARNING =
@@ -81,6 +99,7 @@ interface ProofToolDefinition {
 export interface CodexPoolInstallOptions {
   nativeDelegate?: CodexDelegate;
   oauth?: CanonicalOAuth;
+  requestUsage?: UsageRequest;
 }
 
 interface PoolExtensionApi {
@@ -117,6 +136,7 @@ interface PoolExtensionApi {
 interface RouteEvidence {
   sessionId: string;
   sessionRole: "root" | "child";
+  quotaScope: CodexQuotaScope;
   attempts: number;
   aliases: string[];
   failureClass: ReportFailureClass;
@@ -194,7 +214,10 @@ class ProofEvidence {
     this.refreshedAliases.add(alias);
   }
 
-  beginRoute(options: SimpleStreamOptions | undefined): RouteEvidence | null {
+  beginRoute(
+    options: SimpleStreamOptions | undefined,
+    quotaScope: CodexQuotaScope,
+  ): RouteEvidence | null {
     const sessionId = options?.sessionId;
     if (!sessionId) return null;
     if (this.routes.length >= 16) {
@@ -206,6 +229,7 @@ class ProofEvidence {
     const route: RouteEvidence = {
       sessionId,
       sessionRole: sessionId === this.rootSessionId ? "root" : "child",
+      quotaScope,
       attempts: 0,
       aliases: [],
       failureClass: "none",
@@ -428,7 +452,11 @@ class ProofEvidence {
     );
     add(
       "pressure_cooldown",
-      state.accounts.some((account) => account.cooldown_until_ms > 0),
+      state.accounts.some(
+        (account) =>
+          account.cooldown_until_ms > 0 ||
+          account.quota_scopes.some((scope) => scope.cooldown_until_ms > 0),
+      ),
       "cooldown-observed",
     );
     add("single_retry", retryRoutes.length > 0, "two-attempt-route-observed");
@@ -498,6 +526,7 @@ class ProofEvidence {
       .filter((route) => route.attempts > 0)
       .map((route) => ({
         session_role: route.sessionRole,
+        quota_scope: route.quotaScope,
         attempts: Math.min(2, route.attempts),
         aliases: [...route.aliases].slice(0, 2),
         failure_class: route.failureClass,
@@ -511,6 +540,7 @@ class ProofEvidence {
     clauses: Record<string, boolean>,
     routes: LiveProofReport["routes"],
     state: ReturnType<PoolRouteState["snapshot"]>,
+    quotaScope: CodexQuotaScope,
   ): Array<{ surface: ArtifactSurface; content: string }> {
     const failureClasses = routes
       .map((route) => route.failure_class)
@@ -523,7 +553,7 @@ class ProofEvidence {
       { surface: "state", content: JSON.stringify(state) },
       {
         surface: "proof",
-        content: JSON.stringify({ clauses, routes }),
+        content: JSON.stringify({ quota_scope: quotaScope, clauses, routes }),
       },
       { surface: "transcript", content: JSON.stringify(transcript) },
       {
@@ -533,13 +563,17 @@ class ProofEvidence {
       },
       {
         surface: "error",
-        content: JSON.stringify({ failure_classes: failureClasses }),
+        content: JSON.stringify({
+          quota_scope: quotaScope,
+          failure_classes: failureClasses,
+        }),
       },
       {
         surface: "session",
         content: JSON.stringify(
-          routes.map(({ session_role, attempts }) => ({
+          routes.map(({ session_role, quota_scope, attempts }) => ({
             session_role,
+            quota_scope,
             attempts,
           })),
         ),
@@ -667,9 +701,15 @@ export function installCodexPool(
     options.nativeDelegate ??
     (openAICodexResponsesApi().streamSimple as CodexDelegate);
   let aliases: string[];
+  let aliasPolicy: PoolAliasPolicy | null = null;
   let oauth: CanonicalOAuth | undefined;
   try {
     aliases = aliasesFromEnvironment(process.env[ALIASES_ENV]);
+    aliasPolicy = poolAliasPolicyFromEnvironment(
+      process.env[ALIAS_POLICY_ENV],
+      aliases,
+    );
+    if (aliasPolicy === null) throw new Error("invalid-alias-policy");
     oauth = options.oauth ?? nativeOAuth();
   } catch {
     aliases = [];
@@ -702,7 +742,7 @@ export function installCodexPool(
       process.ppid,
       process.env[KEEPER_MARKER],
     );
-  if (!oauth || aliases.length === 0) {
+  if (!oauth || aliases.length === 0 || aliasPolicy === null) {
     pi.registerProvider("openai-codex", {
       api: "openai-codex-responses",
       streamSimple: (model, context, options) =>
@@ -742,14 +782,21 @@ export function installCodexPool(
     aliases,
     (alias) => evidence?.credentialRefreshed(alias),
   );
+  const initialScope = initialQuotaScopeFromEnvironment(
+    process.env[INITIAL_SCOPE_ENV],
+  );
   const routes = new PoolRouteState(
     aliases,
     new PoolStateStore(),
     Date.now,
-    process.env[INITIAL_ALIAS_ENV],
+    initialScope === undefined ? undefined : process.env[INITIAL_ALIAS_ENV],
+    initialScope,
+    aliasPolicy ?? undefined,
   );
+  const policyBinding = poolAliasPolicyBinding(aliases, aliasPolicy);
   const active =
     process.env[CONFIG_BINDING_ENV] === routes.binding &&
+    process.env[POLICY_BINDING_ENV] === policyBinding &&
     (mode === "active" || evidence !== null);
   if (!active) {
     pi.registerProvider("openai-codex", {
@@ -763,7 +810,13 @@ export function installCodexPool(
         try {
           ctx.ui.notify(
             renderObserverEnvelope(
-              await observePool({ aliases, vault, routes, signal: ctx.signal }),
+              await observePool({
+                aliases,
+                vault,
+                routes,
+                requestUsage: options.requestUsage,
+                signal: ctx.signal,
+              }),
             ),
             "info",
           );
@@ -827,7 +880,8 @@ export function installCodexPool(
         options,
       );
     }
-    const route = evidence.beginRoute(options);
+    const quotaScope = codexQuotaScopeForModelId(model.id);
+    const route = evidence.beginRoute(options, quotaScope);
     if (controls.deliberateAbort === true) evidence.deliberateAbort(route);
     let attemptDelegate: CodexDelegate = nativeDelegate;
     if (controls.deliberateAbort === true) {
@@ -852,21 +906,26 @@ export function installCodexPool(
       attemptContext,
       attemptOptions,
     ) => {
+      const attemptQuotaScope = codexQuotaScopeForModelId(attemptModel.id);
+      const scopeMatches =
+        route === null || attemptQuotaScope === route.quotaScope;
       const alias =
         attemptOptions?.sessionId === undefined
           ? undefined
-          : routes.routeFor(attemptOptions.sessionId);
+          : routes.routeFor(attemptOptions.sessionId, attemptQuotaScope);
+      if (!scopeMatches) evidence.interrupted = true;
       evidence.attempt(
         route,
         alias,
-        sameRequestContract(
-          model,
-          context,
-          options,
-          attemptModel,
-          attemptContext,
-          attemptOptions,
-        ),
+        scopeMatches &&
+          sameRequestContract(
+            model,
+            context,
+            options,
+            attemptModel,
+            attemptContext,
+            attemptOptions,
+          ),
       );
       let terminal = false;
       let substantive = false;
@@ -949,6 +1008,9 @@ export function installCodexPool(
     }
     const times = proofWindowTimes(proofWindow);
     if (times === null) throw new Error("proof-window-invalid");
+    const invocation = proofInvocation;
+    if (invocation === null) throw new Error("proof-invocation-missing");
+    const quotaScope = codexQuotaScopeForModelId(invocation.model.id);
     const proof = await import("./proof.ts");
     const state = routes.snapshot();
     const transcript = proof.buildProofTranscript(
@@ -956,8 +1018,17 @@ export function installCodexPool(
     );
     const clauses = proof.clausesFromProofTranscript(transcript);
     const reportRoutes = evidence?.reportRoutes() ?? [];
+    const scopeMismatch = reportRoutes.some(
+      (route) => route.quota_scope !== quotaScope,
+    );
     const artifactScan = proof.scanProofArtifacts(
-      evidence?.artifacts(transcript, clauses, reportRoutes, state) ?? [],
+      evidence?.artifacts(
+        transcript,
+        clauses,
+        reportRoutes,
+        state,
+        quotaScope,
+      ) ?? [],
     );
     const completedAt = Date.now();
     const aliasBinding = proof.aliasRoleBinding(aliasRoles);
@@ -966,9 +1037,11 @@ export function installCodexPool(
         revision,
         config_binding: routes.binding,
         alias_binding: aliasBinding,
+        quota_scope: quotaScope,
         started_at_ms: times.startedAt,
         completed_at_ms: completedAt,
-        interrupted: interrupted || evidence?.interrupted === true,
+        interrupted:
+          interrupted || scopeMismatch || evidence?.interrupted === true,
         alias_roles: aliasRoles,
         transcript,
         clauses,
@@ -1003,6 +1076,7 @@ export function installCodexPool(
           aliases,
           vault,
           routes,
+          requestUsage: options.requestUsage,
           signal: ctx.signal,
         });
         const rendered = renderObserverEnvelope(envelope);
@@ -1145,6 +1219,7 @@ export function installCodexPool(
               aliases,
               vault,
               routes,
+              requestUsage: options.requestUsage,
               signal: controller.signal,
             }),
           ),
@@ -1155,13 +1230,13 @@ export function installCodexPool(
         const childSession = `${rootSession}:codex-pool-proof-child`;
         await Promise.all([runRoute(rootSession), runRoute(childSession)]);
         await runRoute(rootSession);
+        await runRoute(`${childSession}:abort`, { deliberateAbort: true });
         await runRoute(`${childSession}:retry`, {
           fault: { failure_class: "quota", phase: "pre-output" },
         });
         await runRoute(`${childSession}:cutoff`, {
           fault: { failure_class: "rate", phase: "mid-stream" },
         });
-        await runRoute(`${childSession}:abort`, { deliberateAbort: true });
         await runRoute(undefined);
       } catch {
         evidence.interrupted = true;

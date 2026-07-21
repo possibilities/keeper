@@ -268,20 +268,22 @@ environment can produce a fresh routing observation. A durable `KEEPER_PI_CODEX_
 skips the link and is used verbatim instead.
 
 The companion affects only `openai-codex`. Non-Codex providers keep Pi's native path. Root and inherited
-pi-subagents child requests share the Provider wrapper but select independently by session id. A session
-keeps its healthy opaque alias. One logical Provider call may move to one different alias only after a
-classified quota, rate, authentication, or transport failure **before** Substantive output. Text,
-thinking, tool calls, and unknown stream events close that retry window.
+pi-subagents child requests share the Provider wrapper but select independently by `(session, scope)`. The
+requested model derives the scope: `openai-codex/gpt-5.3-codex-spark` (or basename
+`gpt-5.3-codex-spark`) uses `model:gpt-5.3-codex-spark`; every other Codex request uses `generic`. A
+session keeps its healthy opaque alias only for the same scope. One logical Provider call may move to one
+different alias only after a classified quota, rate, authentication, or transport failure **before**
+Substantive output. Text, thinking, tool calls, and unknown stream events close that retry window.
 
-Activation is intentionally pending until the separate live two-account proof is complete. Pending,
-missing, incompatible, stale, interrupted, or unhealthy machinery uses Pi's native `openai-codex`
-credential and emits the fixed warning
+Activation is intentionally pending until a separate live proof activates the requested scope. Pending,
+missing, incompatible, stale, interrupted, missing Spark-scope evidence, missing scoped authorization, or
+unhealthy machinery uses Pi's native `openai-codex` credential and emits the fixed warning
 `[keeper-codex-pool] pool-unavailable; using native openai-codex`; it never claims a balanced route.
-The launch environment carries only a bounded mode and proof-window state, opaque aliases, an optional
-opaque initial route candidate for Codex work, revision and configuration bindings, and a bounded reason
-code. OAuth credentials remain in Pi's private `auth.json`; account ids, provider
-headers, raw errors, tokens, plan labels, and account PII do not enter Keeper diagnostics, proof reports,
-launch environments, the daemon database, or a Projection.
+The launch environment carries only a bounded mode and proof-window state, opaque aliases, a scope-keyed
+alias policy plus binding, an optional opaque initial route candidate tagged with its scope, revision and
+configuration bindings, and a bounded reason code. OAuth credentials remain in Pi's private `auth.json`;
+account ids, provider headers, raw errors, tokens, plan labels, and account PII do not enter Keeper
+diagnostics, proof reports, launch environments, the daemon database, or a Projection.
 
 Inspect Claude launch-routing and Codex session-routing together. This read does not create a Claude
 Launch reservation or Codex pressure:
@@ -309,19 +311,29 @@ keeper agent accounts codex-pool enroll keeper-codex-b
 Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
 Codex on those surfaces to remain unavailable until activation.
 
-Arm one proof window and run the managed Pi proof probe. The run wrapper accepts this exact Pi-only
-launcher flag and forwards it to the managed launch. The probe directs Pi to invoke the `codex_pool_proof`
-tool exactly once; the tool runs the bounded proof and atomically writes its private report to
-`~/.config/keeper/codex-pool/live-proof.json` before the window closes:
+Arm one proof window and run the managed Pi proof probe for the scope you are activating. The run wrapper
+accepts this exact Pi-only launcher flag and forwards it to the managed launch. The requested model chosen
+by that managed Pi call determines the proof scope; use the actual Spark launch id
+`openai-codex/gpt-5.3-codex-spark` when proving Spark, and ordinary Codex model syntax for `generic`. The
+probe directs Pi to invoke the `codex_pool_proof` tool exactly once; the tool runs the bounded proof and
+atomically writes its private report to `~/.config/keeper/codex-pool/live-proof.json` before the window
+closes:
 
 ```sh
+# Generic Codex
 keeper agent run pi --x-codex-pool-proof-window=arm \
+  'Call the codex_pool_proof tool exactly once and return its JSON result.'
+
+# Spark
+keeper agent run pi --model openai-codex/gpt-5.3-codex-spark \
+  --x-codex-pool-proof-window=arm \
   'Call the codex_pool_proof tool exactly once and return its JSON result.'
 ```
 
-Stage and classify that exact report, then activate promptly. Unknown fields, sanitation findings, stale
-revision/configuration/alias bindings, interruption, incomplete root/child routes, or incomplete restoration
-cannot pass:
+Stage and classify that exact report, then activate promptly. The report must carry one exact top-level
+scope and the same scope on every route; mixed scopes, display labels, old schemas, unknown fields,
+sanitation findings, stale revision/configuration/alias bindings, interruption, incomplete root/child
+routes, or incomplete restoration cannot pass:
 
 ```sh
 keeper agent accounts codex-pool proof capture \
@@ -333,10 +345,14 @@ keeper agent accounts codex-pool verify --json
 
 Activation uses a host-local advisory lock and a private transaction marker. The marker makes native mode
 authoritative throughout reload and verification; the active state publishes atomically only after the
-fresh report still matches the current code revision, configuration, alias roles, companion contract, and
-healthy Capacity observation. A concurrent activation is refused. Reload or immediate verification
-failure returns `rollback-complete`; an interrupted or unwritable rollback leaves `recovery-required`,
-which also forces native mode.
+fresh report still matches the current code revision, configuration, alias roles, proved scope, companion
+contract, scoped alias policy, and healthy Capacity observation. A full proof authorizes all enrolled
+aliases for its scope; a scoped or degraded activation preserves other-scope policy only when the stored
+activation is valid and still binding-matched. Status is `active` when generic is fully pooled,
+`active-scoped` when Spark policy is in force (including a Spark single-alias authorization), and
+`active-degraded` for the compatible explicit generic single-alias pin.
+A concurrent activation is refused. Reload or immediate verification failure returns `rollback-complete`;
+an interrupted or unwritable rollback leaves `recovery-required`, which also forces native mode.
 
 Rollback and recovery are idempotent and require no credential edits:
 
@@ -363,9 +379,9 @@ degraded.
 
 Enroll the **surviving** account as the primary alias (the first entry in `KEEPER_PI_CODEX_POOL_ALIASES`,
 `keeper-codex-a` by default) and the quota-dead account as the alternate; degraded activation pins routing
-to the primary and immediate verification refuses any other pin. Degraded activation is never implicit — it
-requires the explicit flag naming the degraded verdict, and without it a degraded report is refused with
-`proof-degraded-unauthorized`:
+for the proved scope to the primary and immediate verification refuses any other pin. Degraded activation is
+never implicit — it requires the explicit flag naming the degraded verdict, and without it a degraded report
+is refused with `proof-degraded-unauthorized`:
 
 ```sh
 keeper agent accounts codex-pool proof verdict --json   # proven-degraded-single-alias
@@ -375,13 +391,15 @@ keeper agent accounts codex-pool status --json          # state=active-degraded
 keeper agent accounts check                             # activation=active-degraded, DEGRADED single-alias
 ```
 
-The active pool routes only through the pinned healthy alias and surfaces `active-degraded` loudly in
-`status` and `accounts check`; it never presents balanced operation. When the quota recovers, run a fresh
-**full** proof and activate normally — a genuine `proven` report upgrades the pool to full `active` and
-clears the degraded marker. A partial or still-degraded report never upgrades.
+A generic-only degraded pool routes only through the pinned healthy alias and surfaces `active-degraded`
+loudly in `status` and `accounts check`; a degraded Spark proof produces an `active-scoped` policy naming
+only its proved alias. Neither presents balanced operation. When the quota recovers, run
+a fresh **full** proof for that scope and activate normally — a genuine `proven` report upgrades that
+scope's authorization and clears the degraded marker when every effective scope is fully authorized. A
+partial or still-degraded report never upgrades.
 
 ```sh
-keeper agent accounts codex-pool activate --json        # full proven → active, degraded marker cleared
+keeper agent accounts codex-pool activate --json        # full proven → active/active-scoped, degraded marker cleared
 ```
 
 ### Reload trigger

@@ -18,12 +18,19 @@ import {
   renderObserverEnvelope,
 } from "../integrations/pi-codex-pool/src/observer.ts";
 import { PoolRouteState } from "../integrations/pi-codex-pool/src/state.ts";
-import { codexObservationSidecarPath } from "../src/account-routing-config";
+import {
+  CODEX_OBSERVATION_SCHEMA_VERSION,
+  codexObservationSidecarPath,
+} from "../src/account-routing-config";
 import {
   parseCodexObserverEnvelope,
   readCodexObservationSidecar,
 } from "../src/codex-account-observation";
 import { publishCodexObservation } from "../src/codex-account-observation-refresh";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
 
 function jwt(accountId: string): string {
   const encode = (value: unknown) =>
@@ -64,8 +71,26 @@ describe("observer module output lands in the routing state dir", () => {
       async requestUsage() {
         return {
           rate_limit: {
-            primary_window: { used_percent: 20, reset_at: 200 },
+            allowed: false,
+            limit_reached: true,
+            primary_window: {
+              used_percent: 100,
+              reset_at: 200,
+              limit_window_seconds: 604_800,
+            },
           },
+          additional_rate_limits: [
+            {
+              limit_name: "GPT-5.3-Codex-Spark",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 0,
+                  reset_at: 250,
+                  limit_window_seconds: 604_800,
+                },
+              },
+            },
+          ],
         };
       },
     });
@@ -83,15 +108,33 @@ describe("observer module output lands in the routing state dir", () => {
       codexObservationSidecarPath(stateDir),
     );
     expect(landed).toMatchObject({
-      schema_version: 1,
+      schema_version: CODEX_OBSERVATION_SCHEMA_VERSION,
       provider: "openai-codex",
       config_binding: envelope.config_binding,
       aliases: [
         {
           alias: "keeper-codex-a",
-          status: "healthy",
+          status: "exhausted",
           windows: [
-            { role: "primary", used_percent: 20, reset_at_ms: 200_000 },
+            {
+              role: "primary",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+              key: "week",
+              label: "weekly",
+              window_seconds: 604_800,
+              used_percent: 100,
+              exhausted: true,
+              reset_at_ms: 200_000,
+            },
+            {
+              role: "additional",
+              quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+              label: "GPT-5.3-Codex-Spark",
+              window_seconds: 604_800,
+              used_percent: 0,
+              exhausted: false,
+              reset_at_ms: 250_000,
+            },
           ],
         },
       ],

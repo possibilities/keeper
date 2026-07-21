@@ -19,6 +19,11 @@ import {
   observationSidecarPath,
 } from "../src/account-routing-config";
 import { main, seedClaudeWorkspaceTrust } from "../src/agent/main";
+import { poolAliasPolicyBinding } from "../src/codex-pool-activation";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+} from "../src/codex-quota-scope";
 import {
   expectExit,
   makeHarness,
@@ -27,6 +32,22 @@ import {
 
 const CSWAP = "/fake-home/.local/bin/cswap";
 const UUID = "11111111-1111-1111-1111-111111111111";
+const CODEX_ALIASES = ["keeper-codex-a", "keeper-codex-b"];
+
+function aliasPolicy(generic: string[], spark: string[]) {
+  return {
+    [CODEX_GENERIC_QUOTA_SCOPE]: generic,
+    [CODEX_SPARK_QUOTA_SCOPE]: spark,
+  };
+}
+
+function aliasPolicyEnv(generic: string[], spark: string[]): string {
+  return JSON.stringify(aliasPolicy(generic, spark));
+}
+
+function aliasPolicyBindingEnv(generic: string[], spark: string[]): string {
+  return poolAliasPolicyBinding(CODEX_ALIASES, aliasPolicy(generic, spark));
+}
 
 function selection(slot: number, accountOrdinal?: number): RouteSelection {
   return {
@@ -877,6 +898,8 @@ describe("keeper agent accounts non-fable-focus", () => {
 
 describe("keeper agent accounts codex-pool", () => {
   test("an explicitly armed fresh Pi launch receives one bounded pooled proof window", async () => {
+    const launches: Array<[boolean | undefined, string | null | undefined]> =
+      [];
     const h = makeHarness({
       argv: [
         "pi",
@@ -894,14 +917,24 @@ describe("keeper agent accounts codex-pool", () => {
         health: "ready",
         problem_code: null,
       }),
-      codexPoolLaunchContext: () => ({
-        mode: "native",
-        aliases: ["keeper-codex-a", "keeper-codex-b"],
-        config_binding: "b".repeat(64),
-        revision: "c".repeat(40),
-        initial_alias: null,
-        problem_code: "activation-pending",
-      }),
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
+        launches.push([reserve, modelId]);
+        return {
+          mode: "native",
+          activation_mode: "native",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: [],
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          config_binding: "b".repeat(64),
+          revision: "c".repeat(40),
+          initial_alias: null,
+          problem_code: "activation-pending",
+        };
+      },
     });
     const command = await runAndCapture(h, main);
     expect(command).toContain("/fake/pi-codex-pool.ts");
@@ -909,6 +942,15 @@ describe("keeper agent accounts codex-pool", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
       '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv(CODEX_ALIASES, []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("c".repeat(40));
@@ -928,6 +970,62 @@ describe("keeper agent accounts codex-pool", () => {
       h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBeUndefined();
+    expect(launches).toEqual([[false, "openai-codex/gpt-5.4-mini"]]);
+  });
+
+  test("a Spark proof window overrides generic active policy only for Spark", async () => {
+    const launches: Array<[boolean | undefined, string | null | undefined]> =
+      [];
+    const h = makeHarness({
+      argv: [
+        "pi",
+        "--x-codex-pool-proof-window=arm",
+        "--model",
+        "openai-codex/gpt-5.3-codex-spark",
+        "prove spark routing",
+      ],
+      rawArgv: true,
+      now: () => 1_000_000,
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: (reserve?: boolean, modelId?: string | null) => {
+        launches.push([reserve, modelId]);
+        return {
+          mode: "active",
+          activation_mode: "active",
+          aliases: CODEX_ALIASES,
+          alias_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: [],
+          },
+          requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+          config_binding: "d".repeat(64),
+          revision: "e".repeat(40),
+          initial_alias: null,
+          problem_code: null,
+        };
+      },
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], CODEX_ALIASES),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], CODEX_ALIASES),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("e".repeat(40));
+    expect(launches).toEqual([[false, "openai-codex/gpt-5.3-codex-spark"]]);
   });
 
   test("an absent arm clears inherited proof state and leaves native launch behavior", async () => {
@@ -958,6 +1056,15 @@ describe("keeper agent accounts codex-pool", () => {
     const command = await runAndCapture(h, main);
     expect(command).toContain("/fake/pi-codex-pool.ts");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
@@ -1012,6 +1119,15 @@ describe("keeper agent accounts codex-pool", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
       '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
+      aliasPolicyEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
+      aliasPolicyBindingEnv([], []),
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
+      CODEX_GENERIC_QUOTA_SCOPE,
     );
   });
 
@@ -1242,6 +1358,7 @@ describe("keeper agent accounts check", () => {
         config_binding: "a".repeat(64),
         observed_at_ms: 1000,
         fresh: true,
+        quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         refresh_failure_state: {
           schema_version: 1 as const,
           consecutive_failures: 3,
@@ -1257,16 +1374,28 @@ describe("keeper agent accounts check", () => {
         candidates: [
           {
             alias: "keeper-codex-a",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            used_percent: 80,
             worst_used_percent: 80,
             pressure: 0,
             cooldown_until_ms: 0,
+            shared_cooldown_until_ms: 0,
+            quota_cooldown_until_ms: 0,
+            capacity_cooldown_until_ms: 0,
+            authorized: true,
             eligible: true,
           },
           {
             alias: "keeper-codex-b",
+            quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+            used_percent: 10,
             worst_used_percent: 10,
             pressure: 0,
             cooldown_until_ms: 0,
+            shared_cooldown_until_ms: 0,
+            quota_cooldown_until_ms: 0,
+            capacity_cooldown_until_ms: 0,
+            authorized: true,
             eligible: true,
           },
         ],
@@ -1316,6 +1445,7 @@ describe("keeper agent accounts check", () => {
           config_binding: "a".repeat(64),
           observed_at_ms: 1000,
           fresh: true,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
           verdict: {
             kind: "pooled" as const,
             provider: "openai-codex" as const,
@@ -1325,9 +1455,15 @@ describe("keeper agent accounts check", () => {
           candidates: [
             {
               alias: "keeper-codex-a",
+              quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+              used_percent: 10,
               worst_used_percent: 10,
               pressure: 0,
               cooldown_until_ms: 0,
+              shared_cooldown_until_ms: 0,
+              quota_cooldown_until_ms: 0,
+              capacity_cooldown_until_ms: 0,
+              authorized: true,
               eligible: true,
             },
           ],

@@ -10,6 +10,10 @@ import {
   boundedCodexPoolProofRecord,
   exactKeys,
 } from "../../../src/codex-pool-proof-window.ts";
+import {
+  type CodexQuotaScope,
+  codexQuotaScopeForModelId,
+} from "../../../src/codex-quota-scope.ts";
 import { type CredentialVault, PoolCredentialError } from "./auth.ts";
 import type { PoolFailureClass, PoolRouteState } from "./state.ts";
 
@@ -74,6 +78,7 @@ export interface PoolStreamDependencies {
   /** Stable managed identity for provider calls, such as compaction, that omit one. */
   fallbackSessionId?: string;
   retryBackoffMs?: number;
+  retryWait?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
   proofFault?: CodexPoolProofFaultOptions;
 }
@@ -174,13 +179,15 @@ function shouldRetrySameAlias(
   failureClass: PoolFailureClass,
   delegatedAttempts: number,
   routes: PoolRouteState,
+  quotaScope: CodexQuotaScope,
   excluded: ReadonlySet<string>,
 ): boolean {
-  return (
-    failureClass === "transport" &&
-    delegatedAttempts < 2 &&
-    !routes.hasEligibleRoute(excluded)
-  );
+  if (failureClass !== "transport" || delegatedAttempts >= 2) return false;
+  try {
+    return !routes.hasEligibleRoute(quotaScope, excluded);
+  } catch {
+    return false;
+  }
 }
 
 function substantive(
@@ -417,7 +424,29 @@ function remainingTimeout(
   now: () => number,
 ): number | undefined {
   if (deadlineMs === undefined) return original;
-  return Math.max(1, Math.floor(deadlineMs - now()));
+  const remaining = Math.floor(deadlineMs - now());
+  return remaining > 0 ? remaining : undefined;
+}
+
+function deadlineBudgetExpired(
+  deadlineMs: number | undefined,
+  now: () => number,
+): boolean {
+  return (
+    deadlineMs !== undefined &&
+    remainingTimeout(undefined, deadlineMs, now) === undefined
+  );
+}
+
+function boundedNativeOptions(
+  options: SimpleStreamOptions | undefined,
+  deadlineMs: number | undefined,
+  now: () => number,
+): SimpleStreamOptions | undefined | null {
+  if (deadlineMs === undefined) return options;
+  const timeoutMs = remainingTimeout(undefined, deadlineMs, now);
+  if (timeoutMs === undefined) return null;
+  return { ...options, timeoutMs };
 }
 
 function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
@@ -456,6 +485,24 @@ function startNativeFallback(
   })();
 }
 
+function startBoundedNativeFallback(
+  output: ForwardingEventStream,
+  deps: PoolStreamDependencies,
+  model: Model<"openai-codex-responses">,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  deadlineMs: number | undefined,
+  now: () => number,
+): void {
+  const fallbackOptions = boundedNativeOptions(options, deadlineMs, now);
+  if (fallbackOptions === null) {
+    output.push(sanitizedErrorEvent(model, "error", "deadline"));
+    output.end();
+    return;
+  }
+  startNativeFallback(output, deps, model, context, fallbackOptions);
+}
+
 export function createPooledCodexStream(
   deps: PoolStreamDependencies,
   model: Model<"openai-codex-responses">,
@@ -468,6 +515,7 @@ export function createPooledCodexStream(
       : createCodexPoolProofFaultDelegate(deps.delegate, deps.proofFault);
   const output = new ForwardingEventStream();
   const now = deps.now ?? Date.now;
+  const quotaScope = codexQuotaScopeForModelId(model.id);
   const sessionId = options?.sessionId ?? deps.fallbackSessionId;
   if (!sessionId || deps.routes.aliases.length === 0) {
     startNativeFallback(output, deps, model, context, options);
@@ -492,7 +540,7 @@ export function createPooledCodexStream(
         output.end();
         return;
       }
-      if (deadlineMs !== undefined && now() >= deadlineMs) {
+      if (deadlineBudgetExpired(deadlineMs, now)) {
         output.push(
           sanitizedErrorEvent(model, "error", "deadline", lastErrorMessage),
         );
@@ -502,15 +550,33 @@ export function createPooledCodexStream(
 
       let alias: string;
       try {
-        alias = retryAlias ?? deps.routes.select(sessionId, excluded);
+        alias =
+          retryAlias ?? deps.routes.select(sessionId, quotaScope, excluded);
         retryAlias = undefined;
       } catch {
         if (delegatedAttempts === 0) {
-          startNativeFallback(output, deps, model, context, options);
+          startBoundedNativeFallback(
+            output,
+            deps,
+            model,
+            context,
+            options,
+            deadlineMs,
+            now,
+          );
           return;
         }
         output.push(
           sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+
+      if (deadlineBudgetExpired(deadlineMs, now)) {
+        deps.routes.releaseSelection(sessionId, alias, quotaScope);
+        output.push(
+          sanitizedErrorEvent(model, "error", "deadline", lastErrorMessage),
         );
         output.end();
         return;
@@ -525,26 +591,36 @@ export function createPooledCodexStream(
         apiKey = credential.access;
       } catch (error) {
         if (options?.signal?.aborted) {
+          deps.routes.releaseSelection(sessionId, alias, quotaScope);
           output.push(sanitizedErrorEvent(model, "aborted", "auth"));
           output.end();
           return;
         }
         if (
           deadlineMs !== undefined &&
-          (now() >= deadlineMs ||
+          (deadlineBudgetExpired(deadlineMs, now) ||
             (error instanceof PoolCredentialError &&
               error.code === "credential-aborted"))
         ) {
+          deps.routes.releaseSelection(sessionId, alias, quotaScope);
           output.push(sanitizedErrorEvent(model, "error", "deadline"));
           output.end();
           return;
         }
-        deps.routes.recordFailure(sessionId, alias, "auth");
+        deps.routes.recordFailure(sessionId, alias, "auth", quotaScope);
         excluded.add(alias);
         lastFailure = "auth";
         if (excluded.size < deps.routes.aliases.length) continue;
         if (delegatedAttempts === 0) {
-          startNativeFallback(output, deps, model, context, options);
+          startBoundedNativeFallback(
+            output,
+            deps,
+            model,
+            context,
+            options,
+            deadlineMs,
+            now,
+          );
           return;
         }
         output.push(sanitizedErrorEvent(model, "error", "auth"));
@@ -552,13 +628,28 @@ export function createPooledCodexStream(
         return;
       }
 
+      if (options?.signal?.aborted) {
+        deps.routes.releaseSelection(sessionId, alias, quotaScope);
+        output.push(
+          sanitizedErrorEvent(model, "aborted", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      const attemptTimeoutMs = remainingTimeout(timeoutMs, deadlineMs, now);
+      if (deadlineMs !== undefined && attemptTimeoutMs === undefined) {
+        deps.routes.releaseSelection(sessionId, alias, quotaScope);
+        output.push(sanitizedErrorEvent(model, "error", "deadline"));
+        output.end();
+        return;
+      }
       delegatedAttempts += 1;
       const attemptOptions: SimpleStreamOptions = {
         ...options,
         ...(options?.sessionId === undefined ? { sessionId } : {}),
         apiKey,
         maxRetries: 0,
-        timeoutMs: remainingTimeout(timeoutMs, deadlineMs, now),
+        timeoutMs: attemptTimeoutMs,
       };
       let bufferedStart: AssistantMessageEvent | undefined;
       let exposedSubstantive = false;
@@ -583,7 +674,7 @@ export function createPooledCodexStream(
           if (event.type === "done") {
             if (bufferedStart) output.push(bufferedStart);
             output.push(event);
-            deps.routes.recordSuccess(sessionId, alias);
+            deps.routes.recordSuccess(sessionId, alias, quotaScope);
             terminal = true;
             break;
           }
@@ -602,18 +693,29 @@ export function createPooledCodexStream(
                   event.error,
                 ),
               );
-              deps.routes.recordFailure(sessionId, alias, failureClass);
+              deps.routes.recordFailure(
+                sessionId,
+                alias,
+                failureClass,
+                quotaScope,
+              );
               terminal = true;
               break;
             }
             if (!exposedSubstantive && retryable(failureClass)) {
-              deps.routes.recordFailure(sessionId, alias, failureClass);
+              deps.routes.recordFailure(
+                sessionId,
+                alias,
+                failureClass,
+                quotaScope,
+              );
               excluded.add(alias);
               if (
                 shouldRetrySameAlias(
                   failureClass,
                   delegatedAttempts,
                   deps.routes,
+                  quotaScope,
                   excluded,
                 )
               ) {
@@ -625,14 +727,19 @@ export function createPooledCodexStream(
             output.push(
               sanitizedErrorEvent(model, "error", failureClass, event.error),
             );
-            deps.routes.recordFailure(sessionId, alias, failureClass);
+            deps.routes.recordFailure(
+              sessionId,
+              alias,
+              failureClass,
+              quotaScope,
+            );
             terminal = true;
             break;
           }
         }
         if (!terminal && !excluded.has(alias)) {
           lastFailure = "transport";
-          deps.routes.recordFailure(sessionId, alias, lastFailure);
+          deps.routes.recordFailure(sessionId, alias, lastFailure, quotaScope);
           excluded.add(alias);
           if (
             !exposedSubstantive &&
@@ -640,6 +747,7 @@ export function createPooledCodexStream(
               lastFailure,
               delegatedAttempts,
               deps.routes,
+              quotaScope,
               excluded,
             )
           ) {
@@ -655,7 +763,7 @@ export function createPooledCodexStream(
           error instanceof Error ? error.message : "",
         );
         lastFailure = failureClass;
-        deps.routes.recordFailure(sessionId, alias, failureClass);
+        deps.routes.recordFailure(sessionId, alias, failureClass, quotaScope);
         excluded.add(alias);
         if (
           !exposedSubstantive &&
@@ -663,6 +771,7 @@ export function createPooledCodexStream(
             failureClass,
             delegatedAttempts,
             deps.routes,
+            quotaScope,
             excluded,
           )
         ) {
@@ -692,11 +801,40 @@ export function createPooledCodexStream(
         output.end();
         return;
       }
+      if (deadlineBudgetExpired(deadlineMs, now)) {
+        output.push(
+          sanitizedErrorEvent(model, "error", "deadline", lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      const retryBackoffMs = deps.retryBackoffMs ?? 0;
+      const retryWaitMs =
+        deadlineMs === undefined
+          ? retryBackoffMs
+          : Math.min(
+              retryBackoffMs,
+              remainingTimeout(undefined, deadlineMs, now) ?? 0,
+            );
       try {
-        await waitForRetry(deps.retryBackoffMs ?? 0, options?.signal);
+        await (deps.retryWait ?? waitForRetry)(retryWaitMs, options?.signal);
       } catch {
         output.push(
           sanitizedErrorEvent(model, "aborted", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      if (options?.signal?.aborted) {
+        output.push(
+          sanitizedErrorEvent(model, "aborted", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      if (deadlineBudgetExpired(deadlineMs, now)) {
+        output.push(
+          sanitizedErrorEvent(model, "error", "deadline", lastErrorMessage),
         );
         output.end();
         return;

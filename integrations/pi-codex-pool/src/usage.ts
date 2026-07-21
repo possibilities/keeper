@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
+import {
+  CODEX_GENERIC_QUOTA_SCOPE,
+  CODEX_SPARK_QUOTA_SCOPE,
+  type CodexQuotaScope,
+  codexQuotaScopeForUsageMeter,
+} from "../../../src/codex-quota-scope.ts";
 
-export const USAGE_SCHEMA_VERSION = 1;
+export const USAGE_SCHEMA_VERSION = 2;
 export const MAX_USAGE_WINDOWS = 6;
 const MAX_RESET_FUTURE_MS = 45 * 24 * 60 * 60 * 1000;
 const MAX_WINDOW_SECONDS = 45 * 24 * 60 * 60;
@@ -20,17 +26,19 @@ export type CodexAccountCategory =
 
 export interface SanitizedUsageWindow {
   role: UsageWindowRole;
+  quota_scope: CodexQuotaScope;
   /** Stable, PII-free identity used when a provider adds or removes meters. */
   key: string;
   /** Bounded display name from the quota contract, never account metadata. */
   label: string;
   window_seconds: number | null;
   used_percent: number;
+  exhausted: boolean;
   reset_at_ms: number | null;
 }
 
 export interface SanitizedUsageSnapshot {
-  schema_version: 1;
+  schema_version: 2;
   alias: string;
   status: UsageStatus;
   account_category?: CodexAccountCategory;
@@ -146,9 +154,11 @@ function parseWindow(
   raw: unknown,
   role: UsageWindowRole,
   nativeRole: "primary" | "secondary",
+  quotaScope: CodexQuotaScope,
   nowMs: number,
   name: string | null,
   additionalOrdinal: number,
+  explicitlyLimited: boolean,
 ): SanitizedUsageWindow | undefined {
   const record = object(raw);
   if (!record) return undefined;
@@ -172,9 +182,11 @@ function parseWindow(
         };
   return {
     role,
+    quota_scope: quotaScope,
     ...identity,
     window_seconds: seconds,
     used_percent: used,
+    exhausted: explicitlyLimited || used >= 100,
     reset_at_ms: reset,
   };
 }
@@ -184,26 +196,33 @@ function appendRateLimitWindows(
   raw: unknown,
   nowMs: number,
   additional: boolean,
+  quotaScope: CodexQuotaScope,
   name: string | null,
   additionalOrdinal: number,
 ): void {
   const rateLimit = object(raw);
   if (!rateLimit) return;
+  const explicitlyLimited =
+    rateLimit.allowed === false || rateLimit.limit_reached === true;
   const primary = parseWindow(
     rateLimit.primary_window,
     additional ? "additional" : "primary",
     "primary",
+    quotaScope,
     nowMs,
     name,
     additionalOrdinal,
+    explicitlyLimited,
   );
   const secondary = parseWindow(
     rateLimit.secondary_window,
     additional ? "additional" : "secondary",
     "secondary",
+    quotaScope,
     nowMs,
     name,
     additionalOrdinal,
+    explicitlyLimited,
   );
   if (primary && target.length < MAX_USAGE_WINDOWS) target.push(primary);
   if (secondary && target.length < MAX_USAGE_WINDOWS) target.push(secondary);
@@ -226,6 +245,7 @@ export function parseUsageResponse(
     topRateLimit,
     nowMs,
     false,
+    CODEX_GENERIC_QUOTA_SCOPE,
     meterLabel(topRateLimit?.limit_name),
     0,
   );
@@ -240,6 +260,7 @@ export function parseUsageResponse(
         entry?.rate_limit,
         nowMs,
         true,
+        codexQuotaScopeForUsageMeter(entry?.limit_name),
         meterLabel(entry?.limit_name),
         index + 1,
       );
@@ -264,10 +285,10 @@ export function parseUsageResponse(
     keyCounts.set(window.key, count + 1);
     if (count > 0) window.key = `${window.key}:${count + 1}`;
   }
-  const explicitlyLimited =
-    topRateLimit?.allowed === false || topRateLimit?.limit_reached === true;
-  const exhausted =
-    explicitlyLimited || windows.some((window) => window.used_percent >= 100);
+  const genericWindows = windows.filter(
+    (window) => window.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
+  );
+  const exhausted = genericWindows.some((window) => window.exhausted);
   const category = accountCategory(record.plan_type);
   return {
     schema_version: USAGE_SCHEMA_VERSION,
@@ -296,8 +317,81 @@ export function unavailableUsage(
   };
 }
 
-export function worstUsedPercent(snapshot: SanitizedUsageSnapshot): number {
-  if (snapshot.status === "exhausted") return 100;
-  if (snapshot.windows.length === 0) return 50;
-  return Math.max(...snapshot.windows.map((window) => window.used_percent));
+export interface UsageScopeView {
+  quota_scope: CodexQuotaScope;
+  status: UsageStatus;
+  observed_at_ms: number;
+  expires_at_ms: number;
+  windows: SanitizedUsageWindow[];
+  used_percent: number;
+  cooldown_until_ms: number;
+}
+
+function cooldownUntil(
+  windows: readonly SanitizedUsageWindow[],
+  fallbackMs: number,
+): number {
+  return Math.max(
+    fallbackMs,
+    ...windows.map((window) => window.reset_at_ms ?? 0),
+  );
+}
+
+export function usageScopeView(
+  snapshot: SanitizedUsageSnapshot,
+  quotaScope: CodexQuotaScope,
+  nowMs?: number,
+): UsageScopeView {
+  const windows = snapshot.windows.filter(
+    (window) => window.quota_scope === quotaScope,
+  );
+  const stale =
+    nowMs !== undefined &&
+    Number.isFinite(nowMs) &&
+    Math.floor(nowMs) > snapshot.expires_at_ms;
+  if (
+    snapshot.status === "unavailable" ||
+    stale ||
+    (quotaScope === CODEX_SPARK_QUOTA_SCOPE && windows.length === 0)
+  ) {
+    return {
+      quota_scope: quotaScope,
+      status: "unavailable",
+      observed_at_ms: snapshot.observed_at_ms,
+      expires_at_ms: snapshot.expires_at_ms,
+      windows,
+      used_percent: quotaScope === CODEX_GENERIC_QUOTA_SCOPE ? 50 : 100,
+      cooldown_until_ms: 0,
+    };
+  }
+  const windowExhausted = windows.some((window) => window.exhausted);
+  const status =
+    windowExhausted ||
+    (quotaScope === CODEX_GENERIC_QUOTA_SCOPE &&
+      snapshot.status === "exhausted")
+      ? "exhausted"
+      : "healthy";
+  const usedPercent =
+    windows.length === 0
+      ? 50
+      : Math.max(...windows.map((window) => window.used_percent));
+  return {
+    quota_scope: quotaScope,
+    status,
+    observed_at_ms: snapshot.observed_at_ms,
+    expires_at_ms: snapshot.expires_at_ms,
+    windows,
+    used_percent: usedPercent,
+    cooldown_until_ms:
+      status === "exhausted"
+        ? cooldownUntil(windows, snapshot.expires_at_ms)
+        : 0,
+  };
+}
+
+export function worstUsedPercent(
+  snapshot: SanitizedUsageSnapshot,
+  quotaScope: CodexQuotaScope = CODEX_GENERIC_QUOTA_SCOPE,
+): number {
+  return usageScopeView(snapshot, quotaScope).used_percent;
 }

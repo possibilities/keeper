@@ -124,12 +124,13 @@ manifest, compat-root delegate marker, Pi loader seam, and the live pi-subagents
 inheritance markers without registering the companion globally.
 
 The launcher overwrites any inherited pool carriers with a sanitized initial context: activation mode,
-opaque alias array, one pressure-reserved opaque initial route candidate for a Codex workload, SHA-256
-configuration binding, and fixed fallback reason. Pending, stale, missing, or
-incompatible state sets native mode. When active, the companion overrides only `openai-codex`; every other
-model keeps its existing Provider. Root and child sessions select independently within the shared runtime,
-and a logical call retries one different alias only before Substantive output. A companion/runtime failure
-warns and delegates to Pi's native Codex credential.
+opaque alias array, a scope-keyed alias policy plus binding, one pressure-reserved opaque initial route
+candidate tagged with its quota scope for a Codex workload, SHA-256 configuration binding, and fixed
+fallback reason. Pending, stale, missing, or incompatible state sets native mode. When active, the
+companion overrides only `openai-codex`; every other model keeps its existing Provider. Root and child
+sessions select independently within the shared runtime, stickiness is keyed by `(session, scope)`, and a
+logical call retries one different alias only before Substantive output. A companion/runtime failure warns
+and delegates to Pi's native Codex credential.
 
 Pi package commands, metadata commands, and standalone Pi never traverse this source-loading branch.
 Interactive enrollment is a distinct inherited-stdio operator command: it loads only the companion so Pi's

@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
+import {
+  type CodexQuotaScope,
+  isCodexQuotaScope,
+} from "../../../src/codex-quota-scope.ts";
 import { isOpaqueAlias, writePrivateJsonAtomic } from "./auth.ts";
 
-export const LIVE_PROOF_SCHEMA_VERSION = 1;
+export const LIVE_PROOF_SCHEMA_VERSION = 2;
 export const LIVE_PROOF_MAX_AGE_MS = 15 * 60 * 1000;
 const MAX_ARTIFACTS = 64;
 const MAX_ARTIFACT_BYTES = 256 * 1024;
@@ -114,10 +118,11 @@ export interface ArtifactScanResult {
 }
 
 export interface LiveProofReport {
-  schema_version: 1;
+  schema_version: 2;
   revision: string;
   config_binding: string;
   alias_binding: string;
+  quota_scope: CodexQuotaScope;
   started_at_ms: number;
   completed_at_ms: number;
   interrupted: boolean;
@@ -129,6 +134,7 @@ export interface LiveProofReport {
   clauses: Record<LiveProofClause, boolean>;
   routes: Array<{
     session_role: "root" | "child";
+    quota_scope: CodexQuotaScope;
     attempts: number;
     aliases: string[];
     failure_class: "none" | "quota" | "rate" | "auth" | "transport";
@@ -179,6 +185,7 @@ const REPORT_KEYS = [
   "revision",
   "config_binding",
   "alias_binding",
+  "quota_scope",
   "started_at_ms",
   "completed_at_ms",
   "interrupted",
@@ -220,8 +227,8 @@ function hasUnknownKeys(
 
 /**
  * Every required report key present and no key outside the required set plus the
- * optional `degraded` marker — a legacy full report omitting `degraded` reads as
- * a non-degraded report, while an extra unknown key is rejected upstream.
+ * optional `degraded` marker. A report omitting `degraded` reads as a
+ * non-degraded report, while an extra unknown key is rejected upstream.
  */
 function hasReportKeys(value: Record<string, unknown>): boolean {
   const keys = new Set(Object.keys(value));
@@ -277,6 +284,7 @@ function schemaShape(input: unknown): {
     !revision(top.revision) ||
     !hexBinding(top.config_binding) ||
     !hexBinding(top.alias_binding) ||
+    !isCodexQuotaScope(top.quota_scope) ||
     !finiteTimestamp(top.started_at_ms) ||
     !finiteTimestamp(top.completed_at_ms) ||
     typeof top.interrupted !== "boolean" ||
@@ -347,6 +355,7 @@ function schemaShape(input: unknown): {
     const route = record(rawRoute);
     const routeKeys = [
       "session_role",
+      "quota_scope",
       "attempts",
       "aliases",
       "failure_class",
@@ -359,6 +368,8 @@ function schemaShape(input: unknown): {
     if (
       !hasExactKeys(route, routeKeys) ||
       (route.session_role !== "root" && route.session_role !== "child") ||
+      !isCodexQuotaScope(route.quota_scope) ||
+      route.quota_scope !== top.quota_scope ||
       !Array.isArray(routeAliases) ||
       routeAliases.length < 1 ||
       routeAliases.length > 2 ||
@@ -625,6 +636,18 @@ export function classifyLiveProof(
 }
 
 /**
+ * The requested quota scope attested by a fully schema-valid report. Unknown
+ * keys, non-v2 schema, invalid scope vocabulary, or mixed route scopes return
+ * null; verdict classification remains a separate caller decision.
+ */
+export function reportQuotaScope(input: unknown): CodexQuotaScope | null {
+  const parsed = schemaShape(input);
+  return parsed.report !== undefined && !parsed.unknown
+    ? parsed.report.quota_scope
+    : null;
+}
+
+/**
  * The validated degraded marker of a schema-valid report, or null when the
  * report carries none. Callers that have already confirmed a
  * `proven-degraded-single-alias` verdict via {@link classifyLiveProof} use this
@@ -702,9 +725,12 @@ export function collectLiveProof(
     revision: input.revision,
     config_binding: input.config_binding,
     alias_binding: input.alias_binding,
+    quota_scope: input.quota_scope,
     started_at_ms: input.started_at_ms,
     completed_at_ms: input.completed_at_ms,
-    interrupted: input.interrupted,
+    interrupted:
+      input.interrupted ||
+      input.routes.some((route) => route.quota_scope !== input.quota_scope),
     alias_roles: input.alias_roles.map(({ alias, role }) => ({ alias, role })),
     transcript: input.transcript.map((entry) => ({
       sequence: entry.sequence,
@@ -716,6 +742,7 @@ export function collectLiveProof(
     ) as Record<LiveProofClause, boolean>,
     routes: input.routes.map((route) => ({
       session_role: route.session_role,
+      quota_scope: route.quota_scope,
       attempts: route.attempts,
       aliases: [...route.aliases],
       failure_class: route.failure_class,
