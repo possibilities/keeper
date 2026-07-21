@@ -36,5 +36,5 @@ and/or test/daemon.test.ts.
 - [ ] Fail-open and fencing-token monotonicity invariants are preserved.
 
 ## Done summary
-
+Made listGrantLeaves scan the full grants directory (no 256-entry truncation before the exclusion decision) and added a bounded, cursor-driven, fail-open reaper that unlinks expired dead-owner grant leaves while retaining the highest fencing token as the crash-safe monotonicity floor.
 ## Evidence
