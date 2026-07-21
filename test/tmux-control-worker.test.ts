@@ -30,6 +30,7 @@ import {
   pickAnchorSession,
   type RereadScheduler,
   runConnection,
+  supervise,
   type TmuxClientFocusSnapshotMessage,
   type TmuxTopologySnapshotMessage,
 } from "../src/tmux-control-worker";
@@ -710,6 +711,170 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     stopping = true;
     child.eof();
     expect(await conn).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// supervise — reconnect-cap degradation remains in-process and a successful
+// framed read resets the normal exponential backoff cadence.
+// ---------------------------------------------------------------------------
+
+describe("supervise — reconnect-cap degradation", () => {
+  test("keeps pulsing at the cap, logs degradation once, then resets after a framed focus read", async () => {
+    const errorCalls: unknown[][] = [];
+    const processExitCalls: number[] = [];
+    const sleepPoints: Array<{
+      ms: number;
+      spawnCount: number;
+      livenessCount: number;
+    }> = [];
+    const focusPosts: TmuxClientFocusSnapshotMessage[] = [];
+    const originalError = console.error;
+    const originalExit = process.exit;
+    let stopping = false;
+    let spawnCount = 0;
+    let livenessCount = 0;
+    let successfulChild: ReturnType<typeof makeScriptedChild> | null = null;
+
+    // Queue re-reads at a microtask boundary: no real timer is created, while the
+    // production debounce's asynchronous (rather than synchronous) ordering holds.
+    const microtaskRereadScheduler: RereadScheduler = {
+      setTimer: (callback) => {
+        queueMicrotask(callback);
+        return undefined;
+      },
+      clearTimer: () => {},
+    };
+
+    console.error = (...args: unknown[]): void => {
+      errorCalls.push(args);
+    };
+    process.exit = ((code?: number): never => {
+      processExitCalls.push(code ?? 0);
+      throw new Error("unexpected process.exit from supervise");
+    }) as typeof process.exit;
+
+    try {
+      const supervisor = supervise({
+        // `supervise` only passes this through to `readJobs`; the test callback
+        // below is an independent always-live fixture, so no database is opened.
+        db: {} as never,
+        gatePollMs: 1,
+        isStopping: () => stopping,
+        postFocus: (message) => {
+          focusPosts.push(message);
+          // This child has already completed its generation/client/pane re-read,
+          // so EOF makes `runConnection` return `true` to the real supervisor.
+          successfulChild?.eof();
+        },
+        postTopology: () => {},
+        postLiveness: () => {
+          livenessCount += 1;
+        },
+        readJobs: () => [
+          fakeJob({
+            state: "working",
+            backend_exec_type: "tmux",
+            backend_exec_session_id: "main",
+          }),
+        ],
+        spawn: () => {
+          spawnCount += 1;
+          if (spawnCount === 11) {
+            let commandNumber = 600;
+            const child = (() => {
+              const h = makeScriptedChild((command) => {
+                commandNumber += 1;
+                if (
+                  command.startsWith("refresh-client") ||
+                  command.startsWith("copy-mode")
+                ) {
+                  h.pushStdout(replyBlock(commandNumber, []));
+                } else if (command.startsWith("display-message")) {
+                  h.pushStdout(replyBlock(commandNumber, ["700:11"]));
+                } else if (command.startsWith("list-clients")) {
+                  h.pushStdout(
+                    replyBlock(commandNumber, [
+                      "/dev/ttys001\t0\t120\t10\tmain",
+                    ]),
+                  );
+                } else if (command.startsWith("list-panes")) {
+                  h.pushStdout(
+                    replyBlock(commandNumber, ["1\t1\t7\t%70\tmain"]),
+                  );
+                }
+              });
+              return h;
+            })();
+            successfulChild = child;
+            child.pushStdout(
+              "%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n",
+            );
+            return child.child;
+          }
+
+          // No reply is ever framed before EOF: the real `runConnection` returns
+          // false, so the supervisor counts it as a failed connection.
+          const child = makeScriptedChild(() => {});
+          child.eof();
+          return child.child;
+        },
+        watchDbChanges: async () => {},
+        rereadScheduler: microtaskRereadScheduler,
+        sleep: async (ms) => {
+          sleepPoints.push({ ms, spawnCount, livenessCount });
+          // After the successful connection has reset attempts, permit one more
+          // failed child. Its 2,000ms delay proves the normal ramp resumed.
+          if (focusPosts.length === 1 && spawnCount === 12 && ms === 2_000) {
+            stopping = true;
+          }
+          await Promise.resolve();
+        },
+      });
+
+      await expect(supervisor).resolves.toBeUndefined();
+
+      // Eight failures enter the cap; two more prove the gated loop still emits
+      // a liveness pulse each turn rather than wedging after the diagnostic.
+      expect(
+        sleepPoints
+          .filter(({ spawnCount: count }) => count >= 8 && count <= 10)
+          .map(({ ms, livenessCount: pulses }) => [ms, pulses]),
+      ).toEqual([
+        [30_000, 8],
+        [30_000, 9],
+        [30_000, 10],
+      ]);
+      expect(
+        errorCalls.filter(
+          ([message]) =>
+            message ===
+            "[tmux-control-worker] focus observation degraded — control client could not sustain a connection; retrying at max backoff, daemon stays up",
+        ),
+      ).toHaveLength(1);
+      expect(processExitCalls).toEqual([]);
+
+      // The eleventh child completes a real framed re-read and posts focus before
+      // EOF. The next two waits are independently calculated from 500 · 2^1 and
+      // 500 · 2^2, not the 30s capped delay.
+      expect(focusPosts).toEqual([
+        {
+          kind: "tmux-client-focus-snapshot",
+          status: "connected",
+          generation_id: "700:11",
+          session_name: "main",
+          window_index: 7,
+          pane_id: "%70",
+        },
+      ]);
+      expect(sleepPoints.map(({ ms }) => ms)).toEqual([
+        1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000,
+        30_000, 1_000, 2_000,
+      ]);
+    } finally {
+      console.error = originalError;
+      process.exit = originalExit;
+    }
   });
 });
 

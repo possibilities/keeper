@@ -16,23 +16,30 @@
  *  - Typed messages: `{type:"shutdown"}` main→worker; `tmux-client-focus-snapshot`
  *    + `tmux-control-liveness` worker→main. The child + pipes are an EXTERNAL
  *    resource released in the shutdown handler (mirror `bus-worker`).
- *  - `fatalExit` (exit 1) is reserved for a BOOT failure (db-open) and a bounded
- *    reconnect-cap breach (a flapping server). A no-server condition is NOT fatal:
- *    `-N` fails when no server runs, so the worker degrades + retries forever.
+ *  - `fatalExit` (exit 1) is reserved for a BOOT failure (db-open). A no-server
+ *    condition and a reconnect-cap breach are NOT fatal: `-N` fails when no server
+ *    runs, so focus observation degrades + retries forever.
  *
- * Control-mode hard invariants (host tmux is 3.6b — verified by the planning
- * scouts):
+ * Control-mode hard invariants (re-verified live against the host's served
+ * tmux 3.7b):
  *  - `no-output` is set ONCE at attach (`-f no-output,…`) and re-asserted via
- *    `refresh-client -f no-output`, NEVER toggled off→on (the ≤3.6 toggle hangs
- *    the client). `copy-mode -q` is sent defensively on connect (no `%config-error`
- *    on 3.6b → a config error would otherwise silently hang the client).
+ *    `refresh-client -f no-output`, NEVER toggled off→on — a live probe against
+ *    3.7b confirms the set-once/re-assert path replies cleanly (`%begin`/`%end`,
+ *    no hang); the never-toggle discipline is kept regardless, since a toggle
+ *    buys nothing an assert doesn't already give. `copy-mode -q` is sent
+ *    defensively on connect to force-clear any pane mode (copy/view) left over
+ *    from a prior client, independent of `%config-error` — a live probe
+ *    confirms 3.7b DOES emit `%config-error` as an unsolicited notification
+ *    (parsed by `createControlStreamParser`, non-structural — it never changes
+ *    focus so it does not dirty a re-read).
  *  - The reader is a dedicated async loop that drains stdout straight into the
  *    task-1 parser, NEVER blocking on a DB write or a command round-trip — a
  *    notification burst against a stalled reader fills the (small, on macOS) pipe
  *    and trips `%exit "too far behind"`.
  *  - The server generation is read FIRST on every connect; ALL cached ids are
- *    discarded on `%exit`/EOF (tmux reuses pane/window/session ids across
- *    restarts) and the surface is re-bootstrapped via a framed re-read.
+ *    discarded on `%exit`/EOF — a live probe confirms 3.7b reuses pane/window/
+ *    session ids across a server restart — and the surface is re-bootstrapped
+ *    via a framed re-read.
  *
  * The PURE pieces below (`buildAttachArgs`, `pickAnchorSession`, `focusDedupKey`,
  * `decideReconnect`, `isStructuralNotification`) carry no I/O so the fast tier
@@ -278,15 +285,14 @@ export function pickAnchorSession(
  * The reconnect-backoff state machine — PURE clock/counter arithmetic (mirror
  * `decideGitSeedWatchdog`) so the recovery decision is unit-testable with plain
  * inputs. After a child exit/EOF the worker discards cached ids and reconnects
- * with exponential backoff; a bounded cap escalates to `fatalExit` (no in-process
- * respawn — the LaunchAgent is the single recovery path).
+ * with exponential backoff; a bounded cap degrades focus observation in place.
  *
  * Returns:
  *   - `{ action: "retry", delayMs }` — within the cap: wait `delayMs` then
  *     reconnect. `delayMs` doubles per consecutive failure (`base · 2^attempts`),
  *     clamped to `maxDelayMs`.
- *   - `{ action: "escalate" }` — the attempt count reached `maxAttempts`: a
- *     flapping server, crash for a LaunchAgent restart.
+ *   - `{ action: "escalate" }` — the attempt count reached `maxAttempts`: the
+ *     caller logs one degraded-observation diagnostic and remains at max backoff.
  *
  * `attempts` is the count of consecutive failures SO FAR (0 on the first
  * reconnect after a clean run). A clean connect that observes focus resets it to
@@ -381,8 +387,8 @@ const REREAD_DEBOUNCE_MS = 50;
 /** Liveness pulse cadence (ms) — posted even during long idle so a missing pulse
  *  means a STUCK worker, not just a quiet host. */
 const LIVENESS_PULSE_MS = 15_000;
-/** Reconnect backoff: base delay, ceiling, and the consecutive-failure cap before
- *  `fatalExit` (a flapping server → LaunchAgent restart). */
+/** Reconnect backoff: base delay, ceiling, and the consecutive-failure cap where
+ *  focus observation degrades in place and remains at max backoff. */
 const RECONNECT_BASE_DELAY_MS = 500;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_MAX_ATTEMPTS = 8;
@@ -557,9 +563,9 @@ function main(): void {
       process.exit(0);
     })
     .catch((err) => {
-      // A bounded reconnect-cap breach (or an unexpected supervisor fault) lands
-      // here — exit non-zero so the daemon's close guard fatalExits → LaunchAgent
-      // restart (the single recovery path; no in-process respawn).
+      // An unexpected supervisor fault exits non-zero so the daemon's close guard
+      // fatalExits → LaunchAgent restart (the single recovery path; no in-process
+      // respawn). Reconnect-cap exhaustion instead degrades in place in `supervise`.
       console.error("[tmux-control-worker] supervisor exited:", err);
       clearInterval(livenessTimer);
       closeDb();
@@ -596,10 +602,10 @@ class ChildGoneError extends Error {
  * The persistent control-client supervisor. Loops forever: gate on a live tmux
  * job, pick an anchor, spawn the `tmux -C` child, run one connection to exhaustion,
  * then — on the child going away — discard cached ids, back off (bounded), and
- * reconnect. Resolves only when `isStopping()` becomes true; rejects only on a
- * reconnect-cap breach (escalate to a process restart).
+ * reconnect. Resolves only when `isStopping()` becomes true; failed connects,
+ * including reconnect-cap exhaustion, degrade in place rather than rejecting.
  */
-async function supervise(ctx: {
+export async function supervise(ctx: {
   db: Database;
   gatePollMs: number;
   isStopping: () => boolean;
@@ -612,15 +618,22 @@ async function supervise(ctx: {
     onChange: () => void,
     isDone: () => boolean,
   ) => Promise<void>;
+  /** Optional connection scheduler seam for deterministic in-process tests. */
+  rereadScheduler?: RereadScheduler;
+  /** Optional backoff seam; production uses the shutdown-aware real sleep. */
+  sleep?: (ms: number, isStopping: () => boolean) => Promise<void>;
 }): Promise<void> {
+  const sleep = ctx.sleep ?? interruptibleSleep;
   let attempts = 0;
   while (!ctx.isStopping()) {
     // Connect gate — no live tmux job ⇒ nothing to observe (and never hold the
-    // server alive). Poll until one appears.
-    const jobs = readJobs(ctx.db);
+    // server alive). Poll until one appears. Reads through the injectable
+    // `ctx.readJobs` seam (production wires it to `readJobs(db)`) so tests drive
+    // the whole loop with a synthetic jobs fixture and no real db connection.
+    const jobs = ctx.readJobs();
     if (!hasLiveTmuxJob(jobs)) {
       ctx.postLiveness();
-      await interruptibleSleep(ctx.gatePollMs, ctx.isStopping);
+      await sleep(ctx.gatePollMs, ctx.isStopping);
       continue;
     }
 
@@ -634,7 +647,7 @@ async function supervise(ctx: {
       const anchor = pickAnchorForConnect(jobs);
       if (anchor === null) {
         // A live tmux job with no resolvable session name yet — wait a beat.
-        await interruptibleSleep(ctx.gatePollMs, ctx.isStopping);
+        await sleep(ctx.gatePollMs, ctx.isStopping);
         continue;
       }
       child = ctx.spawn(anchor);
@@ -678,11 +691,11 @@ async function supervise(ctx: {
       }
       attempts = RECONNECT_MAX_ATTEMPTS;
       ctx.postLiveness();
-      await interruptibleSleep(RECONNECT_MAX_DELAY_MS, ctx.isStopping);
+      await sleep(RECONNECT_MAX_DELAY_MS, ctx.isStopping);
       continue;
     }
     ctx.postLiveness();
-    await interruptibleSleep(decision.delayMs, ctx.isStopping);
+    await sleep(decision.delayMs, ctx.isStopping);
   }
 }
 
