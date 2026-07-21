@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Land additive incident-column schema on dispatch_failures",
-  "updated_at": "2026-07-21T14:05:20.132000Z"
+  "updated_at": "2026-07-21T15:19:51.912000Z",
+  "worker_done_at": "2026-07-21T15:19:51.912000Z"
 }

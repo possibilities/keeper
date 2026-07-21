@@ -69,5 +69,5 @@ change). Named gates.
       human_notified_at, owner_redispatch_attempts)
 
 ## Done summary
-
+Landed an additive schema step adding blocked_since, block_status, block_outcome, and owner_redispatch_attempts to dispatch_failures so the escalation-retirement collapse can carry block_escalations state forward into the per-key incident projection. Zero behavior change: no producer writes or consumer reads them yet; re-fold stays byte-identical and the page-once human_notified_at + (verb,id) key already exist, so a live block_escalations row is losslessly representable.
 ## Evidence
