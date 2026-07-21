@@ -30,8 +30,11 @@ import {
 } from "../src/auth.ts";
 import { classifyPoolFailure, createPooledCodexStream } from "../src/pool.ts";
 import {
+  MAX_POOL_FAILURE_LOG_RECORDS,
+  MAX_POOL_FAILURE_MESSAGE_BYTES,
   type PersistedPoolState,
   POOL_STATE_SCHEMA_VERSION,
+  PoolFailureLog,
   PoolRouteState,
   PoolStateStore,
   type PoolStateTransactResult,
@@ -2236,6 +2239,104 @@ describe("credential and route state", () => {
   });
 });
 
+describe("pool failure log", () => {
+  test("writes one private record per terminal failure carrying the real message", () => {
+    const dir = mkdtempSync(join(tmpdir(), "codex-pool-failure-log-"));
+    const path = join(dir, "failures.ndjson");
+    const log = new PoolFailureLog(path, () => 12_345);
+    log.record({
+      sessionId: "session-a",
+      alias: "keeper-codex-a",
+      attempt: 1,
+      failureClass: "other",
+      message: "Bearer sk-private opaque provider failure",
+    });
+    const lines = readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0);
+    expect(lines.length).toBe(1);
+    const record = JSON.parse(lines[0]);
+    expect(record).toEqual({
+      schema_version: 1,
+      ts_ms: 12_345,
+      session_id: "session-a",
+      attempt: 1,
+      alias: "keeper-codex-a",
+      failure_class: "other",
+      message: "Bearer sk-private opaque provider failure",
+    });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("bounds the private failure log to a fixed record count", () => {
+    const dir = mkdtempSync(join(tmpdir(), "codex-pool-failure-log-bounds-"));
+    const path = join(dir, "failures.ndjson");
+    const log = new PoolFailureLog(path, () => 1);
+    const total = MAX_POOL_FAILURE_LOG_RECORDS + 25;
+    for (let index = 0; index < total; index += 1) {
+      log.record({
+        sessionId: `session-${index}`,
+        alias: "keeper-codex-a",
+        attempt: 1,
+        failureClass: "transport",
+        message: `failure number ${index}`,
+      });
+    }
+    const lines = readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0);
+    expect(lines.length).toBe(MAX_POOL_FAILURE_LOG_RECORDS);
+    const first = JSON.parse(lines[0]);
+    const last = JSON.parse(lines.at(-1) as string);
+    expect(first.session_id).toBe(
+      `session-${total - MAX_POOL_FAILURE_LOG_RECORDS}`,
+    );
+    expect(last.session_id).toBe(`session-${total - 1}`);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("caps an individual record's message text length", () => {
+    const dir = mkdtempSync(join(tmpdir(), "codex-pool-failure-log-message-"));
+    const path = join(dir, "failures.ndjson");
+    const log = new PoolFailureLog(path, () => 1);
+    log.record({
+      sessionId: "session-oversized",
+      alias: "keeper-codex-a",
+      attempt: 1,
+      failureClass: "other",
+      message: "x".repeat(MAX_POOL_FAILURE_MESSAGE_BYTES * 2),
+    });
+    const lines = readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0);
+    const record = JSON.parse(lines[0]);
+    expect(Buffer.byteLength(record.message, "utf8")).toBe(
+      MAX_POOL_FAILURE_MESSAGE_BYTES,
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("never throws into the caller when the log path is unwritable", () => {
+    const dir = mkdtempSync(
+      join(tmpdir(), "codex-pool-failure-log-unwritable-"),
+    );
+    const path = join(dir, "nested", "unreachable", "failures.ndjson");
+    writeFileSync(join(dir, "nested"), "not-a-directory");
+    const log = new PoolFailureLog(path, () => 1);
+    expect(() =>
+      log.record({
+        sessionId: "session-a",
+        alias: "keeper-codex-a",
+        attempt: 1,
+        failureClass: "other",
+        message: "unreachable",
+      }),
+    ).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("pooled Codex stream", () => {
   test("retries one different alias before output and preserves the request contract and ordering", async () => {
     const calls: Array<{ model: unknown; context: unknown; options: any }> = [];
@@ -2593,6 +2694,22 @@ describe("pooled Codex stream", () => {
     }
   });
 
+  test("classifies login and credential-expiry phrasings as auth", () => {
+    for (const message of [
+      "Error: you are not logged in. Please run `codex login`.",
+      "your login expired, please sign in again",
+      "session expired: please re-authenticate",
+      "please run codex login to continue",
+      "your credentials are invalid",
+      "credentials expired",
+      "credential missing for this account",
+    ]) {
+      expect(classifyPoolFailure(message)).toBe("auth");
+    }
+    // A genuinely unclassifiable phrasing stays bucketed as "other".
+    expect(classifyPoolFailure("opaque provider failure code 7")).toBe("other");
+  });
+
   test("retries the same alias once when no healthy alternate exists", async () => {
     const aliases = ["keeper-codex-a", "keeper-codex-b"];
     const routes = new PoolRouteState(
@@ -2701,8 +2818,8 @@ describe("pooled Codex stream", () => {
     expect(JSON.stringify(events)).not.toContain("private-value");
   });
 
-  test("does not retry an unclassified failure before output", async () => {
-    let calls = 0;
+  test("fails over exactly once for a pre-substantive unclassified failure", async () => {
+    const apiKeys: Array<string | undefined> = [];
     const pooled = createPooledCodexStream(
       {
         vault: new CredentialVault(
@@ -2713,8 +2830,8 @@ describe("pooled Codex stream", () => {
         routes: routeState(),
         warn: () => {},
         nativeDelegate: () => stream([]) as any,
-        delegate: () => {
-          calls += 1;
+        delegate: (_model, _context, options) => {
+          apiKeys.push(options?.apiKey);
           return stream([
             { type: "start", partial: message() },
             {
@@ -2733,10 +2850,128 @@ describe("pooled Codex stream", () => {
       { sessionId: "unclassified-session" },
     );
     const events = await collect(pooled);
-    expect(calls).toBe(1);
-    expect(events.map((event: any) => event.type)).toEqual(["start", "error"]);
+    expect(apiKeys).toEqual(["fake-access-a", "fake-access-b"]);
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      "pool-other-failure",
+    );
     expect(JSON.stringify(events)).not.toContain("owner@example.test");
     expect(JSON.stringify(events)).not.toContain("private-value");
+  });
+
+  test("does not retry a post-substantive unclassified failure", async () => {
+    let calls = 0;
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes: routeState(),
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: () => {
+          calls += 1;
+          return stream([
+            { type: "start", partial: message() },
+            {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: "partial",
+              partial: {
+                ...message(),
+                content: [{ type: "text", text: "partial" }],
+              },
+            },
+            {
+              type: "error",
+              reason: "error",
+              error: message(
+                "error",
+                "opaque provider failure owner@example.test Bearer private-value",
+              ),
+            },
+          ]) as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "unclassified-post-substantive-session" },
+    );
+    const events = await collect(pooled);
+    expect(calls).toBe(1);
+    expect(events.map((event: any) => event.type)).toEqual([
+      "start",
+      "text_delta",
+      "error",
+    ]);
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      "pool-other-failure",
+    );
+    expect(JSON.stringify(events)).not.toContain("owner@example.test");
+    expect(JSON.stringify(events)).not.toContain("private-value");
+  });
+
+  test("logs the real upstream message privately while sanitizing the visible stream", async () => {
+    const recorded: Array<{
+      sessionId: string;
+      alias: string;
+      attempt: number;
+      failureClass: string;
+      message: string;
+    }> = [];
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes: routeState(["keeper-codex-a"]),
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        failureLog: {
+          record: (entry) => recorded.push(entry),
+        },
+        delegate: () => {
+          return stream([
+            { type: "start", partial: message() },
+            {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: "partial",
+              partial: {
+                ...message(),
+                content: [{ type: "text", text: "partial" }],
+              },
+            },
+            {
+              type: "error",
+              reason: "error",
+              error: message(
+                "error",
+                "session expired: please re-authenticate owner@example.test",
+              ),
+            },
+          ]) as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "failure-log-session" },
+    );
+    const events = await collect(pooled);
+    expect((events.at(-1) as any).error.errorMessage).toBe("pool-auth-failure");
+    expect(JSON.stringify(events)).not.toContain("owner@example.test");
+    expect(recorded).toEqual([
+      {
+        sessionId: "failure-log-session",
+        alias: "keeper-codex-a",
+        attempt: 1,
+        failureClass: "auth",
+        message: "session expired: please re-authenticate owner@example.test",
+      },
+    ]);
   });
 
   test("does not retry a stream that ends without a terminal event after output", async () => {

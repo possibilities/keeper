@@ -12,6 +12,7 @@ import {
   defaultAgentDir,
   isOpaqueAlias,
   normalizeAliases,
+  writePrivateFileAtomic,
   writePrivateJsonAtomic,
 } from "./auth.ts";
 import { acquireOwnerFileLock } from "./state-lock.ts";
@@ -28,6 +29,11 @@ const PROVIDER_RESET_HORIZON_MS = 45 * 24 * 60 * 60 * 1000;
 const STATE_LOCK_TIMEOUT_MS = 2_000;
 const STATE_LOCK_RETRY_MS = 10;
 const MAX_PENDING_PRESSURE_RELEASES = 100;
+export const MAX_POOL_FAILURE_LOG_RECORDS = 200;
+export const MAX_POOL_FAILURE_LOG_BYTES = 256 * 1024;
+export const MAX_POOL_FAILURE_MESSAGE_BYTES = 2_000;
+const MAX_POOL_FAILURE_SESSION_ID_BYTES = 256;
+const MAX_POOL_FAILURE_ALIAS_BYTES = 128;
 
 export type PoolFailureClass =
   | "quota"
@@ -36,6 +42,18 @@ export type PoolFailureClass =
   | "transport"
   | "context"
   | "other";
+
+export interface PoolFailureLogEntry {
+  sessionId: string;
+  alias: string;
+  attempt: number;
+  failureClass: PoolFailureClass;
+  message: string;
+}
+
+export interface PoolFailureLogger {
+  record(entry: PoolFailureLogEntry): void;
+}
 
 export interface ScopeQuotaState {
   quota_scope: CodexQuotaScope;
@@ -719,6 +737,79 @@ export class PoolStateStore {
         last_selected_at_ms: account.last_selected_at_ms,
       })),
     });
+  }
+}
+
+function boundedFailureText(value: string, maxBytes: number): string {
+  return Buffer.byteLength(value, "utf8") <= maxBytes
+    ? value
+    : Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8");
+}
+
+/**
+ * Bounded, append-only NDJSON diagnostic log of real upstream pool-failure
+ * text, private to the pool's state directory. The harness-visible event
+ * stream (`sanitizedErrorEvent`) only ever carries the failure code; this
+ * log is the sole place the real message survives, for operator forensics.
+ */
+export class PoolFailureLog implements PoolFailureLogger {
+  constructor(
+    readonly path = join(
+      defaultAgentDir(),
+      "keeper-codex-pool-failures.ndjson",
+    ),
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  record(entry: PoolFailureLogEntry): void {
+    try {
+      this.append(entry);
+    } catch {
+      // Diagnostics must never break the pool stream.
+    }
+  }
+
+  private append(entry: PoolFailureLogEntry): void {
+    const line = JSON.stringify({
+      schema_version: 1,
+      ts_ms: Math.floor(this.now()),
+      session_id: boundedFailureText(
+        entry.sessionId,
+        MAX_POOL_FAILURE_SESSION_ID_BYTES,
+      ),
+      attempt: Number.isSafeInteger(entry.attempt) ? entry.attempt : 0,
+      alias: boundedFailureText(entry.alias, MAX_POOL_FAILURE_ALIAS_BYTES),
+      failure_class: entry.failureClass,
+      message: boundedFailureText(
+        entry.message,
+        MAX_POOL_FAILURE_MESSAGE_BYTES,
+      ),
+    });
+    let lines = [...this.readExistingLines(), line].slice(
+      -MAX_POOL_FAILURE_LOG_RECORDS,
+    );
+    let content = `${lines.join("\n")}\n`;
+    while (
+      Buffer.byteLength(content, "utf8") > MAX_POOL_FAILURE_LOG_BYTES &&
+      lines.length > 1
+    ) {
+      lines = lines.slice(1);
+      content = `${lines.join("\n")}\n`;
+    }
+    writePrivateFileAtomic(this.path, content);
+  }
+
+  private readExistingLines(): string[] {
+    try {
+      if (!existsSync(this.path)) return [];
+      const stat = statSync(this.path);
+      if (!stat.isFile() || stat.size > MAX_POOL_FAILURE_LOG_BYTES) return [];
+      return readFileSync(this.path, "utf8")
+        .split("\n")
+        .filter((line) => line.length > 0);
+    } catch {
+      return [];
+    }
   }
 }
 

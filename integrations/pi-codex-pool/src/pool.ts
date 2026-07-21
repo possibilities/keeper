@@ -15,7 +15,11 @@ import {
   codexQuotaScopeForModelId,
 } from "../../../src/codex-quota-scope.ts";
 import { type CredentialVault, PoolCredentialError } from "./auth.ts";
-import type { PoolFailureClass, PoolRouteState } from "./state.ts";
+import type {
+  PoolFailureClass,
+  PoolFailureLogger,
+  PoolRouteState,
+} from "./state.ts";
 
 export type CodexDelegate = (
   model: Model<"openai-codex-responses">,
@@ -81,6 +85,8 @@ export interface PoolStreamDependencies {
   retryWait?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
   proofFault?: CodexPoolProofFaultOptions;
+  /** Private, bounded sink for the real upstream text behind a sanitized failure code. */
+  failureLog?: PoolFailureLogger;
 }
 
 class ForwardingEventStream implements AsyncIterable<AssistantMessageEvent> {
@@ -155,7 +161,7 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
     return "context";
   }
   if (
-    /unauthori[sz]ed|forbidden|invalid.?token|expired.?token|\b40[13]\b/i.test(
+    /unauthori[sz]ed|forbidden|invalid.?token|expired.?token|\b40[13]\b|not logged in|login expired|session expired|please run .* login|credentials? (?:are )?(?:invalid|expired|missing)/i.test(
       message,
     )
   ) {
@@ -172,7 +178,7 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
 }
 
 function retryable(failureClass: PoolFailureClass): boolean {
-  return ["quota", "rate", "auth", "transport"].includes(failureClass);
+  return ["quota", "rate", "auth", "transport", "other"].includes(failureClass);
 }
 
 function shouldRetrySameAlias(
@@ -258,6 +264,25 @@ function sanitizedErrorEvent(
     reason,
     error: terminalMessage(model, reason, code, source),
   };
+}
+
+function recordPoolFailure(
+  deps: PoolStreamDependencies,
+  context: { sessionId: string; alias: string; attempt: number },
+  failureClass: PoolFailureClass,
+  message: string,
+): void {
+  try {
+    deps.failureLog?.record({
+      sessionId: context.sessionId,
+      alias: context.alias,
+      attempt: context.attempt,
+      failureClass,
+      message,
+    });
+  } catch {
+    // Diagnostics must never break the pool stream.
+  }
 }
 
 function parseProofFaultRequest(input: unknown): CodexPoolProofFaultRequest {
@@ -531,6 +556,7 @@ export function createPooledCodexStream(
     let retryAlias: string | undefined;
     let lastFailure: PoolFailureClass = "other";
     let lastErrorMessage: AssistantMessage | undefined;
+    let lastAlias: string | undefined;
 
     while (delegatedAttempts < 2) {
       if (options?.signal?.aborted) {
@@ -553,6 +579,7 @@ export function createPooledCodexStream(
         alias =
           retryAlias ?? deps.routes.select(sessionId, quotaScope, excluded);
         retryAlias = undefined;
+        lastAlias = alias;
       } catch {
         if (delegatedAttempts === 0) {
           startBoundedNativeFallback(
@@ -566,6 +593,16 @@ export function createPooledCodexStream(
           );
           return;
         }
+        recordPoolFailure(
+          deps,
+          {
+            sessionId,
+            alias: lastAlias ?? "",
+            attempt: delegatedAttempts,
+          },
+          lastFailure,
+          lastErrorMessage?.errorMessage ?? "",
+        );
         output.push(
           sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
         );
@@ -623,6 +660,12 @@ export function createPooledCodexStream(
           );
           return;
         }
+        recordPoolFailure(
+          deps,
+          { sessionId, alias, attempt: delegatedAttempts + 1 },
+          "auth",
+          error instanceof Error ? error.message : String(error),
+        );
         output.push(sanitizedErrorEvent(model, "error", "auth"));
         output.end();
         return;
@@ -724,6 +767,12 @@ export function createPooledCodexStream(
               break;
             }
             if (bufferedStart) output.push(bufferedStart);
+            recordPoolFailure(
+              deps,
+              { sessionId, alias, attempt: delegatedAttempts },
+              failureClass,
+              failureMessage(event),
+            );
             output.push(
               sanitizedErrorEvent(model, "error", failureClass, event.error),
             );
@@ -754,6 +803,12 @@ export function createPooledCodexStream(
             retryAlias = alias;
           }
           if (exposedSubstantive) {
+            recordPoolFailure(
+              deps,
+              { sessionId, alias, attempt: delegatedAttempts },
+              lastFailure,
+              "stream ended without a terminal event",
+            );
             output.push(sanitizedErrorEvent(model, "error", lastFailure));
             terminal = true;
           }
@@ -781,6 +836,12 @@ export function createPooledCodexStream(
           output.push(sanitizedErrorEvent(model, "aborted", failureClass));
           terminal = true;
         } else if (exposedSubstantive || !retryable(failureClass)) {
+          recordPoolFailure(
+            deps,
+            { sessionId, alias, attempt: delegatedAttempts },
+            failureClass,
+            error instanceof Error ? error.message : String(error),
+          );
           output.push(sanitizedErrorEvent(model, "error", failureClass));
           terminal = true;
         }
@@ -795,6 +856,12 @@ export function createPooledCodexStream(
         (retryAlias === undefined &&
           excluded.size >= deps.routes.aliases.length)
       ) {
+        recordPoolFailure(
+          deps,
+          { sessionId, alias, attempt: delegatedAttempts },
+          lastFailure,
+          lastErrorMessage?.errorMessage ?? "",
+        );
         output.push(
           sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
         );
