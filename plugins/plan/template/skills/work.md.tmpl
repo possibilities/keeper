@@ -228,7 +228,7 @@ keeper plan reconcile <task_id>
 
 **Resume machinery** (the three `in_progress_*` / `state_uncommitted` arms). Recovery budget is **5 attempts (1 spawn + 4 retries)**; each warm resume or cold respawn counts one. The budget is best-effort per-invocation — warm retries live in an in-memory counter scoped to this invocation; nothing is persisted on the task. A separate `/plan:work` run that opens on an in-flight task can't see prior attempts, so each cold-resume run gets its own budget. A task that genuinely can't progress just keeps surfacing — the human eyeballs the pattern and blocks it by hand.
 
-**Warm vs cold:** `worker_agent_id` captured in Phase 2a *this invocation* → in-session, go **warm**. Unset (Phase 2a didn't run this invocation but Phase 2b sees a non-`done` verdict) → cross-session, go **cold**.
+**Warm vs cold:** `worker_agent_id` captured this invocation — by Phase 2a's initial spawn, or by an earlier cold respawn within this same invocation — → in-session, go **warm**. Never captured this invocation → cross-session, go **cold**. This gate is per-attempt, not a one-time fork at the top of Phase 2b: re-check it on every non-`done` verdict, so a handle captured mid-invocation routes the next attempt warm instead of cold.
 
 **Warm path (in-session, `worker_agent_id` set):**
 
@@ -246,6 +246,8 @@ keeper plan reconcile <task_id>
 
 **Cold path (cross-session, or warm SendMessage error):**
 
+**Never respawn blind.** A cold respawn is licensed only by a positive probe that the prior leg is absent or terminal — never a bare fallthrough, the same contract the wrapped worker's own Failure map enforces before it relaunches a provider leg. When a `worker_agent_id` is pinned this invocation (Phase 2a's spawn, or an earlier cold respawn below), that probe IS the warm SendMessage: a dead-agent error is positive absence and licenses this respawn; anything else means the prior leg still lives, so re-wait that SAME handle (loop warm) instead of spawning again. With no handle ever pinned this invocation, no in-session probe exists — the daemon's admission gate is the backstop: a respawn raced against a live sibling is denied at the grant gate with a `sibling-live` verdict, so read that deny as "the prior leg lives, re-wait its handle," never as a fresh launch failure.
+
 1. Shell `keeper plan worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `worker_agent` (the null-gate signal — non-null when both axes are set, or `null` for a legacy task missing a tier or a model), `worker_model` (the persisted model axis), `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below. If `worker_agent` is `null`, surface the typed stop *"tier or model unset — remediate via /plan:plan <epic_id> refine"* and stop instead of spawning.
 
 2. Spawn ONE fresh worker (the constant `work:worker`) with a config-only prompt carrying `BRIEF_REF` and the resume `nudge`:
@@ -258,12 +260,12 @@ keeper plan reconcile <task_id>
    )
    ```
 
-   `subagent_type` is the constant string `work:worker` — the launcher loaded the tier-matched cell at launch, so it resolves directly. No `model=` kwarg — the cell's agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `keeper plan done` or continue from implementation).
+   `subagent_type` is the constant string `work:worker` — the launcher loaded the tier-matched cell at launch, so it resolves directly. No `model=` kwarg — the cell's agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `keeper plan done` or continue from implementation). Capture `worker_agent_id` from this spawn's Task result exactly as Phase 2a does (same `agentId:\s*([a-f0-9]{10,})` regex) and pin it — a further non-`done` verdict this invocation probes THIS handle warm (see "Never respawn blind" above) before ever spawning again.
 
 3. Re-run `keeper plan reconcile <task_id>` after the spawn returns and re-switch:
    - `done` → continue to Phase 3.
    - `blocked` → BLOCKED short-circuit.
-   - a non-`done` `in_progress_*` / `state_uncommitted` arm (the cold spawn dropped) → this cold-resume invocation has spent its single attempt. The cold path holds no cross-invocation counter, so do NOT block — surface the verdict verbatim and stop. A fresh `/plan:work` re-run takes another attempt under the best-effort budget; a task that genuinely can't progress surfaces repeatedly and the human blocks it by hand.
+   - a non-`done` `in_progress_*` / `state_uncommitted` arm (the cold spawn dropped) → **reached via a warm-path fallthrough this invocation (the 5-attempt counter is already running):** return to the Warm path's loop with the freshly captured `worker_agent_id` — probe it warm first, per "Never respawn blind" above — and keep counting toward the shared 5-attempt cap; only `RESUME_EXHAUSTED` after that cap is spent stops it. **Reached as this invocation's sole Phase 2b entry (Phase 2a never ran, no counter was ever running):** this cold-resume invocation has spent its single attempt — the cold path holds no cross-invocation counter here, so do NOT block: surface the verdict verbatim and stop. A fresh `/plan:work` re-run takes another attempt under the best-effort budget; a task that genuinely can't progress surfaces repeatedly and the human blocks it by hand.
 
 **`BLOCKED:` short-circuit:** if the worker returns a `BLOCKED: <category>` message at any point, stamp the block and stop — route to **Phase 2c**. Semantic failures bypass the `in_progress_*` recovery flow entirely.
 
