@@ -7,7 +7,7 @@
     "fn-1394-probe-close-claim-holder-liveness-and"
   ],
   "id": "fn-1401-fix-close-claim-liveness-probe-buffer",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T19:06:20.378000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T19:06:12.669000Z"
+  "updated_at": "2026-07-21T19:06:20.378000Z"
 }
