@@ -39,5 +39,5 @@ Update the daemon suites to assert absence: no dispatch arm reachable for any es
 - [ ] All updated suites green via named gates
 
 ## Done summary
-
+Retired out-of-band escalation actuators (launcher, resolver dispatchers+sweeps, legacy unblock arm, repair dispatcher, global escalation cap, autoclose bucket); dispatch verb surface shrunk to work/close/approve. Operator-adopted from wedged leg dae10f2a.
 ## Evidence
