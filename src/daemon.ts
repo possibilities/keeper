@@ -372,13 +372,19 @@ import {
   classifyRestartProvenance,
   collapseRestartLedger,
   compactRestartLedger,
+  createExitAttributionRecorder,
   decideCrashLoop,
+  decideExitAttribution,
   decideRepeatedNativeCrash,
+  type ExitAttributionRecorder,
   isNativeCrashAttributed,
   planNativeCrashEnrichLines,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
+  readExitAttribution,
   readRestartLedger,
+  removeExitAttribution,
+  resolveExitAttributionPath,
 } from "./restart-ledger";
 import type {
   BackendExecStartMessage,
@@ -6684,6 +6690,10 @@ export {
   scanCrashReports,
 } from "./crash-report-scan";
 export type {
+  ExitAttributionKind,
+  ExitAttributionRecord,
+  ExitAttributionRecorder,
+  ExitAttributionSignal,
   RestartBoot,
   RestartBootIdentity,
   RestartBootLine,
@@ -6705,9 +6715,12 @@ export {
   classifyRestartProvenance,
   collapseRestartLedger,
   compactRestartLedger,
+  createExitAttributionRecorder,
   decideCrashLoop,
+  decideExitAttribution,
   decideRepeatedNativeCrash,
   foldBootIntoRestartLedger,
+  HARD_KILL_EXIT_ATTRIBUTION_REASON,
   isNativeCrashAttributed,
   KEEPERD_LAUNCHD_LABEL,
   parseRestartLedger,
@@ -6718,9 +6731,14 @@ export {
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_NATIVE_FIELD_MAX_LEN,
   RESTART_LEDGER_REASON_MAX_LEN,
+  readExitAttribution,
   readRestartLedger,
   readRestartLedgerSnapshot,
+  removeExitAttribution,
+  resolveExitAttributionPath,
   serializeRestartLedgerLine,
+  shouldEnrichPriorExitAttribution,
+  writeExitAttribution,
   writeRestartLedger,
 } from "./restart-ledger";
 
@@ -9690,7 +9708,7 @@ let singleInstanceLock: FileLock | null = null;
  * name the lock path and recovery command, and neither failed boot opens the DB
  * or mints a ledger entry.
  */
-function acquireSingleInstanceLock(): void {
+function acquireSingleInstanceLock(onExit: () => void): void {
   if (singleInstanceLock !== null) {
     // Already held in this process — a re-acquire would self-conflict on our own
     // flock. Idempotent so a second in-process boot never blocks on itself.
@@ -9708,6 +9726,7 @@ function acquireSingleInstanceLock(): void {
   );
   if (action.action === "exit") {
     console.error(action.message);
+    onExit();
     process.exit(action.code);
   }
   singleInstanceLock = action.lock;
@@ -9875,7 +9894,23 @@ export function runNativeCrashAttributionProbe(deps: {
  * restart).
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
+  const restartLedgerPath = resolveRestartLedgerPath();
+  return startDaemonWithExitAttribution(
+    opts,
+    createExitAttributionRecorder({
+      bootId: crypto.randomUUID(),
+      path: resolveExitAttributionPath(restartLedgerPath),
+    }),
+  );
+}
+
+function startDaemonWithExitAttribution(
+  opts: DaemonOptions,
+  exitAttribution: ExitAttributionRecorder,
+): DaemonHandle {
   process.title = "keeperd";
+  const restartLedgerBootId = exitAttribution.bootId;
+  const restartLedgerPath = resolveRestartLedgerPath();
   // Single-instance gate (docs/adr/0030): take a kernel flock on a dedicated
   // keeperd.lock BEFORE openDb/migrate/any worker spawn, so a second concurrent
   // daemon can never open — let alone migrate — the DB. A live incumbent or an
@@ -9884,25 +9919,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // by the in-process test opt (a same-process second boot shares the flock's
   // open-file-description and would self-conflict).
   if (!opts.disableSingleInstanceLock) {
-    acquireSingleInstanceLock();
+    acquireSingleInstanceLock(() =>
+      exitAttribution.record({
+        kind: "fatal_exit",
+        reason: "single-instance admission refused",
+      }),
+    );
   }
   // Persist the recycle-safe identity immediately after admission. No DB path,
   // worker, Drain sample, or readiness surface is touched unless this syncs.
-  const restartLedgerBootId = crypto.randomUUID();
   const restartBootProvenance = classifyRestartProvenance(
     process.env.XPC_SERVICE_NAME,
   );
   const restartBootPid = process.pid;
   const restartBootStartTime = readOsStartTime(restartBootPid);
   if (restartBootStartTime === null) {
-    console.error(
-      "[keeperd] FATAL: restart-ledger boot identity unavailable: process start_time probe failed",
-    );
+    const reason =
+      "restart-ledger boot identity unavailable: process start_time probe failed";
+    console.error(`[keeperd] FATAL: ${reason}`);
+    exitAttribution.record({ kind: "fatal_exit", reason });
     process.exit(1);
   }
   try {
     appendDurableRestartBoot({
-      path: resolveRestartLedgerPath(),
+      path: restartLedgerPath,
       bootId: restartLedgerBootId,
       pid: restartBootPid,
       startTime: restartBootStartTime,
@@ -9910,11 +9950,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       nowMs: Date.now(),
     });
   } catch (error) {
-    console.error(
-      `[keeperd] FATAL: restart-ledger boot append failed: ${boundRestartReason(
-        error instanceof Error ? error.message : String(error),
-      )}`,
-    );
+    const reason = `restart-ledger boot append failed: ${boundRestartReason(
+      error instanceof Error ? error.message : String(error),
+    )}`;
+    console.error(`[keeperd] FATAL: ${reason}`);
+    exitAttribution.record({ kind: "fatal_exit", reason });
     process.exit(1);
   }
   const restartBootIdentity = {
@@ -11729,6 +11769,39 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  let priorBootId: string | null = null;
+  let priorExitAttribution: ReturnType<typeof readExitAttribution> = null;
+
+  const enrichPriorExitAttribution = (): void => {
+    if (priorBootId === null) return;
+    try {
+      const priorBoot = collapseRestartLedger(
+        readRestartLedger(restartLedgerPath),
+      ).find((boot) => boot.boot_id === priorBootId);
+      if (priorBoot === undefined) return;
+      const alreadyAttributed =
+        priorBoot.reason !== undefined || isNativeCrashAttributed(priorBoot);
+      if (alreadyAttributed) {
+        if (priorExitAttribution !== null) {
+          removeExitAttribution(resolveExitAttributionPath(restartLedgerPath));
+        }
+        return;
+      }
+      appendRestartLedgerLine(
+        restartLedgerPath,
+        decideExitAttribution({
+          bootId: priorBootId,
+          ts: Date.now(),
+          exitAttribution: priorExitAttribution,
+          nativeCrash: priorBoot,
+        }),
+      );
+      removeExitAttribution(resolveExitAttributionPath(restartLedgerPath));
+    } catch {
+      // The attribution leaf remains for a future boot if its ledger enrichment fails.
+    }
+  };
+
   // Crash-loop retention is a read-side projection. The already-synced boot row
   // and all forensic history remain byte-for-byte append-only on normal boot.
   {
@@ -11741,10 +11814,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         cap: RESTART_LEDGER_CAP,
       },
     );
+    const boots = collapseRestartLedger(ledgerLines);
+    const currentBootIndex = boots.findIndex(
+      (boot) => boot.boot_id === restartLedgerBootId,
+    );
+    const priorBoot = currentBootIndex > 0 ? boots[currentBootIndex - 1] : null;
+    if (
+      priorBoot !== null &&
+      priorBoot.reason === undefined &&
+      !isNativeCrashAttributed(priorBoot)
+    ) {
+      priorBootId = priorBoot.boot_id;
+      const leaf = readExitAttribution(
+        resolveExitAttributionPath(restartLedgerPath),
+      );
+      if (leaf?.boot_id === priorBootId) {
+        priorExitAttribution = leaf;
+      }
+    }
     const verdict = decideCrashLoop({
       nowMs,
       bootTimestamps: qualifyCrashLoopBootTimestamps(
-        collapseRestartLedger(ledgerLines),
+        boots,
         CRASH_LOOP_YOUNG_RUNTIME_MS,
       ),
       threshold: CRASH_LOOP_THRESHOLD,
@@ -11867,12 +11958,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         nativeCrashReprobeTimer = null;
         if (shuttingDown) return;
         reprobesRemaining -= 1;
-        runNativeCrashProbe(reprobesRemaining === 0);
+        const exhausted = reprobesRemaining === 0;
+        runNativeCrashProbe(exhausted);
+        enrichPriorExitAttribution();
         if (reprobesRemaining > 0) scheduleReprobe();
       }, 30_000);
     };
     runNativeCrashProbe(false);
+    enrichPriorExitAttribution();
     scheduleReprobe();
+  } else {
+    enrichPriorExitAttribution();
   }
 
   // fn-1311: durably record THIS boot's catch-up window (start/end wall-clock +
@@ -18381,35 +18477,25 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  /**
-   * Crash exit. Reserved for unrecoverable errors so launchd restarts us.
-   * `reason` is optional and backward-compatible — every existing bare
-   * `fatalExit()` call site stays valid and records no reason. When given, the
-   * reason is appended as ONE `enrich` line MATCHED on this boot's
-   * `restartLedgerBootId` to the append-only NDJSON ledger — a single bounded
-   * {@link appendRestartLedgerLine}, never a read-modify-write, so it lands
-   * durably BEFORE `process.exit` without blocking or corrupting the ledger on
-   * the crash path. The whole append is wrapped so ledger trouble can never
-   * throw out of the exit path.
-   */
-  function fatalExit(reason?: string): void {
-    if (reason !== undefined) {
-      try {
-        appendRestartLedgerLine(resolveRestartLedgerPath(), {
-          kind: "enrich",
-          boot_id: restartLedgerBootId,
-          ts: Date.now(),
-          reason: boundRestartReason(reason),
-        });
-      } catch {
-        // best-effort; never block the crash exit on ledger trouble
-      }
-    }
+  function fatalExit(
+    reason = "fatalExit (unspecified)",
+    kind:
+      | "fatal_exit"
+      | "uncaught_exception"
+      | "unhandled_rejection" = "fatal_exit",
+  ): void {
+    exitAttribution.record({ kind, reason });
+    try {
+      appendRestartLedgerLine(restartLedgerPath, {
+        kind: "enrich",
+        boot_id: restartLedgerBootId,
+        ts: Date.now(),
+        reason: boundRestartReason(reason),
+      });
+    } catch {}
     try {
       db.close();
-    } catch {
-      // best-effort; we're crashing either way
-    }
+    } catch {}
     process.exit(1);
   }
 
@@ -18754,28 +18840,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Unrecoverable async errors that escape every guard also take the single
-  // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
-  // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
-  // poll) from clobbering the clean `exit(0)` — both fire AFTER `shuttingDown` is
-  // set. Mirrors every worker `onerror` / `close` handler above.
-  process.on("unhandledRejection", (reason) => {
-    if (shuttingDown) return;
-    console.error("[keeperd] unhandled rejection:", reason);
-    fatalExit(
-      `unhandledRejection: ${
-        reason instanceof Error ? reason.message : String(reason)
-      }`,
-    );
-  });
-  process.on("uncaughtException", (err) => {
-    if (shuttingDown) return;
-    console.error("[keeperd] uncaught exception:", err);
-    fatalExit(
-      `uncaughtException: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
-
   // Step 5 — clean teardown. TEARDOWN LOGIC ONLY: set the shutdown flag FIRST (so
   // the `!shuttingDown` guards keep teardown noise from tripping `fatalExit`),
   // post `{type:"shutdown"}` to every worker, race their `close` against the
@@ -18941,22 +19005,82 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
 /**
  * Production daemon entry point. Boots via {@link startDaemon} (no opts) and
- * installs the SIGTERM/SIGINT → clean-exit-0 handlers. The ONLY path that calls
+ * installs the TERM/INT/HUP → clean-exit-0 handlers. The ONLY path that calls
  * `process.exit(0)`: under launchd `KeepAlive.SuccessfulExit=false` a clean exit
  * tells launchd NOT to restart, while a crash takes `fatalExit` → exit 1 →
  * restart.
  */
 function runDaemon(): void {
-  const { stop } = startDaemon();
-  // The ONLY path that exits 0. `stop()` runs the full teardown (idempotent); we
-  // exit 0 once it resolves so launchd does NOT restart a clean stop.
-  const shutdown = (): void => {
-    void stop().then(() => {
-      process.exit(0);
-    });
+  const restartLedgerPath = resolveRestartLedgerPath();
+  const exitAttribution = createExitAttributionRecorder({
+    bootId: crypto.randomUUID(),
+    path: resolveExitAttributionPath(restartLedgerPath),
+  });
+  let stop: (() => Promise<void>) | null = null;
+  let shutdownRequested = false;
+
+  const fatalProcess = (
+    kind: "uncaught_exception" | "unhandled_rejection",
+    reason: string,
+  ): void => {
+    exitAttribution.record({ kind, reason });
+    process.exit(1);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  const shutdown = (signal: "SIGTERM" | "SIGINT" | "SIGHUP"): void => {
+    exitAttribution.record({ kind: "signal", signal });
+    if (shutdownRequested) return;
+    shutdownRequested = true;
+    if (stop === null) {
+      process.exit(0);
+      return;
+    }
+    void stop()
+      .then(() => process.exit(0))
+      .catch((error) =>
+        fatalProcess(
+          "uncaught_exception",
+          `shutdown: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+  };
+
+  process.once("exit", () => {
+    exitAttribution.record({ kind: "clean_shutdown" });
+  });
+  process.on("unhandledRejection", (reason) => {
+    if (shutdownRequested) return;
+    console.error("[keeperd] unhandled rejection:", reason);
+    fatalProcess(
+      "unhandled_rejection",
+      `unhandledRejection: ${
+        reason instanceof Error ? reason.message : String(reason)
+      }`,
+    );
+  });
+  process.on("uncaughtException", (error) => {
+    if (shutdownRequested) return;
+    console.error("[keeperd] uncaught exception:", error);
+    fatalProcess(
+      "uncaught_exception",
+      `uncaughtException: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  });
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGHUP", () => shutdown("SIGHUP"));
+
+  try {
+    stop = startDaemonWithExitAttribution({}, exitAttribution).stop;
+  } catch (error) {
+    fatalProcess(
+      "uncaught_exception",
+      `uncaughtException: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }
 
 // Only boot the daemon when this file is the process entry point — a plain

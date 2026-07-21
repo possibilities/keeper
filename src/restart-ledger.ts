@@ -20,11 +20,37 @@ export const CRASH_LOOP_WINDOW_MS = 30 * 60_000;
 export const RESTART_LEDGER_CAP = 64;
 export const RESTART_LEDGER_REASON_MAX_LEN = 300;
 export const RESTART_LEDGER_NATIVE_FIELD_MAX_LEN = 300;
+export const EXIT_ATTRIBUTION_BOOT_ID_MAX_LEN = 128;
+export const HARD_KILL_EXIT_ATTRIBUTION_REASON =
+  "hard kill or SIGKILL (no exit-attribution leaf, no crash report)";
 export const CRASH_LOOP_YOUNG_RUNTIME_MS = 2 * 60_000;
 export const REPEATED_NATIVE_CRASH_THRESHOLD = 2;
 export const KEEPERD_LAUNCHD_LABEL = "arthack.keeperd";
 
 export type RestartProvenance = "launchd" | "unknown" | "foreign";
+
+export type ExitAttributionKind =
+  | "signal"
+  | "fatal_exit"
+  | "uncaught_exception"
+  | "unhandled_rejection"
+  | "clean_shutdown";
+
+export type ExitAttributionSignal = "SIGTERM" | "SIGINT" | "SIGHUP";
+
+export interface ExitAttributionRecord {
+  boot_id: string;
+  ts: number;
+  kind: ExitAttributionKind;
+  signal?: ExitAttributionSignal;
+  reason?: string;
+}
+
+export interface ExitAttributionRecorder {
+  readonly bootId: string;
+  readonly path: string;
+  record(attribution: Omit<ExitAttributionRecord, "boot_id" | "ts">): void;
+}
 
 export interface RestartBootIdentity {
   boot_id: string;
@@ -99,6 +125,58 @@ export function boundRestartReason(reason: string): string {
   return reason.length > RESTART_LEDGER_REASON_MAX_LEN
     ? reason.slice(0, RESTART_LEDGER_REASON_MAX_LEN)
     : reason;
+}
+
+function isExitAttributionKind(value: unknown): value is ExitAttributionKind {
+  return (
+    value === "signal" ||
+    value === "fatal_exit" ||
+    value === "uncaught_exception" ||
+    value === "unhandled_rejection" ||
+    value === "clean_shutdown"
+  );
+}
+
+function isExitAttributionSignal(
+  value: unknown,
+): value is ExitAttributionSignal {
+  return value === "SIGTERM" || value === "SIGINT" || value === "SIGHUP";
+}
+
+function normalizeExitAttribution(
+  value: unknown,
+): ExitAttributionRecord | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const object = value as Record<string, unknown>;
+  if (
+    typeof object.boot_id !== "string" ||
+    object.boot_id.length === 0 ||
+    object.boot_id.length > EXIT_ATTRIBUTION_BOOT_ID_MAX_LEN ||
+    typeof object.ts !== "number" ||
+    !Number.isFinite(object.ts) ||
+    !isExitAttributionKind(object.kind)
+  ) {
+    return null;
+  }
+  const signal = isExitAttributionSignal(object.signal)
+    ? object.signal
+    : undefined;
+  if ((object.kind === "signal") !== (signal !== undefined)) return null;
+  if (object.signal !== undefined && signal === undefined) return null;
+  const reason =
+    typeof object.reason === "string" && object.reason.length > 0
+      ? boundRestartReason(object.reason)
+      : undefined;
+  if (object.reason !== undefined && reason === undefined) return null;
+  return {
+    boot_id: object.boot_id,
+    ts: object.ts,
+    kind: object.kind,
+    ...(signal !== undefined ? { signal } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
 }
 
 function boundNativeCrashField(value: string): string {
@@ -446,13 +524,74 @@ export function qualifyCrashLoopBootTimestamps(
     .map((boot) => boot.ts);
 }
 
-export function isNativeCrashAttributed(boot: RestartBoot): boolean {
+function hasNativeCrashMatch(fields: RestartNativeCrashFields): boolean {
   return (
-    boot.native_crash_report_id !== undefined ||
-    boot.native_crash_signal !== undefined ||
-    boot.native_crash_exception !== undefined ||
-    boot.native_crash_faulting_image !== undefined
+    fields.native_crash_report_id !== undefined ||
+    fields.native_crash_signal !== undefined ||
+    fields.native_crash_exception !== undefined ||
+    fields.native_crash_faulting_image !== undefined
   );
+}
+
+export function isNativeCrashAttributed(boot: RestartBoot): boolean {
+  return hasNativeCrashMatch(boot);
+}
+
+export function shouldEnrichPriorExitAttribution(inputs: {
+  priorBoot: RestartBoot | null;
+  exitAttribution: ExitAttributionRecord | null;
+  allowHardKillFallback: boolean;
+}): boolean {
+  if (inputs.priorBoot === null) return false;
+  if (
+    inputs.priorBoot.reason !== undefined ||
+    isNativeCrashAttributed(inputs.priorBoot)
+  ) {
+    return false;
+  }
+  return inputs.exitAttribution !== null || inputs.allowHardKillFallback;
+}
+
+export function decideExitAttribution(inputs: {
+  bootId: string;
+  ts: number;
+  exitAttribution: ExitAttributionRecord | null;
+  nativeCrash: RestartNativeCrashFields | null;
+}): RestartEnrichLine {
+  if (inputs.exitAttribution !== null) {
+    const attribution = inputs.exitAttribution;
+    const reason =
+      attribution.reason ??
+      (attribution.signal !== undefined
+        ? `signal: ${attribution.signal}`
+        : `exit attribution: ${attribution.kind}`);
+    return {
+      kind: "enrich",
+      boot_id: inputs.bootId,
+      ts: inputs.ts,
+      reason: boundRestartReason(reason),
+    };
+  }
+  const nativeCrash =
+    inputs.nativeCrash === null
+      ? {}
+      : nativeCrashFields(
+          inputs.nativeCrash as unknown as Record<string, unknown>,
+        );
+  if (hasNativeCrashMatch(nativeCrash)) {
+    return {
+      kind: "enrich",
+      boot_id: inputs.bootId,
+      ts: inputs.ts,
+      ...nativeCrash,
+    };
+  }
+  return {
+    kind: "enrich",
+    boot_id: inputs.bootId,
+    ts: inputs.ts,
+    reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  };
 }
 
 export function planNativeCrashEnrichLines(inputs: {
@@ -552,6 +691,34 @@ export function readRestartLedger(path: string): RestartLedgerLine[] {
   return snapshot.status === "unreadable" ? [] : snapshot.lines;
 }
 
+export function resolveExitAttributionPath(restartLedgerPath: string): string {
+  return join(dirname(restartLedgerPath), "exit-attribution.json");
+}
+
+export function readExitAttribution(
+  path: string,
+): ExitAttributionRecord | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    return normalizeExitAttribution(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function removeExitAttribution(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 function writeAll(fd: number, content: string): void {
   const bytes = Buffer.from(content);
   let offset = 0;
@@ -595,6 +762,40 @@ function atomicWrite(path: string, content: string): void {
     } catch {}
     throw error;
   }
+}
+
+export function writeExitAttribution(
+  path: string,
+  attribution: ExitAttributionRecord,
+): void {
+  const persisted = normalizeExitAttribution(attribution);
+  if (persisted === null) throw new Error("invalid exit attribution");
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  atomicWrite(path, `${JSON.stringify(persisted)}\n`);
+}
+
+export function createExitAttributionRecorder(inputs: {
+  bootId: string;
+  path: string;
+  nowMs?: () => number;
+}): ExitAttributionRecorder {
+  let written = false;
+  const nowMs = inputs.nowMs ?? Date.now;
+  return {
+    bootId: inputs.bootId,
+    path: inputs.path,
+    record(attribution): void {
+      if (written) return;
+      try {
+        writeExitAttribution(inputs.path, {
+          ...attribution,
+          boot_id: inputs.bootId,
+          ts: nowMs(),
+        });
+        written = true;
+      } catch {}
+    },
+  };
 }
 
 /** Compatibility helper for explicit conversion/tests; normal boot never calls it. */
