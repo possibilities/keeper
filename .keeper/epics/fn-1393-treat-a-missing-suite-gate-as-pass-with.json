@@ -6,7 +6,7 @@
     "fn-1352-retire-escalation-sessions"
   ],
   "id": "fn-1393-treat-a-missing-suite-gate-as-pass-with",
-  "last_validated_at": "2026-07-21T06:31:56.748000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T06:31:56.748000Z"
+  "updated_at": "2026-07-21T15:13:17.672000Z"
 }
