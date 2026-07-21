@@ -28,5 +28,5 @@ Files: `src/daemon.ts`, `test/daemon.test.ts`.
 - [ ] Named daemon gate green.
 
 ## Done summary
-
+Gated the trunk-lease residue sweep's DispatchFailed mint on a residue-state transition (caller-owned cross-tick Map) instead of every 3s tick MERGE_HEAD persists; added a daemon.test.ts case covering the no-repeat-mint and reappearance-after-clear behavior.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Dedup daemon residue event minting",
-  "updated_at": "2026-07-20T12:54:47.795000Z"
+  "updated_at": "2026-07-21T07:16:29.221000Z",
+  "worker_done_at": "2026-07-21T07:16:29.221000Z"
 }
