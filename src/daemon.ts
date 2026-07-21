@@ -275,6 +275,9 @@ import type {
   NudgeVanishedSweepMessage,
 } from "./git-worker";
 import {
+  GRANT_LEAF_SCHEMA_VERSION,
+  type GrantLeaf,
+  listGrantLeaves,
   listTrunkLeaseLeaves,
   readTrunkLeaseLeaf,
   readTrunkLeaseRequests,
@@ -283,6 +286,7 @@ import {
   TRUNK_LEASE_SCHEMA_VERSION,
   TRUNK_LEASE_TTL_MS,
   type TrunkLeaseLeaf,
+  writeGrantLeaf,
   writeTrunkLeaseLeaf,
 } from "./grant-leaf";
 import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
@@ -348,7 +352,6 @@ import {
   isStoppedJobLive,
   isWrappedCell,
   nextIncidentOwnerAttachmentMarker,
-  REPAIR_TERMINAL_GRACE_SEC,
   withDispatchAttempt,
   wrappedEnvelopePath,
 } from "./reconcile-core";
@@ -2375,27 +2378,36 @@ export function buildBlockHumanNotifyBody(args: {
 }
 
 /**
- * Build the ONE structured operator page the repair human-notify sweep sends over
- * agentbot when a `repair::<repo-token>` session DECLINES or DIES. Short by design — the
- * sticky repair row + every affected task carry the full context on the board; this is
- * the courtesy page that names the repo, the verdict, and the re-arm command. Pure.
+ * Build the ONE structured operator page the repair human-notify sweep sends when
+ * the granted work owner declines or dies. The sticky repair row and affected tasks
+ * retain the full context; this page names the repo and re-arm command. Pure.
  */
 export function buildRepairHumanNotifyBody(args: {
   repoToken: string;
   repoDir: string | null;
-  verdict: "declined" | "died";
+  verdict: RepairNotifyVerdict;
 }): string {
+  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+  if (args.verdict === "mint_failed") {
+    return [
+      `🔴 keeper: repair::${args.repoToken} needs you — the shared base at repo`,
+      `${repo} is confirmed red at the default tip with no blocked task to own`,
+      `the fix, and the daemon's maintenance-task mint failed.`,
+      ``,
+      `Fix the shared base by hand, or scaffold the maintenance task yourself:`,
+      `  keeper autopilot retry repair::${args.repoToken}`,
+    ].join("\n");
+  }
   const verdictLine =
     args.verdict === "died"
-      ? `its job DIED before landing a fix`
-      : `it DECLINED (could not repair the shared base, or stayed stopped past grace while parked on a question)`;
-  const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
+      ? `the granted work owner DIED before landing a fix`
+      : `the in-session repairer DECLINED the repair`;
   return [
-    `🔴 keeper: repair::${args.repoToken} needs you — the autonomous shared-base`,
-    `repair session gave up on the broken base (${verdictLine}); repo ${repo}`,
+    `🔴 keeper: repair::${args.repoToken} needs you — the granted shared-base`,
+    `repair did not land (${verdictLine}); repo ${repo}`,
     `stays broken and every SHARED_BASE_BROKEN task on it stays BLOCKED.`,
     ``,
-    `Fix the shared base by hand, then re-arm the repair:`,
+    `Fix the shared base by hand, then re-arm owner election:`,
     `  keeper autopilot retry repair::${args.repoToken}`,
   ].join("\n");
 }
@@ -2788,13 +2800,19 @@ export function selectRepairCandidates(
       );
       continue;
     }
-    const repoDir = effectiveBlockEscalationRepo(
+    const effectiveRepo = effectiveBlockEscalationRepo(
       row.target_repo,
       row.project_dir,
     );
-    if (repoDir === "") {
+    if (effectiveRepo === "") {
       drop(row.task_id, "empty_repo", "target_repo+project_dir both empty");
       continue;
+    }
+    let repoDir = effectiveRepo;
+    try {
+      repoDir = realpathSync(effectiveRepo);
+    } catch {
+      // An unresolved repo remains visible to the dirty/eligibility defer gates.
     }
     out.push({
       epic_id: row.epic_id,
@@ -2946,85 +2964,153 @@ export function repairTipBaselineGreen(leaf: BaselineResult | null): boolean {
   return leaf != null && leaf.status === "green";
 }
 
-/** The outcome the repair sweep records on `RepairDispatched`. The TERMINAL
- *  `dispatched` stamps `repair_dispatched_at`; `dispatch_failed` is NON-terminal. */
+/** A published grant reuses the existing repair-dispatch marker as its durable
+ *  issued-once/page anchor; no top-level repair session is launched. */
 export type RepairDispatchOutcome = "dispatched" | "dispatch_failed";
 
-/** The outcome the repair sweep records on `RepairHumanNotified`. The TERMINAL
- *  `notified` stamps `human_notified_at`; `notify_failed` is NON-terminal. */
 export type RepairHumanNotifiedOutcome = "notified" | "notify_failed";
 
-/** Injectable dependency surface for {@link runRepairEscalationSweep}. Same fail-open
- *  injectable-deps discipline as the sibling escalation sweeps — the producer is
- *  testable with synthetic candidates + rows and an injected dispatcher, never touching
- *  a real daemon / git / socket, and never throws into the daemon loop. */
+export const REPAIR_GRANT_TTL_MS = 15 * 60_000;
+
+export interface RepairGrantOwner {
+  epic_id: string;
+  task_id: string;
+  parent_job_id: string;
+}
+
+export type RepairGrantHolderLiveness = "live" | "dead" | "inconclusive";
+
+/** The page-once verdict a granted owner's decline/death carries, plus
+ *  `mint_failed` for a maintenance-task mint that could not land — the SAME
+ *  `PendingRepairRow.human_notified_at` marker gates all three, so a page never
+ *  repeats regardless of which arm fired it. */
+export type RepairNotifyVerdict = "declined" | "died" | "mint_failed";
+
+/** The maintenance-task mint outcome for a trunk-red group with NO live blocked
+ *  consumer to elect an owner from ({@link RepairGroup}'s candidates are all
+ *  task-less `baseline-tip::` entries). `minted` means the plan CLI scaffolded
+ *  and armed a fresh single-task epic; `mint_failed` covers a spawn error, a
+ *  non-zero exit, an unparseable envelope, or an arm failure. */
+export type MaintenanceMintOutcome = "minted" | "mint_failed";
+
 export interface RepairEscalationSweepDeps {
-  /** The current `SHARED_BASE_BROKEN` blocked candidates, resolved to (repo, fingerprint)
-   *  (production builds them from {@link selectPendingBlockEscalations} + the fs reason
-   *  read + {@link repoToken} + {@link fingerprintFailure}). */
   readonly selectCandidates: () => RepairCandidate[];
-  /** The existing sticky repair rows (production: `dispatch_failures WHERE verb='repair'`). */
   readonly selectRepairRows: () => PendingRepairRow[];
-  /** True iff the repo's shared checkout is DIRTY / mid-merge — a DEFER at dispatch time
-   *  (no attempt consumed, and no row minted when none exists yet), per the finalize
-   *  dirty-degrade precedent. Production reads the `git_status` projection. */
-  readonly isDirtyCheckout: (repoDir: string) => boolean;
-  /** The id of the ACTIVE `shared-checkout-dirty` distress row for `repoDir`, or null
-   *  when none is open — used ONLY to name the row in the dirty-checkout DEFER diagnostic
-   *  so a starving repair route correlates to the one operator-visible incident row.
-   *  Optional (an absent hook keeps the bare defer note); the row's own mint/level-clear
-   *  lifecycle is owned OUTSIDE the pure sweep, by the sustained-dirt grace tracker. */
-  readonly activeDirtyDistressId?: (repoDir: string) => string | null;
-  /** True iff the repo's shared base reads GREEN — the positive-evidence gate the clear
-   *  requires (combined with zero remaining candidates). Anything else (red / unknown /
-   *  unseeded) RETAINS the sticky row ("retained on no report"). */
-  readonly isBaseGreen: (repoDir: string) => boolean;
-  /** Launch ONE `repair::<token>` escalation session for the group (DELEGATES to the
-   *  shared {@link dispatchEscalationSession} in production, so the global cap + per-key
-   *  occupancy guard apply). Async + fail-open — a SKIP (`at_cap` / `already_live`) mints
-   *  nothing so the row re-sweeps. */
-  readonly dispatchRepair: (
+  readonly selectGrants: () => GrantLeaf[];
+  readonly selectOwner: (
     group: RepairGroup,
-  ) => Promise<EscalationDispatchOutcome>;
-  /** Classify the dispatched `repair::<token>` session's recorded outcome (DELEGATES to
-   *  {@link classifyEscalationOutcome} over the live `jobs` in production). Its existing
-   *  terminal died/declined verdict always wins. A missing terminal verdict is promoted
-   *  producer-side only after the injected grace below. */
-  readonly repairOutcome: (repoToken: string) => ResolverOutcome;
-  /** Fail-safe turn-activity probe. A working repair NEVER grace-promotes, regardless of
-   *  dispatch age. Production returns true on a jobs-read failure. */
-  readonly repairSessionWorking: (repoToken: string) => boolean;
-  /** Producer clock and generous grace, in unix seconds. The durable anchor is the
-   *  existing `repair_dispatched_at` marker; no second timestamp/column is needed. */
-  readonly nowSec: () => number;
-  readonly terminalGraceSec: number;
-  /** Send the ONE agentbot page about a declined/dead `repair::<token>` session. Async +
-   *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
+    candidates: readonly RepairCandidate[],
+  ) => RepairGrantOwner | null;
+  readonly grantHolderLiveness: (grant: GrantLeaf) => RepairGrantHolderLiveness;
+  readonly grantOwnerOutcome: (grant: GrantLeaf) => ResolverOutcome;
+  readonly isDirtyCheckout: (repoDir: string) => boolean;
+  readonly activeDirtyDistressId?: (repoDir: string) => string | null;
+  readonly isBaseGreen: (repoDir: string) => boolean;
+  readonly nowMs: () => number;
+  readonly grantTtlMs?: number;
+  readonly publishGrant: (grant: GrantLeaf) => boolean;
+  readonly expireGrant: (grant: GrantLeaf, nowMs: number) => void;
+  readonly unblockTask: (candidate: RepairCandidate) => Promise<boolean>;
   readonly notifyHuman: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
-  /** Mint the sticky repair row (a `DispatchFailed{verb:'repair', id:token,
-   *  reason:'shared-base-broken:<fp>', dir:repoDir}`) — the durable latch escalation-brief
-   *  reads and the once-page anchor. Idempotent UPSERT (preserves `created_at`). */
   readonly mintRow: (group: RepairGroup) => void;
-  /** Mint a `RepairDispatched{outcome}` synthetic event — the fold stamps
-   *  `repair_dispatched_at` ONLY on the terminal `dispatched`. */
   readonly mintDispatched: (
     repoToken: string,
     outcome: RepairDispatchOutcome,
   ) => void;
-  /** Mint a `RepairHumanNotified{outcome}` synthetic event — the fold stamps
-   *  `human_notified_at` ONLY on the terminal `notified`. */
   readonly mintNotified: (
     repoToken: string,
     outcome: RepairHumanNotifiedOutcome,
   ) => void;
-  /** Mint a `DispatchCleared{verb:'repair', id:token}` — the positive-evidence clear.
-   *  Drops the row + every marker so a fresh breakage re-arms at NULL. */
   readonly clearRow: (row: PendingRepairRow) => void;
-  /** Warn sink for non-fatal diagnostics. */
+  /** Re-probed before every mint attempt — true when an OPEN epic already
+   *  carries this (repo, fingerprint)'s deterministic maintenance-task title, so
+   *  a still-open mint from an earlier tick is never duplicated. */
+  readonly hasOpenMaintenanceTask: (group: RepairGroup) => boolean;
+  /** Scaffold + arm the single-task maintenance epic via the plan CLI. The
+   *  producer only spawns it — the plan CLI is the sole writer of plan state. */
+  readonly mintMaintenanceTask: (
+    group: RepairGroup,
+  ) => Promise<MaintenanceMintOutcome>;
   readonly noteLine?: (line: string) => void;
+}
+
+/** The fixed leading token every maintenance-task title carries — greppable, and
+ *  the stable half of the (repo, fingerprint) idempotence key {@link
+ *  maintenanceEpicTitle} embeds the other half into. */
+export const MAINTENANCE_TASK_TITLE_PREFIX = "keeper trunk repair";
+
+/** The deterministic maintenance-epic/task title for a (repo, fingerprint) pair —
+ *  the ONE key both the daemon's own re-probe ({@link hasOpenMaintenanceTask} at
+ *  the wiring site) and the minted YAML ({@link buildMaintenanceScaffoldYaml}) key
+ *  on, so a still-open mint from an earlier tick is found by exact title match.
+ *  Pure; total. */
+export function maintenanceEpicTitle(group: RepairGroup): string {
+  return `${MAINTENANCE_TASK_TITLE_PREFIX}: ${group.repo_token} ${group.fingerprint}`;
+}
+
+/**
+ * Build the single-task scaffold YAML the maintenance-task mint pipes to
+ * `keeper plan scaffold --file -` — the mechanical default cell (`tier: xhigh`,
+ * `model: opus`; the post-scaffold selector beat does not run for a producer-mint)
+ * carrying the confirmed-red baseline leaf key and failing-tests digest in the
+ * task spec, per {@link RepairGroup.baseline_diagnosis}. Every free-text scalar
+ * rides as a JSON-quoted YAML flow scalar (valid YAML 1.1 double-quoting) so a
+ * test name with a colon or quote can never corrupt the document shape. Pure.
+ */
+export function buildMaintenanceScaffoldYaml(group: RepairGroup): string {
+  const title = JSON.stringify(maintenanceEpicTitle(group));
+  const leafKey = JSON.stringify(
+    group.baseline_diagnosis?.baseline_leaf_key ?? "",
+  );
+  const digest = JSON.stringify(
+    group.baseline_diagnosis?.failing_tests_digest ?? "",
+  );
+  return `epic:
+  title: ${title}
+  spec: |
+    ## Overview
+
+    The shared base at ${group.repo_token} is confirmed red at the default tip
+    with no blocked task to own the fix (a trunk-only regression). Repair it in
+    an ordinary work lane — no repair grant is involved.
+
+    ## Acceptance
+
+    - [ ] The default tip's baseline leaf ${leafKey} reads green after the fix lands
+tasks:
+  - title: ${title}
+    tier: xhigh
+    model: opus
+    spec: |
+      ## Description
+
+      **Size:** M
+      **Files:** (unknown — trunk-wide regression; investigate before touching)
+
+      ### Approach
+
+      Diagnose and fix the trunk regression the daemon's baseline sweep confirmed
+      red at the default tip. Reproduce it locally at HEAD before changing
+      anything, then land the smallest correct fix.
+
+      ### Investigation targets
+
+      **Required** (read before coding):
+      - The confirmed-red baseline leaf ${leafKey} — the diagnosed run this task was minted from
+      - Failing tests: ${digest}
+
+      ## Acceptance
+
+      - [ ] The failing tests named in Investigation targets pass
+      - [ ] The full suite is green via named gates
+
+      ## Done summary
+
+      ## Evidence
+`;
 }
 
 /** Deterministic `(epic_id, task_id)` order — the stable total sort the coalesced
@@ -3087,26 +3173,11 @@ export function buildSharedDirtyObservation(
 }
 
 /**
- * Run one daemon repair-escalation sweep — the producer for the `SHARED_BASE_BROKEN`
- * incident class. Coalesce every shared-base-broken blocked candidate to one group per
- * repo token (representative = the (repo_dir, fingerprint) of the lexicographically-first
- * candidate), then per token:
- *
- *  - A row with `repair_dispatched_at` set and candidates STILL remaining waits for the
- *    recorded repair verdict. A terminal DECLINED / DIED verdict pages immediately; a
- *    stopped/vanished repair with no recorded verdict promotes to DECLINED only after the
- *    injected dispatch-marker grace. A working repair never promotes. The page fires ONCE
- *    via `human_notified_at`, then the row stays sticky until `retry_dispatch` re-arms it.
- *  - A token with no dispatched repair yet DISPATCHES one `repair::<token>` session (the
- *    global cap + per-key occupancy guard apply via `dispatchRepair`), minting the sticky
- *    latch first when none exists. A DIRTY shared checkout DEFERS — no attempt consumed,
- *    and no row minted when none exists yet.
- *  - A sticky row whose repo token has ZERO remaining candidates AND whose base reads
- *    GREEN is CLEARED on positive evidence (an unknown/red base RETAINS it).
- *
- * NEVER throws — every helper edge degrades to a recorded outcome (mirrors the sibling
- * escalation sweeps). The spawn lives ONLY here in the producer, never reachable from
- * `applyEvent`, so a re-fold never re-fires a launch.
+ * Elect one live blocked-task owner for each broken shared checkout and publish a
+ * confined repair grant for that owner's in-session repairer. The grant leaf is
+ * the exclusion lock: an unexpired holder prevents every sibling from writing,
+ * and expiry alone never permits takeover. Re-election requires both expiry and
+ * positive holder-death evidence. No top-level repair session is launched here.
  */
 export async function runRepairEscalationSweep(
   deps: RepairEscalationSweepDeps,
@@ -3114,21 +3185,14 @@ export async function runRepairEscalationSweep(
   const note = deps.noteLine ?? (() => {});
   let candidates: RepairCandidate[];
   let rows: PendingRepairRow[];
+  let grants: GrantLeaf[];
   try {
     candidates = deps.selectCandidates();
-  } catch (err) {
-    note(
-      `# warn: repair-escalation sweep candidate read threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  try {
     rows = deps.selectRepairRows();
+    grants = deps.selectGrants();
   } catch (err) {
     note(
-      `# warn: repair-escalation sweep row read threw (non-fatal): ${
+      `# warn: repair-escalation sweep read threw (non-fatal): ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -3136,86 +3200,115 @@ export async function runRepairEscalationSweep(
   }
   if (candidates.length === 0 && rows.length === 0) return;
 
-  // Coalesce to one group per repo token. The candidates are walked in a stable total
-  // order so the representative (repo_dir, fingerprint) is deterministic — a re-key of a
-  // token that gains/loses siblings never flaps.
   const groups = new Map<string, RepairGroup>();
-  for (const c of [...candidates].sort(compareRepairCandidate)) {
-    if (c.repo_token === "" || c.repo_dir === "") {
+  const members = new Map<string, RepairCandidate[]>();
+  for (const candidate of [...candidates].sort(compareRepairCandidate)) {
+    if (candidate.repo_token === "" || candidate.repo_dir === "") {
       emitRepairCandidateDrop(
         note,
-        c.task_id,
+        candidate.task_id,
         "empty_token",
-        `repo_dir=${c.repo_dir || "null"}`,
+        `repo_dir=${candidate.repo_dir || "null"}`,
       );
       continue;
     }
-    if (!groups.has(c.repo_token)) {
-      groups.set(c.repo_token, {
-        repo_token: c.repo_token,
-        repo_dir: c.repo_dir,
-        fingerprint: c.fingerprint,
-        ...(c.baseline_diagnosis == null
+    const groupMembers = members.get(candidate.repo_token) ?? [];
+    groupMembers.push(candidate);
+    members.set(candidate.repo_token, groupMembers);
+    if (!groups.has(candidate.repo_token)) {
+      groups.set(candidate.repo_token, {
+        repo_token: candidate.repo_token,
+        repo_dir: candidate.repo_dir,
+        fingerprint: candidate.fingerprint,
+        ...(candidate.baseline_diagnosis == null
           ? {}
-          : { baseline_diagnosis: c.baseline_diagnosis }),
+          : { baseline_diagnosis: candidate.baseline_diagnosis }),
       });
     }
   }
-  const rowByToken = new Map(rows.map((r) => [r.id, r]));
 
-  // DISPATCH / NOTIFY — one pass over the tokens that still carry a breakage.
+  const nowMs = deps.nowMs();
+  const ttlMs = deps.grantTtlMs ?? REPAIR_GRANT_TTL_MS;
+  const rowByToken = new Map(rows.map((row) => [row.id, row]));
+  let nextToken = grants.reduce(
+    (max, grant) => Math.max(max, grant.fencing_token),
+    0,
+  );
+  const repairGrants = grants.filter(
+    (grant) => grant.role === "repair" && grant.agent_type === "plan:repairer",
+  );
+
   for (const [token, group] of groups) {
+    const groupMembers = members.get(token) ?? [];
     const existing = rowByToken.get(token);
-    if (existing != null && existing.repair_dispatched_at != null) {
-      // A repair already ran, yet the breakage persists (candidates remain) — it
-      // DECLINED / DIED. Page the human ONCE, sequenced behind the session's TERMINAL
-      // verdict; the row then stays sticky until `retry_dispatch`.
-      if (existing.human_notified_at != null) continue; // already paged
-      const outcome = deps.repairOutcome(token);
-      let verdict: "declined" | "died";
-      if (outcome.terminal) {
-        // Preserve the shared classifier's recorded stopped→declined / dead→died split.
-        verdict = outcome.verdict;
-      } else {
-        // A healthy slow repair is exempt forever. Only a non-working session with no
-        // recorded terminal verdict may be promoted, and only after the dispatch-marker
-        // grace. This producer-local fallback deliberately does not alter unblock or
-        // deconflict classification.
-        if (deps.repairSessionWorking(token)) continue;
+    const incidentId = `repair::${token}`;
+    const groupGrants = repairGrants.filter(
+      (grant) =>
+        grant.incident_id === incidentId &&
+        grant.writable_root === group.repo_dir,
+    );
+    const active = groupGrants.find((grant) => nowMs < grant.expires_at);
+
+    if (deps.isBaseGreen(group.repo_dir)) {
+      for (const candidate of groupMembers) {
         if (
-          deps.nowSec() - existing.repair_dispatched_at <
-          deps.terminalGraceSec
+          candidate.epic_id === "" ||
+          candidate.task_id.startsWith("baseline-tip::")
         ) {
           continue;
         }
-        verdict = "declined";
+        try {
+          if (!(await deps.unblockTask(candidate))) {
+            note(`# repair-unblock task=${candidate.task_id} class=failed`);
+          }
+        } catch (err) {
+          note(
+            `# warn: repair unblock threw for ${candidate.task_id} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
       }
-      let result: RepairHumanNotifiedOutcome;
-      try {
-        result = await deps.notifyHuman(existing, verdict);
-      } catch (err) {
-        note(
-          `# warn: repair human-notify threw for ${token} (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        result = "notify_failed";
-      }
-      deps.mintNotified(token, result);
+      for (const grant of groupGrants) deps.expireGrant(grant, nowMs);
       continue;
     }
-    // Not yet dispatched (no row, or a minted-but-undispatched row waiting on a cap slot).
-    // A DIRTY shared checkout DEFERS — never launch a write-capable session into a
-    // mid-merge/dirty tree, consume no attempt, and mint no row when none exists yet.
-    // This defer is the gate that silently starved the repair route in production: on a
-    // busy worktree-mode board the shared checkout is rarely clean, so a repeated defer
-    // MUST leave a class-stable trace or a live shared-base breakage looks identical to a
-    // broken feature. Emitted every deferring tick (bounded by the concurrently-broken
-    // token count), keyed so an operator can grep "why is repair not dispatching".
+
+    if (active !== undefined) {
+      const outcome = deps.grantOwnerOutcome(active);
+      if (
+        existing != null &&
+        existing.human_notified_at == null &&
+        outcome.terminal
+      ) {
+        let result: RepairHumanNotifiedOutcome;
+        try {
+          result = await deps.notifyHuman(existing, outcome.verdict);
+        } catch (err) {
+          note(
+            `# warn: repair human-notify threw for ${token} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          result = "notify_failed";
+        }
+        deps.mintNotified(token, result);
+      }
+      continue;
+    }
+
+    const expired = [...groupGrants]
+      .filter((grant) => nowMs >= grant.expires_at)
+      .sort((a, b) => b.fencing_token - a.fencing_token)[0];
+    if (expired !== undefined) {
+      const liveness = deps.grantHolderLiveness(expired);
+      if (liveness !== "dead") {
+        note(`# repair-grant-hold token=${token} class=holder_${liveness}`);
+        continue;
+      }
+      deps.expireGrant(expired, nowMs);
+    }
+
     if (deps.isDirtyCheckout(group.repo_dir)) {
-      // Name the ACTIVE shared-checkout-dirty distress row (once sustained dirt has
-      // crossed grace and minted one) so the greppable defer trace and the one
-      // operator-visible needs-human row are the SAME incident, two consumers.
       const distress = deps.activeDirtyDistressId?.(group.repo_dir) ?? null;
       note(
         `# repair-defer token=${token} class=dirty_checkout dir=${group.repo_dir}` +
@@ -3223,39 +3316,111 @@ export async function runRepairEscalationSweep(
       );
       continue;
     }
-    if (existing == null) deps.mintRow(group); // the durable latch, minted once
-    let outcome: EscalationDispatchOutcome;
+    if (existing == null) {
+      deps.mintRow(group);
+      continue;
+    }
+    if (existing.instance_event_id == null) {
+      note(`# repair-grant-hold token=${token} class=incident_unfolded`);
+      continue;
+    }
+
+    // Trunk red with NO live blocked consumer at all — every candidate in this
+    // group is a task-less `baseline-tip::` entry, so `selectOwner` has no task
+    // row to elect from and would return null unconditionally. Holding the
+    // incident ownerless would starve forever (no worker will ever go blocked
+    // for a defect nobody hit yet); mint a real maintenance plan task instead —
+    // ordinary work dispatch fixes trunk in its own lane, no grant involved.
+    const hasLiveConsumer = groupMembers.some(
+      (candidate) => !candidate.task_id.startsWith("baseline-tip::"),
+    );
+    if (!hasLiveConsumer) {
+      if (!deps.hasOpenMaintenanceTask(group)) {
+        let mintOutcome: MaintenanceMintOutcome;
+        try {
+          mintOutcome = await deps.mintMaintenanceTask(group);
+        } catch (err) {
+          note(
+            `# warn: maintenance-task mint threw for ${token} (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          mintOutcome = "mint_failed";
+        }
+        if (
+          mintOutcome === "mint_failed" &&
+          existing.human_notified_at == null
+        ) {
+          let result: RepairHumanNotifiedOutcome;
+          try {
+            result = await deps.notifyHuman(existing, "mint_failed");
+          } catch (err) {
+            note(
+              `# warn: repair human-notify threw for ${token} (non-fatal): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            result = "notify_failed";
+          }
+          deps.mintNotified(token, result);
+        }
+      }
+      continue;
+    }
+
+    const owner = deps.selectOwner(group, groupMembers);
+    if (owner == null) {
+      for (const candidate of groupMembers) {
+        if (!candidate.task_id.startsWith("baseline-tip::")) {
+          note(
+            `# repair-park task=${candidate.task_id} token=${token} ` +
+              `class=shared_checkout_owner_unavailable`,
+          );
+        }
+      }
+      continue;
+    }
+    if (
+      !groupMembers.some((candidate) => candidate.task_id === owner.task_id)
+    ) {
+      note(`# repair-grant-hold token=${token} class=owner_not_affected`);
+      continue;
+    }
+
+    nextToken += 1;
+    const grant: GrantLeaf = {
+      schema_version: GRANT_LEAF_SCHEMA_VERSION,
+      parent_job_id: owner.parent_job_id,
+      agent_type: "plan:repairer",
+      incident_id: incidentId,
+      owner_task_id: owner.task_id,
+      attempt_id: `${existing.attempt_id ?? 0}:${group.fingerprint}`,
+      instance_event_id: existing.instance_event_id,
+      writable_root: group.repo_dir,
+      role: "repair",
+      expires_at: nowMs + ttlMs,
+      fencing_token: nextToken,
+    };
+    let published = false;
     try {
-      outcome = await deps.dispatchRepair(group);
+      published = deps.publishGrant(grant);
     } catch (err) {
       note(
-        `# warn: repair dispatch threw for ${token} (non-fatal): ${
+        `# warn: repair grant publish threw for ${token} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      outcome = "dispatch_failed";
     }
-    // A SKIP (`at_cap` / `already_live` / `checkout_busy`) mints nothing — the row
-    // persists and re-sweeps. `checkout_busy` is structurally unreachable here (the
-    // per-checkout guard only gates the `deconflict` verb), but the shared dispatch
-    // outcome type carries it, so this stays exhaustive.
-    if (
-      outcome === "at_cap" ||
-      outcome === "already_live" ||
-      outcome === "checkout_busy"
-    ) {
-      note(`# repair-skip token=${token} class=${outcome}`);
-      continue;
-    }
-    deps.mintDispatched(token, outcome);
+    deps.mintDispatched(token, published ? "dispatched" : "dispatch_failed");
   }
 
-  // CLEAR — positive-evidence level-clear. A sticky repair row whose repo token no longer
-  // carries ANY shared-base-broken candidate (the breakage is gone) clears IFF the base
-  // reads green; an unknown/red base RETAINS the row (never a false clear on no report).
   for (const row of rows) {
-    if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
-    if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
+    if (groups.has(row.id) || !deps.isBaseGreen(row.dir ?? "")) continue;
+    for (const grant of repairGrants) {
+      if (grant.incident_id === `repair::${row.id}`) {
+        deps.expireGrant(grant, nowMs);
+      }
+    }
     deps.clearRow(row);
   }
 }
@@ -16351,6 +16516,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // every newest-tip leaf read this daemon does. Matches the tip producer's + worker's +
   // CLI's `currentToolchain()`, so all compose the identical key for one (repo, tip).
   const baselineToolchain = currentToolchain();
+  const repairGrantsDir = join(keeperStateDir(), "grants");
 
   // Read a repo's current default-branch tip off the `git_status` projection (the
   // git-worker's feed) — the sha half of the newest-tip baseline key. Null when no seeded
@@ -16556,30 +16722,145 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
-  // checkout (the repo dir itself — NOT the lane-or-project resolution unblock uses),
-  // where the base branch lives and `keeper commit-work` lands a trunk commit; the prompt
-  // is `/plan:repair <token>`, run at the escalation model/effort via the shared
-  // `dispatchEscalationSession` (so the global cap + per-key occupancy guard apply).
-  async function dispatchRepair(
+  function canonicalRepairDir(path: string): string | null {
+    try {
+      return realpathSync(path);
+    } catch {
+      return null;
+    }
+  }
+
+  function selectRepairGrantOwner(
     group: RepairGroup,
-  ): Promise<EscalationDispatchOutcome> {
-    return dispatchEscalationSession(liveEscalationDispatchDeps, {
-      verb: "repair",
-      id: group.repo_token,
-      prompt: defaultPlanPrompt("repair", group.repo_token),
-      cwd: group.repo_dir,
+    candidates: readonly RepairCandidate[],
+  ): RepairGrantOwner | null {
+    const shared = canonicalRepairDir(group.repo_dir);
+    if (shared == null) return null;
+    for (const candidate of [...candidates].sort(compareRepairCandidate)) {
+      if (
+        candidate.epic_id === "" ||
+        candidate.task_id.startsWith("baseline-tip::")
+      ) {
+        continue;
+      }
+      let jobs: Job[];
+      try {
+        jobs = db
+          .query(
+            "SELECT * FROM jobs WHERE plan_verb = 'work' AND plan_ref = ? ORDER BY last_event_id DESC",
+          )
+          .all(candidate.task_id) as unknown as Job[];
+      } catch {
+        return null;
+      }
+      for (const job of jobs) {
+        if (job.state !== "working") continue;
+        if (job.cwd == null || canonicalRepairDir(job.cwd) !== shared) continue;
+        if (job.pid == null || job.start_time == null || !pidAlive(job.pid)) {
+          continue;
+        }
+        const startTime = probeChildStartTime(job.pid);
+        if (startTime == null || startTime !== job.start_time) continue;
+        return {
+          epic_id: candidate.epic_id,
+          task_id: candidate.task_id,
+          parent_job_id: job.job_id,
+        };
+      }
+    }
+    return null;
+  }
+
+  function repairGrantHolderLiveness(
+    grant: GrantLeaf,
+  ): RepairGrantHolderLiveness {
+    try {
+      const row = db
+        .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+        .get(grant.parent_job_id) as {
+        pid: number | null;
+        start_time: string | null;
+      } | null;
+      if (row == null || row.pid == null || row.start_time == null) {
+        return "inconclusive";
+      }
+      if (!pidAlive(row.pid)) return "dead";
+      const startTime = probeChildStartTime(row.pid);
+      if (startTime == null) return "inconclusive";
+      return startTime === row.start_time ? "live" : "dead";
+    } catch {
+      return "inconclusive";
+    }
+  }
+
+  function repairGrantOwnerOutcome(grant: GrantLeaf): ResolverOutcome {
+    try {
+      const row = db
+        .query("SELECT state FROM jobs WHERE job_id = ?")
+        .get(grant.parent_job_id) as { state: Job["state"] } | null;
+      if (row?.state === "killed" || row?.state === "ended") {
+        return { terminal: true, verdict: "died" };
+      }
+      if (row?.state === "stopped") {
+        return { terminal: true, verdict: "declined" };
+      }
+    } catch {
+      return { terminal: false };
+    }
+    return repairGrantHolderLiveness(grant) === "dead"
+      ? { terminal: true, verdict: "died" }
+      : { terminal: false };
+  }
+
+  function publishRepairGrant(grant: GrantLeaf): boolean {
+    const active = listGrantLeaves(repairGrantsDir).some(
+      (leaf) =>
+        leaf.role === "repair" &&
+        leaf.writable_root === grant.writable_root &&
+        Date.now() < leaf.expires_at,
+    );
+    return !active && writeGrantLeaf(repairGrantsDir, grant);
+  }
+
+  function expireRepairGrant(grant: GrantLeaf, nowMs: number): void {
+    writeGrantLeaf(repairGrantsDir, {
+      ...grant,
+      expires_at: Math.min(grant.expires_at, nowMs),
     });
   }
 
-  // Send the ONE agentbot page about a declined/dead `repair::<token>` session. Sibling of
-  // `notifyHumanOfBlock`: ASYNC spawn, array form so the body rides as a literal argv
-  // element. A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal,
-  // so the marker stays NULL and the row re-sweeps: the page is never lost, and the sticky
-  // repair row stays operator-visible on the board throughout.
+  async function unblockRepairedTask(
+    candidate: RepairCandidate,
+  ): Promise<boolean> {
+    try {
+      const proc = Bun.spawn(
+        [
+          ...launcherArgvPrefix.slice(0, -1),
+          "plan",
+          "unblock",
+          candidate.task_id,
+        ],
+        {
+          cwd: candidate.repo_dir,
+          stdout: "ignore",
+          stderr: "ignore",
+        },
+      );
+      return (await proc.exited) === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // Send the ONE agentbot page about a declined/dead granted owner, or a failed
+  // maintenance-task mint. Sibling of `notifyHumanOfBlock`: ASYNC spawn, array form
+  // so the body rides as a literal argv element. A non-zero exit OR a missing
+  // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and
+  // the row re-sweeps: the page is never lost, and the sticky repair row stays
+  // operator-visible on the board throughout.
   async function notifyHumanOfRepair(
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ): Promise<RepairHumanNotifiedOutcome> {
     const body = buildRepairHumanNotifyBody({
       repoToken: row.id,
@@ -16589,70 +16870,76 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return notifyHuman(body);
   }
 
-  // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
-  // read failure returns TRUE so an old dispatch marker can never false-decline a healthy
-  // repair merely because its job row was temporarily unreadable.
-  function repairSessionWorking(token: string): boolean {
+  // The daemon-side maintenance-task idempotence probe: an OPEN (non-`done`) epic
+  // in this repo already carrying the deterministic (repo, fingerprint) title —
+  // re-run before every mint attempt so a still-open mint from an earlier tick is
+  // never duplicated. A read failure defers (treated as "cannot confirm absent"):
+  // the next tick re-probes rather than risking a double mint on a DB hiccup.
+  function hasOpenMaintenanceTask(group: RepairGroup): boolean {
     try {
-      const instance = stickyRepairInstanceFor(token);
-      const jobs =
-        instance == null
-          ? (db
-              .query(
-                "SELECT state FROM jobs WHERE plan_verb = 'repair' AND plan_ref = ?",
-              )
-              .all(token) as Array<Pick<Job, "state">>)
-          : (db
-              .query(
-                `SELECT state FROM jobs
-                   WHERE plan_verb = 'repair' AND plan_ref = ?
-                     AND (escalation_instance = ? OR
-                       (escalation_instance IS NULL AND last_event_id >= ?))`,
-              )
-              .all(token, instance, instance) as Array<Pick<Job, "state">>);
-      return jobs.some((job) => job.state === "working");
+      const row = db
+        .query(
+          `SELECT 1 FROM epics WHERE project_dir = ? AND title = ? AND status IS NOT 'done' LIMIT 1`,
+        )
+        .get(group.repo_dir, maintenanceEpicTitle(group));
+      return row != null;
     } catch {
       return true;
     }
   }
 
-  // The stage-3 board-state gate for the repair notify: is the sticky
-  // `repair::<token>` row still present? A successful repair clears it (the sweep's
-  // positive-evidence `DispatchCleared`) before the notify fires, so a surviving row
-  // means the breakage is unresolved — the incident {@link classifyEscalationOutcome}
-  // may page on. A read miss degrades to `false` (incident treated closed → the
-  // notify WAITS, never a premature page on a transient error), mirroring
-  // {@link deconflictIncidentOpen}.
-  function repairIncidentOpen(token: string): boolean {
+  // Mint the maintenance plan task for a trunk-red group with no live blocked
+  // consumer: a bounded `keeper plan scaffold --file -` subprocess piped the YAML
+  // on stdin, then `keeper plan validate --epic` arms it so autopilot's readiness
+  // gate can dispatch it as ordinary work. The plan CLI writes the plan; this
+  // producer only spawns it (sole-writer discipline holds). Fail-open — any spawn
+  // error, non-zero exit, unparseable envelope, or arm failure maps to
+  // `mint_failed`, never a throw.
+  async function mintMaintenanceTask(
+    group: RepairGroup,
+  ): Promise<MaintenanceMintOutcome> {
     try {
-      return (
-        db
-          .query(
-            "SELECT 1 FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
-          )
-          .get(token) != null
+      const scaffoldProc = Bun.spawn(
+        [...launcherArgvPrefix.slice(0, -1), "plan", "scaffold", "--file", "-"],
+        {
+          cwd: group.repo_dir,
+          stdin: Buffer.from(buildMaintenanceScaffoldYaml(group)),
+          stdout: "pipe",
+          stderr: "ignore",
+        },
       );
+      const [exitCode, stdout] = await Promise.all([
+        scaffoldProc.exited,
+        new Response(scaffoldProc.stdout).text(),
+      ]);
+      if (exitCode !== 0) return "mint_failed";
+      let epicId: string | null = null;
+      try {
+        const parsed = JSON.parse(stdout) as {
+          success?: unknown;
+          epic_id?: unknown;
+        };
+        epicId =
+          parsed.success === true && typeof parsed.epic_id === "string"
+            ? parsed.epic_id
+            : null;
+      } catch {
+        epicId = null;
+      }
+      if (epicId == null || epicId === "") return "mint_failed";
+      const armProc = Bun.spawn(
+        [
+          ...launcherArgvPrefix.slice(0, -1),
+          "plan",
+          "validate",
+          "--epic",
+          epicId,
+        ],
+        { cwd: group.repo_dir, stdout: "ignore", stderr: "ignore" },
+      );
+      return (await armProc.exited) === 0 ? "minted" : "mint_failed";
     } catch {
-      return false;
-    }
-  }
-
-  // The sticky repair row's `instance_event_id` — the incident anchor the repair
-  // human-notify probe scopes its jobs read on, so a stale `repair::<token>` session
-  // row from a resolved (cleared) prior breakage never suppresses or prematurely
-  // fires the notify for a re-minted one. A read miss or absent row degrades to NULL
-  // (the unscoped verb+ref fallback), never a thrown error — mirrors
-  // {@link stickyCloseInstanceFor}.
-  function stickyRepairInstanceFor(token: string): number | null {
-    try {
-      const row = db
-        .query(
-          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'repair' AND id = ? LIMIT 1",
-        )
-        .get(token) as { instance_event_id: number | null } | null;
-      return row?.instance_event_id ?? null;
-    } catch {
-      return null;
+      return "mint_failed";
     }
   }
 
@@ -16737,34 +17024,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     await runRepairEscalationSweep({
       selectCandidates: () => candidatesAll,
       selectRepairRows: () => selectRepairRows(),
-      // DEFER gate — checkout cleanliness (dirty / unseeded → defer the write-capable
-      // launch), DISTINCT from the suite-green clear gate below.
+      selectGrants: () => listGrantLeaves(repairGrantsDir),
+      selectOwner: (group, affected) => selectRepairGrantOwner(group, affected),
+      grantHolderLiveness: (grant) => repairGrantHolderLiveness(grant),
+      grantOwnerOutcome: (grant) => repairGrantOwnerOutcome(grant),
       isDirtyCheckout: (repoDir) =>
         repairCheckoutDirty(repoDirtyCount(repoDir)),
-      // CLEAR gate — the newest-tip baseline LEAF reads SUITE-GREEN. A clean checkout does
-      // NOT prove the suite passes, so the clear gate consults the tested result, never
-      // checkout cleanliness — the green ambiguity the gap analysis named.
       isBaseGreen: (repoDir) =>
         repairTipBaselineGreen(readNewestTipLeaf(repoDir)),
-      // Name the active dirt distress row in the defer diagnostic (once one is open) so
-      // the greppable defer trace and the operator-visible needs-human row correlate.
       activeDirtyDistressId: (repoDir) => openDirtyById.get(repoDir) ?? null,
-      dispatchRepair: (group) => dispatchRepair(group),
-      repairOutcome: (token) =>
-        classifyEscalationOutcome(
-          resolveEscalationJobsFor(
-            db,
-            "repair",
-            token,
-            stickyRepairInstanceFor(token),
-          ),
-          "repair",
-          token,
-          repairIncidentOpen(token),
-        ),
-      repairSessionWorking: (token) => repairSessionWorking(token),
-      nowSec: () => Date.now() / 1000,
-      terminalGraceSec: REPAIR_TERMINAL_GRACE_SEC,
+      nowMs: () => Date.now(),
+      publishGrant: (grant) => publishRepairGrant(grant),
+      expireGrant: (grant, nowMs) => expireRepairGrant(grant, nowMs),
+      unblockTask: (candidate) => unblockRepairedTask(candidate),
       notifyHuman: (row, verdict) => notifyHumanOfRepair(row, verdict),
       mintRow: (group) =>
         mintRepairRowEvent(
@@ -16782,6 +17054,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           expected_attempt_id: row.attempt_id,
           expected_instance_event_id: row.instance_event_id,
         }),
+      hasOpenMaintenanceTask: (group) => hasOpenMaintenanceTask(group),
+      mintMaintenanceTask: (group) => mintMaintenanceTask(group),
       noteLine: note,
     });
 

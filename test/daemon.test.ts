@@ -19,6 +19,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -77,6 +78,7 @@ import {
   buildDeconflictHumanNotifyBody,
   buildDispatchClearedData,
   buildIncidentOwnerPageBody,
+  buildMaintenanceScaffoldYaml,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildRetryDispatchResultMessage,
@@ -126,12 +128,15 @@ import {
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
+  MAINTENANCE_TASK_TITLE_PREFIX,
   MAX_LIVE_ESCALATION_SESSIONS,
+  type MaintenanceMintOutcome,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
   MUTATION_PATH_BACKFILL_INTERVAL_MS,
+  maintenanceEpicTitle,
   matchCrashReportToBoot,
   mergeConflictBaseCheckout,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
@@ -169,8 +174,8 @@ import {
   type RepairCandidate,
   type RepairCandidateDropClass,
   type RepairEscalationSweepDeps,
-  type RepairGroup,
   type RepairHumanNotifiedOutcome,
+  type RepairNotifyVerdict,
   type ResolverDispatchOutcome,
   type ResolverDispatchResult,
   type ResolverDispatchSweepDeps,
@@ -286,6 +291,7 @@ import {
 } from "../src/fable-focus";
 import {
   decideTrunkIntegrationFence,
+  type GrantLeaf,
   type SpooledTrunkLeaseRequest,
   TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
   TRUNK_LEASE_SCHEMA_VERSION,
@@ -8500,37 +8506,65 @@ function repairRow(
   };
 }
 
+function repairGrant(overrides: Partial<GrantLeaf> = {}): GrantLeaf {
+  return {
+    schema_version: 1,
+    parent_job_id: "job-fn-1-foo.2",
+    agent_type: "plan:repairer",
+    incident_id: "repair::repo-abc",
+    owner_task_id: "fn-1-foo.2",
+    attempt_id: "41:fp1",
+    instance_event_id: 51,
+    writable_root: "/repo",
+    role: "repair",
+    expires_at: 2_000_000,
+    fencing_token: 7,
+    ...overrides,
+  };
+}
+
 function fakeRepairSweepDeps(opts: {
   candidates?: RepairCandidate[];
   rows?: PendingRepairRow[];
-  /** repo_dirs whose shared checkout is DIRTY (DEFER). */
+  grants?: GrantLeaf[];
   dirty?: Set<string>;
-  /** repo_dir → active shared-checkout-dirty distress row id (defer-note naming). */
   activeDirty?: Map<string, string>;
-  /** repo_dirs whose base reads GREEN (positive-evidence clear gate). */
   green?: Set<string>;
-  dispatch?: (group: RepairGroup) => Promise<EscalationDispatchOutcome>;
-  repairOutcome?: (token: string) => ResolverOutcome;
-  repairWorking?: (token: string) => boolean;
-  nowSec?: number;
-  terminalGraceSec?: number;
+  ownerTask?: string | null;
+  holderLiveness?: "live" | "dead" | "inconclusive";
+  ownerOutcome?: ResolverOutcome;
+  nowMs?: number;
+  publish?: (grant: GrantLeaf) => boolean;
   notify?: (
     row: PendingRepairRow,
-    verdict: "declined" | "died",
+    verdict: RepairNotifyVerdict,
   ) => Promise<RepairHumanNotifiedOutcome>;
   candidatesThrow?: boolean;
   rowsThrow?: boolean;
+  maintenanceOpen?: boolean;
+  maintenanceOutcome?: MaintenanceMintOutcome;
+  maintenanceThrows?: boolean;
 }): {
   deps: RepairEscalationSweepDeps;
   mints: RepairMint[];
-  dispatches: RepairGroup[];
-  notifies: { token: string; verdict: "declined" | "died" }[];
+  grants: GrantLeaf[];
+  published: GrantLeaf[];
+  expired: GrantLeaf[];
+  unblocked: string[];
+  notifies: { token: string; verdict: RepairNotifyVerdict }[];
   notes: string[];
+  maintenanceProbed: string[];
+  maintenanceMinted: string[];
 } {
   const mints: RepairMint[] = [];
-  const dispatches: RepairGroup[] = [];
-  const notifies: { token: string; verdict: "declined" | "died" }[] = [];
+  const grants = [...(opts.grants ?? [])];
+  const published: GrantLeaf[] = [];
+  const expired: GrantLeaf[] = [];
+  const unblocked: string[] = [];
+  const notifies: { token: string; verdict: RepairNotifyVerdict }[] = [];
   const notes: string[] = [];
+  const maintenanceProbed: string[] = [];
+  const maintenanceMinted: string[] = [];
   const deps: RepairEscalationSweepDeps = {
     noteLine: (line) => notes.push(line),
     selectCandidates: () => {
@@ -8541,18 +8575,43 @@ function fakeRepairSweepDeps(opts: {
       if (opts.rowsThrow) throw new Error("row read boom");
       return opts.rows ?? [];
     },
+    selectGrants: () => grants,
+    selectOwner: (_group, candidates) => {
+      if (opts.ownerTask === null) return null;
+      const taskId =
+        opts.ownerTask ??
+        candidates.find((candidate) => candidate.epic_id !== "")?.task_id;
+      const candidate = candidates.find((entry) => entry.task_id === taskId);
+      return candidate == null
+        ? null
+        : {
+            epic_id: candidate.epic_id,
+            task_id: candidate.task_id,
+            parent_job_id: `job-${candidate.task_id}`,
+          };
+    },
+    grantHolderLiveness: () => opts.holderLiveness ?? "live",
+    grantOwnerOutcome: () => opts.ownerOutcome ?? { terminal: false },
     isDirtyCheckout: (dir) => opts.dirty?.has(dir) ?? false,
     activeDirtyDistressId: (dir) => opts.activeDirty?.get(dir) ?? null,
     isBaseGreen: (dir) => opts.green?.has(dir) ?? false,
-    dispatchRepair: async (group) => {
-      dispatches.push(group);
-      return (await opts.dispatch?.(group)) ?? "dispatched";
+    nowMs: () => opts.nowMs ?? 1_000_000,
+    publishGrant: (grant) => {
+      const ok = opts.publish?.(grant) ?? true;
+      if (ok) {
+        grants.push(grant);
+        published.push(grant);
+      }
+      return ok;
     },
-    repairOutcome:
-      opts.repairOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
-    repairSessionWorking: opts.repairWorking ?? (() => false),
-    nowSec: () => opts.nowSec ?? 1_000,
-    terminalGraceSec: opts.terminalGraceSec ?? 300,
+    expireGrant: (grant, nowMs) => {
+      grant.expires_at = Math.min(grant.expires_at, nowMs);
+      expired.push(grant);
+    },
+    unblockTask: async (candidate) => {
+      unblocked.push(candidate.task_id);
+      return true;
+    },
     notifyHuman: async (row, verdict) => {
       notifies.push({ token: row.id, verdict });
       return (await opts.notify?.(row, verdict)) ?? "notified";
@@ -8569,12 +8628,32 @@ function fakeRepairSweepDeps(opts: {
     mintNotified: (token, outcome) =>
       mints.push({ kind: "notified", token, outcome }),
     clearRow: (row) => mints.push({ kind: "clear", token: row.id }),
+    hasOpenMaintenanceTask: (group) => {
+      maintenanceProbed.push(group.repo_token);
+      return opts.maintenanceOpen ?? false;
+    },
+    mintMaintenanceTask: async (group) => {
+      maintenanceMinted.push(group.repo_token);
+      if (opts.maintenanceThrows) throw new Error("maintenance mint boom");
+      return opts.maintenanceOutcome ?? "minted";
+    },
   };
-  return { deps, mints, dispatches, notifies, notes };
+  return {
+    deps,
+    mints,
+    grants,
+    published,
+    expired,
+    unblocked,
+    notifies,
+    notes,
+    maintenanceProbed,
+    maintenanceMinted,
+  };
 }
 
-test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE repo+fingerprint → exactly one dispatch + one sticky row", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: coalesced blocked owners mint one row before grant election", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: [
       repairCandidate("fn-1-foo", "fn-1-foo.2"),
       repairCandidate("fn-1-foo", "fn-1-foo.3"),
@@ -8582,10 +8661,7 @@ test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE r
     ],
   });
   await runRepairEscalationSweep(deps);
-  // Coalesced to ONE repair for the repo token.
-  expect(dispatches).toEqual([
-    { repo_token: "repo-abc", repo_dir: "/repo", fingerprint: "fp1" },
-  ]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([
     {
       kind: "row",
@@ -8593,12 +8669,35 @@ test("runRepairEscalationSweep: N SHARED_BASE_BROKEN tasks across epics on ONE r
       reason: "shared-base-broken:fp1",
       dir: "/repo",
     },
+  ]);
+});
+
+test("runRepairEscalationSweep: concurrent affected owners receive exactly one grant and no session dispatch", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-1-foo", "fn-1-foo.3"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
+    rows: [repairRow()],
+  });
+  await runRepairEscalationSweep(deps);
+  expect(published).toHaveLength(1);
+  expect(published[0]).toMatchObject({
+    parent_job_id: "job-fn-1-foo.2",
+    owner_task_id: "fn-1-foo.2",
+    incident_id: "repair::repo-abc",
+    writable_root: "/repo",
+    role: "repair",
+    fencing_token: 1,
+  });
+  expect(mints).toEqual([
     { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
   ]);
 });
 
-test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (independent tokens)", async () => {
-  const { deps, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: distinct repos elect independent grants", async () => {
+  const { deps, published } = fakeRepairSweepDeps({
     candidates: [
       repairCandidate("fn-1-foo", "fn-1-foo.2", {
         repo_dir: "/a",
@@ -8611,26 +8710,27 @@ test("runRepairEscalationSweep: two distinct repos each dispatch under the cap (
         fingerprint: "fpb",
       }),
     ],
+    rows: [
+      repairRow({ id: "a-111", dir: "/a", instance_event_id: 61 }),
+      repairRow({ id: "b-222", dir: "/b", instance_event_id: 62 }),
+    ],
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.map((g) => g.repo_token).sort()).toEqual([
-    "a-111",
-    "b-222",
+  expect(published.map((grant) => grant.incident_id).sort()).toEqual([
+    "repair::a-111",
+    "repair::b-222",
   ]);
 });
 
-test("runRepairEscalationSweep: a dirty shared checkout DEFERS — no dispatch, no row minted, no attempt, but leaves an observable trace", async () => {
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a dirty shared checkout defers grant publication with an observable trace", async () => {
+  const { deps, mints, published, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow()],
     dirty: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([]);
-  // Regression guard (fn-1198): the incident dirty-defer was invisible — every defer
-  // MUST now emit a class-stable, token+dir-keyed diagnostic so a starving repair route
-  // is greppable instead of looking like a dead feature. With no ACTIVE dirt distress row
-  // yet (sustained dirt has not crossed grace), the note carries no `distress=` suffix.
   expect(notes).toEqual([
     "# repair-defer token=repo-abc class=dirty_checkout dir=/repo",
   ]);
@@ -8642,14 +8742,14 @@ test("runRepairEscalationSweep: a dirty defer NAMES the active shared-checkout-d
   // needs-human row are the one incident — the whole point of routing the two consumers
   // (the sweep defer + the distress family) through one `shared-checkout-dirty:<hash>` id.
   const distressId = `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`;
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+  const { deps, mints, published, notes } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow()],
     dirty: new Set(["/repo"]),
     activeDirty: new Map([["/repo", distressId]]),
   });
   await runRepairEscalationSweep(deps);
-  // Still a pure DEFER — no dispatch, no repair row minted (the naming is diagnostic-only).
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(mints).toEqual([]);
   expect(notes).toEqual([
     `# repair-defer token=repo-abc class=dirty_checkout dir=/repo distress=${distressId}`,
@@ -8707,149 +8807,106 @@ test("buildSharedDirtyObservation: candidate-scoped GENUINE dirt mints; unseeded
   expect([...obs.keys()].sort()).toEqual([dirtyRepo, staleRepo].sort());
 });
 
-test("runRepairEscalationSweep: an at_cap dispatch mints the sticky row but NO RepairDispatched (re-sweeps), with an observable skip trace", async () => {
-  const { deps, mints, dispatches, notes } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a grant publication failure records a retryable failed attempt", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    dispatch: async () => "at_cap",
+    rows: [repairRow()],
+    publish: () => false,
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  // The latch is minted (durable), but repair_dispatched_at stays NULL (no RepairDispatched).
+  expect(published).toEqual([]);
   expect(mints).toEqual([
-    {
-      kind: "row",
-      token: "repo-abc",
-      reason: "shared-base-broken:fp1",
-      dir: "/repo",
-    },
+    { kind: "dispatched", token: "repo-abc", outcome: "dispatch_failed" },
   ]);
-  expect(notes).toEqual(["# repair-skip token=repo-abc class=at_cap"]);
 });
 
-test("runRepairEscalationSweep: a dispatch_failed mints RepairDispatched{dispatch_failed} (non-terminal, re-sweeps)", async () => {
-  const { deps, mints } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    dispatch: async () => "dispatch_failed",
+test("runRepairEscalationSweep: an unexpired grant prevents every sibling election", async () => {
+  const { deps, mints, published, notifies } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-1-foo", "fn-1-foo.3"),
+    ],
+    rows: [repairRow({ repair_dispatched_at: 100 })],
+    grants: [repairGrant()],
   });
   await runRepairEscalationSweep(deps);
+  expect(published).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: expiry without positive holder death never re-elects", async () => {
+  for (const liveness of ["live", "inconclusive"] as const) {
+    const fixture = fakeRepairSweepDeps({
+      candidates: [repairCandidate("fn-1-foo", "fn-1-foo.3")],
+      rows: [repairRow()],
+      grants: [repairGrant({ expires_at: 900_000 })],
+      holderLiveness: liveness,
+    });
+    await runRepairEscalationSweep(fixture.deps);
+    expect(fixture.published).toEqual([]);
+    expect(fixture.notes).toEqual([
+      `# repair-grant-hold token=repo-abc class=holder_${liveness}`,
+    ]);
+  }
+});
+
+test("runRepairEscalationSweep: an expired positively-dead holder is fenced before re-election", async () => {
+  const { deps, published, expired, mints } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.3")],
+    rows: [repairRow()],
+    grants: [repairGrant({ expires_at: 900_000, fencing_token: 7 })],
+    holderLiveness: "dead",
+    ownerTask: "fn-1-foo.3",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(expired).toHaveLength(1);
+  expect(published).toHaveLength(1);
+  expect(published[0]).toMatchObject({
+    parent_job_id: "job-fn-1-foo.3",
+    owner_task_id: "fn-1-foo.3",
+    fencing_token: 8,
+  });
   expect(mints).toContainEqual({
     kind: "dispatched",
     token: "repo-abc",
-    outcome: "dispatch_failed",
+    outcome: "dispatched",
   });
 });
 
-test("runRepairEscalationSweep: a LIVE repair (row dispatched, session not terminal) → no re-dispatch, no page", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a terminal granted owner pages once without launching repair", async () => {
+  const { deps, mints, published, notifies } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "declined" },
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a stopped repair without a terminal outcome waits inside grace", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 800 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => false,
-    nowSec: 1_000,
-    terminalGraceSec: 300,
-  });
-  await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a stopped repair past grace promotes to declined, pages once, and retry re-arms dispatch", async () => {
-  const candidate = repairCandidate("fn-1-foo", "fn-1-foo.2");
-  const stale = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow({ repair_dispatched_at: 600 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => false,
-    nowSec: 1_000,
-    terminalGraceSec: 300,
-  });
-  await runRepairEscalationSweep(stale.deps);
-  expect(stale.notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
-  expect(stale.mints).toEqual([
-    { kind: "notified", token: "repo-abc", outcome: "notified" },
-  ]);
-
-  // The folded page marker makes every later sweep inert: exactly one page.
-  const paged = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow({ repair_dispatched_at: 600, human_notified_at: 1_000 })],
-    nowSec: 2_000,
-  });
-  await runRepairEscalationSweep(paged.deps);
-  expect(paged.notifies).toEqual([]);
-  expect(paged.dispatches).toEqual([]);
-
-  // retry_dispatch clears the once markers while retaining the sticky row. The next
-  // sweep therefore dispatches exactly one fresh repair instead of re-notifying.
-  const retried = fakeRepairSweepDeps({
-    candidates: [candidate],
-    rows: [repairRow()],
-  });
-  await runRepairEscalationSweep(retried.deps);
-  expect(retried.notifies).toEqual([]);
-  expect(retried.dispatches).toHaveLength(1);
-  expect(retried.mints).toEqual([
-    { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
-  ]);
-});
-
-test("runRepairEscalationSweep: an old but working repair never grace-promotes", async () => {
-  const { deps, mints, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 1 })],
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
-    nowSec: 100_000,
-    terminalGraceSec: 1,
-  });
-  await runRepairEscalationSweep(deps);
-  expect(notifies).toEqual([]);
-  expect(mints).toEqual([]);
-});
-
-test("runRepairEscalationSweep: a DECLINED repair (dispatched, terminal, candidates remain) pages the human ONCE", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
-    rows: [repairRow({ repair_dispatched_at: 100 })],
-    repairOutcome: () => ({ terminal: true, verdict: "declined" }),
-  });
-  await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
   expect(notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
   expect(mints).toEqual([
     { kind: "notified", token: "repo-abc", outcome: "notified" },
   ]);
 });
 
-test("runRepairEscalationSweep: an already-paged repair does NOT re-page and does NOT re-dispatch (sticky until retry)", async () => {
-  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a stamped page marker suppresses repeat owner pages", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100, human_notified_at: 200 })],
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "died" },
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
   expect(notifies).toEqual([]);
   expect(mints).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a notify_failed leaves the page marker unset (re-sweepable, never silent)", async () => {
+test("runRepairEscalationSweep: a failed owner page remains re-sweepable", async () => {
   const { deps, mints } = fakeRepairSweepDeps({
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100 })],
+    grants: [repairGrant()],
+    ownerOutcome: { terminal: true, verdict: "died" },
     notify: async () => "notify_failed",
   });
   await runRepairEscalationSweep(deps);
@@ -8858,14 +8915,13 @@ test("runRepairEscalationSweep: a notify_failed leaves the page marker unset (re
   ]);
 });
 
-test("runRepairEscalationSweep: positive-evidence CLEAR — a row with zero candidates + green base clears", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a candidate-free green baseline clears the incident", async () => {
+  const { deps, mints } = fakeRepairSweepDeps({
     candidates: [],
     rows: [repairRow({ repair_dispatched_at: 100 })],
     green: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches).toEqual([]);
   expect(mints).toEqual([{ kind: "clear", token: "repo-abc" }]);
 });
 
@@ -8879,33 +8935,169 @@ test("runRepairEscalationSweep: a row with zero candidates but a NON-green base 
   expect(mints).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a row whose token STILL has candidates is never cleared (owned by dispatch/notify)", async () => {
-  const { deps, mints } = fakeRepairSweepDeps({
-    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+test("runRepairEscalationSweep: objective green unblocks every parked owner and expires the grant", async () => {
+  const { deps, mints, unblocked, expired } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
     rows: [repairRow({ repair_dispatched_at: 100 })],
-    green: new Set(["/repo"]), // green, but candidates remain → NOT cleared
-    repairOutcome: () => ({ terminal: false }),
-    repairWorking: () => true,
+    grants: [repairGrant()],
+    green: new Set(["/repo"]),
   });
   await runRepairEscalationSweep(deps);
-  expect(mints.find((m) => m.kind === "clear")).toBeUndefined();
+  expect(unblocked).toEqual(["fn-1-foo.2", "fn-2-bar.1"]);
+  expect(expired).toHaveLength(1);
+  expect(mints.find((mint) => mint.kind === "clear")).toBeUndefined();
+});
+
+test("runRepairEscalationSweep: owners without a shared-checkout session park visibly and never receive a grant", async () => {
+  const { deps, published, notes } = fakeRepairSweepDeps({
+    candidates: [
+      repairCandidate("fn-1-foo", "fn-1-foo.2"),
+      repairCandidate("fn-2-bar", "fn-2-bar.1"),
+    ],
+    rows: [repairRow()],
+    ownerTask: null,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(published).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
+    "# repair-park task=fn-2-bar.1 token=repo-abc class=shared_checkout_owner_unavailable",
+  ]);
+});
+
+test("runRepairEscalationSweep: trunk red with NO blocked consumer mints a maintenance task instead of parking", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes, published } =
+    fakeRepairSweepDeps({
+      candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+      rows: [repairRow()],
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual(["repo-abc"]);
+  expect(published).toEqual([]);
+  expect(notes.some((line) => line.startsWith("# repair-park"))).toBe(false);
+});
+
+test("runRepairEscalationSweep: an already-open maintenance task suppresses re-mint", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOpen: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual(["repo-abc"]);
+  expect(maintenanceMinted).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a failed maintenance mint pages exactly once", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+  expect(mints).toContainEqual({
+    kind: "notified",
+    token: "repo-abc",
+    outcome: "notified",
+  });
+
+  // A second sweep against the marker the fold would have stamped never re-pages.
+  const resweep = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow({ human_notified_at: 100 })],
+    maintenanceOutcome: "mint_failed",
+  });
+  await runRepairEscalationSweep(resweep.deps);
+  expect(resweep.notifies).toEqual([]);
+  // The mint keeps retrying silently — only the PAGE is once.
+  expect(resweep.maintenanceMinted).toEqual(["repo-abc"]);
+});
+
+test("runRepairEscalationSweep: a throwing maintenance mint degrades to mint_failed (non-fatal)", async () => {
+  const { deps, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+    maintenanceThrows: true,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(notifies).toEqual([{ token: "repo-abc", verdict: "mint_failed" }]);
+});
+
+test("runRepairEscalationSweep: a MIXED group (a real candidate plus a task-less one) still parks — has a live task row to elect from", async () => {
+  const { deps, maintenanceProbed, maintenanceMinted, notes } =
+    fakeRepairSweepDeps({
+      candidates: [
+        repairCandidate("fn-1-foo", "fn-1-foo.2"),
+        repairCandidate("", "baseline-tip::repo-abc"),
+      ],
+      rows: [repairRow()],
+      ownerTask: null,
+    });
+  await runRepairEscalationSweep(deps);
+  expect(maintenanceProbed).toEqual([]);
+  expect(maintenanceMinted).toEqual([]);
+  expect(notes).toEqual([
+    "# repair-park task=fn-1-foo.2 token=repo-abc class=shared_checkout_owner_unavailable",
+  ]);
+});
+
+test("maintenanceEpicTitle: deterministic per (repo, fingerprint) — the daemon's own re-probe key", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+  };
+  expect(maintenanceEpicTitle(group)).toBe(
+    `${MAINTENANCE_TASK_TITLE_PREFIX}: repo-abc fp1`,
+  );
+  // A different fingerprint (a distinct defect) yields a distinct title.
+  expect(maintenanceEpicTitle({ ...group, fingerprint: "fp2" })).not.toBe(
+    maintenanceEpicTitle(group),
+  );
+});
+
+test("buildMaintenanceScaffoldYaml: carries the failing-tests digest and baseline leaf key in the task spec", () => {
+  const group = {
+    repo_token: "repo-abc",
+    repo_dir: "/repo",
+    fingerprint: "fp1",
+    baseline_diagnosis: {
+      baseline_leaf_key: "k-deadbee",
+      failing_tests_digest: "alpha_fail; beta_fail",
+    },
+  };
+  const yamlDoc = buildMaintenanceScaffoldYaml(group);
+  expect(yamlDoc).toContain(JSON.stringify(maintenanceEpicTitle(group)));
+  expect(yamlDoc).toContain("k-deadbee");
+  expect(yamlDoc).toContain("alpha_fail; beta_fail");
+  expect(yamlDoc).toContain("tier: xhigh");
+  expect(yamlDoc).toContain("model: opus");
+  expect(yamlDoc).toContain("## Description");
+  expect(yamlDoc).toContain("## Acceptance");
+  expect(yamlDoc).toContain("## Done summary");
+  expect(yamlDoc).toContain("## Evidence");
 });
 
 test("runRepairEscalationSweep: empty candidates + empty rows is a no-op", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({});
+  const { deps, mints, published } = fakeRepairSweepDeps({});
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op (fail-open)", async () => {
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+test("runRepairEscalationSweep: a throwing candidate read degrades to a no-op", async () => {
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidatesThrow: true,
     rows: [repairRow()],
   });
   await runRepairEscalationSweep(deps);
   expect(mints).toEqual([]);
-  expect(dispatches).toEqual([]);
+  expect(published).toEqual([]);
 });
 
 // ---- runSharedCheckoutPageSweep (dirty/desync distress page-once, injected deps) --
@@ -9207,13 +9399,13 @@ test("selectRepairCandidates: a SHARED_BASE_BROKEN block written by the real wri
   );
   expect(candidates.length).toBe(1);
   expect(candidates[0]?.task_id).toBe("fn-1-foo.1");
-  expect(candidates[0]?.repo_dir).toBe(proj);
+  expect(candidates[0]?.repo_dir).toBe(realpathSync(proj));
   // A produced candidate drops nothing → no diagnostic.
   expect(notes).toEqual([]);
   db.close();
 });
 
-test("selectRepairCandidates: the real round-trip drives an actual dispatch decision at the pure sweep seam (clean checkout)", async () => {
+test("selectRepairCandidates: the real round-trip feeds one owner grant election", async () => {
   const { db } = freshMemDb();
   const proj = join(tmpDir, "proj");
   writeBlockedStateFile(
@@ -9226,30 +9418,24 @@ test("selectRepairCandidates: the real round-trip drives an actual dispatch deci
   ]);
   seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
 
-  // Feed the REAL candidate selector into the sweep; clean checkout (dirty set empty).
-  const dispatches: RepairGroup[] = [];
-  await runRepairEscalationSweep({
-    selectCandidates: () => selectRepairCandidates(db, readTaskBlockedReason),
-    selectRepairRows: () => [],
-    isDirtyCheckout: () => false,
-    isBaseGreen: () => false,
-    dispatchRepair: async (group) => {
-      dispatches.push(group);
-      return "dispatched";
-    },
-    repairOutcome: () => ({ terminal: false }),
-    repairSessionWorking: () => true,
-    nowSec: () => 1_000,
-    terminalGraceSec: 300,
-    notifyHuman: async () => "notified",
-    mintRow: () => {},
-    mintDispatched: () => {},
-    mintNotified: () => {},
-    clearRow: () => {},
+  const candidates = selectRepairCandidates(db, readTaskBlockedReason);
+  const candidate = candidates[0] as RepairCandidate;
+  const fixture = fakeRepairSweepDeps({
+    candidates,
+    rows: [
+      repairRow({
+        id: candidate.repo_token,
+        dir: candidate.repo_dir,
+        instance_event_id: 71,
+      }),
+    ],
   });
-  // One sweep invocation → one repair dispatch decision for the repo.
-  expect(dispatches.length).toBe(1);
-  expect(dispatches[0]?.repo_dir).toBe(proj);
+  await runRepairEscalationSweep(fixture.deps);
+  expect(fixture.published).toHaveLength(1);
+  expect(fixture.published[0]).toMatchObject({
+    owner_task_id: "fn-1-foo.1",
+    writable_root: realpathSync(proj),
+  });
   db.close();
 });
 
@@ -9586,26 +9772,24 @@ test("buildBaselineRepairCandidates: infra / timeout / green / null / empty-dir 
   expect(notes).toEqual([]);
 });
 
-test("runRepairEscalationSweep: a confirmed-red baseline candidate with ZERO blocked tasks drives ONE dispatch + one sticky row", async () => {
+test("runRepairEscalationSweep: baseline red with no blocked consumer mints only the incident row", async () => {
   const baseline = buildBaselineRepairCandidates([
     { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
   ]);
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+  const { deps, mints, published } = fakeRepairSweepDeps({
     candidates: baseline,
   });
   await runRepairEscalationSweep(deps);
-  expect(dispatches.length).toBe(1);
-  expect((dispatches[0] as RepairGroup).repo_token).toBe(repoToken("/repo"));
-  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
-  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+  expect(published).toEqual([]);
+  expect(mints.filter((mint) => mint.kind === "row")).toHaveLength(1);
+  expect(mints.filter((mint) => mint.kind === "dispatched")).toHaveLength(0);
 });
 
-test("runRepairEscalationSweep: a worker-stamped block + a baseline-red candidate on one repo+fingerprint coalesce to ONE sticky", async () => {
+test("runRepairEscalationSweep: a worker block coalesces with baseline evidence into one owner grant", async () => {
   const baseline = buildBaselineRepairCandidates([
     { repoDir: "/repo", leaf: suiteRedLeaf({ runs: 2, hard: ["alpha_fail"] }) },
   ]);
   const bc = baseline[0] as RepairCandidate;
-  // A worker-sourced candidate on the SAME repo (same token) + SAME fingerprint.
   const worker: RepairCandidate = {
     epic_id: "fn-9-x",
     task_id: "fn-9-x.1",
@@ -9613,15 +9797,16 @@ test("runRepairEscalationSweep: a worker-stamped block + a baseline-red candidat
     repo_token: bc.repo_token,
     fingerprint: bc.fingerprint,
   };
-  const { deps, mints, dispatches } = fakeRepairSweepDeps({
+  const { deps, published } = fakeRepairSweepDeps({
     candidates: [worker, bc],
+    rows: [
+      repairRow({ id: bc.repo_token, dir: bc.repo_dir, instance_event_id: 81 }),
+    ],
   });
   await runRepairEscalationSweep(deps);
-  // Coalesced by repo token → exactly one dispatch + one sticky row.
-  expect(dispatches.length).toBe(1);
-  expect((dispatches[0] as RepairGroup).repo_token).toBe(bc.repo_token);
-  expect(mints.filter((m) => m.kind === "row").length).toBe(1);
-  expect(mints.filter((m) => m.kind === "dispatched").length).toBe(1);
+  expect(published).toHaveLength(1);
+  expect(published[0]?.owner_task_id).toBe("fn-9-x.1");
+  expect(published[0]?.incident_id).toBe(`repair::${bc.repo_token}`);
 });
 
 test("repairCheckoutDirty (DEFER gate): dirty (>0) or unseeded (null) defers; a clean 0 does not", () => {

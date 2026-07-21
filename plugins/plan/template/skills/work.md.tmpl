@@ -7,7 +7,7 @@ description: >-
   says "work", "/work", or invokes the plan work workflow on an existing
   `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(keeper plan:*), Bash(keeper incident:*), Bash(keeper escalation-brief:*), Glob, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Bash(keeper incident:*), Bash(keeper escalation-brief:*), Bash(jq:*), Bash(shasum:*), Bash(cut:*), Bash(git:*), Bash(pwd:*), Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -272,7 +272,7 @@ keeper plan block <task_id> --reason "<CATEGORY>: <one-line text>"
 
 Format the reason with the worker's `BLOCKED: <category>` category as the prefix (`SPEC_UNCLEAR: …`, `DEPENDENCY_BLOCKED: …`, etc.). If the task is ALREADY `blocked` (the `blocked` reconcile verdict — the board already carries the reason), do not re-stamp.
 
-**Step 2 — preserve excluded routes.** Parse only the leading `<CATEGORY>:` prefix from the stamped `blocked_reason` (or the `BLOCKED: <CATEGORY>` breadcrumb when stamping). `TOOLING_FAILURE`, a missing/unparseable category, `AUDIT_SEVERE`, and `SHARED_BASE_BROKEN` keep their current non-inline behavior; leave the block stamped, surface the breadcrumb/reason, and STOP. `AUDIT_READY` goes to **Phase 2d**. The audit and shared-base routes never enter this inline round. Every other parsed category is an ordinary escalatable block.
+**Step 2 — preserve excluded routes.** Parse only the leading `<CATEGORY>:` prefix from the stamped `blocked_reason` (or the `BLOCKED: <CATEGORY>` breadcrumb when stamping). `TOOLING_FAILURE`, a missing/unparseable category, and `AUDIT_SEVERE` keep their current non-inline behavior; leave the block stamped, surface the breadcrumb/reason, and STOP. `SHARED_BASE_BROKEN` goes to **Phase 2r**. `AUDIT_READY` goes to **Phase 2d**. The audit and shared-base routes never enter the unblocker round. Every other parsed category is an ordinary escalatable block.
 
 **Step 3 — one unblocker round.** Before spawning, set an invocation-local round latch keyed by `<task_id>:phase-2c`. It remains set through the following resume and reconcile; a semantic re-block during that cycle leaves its new block stamped, reports it, and STOPs rather than spawning again. This bounds one Task call and one receipt per block-handling step.
 
@@ -314,6 +314,54 @@ Resume <task_id> under your existing agent spec and BRIEF_REF. The receipt below
 ```
 
 Record the unblock-and-resume step before sending so repeated receipt handling is a no-op. Re-run `keeper plan reconcile <task_id>` and use the normal Phase 2b switch: `done` continues to Phase 3, and `AUDIT_READY` keeps its Phase 2d route. Any other semantic `blocked` verdict after this resolved round is terminal for this invocation: leave it stamped, surface the reason, and STOP. Do not start another unblocker round; the daemon fallback owns further handling.
+
+### 2r. Granted shared-base repair (SHARED_BASE_BROKEN only)
+
+A shared-base block never enters the inline unblocker round and never launches a top-level `repair::` session. The daemon groups affected blocks by canonical repo + fingerprint and publishes at most one live `plan:repairer` grant. Eligibility is deliberately restricted to an owning `work::<task>` session whose canonical cwd is the shared checkout; a lane-rooted owner cannot satisfy the repairer's reproduce-at-HEAD contract and remains parked.
+
+**Find this owner's grant.** Resolve the conventional grant directory and current parent job, then derive the one owner-private leaf path. The digest input is exactly `<parent job>`, one newline, and `plan:repairer`, with no trailing newline:
+
+```bash
+GRANTS_DIR="${KEEPER_GRANT_DIR:-${KEEPER_STATE_DIR:-$HOME/.local/state/keeper}/grants}"
+PARENT_JOB="${KEEPER_JOB_ID:-$CLAUDE_CODE_SESSION_ID}"
+GRANT_KEY="$(jq -jn --arg parent "$PARENT_JOB" --arg agent "plan:repairer" '$parent + "\n" + $agent' | shasum -a 256 | cut -c1-32)"
+GRANT_REF="$GRANTS_DIR/grant-$GRANT_KEY.json"
+jq -e --arg parent "$PARENT_JOB" --arg task "$task_id" 'select(.schema_version == 1 and .parent_job_id == $parent and .agent_type == "plan:repairer" and .role == "repair" and .owner_task_id == $task and .expires_at > (now * 1000))' "$GRANT_REF"
+```
+
+Treat any derivation, read, or validation failure as **ungranted**. Surface exactly *"`<task_id>` parked: shared-base repair is owned elsewhere or requires a shared-checkout owner."* and STOP. Do not spawn any Task and do not write the trunk. The block itself is the visible park; the daemon's objective baseline-green clear unblocks every affected owner.
+
+For exactly one match, pin `GRANT_REF`, read its JSON with `jq`, and require all fields matched by the scan plus a positive integer `instance_event_id`, non-empty `attempt_id`, positive `fencing_token`, and `writable_root === $(pwd -P)`. A mismatch is an ungranted park. Pin `incident_id` from the leaf and load the repo-scoped brief:
+
+```bash
+keeper escalation-brief <incident_id>
+git branch --show-current
+git rev-parse HEAD
+```
+
+Require `schema_version: 1`, `ok: true`, `kind: "repair"`, `primary_repo === writable_root`, a non-null fingerprint, and the current checkout's default branch at the captured HEAD. Build `affected_tasks_files` by running `keeper plan cat <task_id>` for each brief `incident.affected_tasks[]` and copying only its declared `**Files:**` line. A structural miss parks without spawning.
+
+Spawn `plan:repairer` once, no `model=`, with configuration plus one JSON-serialized data section. Encode literal `<` as `\u003c` in interpolated strings:
+
+```text
+BRIEF_REF=<incident_id>
+TASK_ID=<task_id>
+EPIC_ID=<epic_id>
+PRIMARY_REPO=<primary_repo>
+TARGET_REPO=<writable_root>
+
+<incident-data>
+{"brief":<entire repair brief>,"grant_ref":"<GRANT_REF>","grant":<grant leaf>,"orchestrator":{"working_directory":"<writable_root>","default_branch":"<branch>","expected_tip":"<HEAD>","verification_gate":"bun run test:full","affected_tasks_files":[{"task_id":"<id>","files":"<declared Files line>"}]}}
+</incident-data>
+```
+
+Mechanically accept only one complete terminal line:
+
+```text
+receipt=<resolved|declined_clean|declined_residue|stale_base> reason=<JSON string>
+```
+
+A Task drop, extra prose, unknown receipt, invalid JSON, or a reason over 240 UTF-8 bytes is `declined_clean`. On `resolved`, surface that the gated fix or green no-op landed and STOP; do not unblock tasks from the receipt. On every other receipt, surface the escaped receipt and STOP. The daemon alone re-probes the default-tip baseline, expires the grant, and fan-out unblocks on objective green evidence; a receipt never clears the incident or grants new authority.
 
 ### 2d. Audit gate (AUDIT_READY blocks only)
 

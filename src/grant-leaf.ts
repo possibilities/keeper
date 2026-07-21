@@ -30,6 +30,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 export const GRANT_LEAF_SCHEMA_VERSION = 1 as const;
@@ -560,6 +561,8 @@ export interface GrantLeaf {
   parent_job_id: string;
   agent_type: EscalationAgentType;
   incident_id: string;
+  /** The blocked task whose work owner may consume a repo-scoped repair grant. */
+  owner_task_id?: string;
   /** Fencing identities per the incident-fenced-clear discipline (ADR 0070). */
   attempt_id: string;
   instance_event_id: number;
@@ -726,6 +729,8 @@ function parseGrant(bytes: string): GrantLeaf | null {
     expectedRole === null ||
     typeof g.incident_id !== "string" ||
     g.incident_id === "" ||
+    (g.owner_task_id !== undefined &&
+      (typeof g.owner_task_id !== "string" || g.owner_task_id === "")) ||
     typeof g.attempt_id !== "string" ||
     g.attempt_id === "" ||
     typeof g.instance_event_id !== "number" ||
@@ -791,6 +796,52 @@ export function readGrantLeaf(
 // ---------------------------------------------------------------------------
 
 const MAX_GRANT_BYTES = 8192;
+
+/** Read a bounded snapshot of valid owner-private grant leaves. Malformed,
+ *  raced, or insecure leaves are omitted; callers still apply incident/expiry
+ *  filters before treating a leaf as authority. */
+export function listGrantLeaves(grantsDir: string): GrantLeaf[] {
+  if (
+    grantsDir === "" ||
+    !isAbsolute(grantsDir) ||
+    !plainPrivateDir(grantsDir)
+  ) {
+    return [];
+  }
+  const leaves: GrantLeaf[] = [];
+  let dir: ReturnType<typeof opendirSync> | null = null;
+  try {
+    dir = opendirSync(grantsDir);
+    for (
+      let inspected = 0;
+      inspected < MAX_TRUNK_LEASE_REQUESTS;
+      inspected += 1
+    ) {
+      const entry = dir.readSync();
+      if (entry === null) break;
+      if (!entry.name.startsWith("grant-") || !entry.name.endsWith(".json")) {
+        continue;
+      }
+      const read = readOwnerPrivateLeaf(join(grantsDir, entry.name));
+      if ("verdict" in read) continue;
+      const grant = parseGrant(read.bytes);
+      if (grant !== null) leaves.push(grant);
+    }
+  } catch {
+    return leaves;
+  } finally {
+    try {
+      dir?.closeSync();
+    } catch {
+      // A completed bounded read needs no recovery action.
+    }
+  }
+  return leaves.sort(
+    (a, b) =>
+      a.fencing_token - b.fencing_token ||
+      a.parent_job_id.localeCompare(b.parent_job_id),
+  );
+}
 
 /** Publish `grant` under `grantsDir` (created 0o700 if absent). Writes a fresh
  *  O_EXCL|O_NOFOLLOW temp leaf, fsyncs, then atomically renames it onto the
@@ -874,6 +925,10 @@ export interface GrantEnv {
   KEEPER_GRANT_FENCING_TOKEN?: string;
   KEEPER_GRANT_ATTEMPT?: string;
   KEEPER_GRANT_INSTANCE_EVENT?: string;
+  KEEPER_STATE_DIR?: string;
+  KEEPER_JOB_ID?: string;
+  CLAUDE_CODE_SESSION_ID?: string;
+  HOME?: string;
 }
 
 /** Build the launch-anchored expectation for `agentType`, or null when the env
@@ -882,30 +937,64 @@ export function grantExpectationFromEnv(
   env: GrantEnv,
   agentType: string,
 ): GrantExpectation | null {
-  const parentJobId = (env.KEEPER_GRANT_PARENT_JOB ?? "").trim();
+  const explicitParent = (env.KEEPER_GRANT_PARENT_JOB ?? "").trim();
   const incidentId = (env.KEEPER_GRANT_INCIDENT ?? "").trim();
   const tokenRaw = (env.KEEPER_GRANT_FENCING_TOKEN ?? "").trim();
-  if (parentJobId === "" || incidentId === "" || tokenRaw === "") return null;
-  const fencingToken = Number(tokenRaw);
-  if (!Number.isFinite(fencingToken)) return null;
-  const attempt = (env.KEEPER_GRANT_ATTEMPT ?? "").trim();
-  const instanceRaw = (env.KEEPER_GRANT_INSTANCE_EVENT ?? "").trim();
-  const expectation: GrantExpectation = {
+  if (explicitParent !== "" && incidentId !== "" && tokenRaw !== "") {
+    const fencingToken = Number(tokenRaw);
+    if (!Number.isFinite(fencingToken)) return null;
+    const attempt = (env.KEEPER_GRANT_ATTEMPT ?? "").trim();
+    const instanceRaw = (env.KEEPER_GRANT_INSTANCE_EVENT ?? "").trim();
+    const expectation: GrantExpectation = {
+      parentJobId: explicitParent,
+      agentType,
+      incidentId,
+      fencingToken,
+    };
+    if (attempt !== "") expectation.attemptId = attempt;
+    if (instanceRaw !== "") {
+      const n = Number(instanceRaw);
+      if (Number.isFinite(n)) expectation.instanceEventId = n;
+    }
+    return expectation;
+  }
+
+  const parentJobId = (
+    env.KEEPER_JOB_ID ??
+    env.CLAUDE_CODE_SESSION_ID ??
+    ""
+  ).trim();
+  const grantsDir = grantsDirOf(env);
+  if (parentJobId === "" || grantsDir === "") return null;
+  const read = readOwnerPrivateLeaf(
+    deriveGrantLeafPath(grantsDir, parentJobId, agentType),
+  );
+  if ("verdict" in read) return null;
+  const grant = parseGrant(read.bytes);
+  if (
+    grant === null ||
+    grant.parent_job_id !== parentJobId ||
+    grant.agent_type !== agentType
+  ) {
+    return null;
+  }
+  return {
     parentJobId,
     agentType,
-    incidentId,
-    fencingToken,
+    incidentId: grant.incident_id,
+    fencingToken: grant.fencing_token,
+    attemptId: grant.attempt_id,
+    instanceEventId: grant.instance_event_id,
   };
-  if (attempt !== "") expectation.attemptId = attempt;
-  if (instanceRaw !== "") {
-    const n = Number(instanceRaw);
-    if (Number.isFinite(n)) expectation.instanceEventId = n;
-  }
-  return expectation;
 }
 
 export function grantsDirOf(env: GrantEnv): string {
-  return (env.KEEPER_GRANT_DIR ?? "").trim();
+  const explicit = (env.KEEPER_GRANT_DIR ?? "").trim();
+  if (explicit !== "") return explicit;
+  const stateDir = (env.KEEPER_STATE_DIR ?? "").trim();
+  if (stateDir !== "") return join(stateDir, "grants");
+  const home = (env.HOME ?? "").trim() || homedir();
+  return join(home, ".local", "state", "keeper", "grants");
 }
 
 /** The shared grant-override decision: does a valid, unexpired, write-capable
