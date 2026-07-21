@@ -28,5 +28,5 @@ Files:
 - [ ] Existing close-claim arbitration and kill-path tests stay green.
 
 ## Done summary
-
+Uncapped the darwin close-claim probe's maxBuffer so a long-argv holder resolves alive/dead instead of falling through to the 24h stale bound; added a regression test with a 48KB-argv holder.
 ## Evidence
