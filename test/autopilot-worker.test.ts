@@ -66,6 +66,7 @@ import {
   classifyCloseRecoveryStampExit,
   classifyResolverOutcome,
   classifyWorktreeRepos,
+  clearPushTimeoutStreak,
   closerJobFinished,
   computeBaseDriftEntries,
   computeCloseRecoveryEligibleIds,
@@ -153,6 +154,7 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
+  recordPushTimeout,
   recoverFailureDispatchId,
   recoverFailuresToClear,
   recoverWorktrees,
@@ -180,6 +182,7 @@ import {
   type SlotOccupancySignal,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
+  STUCK_PUSH_STICKY_THRESHOLD,
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
   type StaleBaseLaneObservation,
@@ -21824,4 +21827,20 @@ test("gather + plan: a trunk tip advance on an open-epic repo produces exactly o
   });
   expect(requests.length).toBe(1);
   expect(requests[0]?.sha).toBe(TIP_SHA_B);
+});
+
+test("push-timeout streak: crosses the sticky threshold only on consecutive timeouts, resets on a healthy push", () => {
+  const repo = "/tmp/streak-repo-a";
+  const other = "/tmp/streak-repo-b";
+  for (let i = 1; i < STUCK_PUSH_STICKY_THRESHOLD; i++) {
+    expect(recordPushTimeout(repo)).toBe(false);
+  }
+  expect(recordPushTimeout(repo)).toBe(true);
+  // A second repo's streak is independent.
+  expect(recordPushTimeout(other)).toBe(false);
+  clearPushTimeoutStreak(other);
+  // A healthy push-surface outcome resets the streak entirely.
+  clearPushTimeoutStreak(repo);
+  expect(recordPushTimeout(repo)).toBe(false);
+  clearPushTimeoutStreak(repo);
 });

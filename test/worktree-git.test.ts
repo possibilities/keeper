@@ -751,7 +751,7 @@ function fakeWorktreeDepLinkFs(opts: {
     fs: {
       async lstat(path: string) {
         const s = relUnder(SOURCE, path);
-        if (s !== null && s.endsWith("/package.json")) {
+        if (s?.endsWith("/package.json")) {
           if (pkgs.has(s.slice(0, -"/package.json".length))) {
             return { isSymbolicLink: () => false };
           }

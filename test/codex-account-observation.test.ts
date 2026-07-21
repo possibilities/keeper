@@ -83,6 +83,12 @@ function parse(value: unknown = envelope()) {
   });
 }
 
+/** Narrow a fixture value that must exist; a missing one is a test bug. */
+function must<T>(v: T | undefined | null): T {
+  if (v == null) throw new Error("fixture value missing");
+  return v;
+}
+
 describe("Codex observer envelope", () => {
   test("normalizes provider-qualified bounded capacity without retaining PII", () => {
     const observation = parse();
@@ -221,7 +227,7 @@ describe("Codex scoped capacity view", () => {
     const observation = parse();
     if (observation === null) throw new Error("fixture did not parse");
     const alias = {
-      ...observation.aliases[0]!,
+      ...must(observation.aliases[0]),
       status: "exhausted" as const,
       windows: [
         {
@@ -271,10 +277,10 @@ describe("Codex scoped capacity view", () => {
     const observation = parse();
     if (observation === null) throw new Error("fixture did not parse");
     const alias = {
-      ...observation.aliases[0]!,
+      ...must(observation.aliases[0]),
       windows: [
         {
-          ...observation.aliases[0]!.windows[0]!,
+          ...must(must(observation.aliases[0]).windows[0]),
           quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
           used_percent: 10,
           exhausted: false,

@@ -10241,6 +10241,15 @@ function startDaemonWithExitAttribution(
           if (reply.ok) {
             wakePending = true;
             pumpWakes();
+            // Drop the reconciler's in-memory redispatch cooldown for the
+            // cleared key: the anti-churn window suppresses automatic loops,
+            // and an explicit operator clear is the opposite signal — the
+            // re-arm should re-mint on the next cycle, not sit out ~200s.
+            autopilotWorker?.postMessage({
+              type: "retry-armed",
+              verb: msg.verb,
+              id: msg.dispatch_id,
+            });
           }
         } catch (err) {
           reply = {
@@ -11261,6 +11270,26 @@ function startDaemonWithExitAttribution(
       // lands without a poll-cycle delay.
       wakePending = true;
       pumpWakes();
+      // Best-effort janitor: an identity-proven dead session's plan marker
+      // (`~/.local/state/keeper/sessions/<sid>.json`, work OR close) is a leak
+      // by definition — its owner can never clear it, and a leaked close
+      // marker blocks re-closes at preflight until the read-side liveness
+      // probe or the staleness window dismisses it. Unlink at the source; all
+      // errors swallowed (marker IO never blocks the terminal mint).
+      try {
+        unlinkSync(
+          join(
+            homedir(),
+            ".local",
+            "state",
+            "keeper",
+            "sessions",
+            `${msg.jobId}.json`,
+          ),
+        );
+      } catch {
+        // absent marker / IO failure — nothing to clean
+      }
     };
 
     ew.onerror = (err: ErrorEvent): void => {

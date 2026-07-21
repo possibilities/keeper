@@ -1633,6 +1633,33 @@ export function sharedWedgeDistressId(repoDir: string): string {
 }
 
 /**
+ * Consecutive same-repo finalize push-timeout skips tolerated before the silent
+ * retry loop escalates into a VISIBLE sticky failure. Three cycles separates a
+ * transient network stall (which resolves inside the window) from a wedged
+ * push, where every silent retry lets origin fall further behind unbounded.
+ */
+export const STUCK_PUSH_STICKY_THRESHOLD = 3;
+
+/** In-memory per-repo consecutive push-timeout streak. Boots empty on restart
+ * — a genuinely stuck push re-accumulates within three cycles. */
+const pushTimeoutStreakByRepo = new Map<string, number>();
+
+/** Bump `repoDir`'s consecutive push-timeout streak, returning true once it
+ * crosses {@link STUCK_PUSH_STICKY_THRESHOLD}. Pure counter — the caller owns
+ * the escalation. */
+export function recordPushTimeout(repoDir: string): boolean {
+  const n = (pushTimeoutStreakByRepo.get(repoDir) ?? 0) + 1;
+  pushTimeoutStreakByRepo.set(repoDir, n);
+  return n >= STUCK_PUSH_STICKY_THRESHOLD;
+}
+
+/** Reset `repoDir`'s push-timeout streak on any healthy push-surface outcome
+ * (pushed, or nothing to push). */
+export function clearPushTimeoutStreak(repoDir: string): void {
+  pushTimeoutStreakByRepo.delete(repoDir);
+}
+
+/**
  * The `dispatch_failures` id a per-repo shared-checkout-DIRTY distress row keys on —
  * `shared-checkout-dirty:<repoDirHash(repoDir)>`. The SIBLING of {@link
  * sharedWedgeDistressId} on a DISTINCT prefix, so a mid-merge wedge row and a
@@ -6645,6 +6672,12 @@ export function createWorktreeDriver(
                 `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
               );
             case "push-timeout":
+              if (recordPushTimeout(repoDir)) {
+                return {
+                  ok: false,
+                  reason: `worktree-finalize-push-stuck: pushing ${defaultBranch} to origin has timed out ${STUCK_PUSH_STICKY_THRESHOLD}+ consecutive cycles in ${repoDir} (no fetch/rebase/force) — origin is silently falling behind; needs an operator to probe (git push --dry-run origin HEAD:${defaultBranch}) and reconcile`,
+                };
+              }
               return retrySkip(
                 `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying the push next cycle`,
               );
@@ -6686,6 +6719,7 @@ export function createWorktreeDriver(
               };
             case "not-ahead":
             case "merged":
+              clearPushTimeoutStreak(repoDir);
               break;
             default:
               assertNever(merge);
@@ -6702,6 +6736,7 @@ export function createWorktreeDriver(
           );
           switch (integrated.kind) {
             case "ready":
+              clearPushTimeoutStreak(repoDir);
               break;
             case "not-integrated":
               return retrySkip(
@@ -6754,6 +6789,12 @@ export function createWorktreeDriver(
                 `worktree-finalize-push-not-turn-key: ${describePushNotReady(integrated.reason)} — skipping push and teardown until the push is turn-key (no fetch/rebase/force)`,
               );
             case "push-timeout":
+              if (recordPushTimeout(repoDir)) {
+                return {
+                  ok: false,
+                  reason: `worktree-finalize-push-stuck: pushing ${defaultBranch} to origin has timed out ${STUCK_PUSH_STICKY_THRESHOLD}+ consecutive cycles in ${repoDir} (no fetch/rebase/force) — origin is silently falling behind; needs an operator to probe (git push --dry-run origin HEAD:${defaultBranch}) and reconcile`,
+                };
+              }
               return retrySkip(
                 `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying next cycle`,
               );
@@ -9888,10 +9929,23 @@ export interface VanishedSweepNudgeMessage {
   kind: "nudge-vanished-sweep";
 }
 
+/** Main→worker notice that an operator `retry_dispatch` cleared
+ * `${verb}::${id}` — the worker drops the key's in-memory redispatch cooldown
+ * (and, for `close`, the epic's finalizer guard) so a deliberate operator
+ * re-arm re-mints on the next cycle instead of waiting out the anti-churn
+ * window. The cooldown exists to suppress automatic hot loops; an explicit
+ * human clear is the opposite signal. */
+interface RetryArmedMessage {
+  type: "retry-armed";
+  verb: string;
+  id: string;
+}
+
 type IncomingMessage =
   | SetPausedMessage
   | ShutdownMessage
-  | DispatchedAckMessage;
+  | DispatchedAckMessage
+  | RetryArmedMessage;
 // `DispatchFailedMessage` / `DispatchedMessage` / `DispatchExpiredMessage` are
 // the outgoing wire shapes main consumes; `DispatchedAckMessage` is the reply
 // the worker keys against its pending-ack map.
@@ -11154,6 +11208,14 @@ function main(): void {
           attemptId: msg.attemptId,
         });
       }
+      return;
+    }
+    if (msg.type === "retry-armed") {
+      state.redispatchCooldown.delete(`${msg.verb}::${msg.id}`);
+      if (msg.verb === "close") {
+        state.finalizerGuard.delete(msg.id);
+      }
+      requestCycle();
       return;
     }
     if (msg.type === "set-paused") {

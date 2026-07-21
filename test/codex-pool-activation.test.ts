@@ -353,6 +353,12 @@ function inspectionFor(
   };
 }
 
+/** Narrow a fixture value that must exist; a missing one is a test bug. */
+function must<T>(v: T | undefined | null): T {
+  if (v == null) throw new Error("fixture value missing");
+  return v;
+}
+
 describe("Codex pool launch-scoped proof window", () => {
   test("arms one exact bounded launcher-child window", () => {
     const state = armCodexPoolProofWindow(1_000_000, 4242);
@@ -679,7 +685,7 @@ describe("Codex pool scoped activation", () => {
     const missingMarker = clone(valid);
     delete missingMarker.scoped;
     const duplicateAlias = clone(valid);
-    duplicateAlias.scoped!.authorized_aliases[CODEX_SPARK_QUOTA_SCOPE] = [
+    must(duplicateAlias.scoped).authorized_aliases[CODEX_SPARK_QUOTA_SCOPE] = [
       "keeper-codex-a",
       "keeper-codex-a",
     ];
@@ -725,7 +731,7 @@ describe("Codex pool scoped activation", () => {
         [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
       },
     });
-    expect(codexPoolAliasPolicyForActivation(written!)).toEqual({
+    expect(codexPoolAliasPolicyForActivation(must(written))).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: [],
       [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
     });
@@ -775,7 +781,9 @@ describe("Codex pool scoped activation", () => {
       ok: true,
       state: "active-scoped",
     });
-    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+    expect(
+      codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
+    ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
       [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
     });
@@ -788,7 +796,9 @@ describe("Codex pool scoped activation", () => {
     expect(store.writes.at(-1)?.scoped?.proof_scope).toBe(
       CODEX_GENERIC_QUOTA_SCOPE,
     );
-    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+    expect(
+      codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
+    ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
       [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
     });
@@ -800,7 +810,9 @@ describe("Codex pool scoped activation", () => {
       ok: true,
       state: "active-scoped",
     });
-    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+    expect(
+      codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
+    ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
       [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a"],
     });
@@ -822,7 +834,9 @@ describe("Codex pool scoped activation", () => {
       ok: true,
       state: "active-scoped",
     });
-    expect(codexPoolAliasPolicyForActivation(store.writes.at(-1)!)).toEqual({
+    expect(
+      codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
+    ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: [],
       [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
     });
@@ -837,7 +851,8 @@ describe("Codex pool scoped activation", () => {
       alias_binding: ALIAS_BINDING,
       aliases: ["keeper-codex-a", "keeper-codex-b"],
       updated_at_ms: NOW,
-    })!;
+    });
+    if (active === null) throw new Error("fixture did not parse");
     expect(
       codexPoolObservationVerifies(
         active,
