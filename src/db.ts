@@ -4542,6 +4542,53 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       ctx.db.run("DROP TABLE IF EXISTS builds");
     },
   },
+  {
+    // Incident-collapse groundwork on `dispatch_failures`: the additive columns
+    // the escalation-retirement collapse re-points onto so `block_escalations`
+    // state carries forward INTO this per-key incident projection. Zero behavior
+    // change here — no producer writes them and no consumer reads them yet, so a
+    // folded row (merge/never-bound/instant-death) leaves them at these
+    // fresh-vs-migrated-identical defaults and a from-scratch re-fold reproduces
+    // them byte-for-byte:
+    //   - `blocked_since` (INTEGER, nullable): the block latch's blocked-since
+    //     EVENT ID (never wall-clock, so it stays re-fold-deterministic), the
+    //     re-arm-once discriminant. NULL for a non-block row.
+    //   - `block_status` (TEXT, nullable): the escalate-once latch sub-state
+    //     (pending/requested/attempted). NULL for a non-block row, so non-NULL
+    //     doubles as the block-vs-merge row-kind mark; the `(verb, id)` key still
+    //     separates a block incident (its own verb) from a same-id merge row.
+    //   - `block_outcome` (TEXT, nullable): the last-attempt outcome ref
+    //     (`owner_redispatched` / `dispatched` / …). NULL for a non-block row.
+    //   - `owner_redispatch_attempts` (INTEGER NOT NULL DEFAULT 0): the durable
+    //     attachment count, exact analogue of `block_escalations`'
+    //     `owner_redispatch_attempts`. The default MATCHES the fold's never-set
+    //     value (0), so — unlike the nullable claim once-markers whose never-set
+    //     value is NULL — a DEFAULT here does NOT break re-fold byte-identity.
+    // The page-once state (`human_notified_at`) and the key `(verb, id)` already
+    // exist, so a live `block_escalations` row is losslessly representable. Kept
+    // OUT of the CREATE_DISPATCH_FAILURES literal (mirrors every prior marker
+    // add), appended here so column order is fresh-vs-migrated identical. Plain
+    // additive ALTER — no cursor rewind (the future fold reads only payload +
+    // event.id/ts). Provisional tail version; fan-in renumbers this singleton.
+    version: 141,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "blocked_since",
+        "INTEGER",
+      );
+      addColumnIfMissing(ctx.db, "dispatch_failures", "block_status", "TEXT");
+      addColumnIfMissing(ctx.db, "dispatch_failures", "block_outcome", "TEXT");
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "owner_redispatch_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+    },
+  },
 ];
 
 /**
@@ -4562,7 +4609,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v140:95c9ccd85b6d99d30c1874e3acd65a155a47e065d89dd1a416608a1cb49e27e4";
+  "v141:24d4ac10db9503d56e02c38f6b0bb52c4b9cf8d587294423ab405cf70e6481fb";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

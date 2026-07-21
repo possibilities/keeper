@@ -893,6 +893,72 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
   expect(after).toEqual(before);
 });
 
+test("the v141 incident-collapse columns default to the zero-projection values under a normal fold, and losslessly round-trip every block_escalations field", () => {
+  // Zero behavior change: a normally-folded DispatchFailed row leaves the four
+  // collapse-groundwork columns at their fresh-vs-migrated-identical defaults
+  // (no producer writes them yet), so the re-fold byte-identity above is not
+  // perturbed.
+  dispatchFailedEvent(
+    "close",
+    "fn-collapse-defaults",
+    "confirm_timeout",
+    "/r",
+    1700,
+  );
+  drainAll();
+  expect(
+    db
+      .query(
+        `SELECT blocked_since, block_status, block_outcome, owner_redispatch_attempts
+           FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-collapse-defaults'`,
+      )
+      .get(),
+  ).toEqual({
+    blocked_since: null,
+    block_status: null,
+    block_outcome: null,
+    owner_redispatch_attempts: 0,
+  });
+
+  // Representability: the new columns plus the pre-existing `human_notified_at`
+  // page-once marker and the `(verb, id)` key must losslessly hold every field of
+  // a live `block_escalations` row. `id` carries the task id (whose prefix is the
+  // epic id), and a block incident keys under its own `verb`, so the composite
+  // (epic, task) key coexists with a same-id merge row. Values below mirror a
+  // live latch row: `blocked_since` an event id (INTEGER), `owner_redispatch_
+  // attempts` a positive count, `human_notified_at` an epoch REAL, and the staged
+  // `status`/`outcome` strings.
+  db.run(
+    `INSERT INTO dispatch_failures (
+       verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+       blocked_since, block_status, block_outcome, owner_redispatch_attempts,
+       human_notified_at
+     ) VALUES (
+       'block', 'fn-1352-retire-escalation-sessions.4', 'block-escalation', NULL,
+       1800, 4242, 1800, 1900, 4242, 'attempted', 'owner_redispatch_failed', 3,
+       1720000000.5
+     )`,
+  );
+  expect(
+    db
+      .query(
+        `SELECT verb, id, blocked_since, block_status, block_outcome,
+                owner_redispatch_attempts, human_notified_at
+           FROM dispatch_failures
+          WHERE verb = 'block' AND id = 'fn-1352-retire-escalation-sessions.4'`,
+      )
+      .get(),
+  ).toEqual({
+    verb: "block",
+    id: "fn-1352-retire-escalation-sessions.4",
+    blocked_since: 4242,
+    block_status: "attempted",
+    block_outcome: "owner_redispatch_failed",
+    owner_redispatch_attempts: 3,
+    human_notified_at: 1720000000.5,
+  });
+});
+
 function incidentClaimedEvent(
   verb: string,
   id: string,

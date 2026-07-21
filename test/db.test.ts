@@ -789,8 +789,10 @@ test("openDb adds nullable incident claim identity, generation, and freshness co
     notnull: number;
     dflt_value: string | null;
   }[];
+  // The four incident-collapse columns now trail, so the claim block sits at
+  // [-8, -4) rather than the tail.
   expect(
-    columns.slice(-4).map(({ name, type, notnull, dflt_value }) => ({
+    columns.slice(-8, -4).map(({ name, type, notnull, dflt_value }) => ({
       name,
       type,
       notnull,
@@ -829,6 +831,95 @@ test("openDb adds nullable incident claim identity, generation, and freshness co
     claimed_at: null,
   });
   db.close();
+});
+
+test("the v141 incident-collapse columns are the byte-identical dispatch_failures tail on fresh vs migrated", () => {
+  // The four groundwork columns the escalation-retirement collapse re-points
+  // onto are kept OUT of the CREATE_DISPATCH_FAILURES literal and appended as the
+  // last `addColumnIfMissing` calls, so they must land as the trailing columns of
+  // `table_info(dispatch_failures)` — same order, same nullability/default — on
+  // both the fresh CREATE path and a stepped upgrade over a legacy row-shaped
+  // table. `owner_redispatch_attempts` is NOT NULL DEFAULT 0 (the count's
+  // never-set value IS 0, so the default is re-fold-safe); the other three are
+  // nullable NO DEFAULT (never-set value is NULL for a non-block row).
+  const expectedTail = [
+    { name: "blocked_since", type: "INTEGER", notnull: 0, dflt_value: null },
+    { name: "block_status", type: "TEXT", notnull: 0, dflt_value: null },
+    { name: "block_outcome", type: "TEXT", notnull: 0, dflt_value: null },
+    {
+      name: "owner_redispatch_attempts",
+      type: "INTEGER",
+      notnull: 1,
+      dflt_value: "0",
+    },
+  ];
+  const colsOf = (
+    database: Database,
+  ): { name: string; type: string; notnull: number; dflt_value: unknown }[] =>
+    database.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[];
+  const tailOf = (
+    cols: {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[],
+  ) =>
+    cols
+      .slice(-expectedTail.length)
+      .map(({ name, type, notnull, dflt_value }) => ({
+        name,
+        type,
+        notnull,
+        dflt_value,
+      }));
+
+  const { db: fresh } = openDb(":memory:");
+  const freshCols = colsOf(fresh);
+  expect(tailOf(freshCols)).toEqual(expectedTail);
+  fresh.close();
+
+  // Seed the LEGACY dispatch_failures shape (the CREATE_DISPATCH_FAILURES base
+  // literal, which predates every marker/claim/collapse column) stamped at an old
+  // version, so migrate()'s idempotent ALTERs append every missing column —
+  // including the four new ones — over a pre-existing table rather than the fresh
+  // CREATE materializing them.
+  const old = new Database(dbPath, { create: true });
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  old.run(
+    `CREATE TABLE dispatch_failures (
+        verb TEXT NOT NULL,
+        id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        dir TEXT,
+        ts REAL NOT NULL,
+        last_event_id INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (verb, id)
+      )`,
+  );
+  old.close();
+
+  const { db: migrated } = openDb(dbPath);
+  expect(
+    (
+      migrated
+        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value: string }
+    ).value,
+  ).toBe(String(SCHEMA_VERSION));
+  const migratedCols = colsOf(migrated);
+  expect(tailOf(migratedCols)).toEqual(expectedTail);
+  // Fresh and stepped-upgrade converge on the same full column order.
+  expect(migratedCols.map((c) => c.name)).toEqual(freshCols.map((c) => c.name));
+  migrated.close();
 });
 
 test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {
