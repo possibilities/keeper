@@ -293,7 +293,7 @@ test("readTestGateCommand returns the exact named script instead of scripts.test
   }
 });
 
-test("a missing or malformed test:gate resolves null and Baseline classifies it as infra", () => {
+test("a missing or malformed test:gate resolves null and Baseline passes with a note", () => {
   const noGateDir = mkdtempSync(join(tmpdir(), "keeper-baseline-no-gate-"));
   const malformedDir = mkdtempSync(join(tmpdir(), "keeper-baseline-bad-gate-"));
   try {
@@ -305,14 +305,13 @@ test("a missing or malformed test:gate resolves null and Baseline classifies it 
     expect(readTestGateCommand(noGateDir)).toBeNull();
     expect(readTestGateCommand(malformedDir)).toBeNull();
 
-    const result = deriveResult({
-      ...DERIVE_BASE,
-      outcome: noTestGateOutcome(),
-    });
-    expect(result.status).toBe("infra-error");
-    if (result.status !== "infra-error") throw new Error("unreachable");
-    expect(result.kind).toBe("spawn");
-    expect(result.message).toContain("no test-gate script");
+    const outcome = noTestGateOutcome();
+    expect(outcome.kind).toBe("pass-with-note");
+    const result = deriveResult({ ...DERIVE_BASE, outcome });
+    expect(result.status).toBe("green");
+    if (result.status !== "green") throw new Error("unreachable");
+    expect(result.runs).toEqual([]);
+    expect(result.note).toContain("no test-gate script configured");
   } finally {
     rmSync(noGateDir, { recursive: true, force: true });
     rmSync(malformedDir, { recursive: true, force: true });

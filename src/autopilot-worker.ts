@@ -127,6 +127,7 @@ import {
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
+  WORKTREE_RECOVER_KEY_PREFIX,
   ZOMBIE_SESSION_DISTRESS_ID_PREFIX,
   ZOMBIE_SESSION_DISTRESS_REASON,
   zombieSessionJobId,
@@ -203,6 +204,7 @@ import {
   type WorktreeRepoStatusEntry,
   withDispatchAttempt,
   worktreeRecoverDispatchId,
+  worktreeRecoverEpicDispatchId,
   wrappedEnvelopePath,
 } from "./reconcile-core";
 import { readOsStartTime } from "./seed-sweep";
@@ -591,6 +593,24 @@ export function recoverFailuresToClear(
     }
   }
   return cleared;
+}
+
+export function openRecoverRowFromFailure(
+  id: string,
+  dir: string,
+): { id: string; epicId: string | null; dir: string } | null {
+  if (dir === "") return null;
+  if (id === worktreeRecoverDispatchId(dir)) {
+    return { id, epicId: null, dir };
+  }
+  if (!id.startsWith(WORKTREE_RECOVER_KEY_PREFIX)) return null;
+  const keyed = id.slice(WORKTREE_RECOVER_KEY_PREFIX.length);
+  const hashSep = keyed.lastIndexOf("-");
+  if (hashSep <= 0) return null;
+  const epicId = keyed.slice(0, hashSep);
+  return worktreeRecoverEpicDispatchId(epicId, dir) === id
+    ? { id, epicId, dir }
+    : null;
 }
 
 /**
@@ -1193,10 +1213,9 @@ export interface ConfirmRunningDeps {
   /**
    * The merge-suite gate probe threaded into `worktree.finalizeEpic` (the {@link
    * isEpicDone} precedent): given the owner-integrated local-default commit, run the
-   * fast suite against it in a scratch worktree and return green / red / cannot-run.
-   * OPTIONAL — omitted makes finalize skip the gate. Production wires {@link
-   * runMergeSuiteGate}; the fast/slow finalize-gate tests inject a fake to drive the
-   * three verdicts purely.
+   * fast suite against it in a scratch worktree and return green / pass-with-note /
+   * red / cannot-run. OPTIONAL — omitted makes finalize skip the gate. Production
+   * wires {@link runMergeSuiteGate}; tests inject a fake to drive the verdicts purely.
    */
   runMergeSuite?: MergeSuiteProbe;
   /**
@@ -1210,15 +1229,17 @@ export interface ConfirmRunningDeps {
 
 /**
  * The verdict of running the fast suite against a PROSPECTIVE lane→default merge
- * result (fn-1204). `green` clears the merge to advance local default; `red` is the
+ * result. `green` and `pass-with-note` clear the merge to advance local default;
+ * the latter records that the package has no configured suite. `red` is the
  * semantic-merge-conflict jam (two individually-green sides whose merged tree breaks
- * the suite) that parks the epic on a visible sticky; `cannot-run` is a gate that
- * could not produce a verdict (scratch provision / frozen-lockfile install failure /
- * suite crash / timeout) and degrades to a non-sticky retry-skip — NEVER a silent
+ * the suite) that parks the epic on a visible sticky; `cannot-run` is a configured
+ * gate that could not produce a verdict (scratch provision / frozen-lockfile install
+ * failure / suite timeout) and degrades to a non-sticky retry-skip — NEVER a silent
  * push and NEVER a permanent silent block.
  */
 export type MergeSuiteVerdict =
   | { kind: "green" }
+  | { kind: "pass-with-note"; detail: string }
   | { kind: "red"; detail: string }
   | { kind: "cannot-run"; detail: string };
 
@@ -1320,8 +1341,9 @@ export interface WorktreeDriver {
    *
    * `runMergeSuite` is the merge-suite gate probe: before origin advances, the
    * integrated local-default commit's fast suite runs on a scratch worktree. Green
-   * proceeds to push; red parks a VISIBLE sticky with nothing pushed; a gate that
-   * cannot run degrades to a retry-skip. OMITTED skips the gate.
+   * and pass-with-note proceed to push; red parks a VISIBLE sticky with nothing
+   * pushed; a configured gate that cannot run degrades to a retry-skip. OMITTED skips
+   * the gate.
    *
    * A failure is one of two kinds, distinguished by `retry`:
    *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
@@ -1413,6 +1435,11 @@ export interface WorktreeDriver {
     laneTeardown?: LaneTeardownRecoveryOptions,
     laneMaintenanceProbe?: LaneMaintenanceProbe,
     hasDispatchableCloser?: (epicId: string) => boolean,
+    openRecoverRows?: readonly {
+      id: string;
+      epicId: string | null;
+      dir: string;
+    }[],
   ): Promise<WorktreeRecoveryOutcome>;
 }
 
@@ -6284,7 +6311,7 @@ export function createWorktreeDriver(
   recoverMergeSuite?: MergeSuiteProbe,
 ): WorktreeDriver {
   // Merge-suite gate memo (fn-1204), keyed by the prospective merged-commit OID: a
-  // TERMINAL verdict (green/red) is cached so a parked epic's finalize retries never
+  // TERMINAL verdict (green/pass-with-note/red) is cached so finalize retries never
   // recompute an UNCHANGED merge. The OID is a pure function of the two tips, so an
   // advanced default (another lane landed) mints a fresh key and re-runs the suite;
   // a cannot-run verdict is NEVER cached (it is transient and must recompute). Lives
@@ -6923,6 +6950,7 @@ export function createWorktreeDriver(
       laneTeardown,
       laneMaintenanceProbe,
       hasDispatchableCloser,
+      openRecoverRows,
     ) {
       return recoverWorktrees(
         repos,
@@ -6939,6 +6967,7 @@ export function createWorktreeDriver(
         recoverMergeSuite,
         mergeSuiteMemo,
         hasDispatchableCloser,
+        openRecoverRows,
       );
     },
   };
@@ -7574,13 +7603,16 @@ const MERGE_GATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
 const MERGE_GATE_SUITE_DEADLINE_MS = 15 * 60_000;
 /** Cap on the failing-test names carried in a red verdict's detail. */
 const MERGE_GATE_MAX_FAILING_NAMES = 8;
+const MERGE_GATE_MAX_NOTE_LEN = 512;
 
 /**
- * Run ONE package's fast gate suite in `pkgDir` (a scratch-worktree subdir): a
- * frozen-lockfile install, then the gate-phase command. Classifies via the SAME pure
- * baseline-runner core so a compile-error/bail (`crashed`) is never folded to green:
- *  - install fail/timeout, no gate script, or suite timeout → `cannot-run` (a
- *    transient/infra gate that could not produce a verdict).
+ * Run ONE package's fast gate suite in `pkgDir` (a scratch-worktree subdir): resolve
+ * its configured gate, then run a frozen-lockfile install and the gate command.
+ * Classifies via the SAME pure baseline-runner core so a compile-error/bail
+ * (`crashed`) is never folded to green:
+ *  - no gate script → `pass-with-note` (there is no configured suite to run).
+ *  - install fail/timeout or suite timeout → `cannot-run` (a configured gate that
+ *    could not produce a verdict).
  *  - the suite ran clean → `green`.
  *  - the suite reported failing tests → `red`.
  *  - the suite exited non-zero with NO failing-test signal (a compile error / bail in
@@ -7606,6 +7638,16 @@ export async function runPackageSuiteGate(
     skipInstall?: boolean;
   },
 ): Promise<MergeSuiteVerdict> {
+  const gateCmd = opts.command ?? readTestGateCommand(pkgDir);
+  if (gateCmd === null) {
+    return {
+      kind: "pass-with-note",
+      detail: `no test-gate script configured in ${pkgDir}/package.json`.slice(
+        0,
+        MERGE_GATE_MAX_NOTE_LEN,
+      ),
+    };
+  }
   if (!opts.skipInstall) {
     const install = await runDetached(
       "bun",
@@ -7626,13 +7668,6 @@ export async function runPackageSuiteGate(
         detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
       };
     }
-  }
-  const gateCmd = opts.command ?? readTestGateCommand(pkgDir);
-  if (gateCmd === null) {
-    return {
-      kind: "cannot-run",
-      detail: `no test-gate script in ${pkgDir}/package.json`,
-    };
   }
   const raw = await runDetached(
     "/bin/sh",
@@ -7678,8 +7713,8 @@ const MERGE_GATE_SMOKE_COMMAND = "bun run test:slow-daemon";
  * The production {@link MergeSuiteProbe}: provision a detached scratch worktree at the
  * prospective merged commit, run the root fast suite there (plus the named daemon
  * smoke gate when the merge touches the daemon Load surface, plus the plan suite
- * when the merge touches `plugins/plan`), and classify green / red / cannot-run.
- * Runs INLINE on the single-flight reconcile drive (a producer git+suite side
+ * when the merge touches `plugins/plan`), and classify green / pass-with-note / red /
+ * cannot-run. Runs INLINE on the single-flight reconcile drive (a producer git+suite side
  * effect, never a fold) — an accepted, bounded tradeoff for a default-OFF feature,
  * with the full rationale at the `runMergeSuite` dep wiring (the
  * `ConfirmRunningDeps` object). The scratch worktree is reaped on EVERY path.
@@ -7726,14 +7761,18 @@ export async function runMergeSuiteGate(
         detail: `scratch checkout of ${args.mergedCommit} failed: ${prov.detail}`,
       };
     }
+    const notes: string[] = [];
     const rootVerdict = await runPackageSuiteGate(scratchPath, {
       installTimeoutMs,
       suiteDeadlineMs,
       spawnFn: opts.spawnFn,
       killGraceMs: opts.killGraceMs,
     });
-    if (rootVerdict.kind !== "green") {
+    if (rootVerdict.kind === "red" || rootVerdict.kind === "cannot-run") {
       return rootVerdict;
+    }
+    if (rootVerdict.kind === "pass-with-note") {
+      notes.push(rootVerdict.detail);
     }
     if (args.runsSmokeGate) {
       // The merge touched the daemon Load surface — chain the named smoke gate
@@ -7747,24 +7786,38 @@ export async function runMergeSuiteGate(
         command: MERGE_GATE_SMOKE_COMMAND,
         skipInstall: true,
       });
-      if (smokeVerdict.kind !== "green") {
+      if (smokeVerdict.kind === "red" || smokeVerdict.kind === "cannot-run") {
         return smokeVerdict;
       }
+      if (smokeVerdict.kind === "pass-with-note") {
+        notes.push(smokeVerdict.detail);
+      }
     }
-    if (!args.runsPlanSuite) {
-      return rootVerdict;
+    if (args.runsPlanSuite) {
+      // The merge touched plugins/plan — cover its own suite too (git's merge-tree
+      // cannot see a semantic conflict there any more than in the root).
+      const planVerdict = await runPackageSuiteGate(
+        join(scratchPath, MERGE_GATE_PLAN_PKG_DIR),
+        {
+          installTimeoutMs,
+          suiteDeadlineMs,
+          spawnFn: opts.spawnFn,
+          killGraceMs: opts.killGraceMs,
+        },
+      );
+      if (planVerdict.kind === "red" || planVerdict.kind === "cannot-run") {
+        return planVerdict;
+      }
+      if (planVerdict.kind === "pass-with-note") {
+        notes.push(planVerdict.detail);
+      }
     }
-    // The merge touched plugins/plan — cover its own suite too (git's merge-tree
-    // cannot see a semantic conflict there any more than in the root).
-    return await runPackageSuiteGate(
-      join(scratchPath, MERGE_GATE_PLAN_PKG_DIR),
-      {
-        installTimeoutMs,
-        suiteDeadlineMs,
-        spawnFn: opts.spawnFn,
-        killGraceMs: opts.killGraceMs,
-      },
-    );
+    return notes.length === 0
+      ? { kind: "green" }
+      : {
+          kind: "pass-with-note",
+          detail: notes.join("; ").slice(0, MERGE_GATE_MAX_NOTE_LEN),
+        };
   } catch (err) {
     return {
       kind: "cannot-run",
@@ -8332,6 +8385,11 @@ export async function recoverWorktrees(
   runMergeSuite?: MergeSuiteProbe,
   mergeSuiteMemo: Map<string, MergeSuiteVerdict> = new Map(),
   hasDispatchableCloser: (epicId: string) => boolean = () => false,
+  openRecoverRows: readonly {
+    id: string;
+    epicId: string | null;
+    dir: string;
+  }[] = [],
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -8386,6 +8444,20 @@ export async function recoverWorktrees(
     }
     seen.add(key);
     uniqueRepos.push(r);
+  }
+  const openRecoverByRepo = new Map<
+    string,
+    { id: string; epicId: string | null; dir: string }[]
+  >();
+  for (const row of openRecoverRows) {
+    const key = stripTrailingSlashPath(row.dir.trim());
+    if (key === "") continue;
+    const prior = openRecoverByRepo.get(key);
+    if (prior === undefined) {
+      openRecoverByRepo.set(key, [row]);
+    } else {
+      prior.push(row);
+    }
   }
   laneEnumerationComplete = uniqueRepos.length > 0;
 
@@ -8573,6 +8645,14 @@ export async function recoverWorktrees(
         dir: repo,
       });
       continue;
+    }
+    const baseEpicIds = new Set(bases.map((base) => base.epicId));
+    for (const open of openRecoverByRepo.get(
+      stripTrailingSlashPath(repo.trim()),
+    ) ?? []) {
+      if (open.epicId !== null && !baseEpicIds.has(open.epicId)) {
+        resolved.push({ epicId: open.epicId, dir: open.dir });
+      }
     }
     for (const base of bases) {
       try {
@@ -10211,6 +10291,7 @@ export async function loadReconcileSnapshot(
   }
   const dispatchFailureFences = new Map<DispatchKey, DispatchFailureFence>();
   const recoverFailureIds = new Set<string>();
+  const openRecoverRows: NonNullable<ReconcileSnapshot["openRecoverRows"]> = [];
   const finalizeFailureIds = new Set<string>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
   // The `repoDir`s with an OPEN shared-checkout-wedge distress row — the level-clear
@@ -10433,9 +10514,15 @@ export async function loadReconcileSnapshot(
         }
       }
       switch (route.kind) {
-        case "worktree-recover":
+        case "worktree-recover": {
           recoverFailureIds.add(id);
+          const dir = (row as { dir?: unknown }).dir;
+          if (typeof dir === "string") {
+            const open = openRecoverRowFromFailure(id, dir);
+            if (open !== null) openRecoverRows.push(open);
+          }
           break;
+        }
         case "worktree-finalize":
           finalizeFailureIds.add(id);
           break;
@@ -10919,6 +11006,7 @@ export async function loadReconcileSnapshot(
     claimedIncidentKeys,
     dispatchFailureFences,
     recoverFailureIds,
+    openRecoverRows,
     finalizeFailureIds,
     slotOccupancyFailures,
     sharedWedgeDistressDirs,
@@ -11678,10 +11766,14 @@ function main(): void {
         // Wrapped so a producer git failure can't wedge the wake loop.
         if (snapshot.worktreeMode && !state.paused && deps.worktree) {
           try {
+            const openRecoverRows = snapshot.openRecoverRows ?? [];
             const repos = reposForRecovery(
               snapshot.epics,
               snapshot.worktreeRepoByEpicId,
-              snapshot.worktreeKnownRoots ?? [],
+              [
+                ...(snapshot.worktreeKnownRoots ?? []),
+                ...openRecoverRows.map((row) => row.dir),
+              ],
             );
             // The SAME snapshot the cycle reconciled, indexed by epic id so the
             // pass-3 occupancy gate can enumerate an epic's tasks for the work-arm.
@@ -11749,6 +11841,7 @@ function main(): void {
                 snapshot.incidentOwnerKeys?.has(
                   dispatchKey("close", epicId),
                 ) === true,
+              openRecoverRows,
             );
             // A COMPLETED pass-3 lane teardown: nudge the git vanished sweep so it
             // retires the torn-down lane's git_status row promptly, not at the next

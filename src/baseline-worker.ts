@@ -182,9 +182,8 @@ export interface RawRun {
 
 export function noTestGateOutcome(): BaselineOutcome {
   return {
-    kind: "infra",
-    infra: "spawn",
-    message: "no test-gate script in package.json at sha",
+    kind: "pass-with-note",
+    note: "no test-gate script configured in package.json at sha",
   };
 }
 

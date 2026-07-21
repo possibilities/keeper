@@ -11459,6 +11459,24 @@ test("owner-mediated finalize only verifies, gates, and pushes an already-integr
   expect(cmds).toContain(`push origin ${MG_DEFAULT_TIP}:refs/heads/main`);
 });
 
+test("owner-mediated finalize accepts a pass-with-note suite verdict before push", async () => {
+  const { run, cmds } = makeMergeGit({ baseAncestorOfDefault: true });
+  const { probe } = makeSuiteProbe({
+    kind: "pass-with-note",
+    detail: "no test-gate script configured",
+  });
+  const result = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    true,
+    probe,
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+
+  expect(result).toEqual({ ok: true });
+  expect(cmds).toContain(`push origin ${MG_DEFAULT_TIP}:refs/heads/main`);
+});
+
 test("owner-mediated finalize re-grades when default drifts after the suite verdict", async () => {
   const base = makeMergeGit({ baseAncestorOfDefault: true });
   let defaultTipReads = 0;
@@ -15450,6 +15468,56 @@ test("owner-mediated recovery keeps a backstop conflict recover-scoped and mints
   expect(isWorktreeRecoverReason(outcome.failures[0]?.reason ?? "")).toBe(true);
 });
 
+test("owner-mediated recovery accepts pass-with-note, pushes, and emits resolution without a failure", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    originAncestors: new Set([base]),
+    repoHead: "main",
+  });
+  let suiteCalls = 0;
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => "done",
+    run,
+    lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+    async () => {
+      suiteCalls += 1;
+      return {
+        kind: "pass-with-note",
+        detail: "no test-gate script configured",
+      };
+    },
+  );
+
+  expect(outcome.failures).toEqual([]);
+  expect(outcome.resolved).toContainEqual({ epicId: "fn-1-foo", dir: "/repo" });
+  const standingUnavailableId = worktreeRecoverEpicDispatchId(
+    "fn-1-foo",
+    "/repo",
+  );
+  expect(
+    recoverFailuresToClear(
+      new Set([standingUnavailableId]),
+      outcome.failures,
+      outcome.resolved,
+    ),
+  ).toEqual([standingUnavailableId]);
+  expect(suiteCalls).toBe(1);
+  expect(calls.some((call) => call.args.startsWith("push origin"))).toBe(true);
+});
+
 test("fn-1119 recoverWorktrees pass-2: a done epic with a LIVE merge-resolver is NOT merge-attempted (gated skip, no observation, rows retained)", async () => {
   // A retargeted conflict dispatched a `resolve::fn-1-foo` worker for this now-done
   // epic; it is mid-`git merge`. Pass-2 must skip re-attempting the same base→default
@@ -15504,6 +15572,43 @@ test("fn-1119 recoverWorktrees pass-2: an authoritatively-ABSENT epic → skip t
   expect(
     resolved.some((r) => r.epicId === "fn-1-foo" && r.dir === "/repo"),
   ).toBe(true);
+});
+
+test("recoverWorktrees clears an open recover row after a closed epic's lane and base are gone", async () => {
+  const epicId = "fn-1-closed";
+  const dir = "/repo";
+  const id = worktreeRecoverEpicDispatchId(epicId, dir);
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: [],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const outcome = await recoverWorktrees(
+    [dir],
+    async () => "done",
+    run,
+    lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    undefined,
+    undefined,
+    [{ id, epicId, dir }],
+  );
+
+  expect(outcome.failures).toEqual([]);
+  expect(outcome.resolved).toContainEqual({ epicId, dir });
+  expect(
+    recoverFailuresToClear(new Set([id]), outcome.failures, outcome.resolved),
+  ).toEqual([id]);
 });
 
 test("fn-1119 recoverWorktrees pass-2: an INCONCLUSIVE done-probe → DEFER (no merge, no observation, open rows retained)", async () => {
@@ -16238,12 +16343,31 @@ test("fn-982 loadReconcileSnapshot.recoverFailureIds: scopes to recover-reason c
       worktreeRecoverDispatchId("/repo"),
       "worktree-recover-abort-failed: …",
     );
+    const currentEpicId = worktreeRecoverEpicDispatchId(
+      "fn-3-current",
+      "/repo",
+    );
+    insert(
+      "close",
+      currentEpicId,
+      "worktree-recover-suite-gate-unavailable: …",
+    );
     // A non-close failure even with a recover-ish reason → excluded (verb gate).
     insert("work", "fn-9-baz.1", "worktree-recover-conflict: …");
 
     const snap = await loadReconcileSnapshot(db);
     expect([...snap.recoverFailureIds].sort()).toEqual(
-      ["fn-1-foo", worktreeRecoverDispatchId("/repo")].sort(),
+      ["fn-1-foo", worktreeRecoverDispatchId("/repo"), currentEpicId].sort(),
+    );
+    expect(
+      [...(snap.openRecoverRows ?? [])].sort((a, b) =>
+        a.id.localeCompare(b.id),
+      ),
+    ).toEqual(
+      [
+        { id: worktreeRecoverDispatchId("/repo"), epicId: null, dir: "/repo" },
+        { id: currentEpicId, epicId: "fn-3-current", dir: "/repo" },
+      ].sort((a, b) => a.id.localeCompare(b.id)),
     );
     // Every row still gates dispatch via failedKeys (auto-clear scoping is
     // orthogonal to the suppression arm).
@@ -16690,6 +16814,22 @@ test("fn-1204 finalizeEpic gate: a GREEN merge-suite verdict proceeds through th
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
+test("finalizeEpic gate: a PASS-WITH-NOTE verdict proceeds through merge and push", async () => {
+  const { run, cmds } = makeMergeGit();
+  const { probe } = makeSuiteProbe({
+    kind: "pass-with-note",
+    detail: "no test-gate script configured",
+  });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+  expect(res).toEqual({ ok: true });
+  expect(cmds.some((c) => c.startsWith("update-ref --end-of-options"))).toBe(
+    true,
+  );
+  expect(cmds.some((c) => c === "push origin main")).toBe(true);
+});
+
 test("fn-1204 finalizeEpic gate: a RED merge-suite verdict parks a VISIBLE sticky (no retry) with local default unmoved and nothing pushed", async () => {
   const { run, cmds } = makeMergeGit();
   const { probe, calls } = makeSuiteProbe({
@@ -17102,10 +17242,10 @@ test("fn-1213 runMergeSuiteGate: an install TIMEOUT degrades to cannot-run", asy
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-test("fn-1213 runMergeSuiteGate: NO named test:gate script degrades to cannot-run after a clean install", async () => {
+test("runMergeSuiteGate: NO named test:gate script passes with a bounded note and runs no subprocess", async () => {
   const { run } = makeMergeSuiteGit({ pkgJson: { scripts: {} } });
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-no-gate-"));
-  const { spawnFn, calls } = makeQueuedSpawn([resolved(0)]);
+  const { spawnFn, calls } = makeQueuedSpawn([]);
   const verdict = await runMergeSuiteGate(
     { repoDir: "/repo", mergedCommit: MG_SHA, runsPlanSuite: false },
     {
@@ -17116,11 +17256,12 @@ test("fn-1213 runMergeSuiteGate: NO named test:gate script degrades to cannot-ru
       spawnFn,
     },
   );
-  expect(verdict.kind).toBe("cannot-run");
-  if (verdict.kind === "cannot-run") {
-    expect(verdict.detail).toContain("no test-gate script");
+  expect(verdict.kind).toBe("pass-with-note");
+  if (verdict.kind === "pass-with-note") {
+    expect(verdict.detail).toContain("no test-gate script configured");
+    expect(verdict.detail.length).toBeLessThanOrEqual(512);
   }
-  expect(calls.length).toBe(1); // install ran; the gate-run call never fired
+  expect(calls).toEqual([]);
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 

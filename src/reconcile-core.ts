@@ -791,6 +791,11 @@ export interface ReconcileSnapshot {
    * (`finalizeEpic`) sharing the `close::<id>` key is NEVER auto-dismissed.
    */
   recoverFailureIds: Set<string>;
+  openRecoverRows?: {
+    id: string;
+    epicId: string | null;
+    dir: string;
+  }[];
   /**
    * The `id`s of every OPEN per-repo worktree-FINALIZE dispatch-failure row (its id
    * carries the {@link WORKTREE_FINALIZE_ID_PREFIX} marker — one row per (epic, repo)
