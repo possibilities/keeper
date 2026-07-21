@@ -32,5 +32,5 @@ existing suite-gate classifier tests.
 - [ ] Retry state is bounded per key and resets on green/named-red.
 
 ## Done summary
-
+Classify deadline-kill/empty-digest crashes as load-suspect and retry the finalize/recover merge-suite gate once per (row, merged commit) before minting the visible suite-red row; a second consecutive load-suspect or a named failure still parks immediately, and the per-key retry memo is bounded and resets on green/named-red.
 ## Evidence

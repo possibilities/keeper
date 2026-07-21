@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add one bounded retry for load-suspect suite verdicts",
-  "updated_at": "2026-07-21T07:26:04.616000Z"
+  "updated_at": "2026-07-21T18:39:29.778000Z",
+  "worker_done_at": "2026-07-21T18:39:29.778000Z"
 }
