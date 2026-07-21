@@ -28,5 +28,5 @@ code change).
 - [ ] No production source under `plugins/plan/src/` is modified; the named test gate passes.
 
 ## Done summary
-
+Added three saga cases (requestLease request_failed/pending, lockOk:false) covering the relocated TRUNK_LEASE_REQUEST_FAILED, TRUNK_LEASE_PENDING, and TRUNK_INTEGRATION_LOCK_TIMEOUT exits over the existing makeFakeTrunkDeps harness.
 ## Evidence
