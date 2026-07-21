@@ -916,6 +916,30 @@ test("providerLegGrantStatus: an ended wrapper job denies wrapper-terminal", () 
   db.close();
 });
 
+test("providerLegGrantStatus: an ended wrapper with NO claim denies wrapper-terminal immediately (never waits on an absent claim)", () => {
+  const { db } = freshMemDb();
+  // Ended wrapper, no claim seeded: positive terminality wins over claim-absence,
+  // so the leg fails fast instead of burning the full grant gate.
+  seedWrapperJob(db, "ended");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "wrapper-terminal",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: a killed wrapper with NO claim denies wrapper-terminal immediately", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "killed");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "wrapper-terminal",
+  });
+  db.close();
+});
+
 test("providerLegGrantStatus: an incomplete owner tuple denies owner-incomplete", () => {
   const { db } = freshMemDb();
   // A legacy/non-owned birth (no leg_launch_id) carries no owner tuple.
@@ -1183,6 +1207,72 @@ test("scanBirthDir end-to-end: a second leg on a live attempt is withheld (no gr
     }),
   ).toBe(true);
   expect(existsSync(full)).toBe(false); // the granted record is consumed
+  db.close();
+});
+
+test("scanBirthDir prunes a wait-log memo entry when the leg's birth record disappears without a terminal settle (bounds the resident memo)", () => {
+  const { db } = freshMemDb();
+  const memo = new Map<string, string>();
+  const ctx: EventsIngestContext = {
+    counters: new BackstopCounters(),
+    backstopLogPath: join(tmpDir, "backstop.ndjson"),
+    providerLegGrantWaitLog: memo,
+  };
+  // A leg whose wrapper never folds waits indefinitely (wrapper-unfolded).
+  const leg = makeBirthRecord({
+    session_id: "prune-leg-session",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-prune-1",
+    wrapper_job_id: "wrapper-never-folds",
+    wrapper_dispatch_attempt_id: 321,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:321",
+  });
+  writeBirthRecord(birthDir, leg);
+  const full = soleNewRecordPath();
+
+  // First scan: the leg waits, its memo entry lands, and the record is retained
+  // (a live pid, so the stuck-GC does not retire it).
+  scanBirthDir(db, birthDir, ctx);
+  expect(memo.has("leg-prune-1")).toBe(true);
+  expect(existsSync(full)).toBe(true);
+
+  // The shim self-retires its own birth record with no terminal settle behind it.
+  rmSync(full);
+
+  // The next completed scan does not observe the leg, so it prunes the entry —
+  // the memo cannot leak one entry per timed-out leg.
+  scanBirthDir(db, birthDir, ctx);
+  expect(memo.has("leg-prune-1")).toBe(false);
+  expect(memo.size).toBe(0);
+  db.close();
+});
+
+test("scanBirthDir keeps a still-waiting leg's memo entry across scans (prune only drops vanished legs)", () => {
+  const { db } = freshMemDb();
+  const memo = new Map<string, string>();
+  const ctx: EventsIngestContext = {
+    counters: new BackstopCounters(),
+    backstopLogPath: join(tmpDir, "backstop.ndjson"),
+    providerLegGrantWaitLog: memo,
+  };
+  const leg = makeBirthRecord({
+    session_id: "keep-leg-session",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-keep-1",
+    wrapper_job_id: "wrapper-never-folds",
+    wrapper_dispatch_attempt_id: 654,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:654",
+  });
+  writeBirthRecord(birthDir, leg);
+
+  scanBirthDir(db, birthDir, ctx);
+  expect(memo.has("leg-keep-1")).toBe(true);
+  // The record is still present and still waiting, so a second completed scan
+  // re-observes it and retains the entry.
+  scanBirthDir(db, birthDir, ctx);
+  expect(memo.has("leg-keep-1")).toBe(true);
   db.close();
 });
 

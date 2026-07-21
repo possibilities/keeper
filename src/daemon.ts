@@ -7030,17 +7030,22 @@ export function providerLegGrantStatus(
   if (job === null) {
     return { decision: "wait", cause: "wrapper-unfolded" };
   }
+  // Positive wrapper terminality is independent of the claim and can NEVER become
+  // grantable, so deny it BEFORE the claim-absence wait — an ended/killed wrapper
+  // with no claim must fail immediately, not burn the full grant gate waiting on a
+  // claim that will never arrive.
+  if (job.wrapper_state === "ended" || job.wrapper_state === "killed") {
+    return { decision: "deny", cause: "wrapper-terminal" };
+  }
   if (claim === null) {
     // The wrapper folded but its exact attempt carries no claim — superseded,
     // released, or never acquired. Non-authoritative; a later scan rechecks and
     // the dead-pid GC bounds a permanently stranded record.
     return { decision: "wait", cause: "claim-absent" };
   }
-  if (
-    job.wrapper_state === "ended" ||
-    job.wrapper_state === "killed" ||
-    claim.legacy_unfenced !== 0
-  ) {
+  // A legacy-unfenced claim is a non-grantable terminal — but this classification
+  // requires the claim row to exist, so it stays AFTER the claim-absence check.
+  if (claim.legacy_unfenced !== 0) {
     return { decision: "deny", cause: "wrapper-terminal" };
   }
   if (claim.claim_state === "acquired") {
@@ -7439,6 +7444,12 @@ export function scanBirthDir(
   dir: string,
   ctx?: EventsIngestContext,
 ): void {
+  // Every owned leg observed still WAITING this scan. A completed scan prunes any
+  // wait-log memo entry not in this set: a shim that self-retires its own birth
+  // record (grant timeout) leaves no terminal settle to trigger the per-leg clear,
+  // so absence-from-a-completed-scan is the bound that keeps the resident memo
+  // from leaking one entry per timed-out leg forever.
+  const observedWaitLegs = new Set<string>();
   for (const bucket of ["pending", "new"] as const) {
     const bucketDir = join(dir, bucket);
     if (!existsSync(bucketDir)) {
@@ -7520,6 +7531,9 @@ export function scanBirthDir(
         // attempt. Surface the DISTINCT lag cause (naming the blocking sibling for
         // `sibling-live`) once per transition, then keep the promoted identity
         // visible so a later scan can recheck it without launching paid work.
+        if (owner !== null) {
+          observedWaitLegs.add(owner.leg_launch_id);
+        }
         if (owner !== null && ctx?.providerLegGrantWaitLog !== undefined) {
           const line = decideProviderLegGrantWaitLog(
             ctx.providerLegGrantWaitLog,
@@ -7579,6 +7593,17 @@ export function scanBirthDir(
         continue;
       }
       gcStuckBirthRecord(db, full, record, ctx);
+    }
+  }
+  // A completed scan saw every still-present waiting leg. Prune any memo entry for
+  // a leg this scan no longer observed (its record vanished with no terminal
+  // settle), so the resident wait-log map stays bounded to legs still waiting.
+  const waitLog = ctx?.providerLegGrantWaitLog;
+  if (waitLog !== undefined) {
+    for (const legLaunchId of [...waitLog.keys()]) {
+      if (!observedWaitLegs.has(legLaunchId)) {
+        waitLog.delete(legLaunchId);
+      }
     }
   }
 }
