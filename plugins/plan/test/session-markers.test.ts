@@ -19,6 +19,7 @@
 // session_markers.ts deliberately has no reader — that lives in plugin/hooks/lib).
 
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -28,9 +29,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
+import { splitArgsLstart } from "../../../src/proc-starttime.ts";
 import {
+  claimCloseExclusive,
   clearDeadSessionMarker,
   type SessionMarkerProcessProbe,
 } from "../src/session_markers.ts";
@@ -83,6 +86,33 @@ function markerPresent(home: string): boolean {
 
 function readMarker(home: string): Record<string, unknown> {
   return JSON.parse(readFileSync(markerFile(home), "utf-8"));
+}
+
+function readDarwinStartTime(pid: number): string | null {
+  const result = Bun.spawnSync(
+    ["ps", "-ww", "-p", String(pid), "-o", "lstart=,args="],
+    {
+      timeout: 500,
+    },
+  );
+  if (!result.success || result.exitCode !== 0) {
+    return null;
+  }
+  const split = splitArgsLstart(result.stdout?.toString() ?? "");
+  return split === null ? null : `darwin:${split.lstart}`;
+}
+
+function withPlatform<T>(value: string, callback: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  if (descriptor === undefined || descriptor.configurable === false) {
+    return callback();
+  }
+  Object.defineProperty(process, "platform", { ...descriptor, value });
+  try {
+    return callback();
+  } finally {
+    Object.defineProperty(process, "platform", descriptor);
+  }
 }
 
 function withDeadMarkerHome<T>(callback: (home: string) => T): T {
@@ -640,6 +670,68 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
     expect(b.code).toBe(0);
     expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
   });
+
+  test.skipIf(process.platform === "win32")(
+    "a long-argv live darwin holder blocks stale reclaim past the 24-hour backstop",
+    () => {
+      const proj = getProj();
+      const oldCreatedAt = isoAt(Date.now() - 25 * 60 * 60 * 1000);
+      const longArg = "x".repeat(48 * 1024);
+      const holder = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000);", longArg],
+        { stdio: "ignore" },
+      );
+      holder.unref();
+      const priorHome = process.env.HOME;
+      const priorSid = process.env.CLAUDE_CODE_SESSION_ID;
+      const priorPid = holder.pid;
+      if (priorPid === undefined) {
+        holder.kill();
+        throw new Error("failed to spawn long-argv hold process");
+      }
+      try {
+        const result = withPlatform("darwin", () => {
+          const holderStartTime = readDarwinStartTime(holder.pid as number);
+          expect(holderStartTime).not.toBeNull();
+
+          process.env.HOME = proj.home;
+          process.env.CLAUDE_CODE_SESSION_ID = SID_A;
+          const path = markerFor(proj.home, SID_A);
+          mkdirSync(dirname(path), { recursive: true });
+          writeFileSync(
+            path,
+            JSON.stringify({
+              schema_version: 2,
+              session_id: SID_A,
+              kind: "close",
+              epic_id: "fn-claim-liveness-argv",
+              created_at: oldCreatedAt,
+              pid: priorPid,
+              start_time: holderStartTime,
+            }),
+          );
+
+          process.env.CLAUDE_CODE_SESSION_ID = SID_B;
+          return claimCloseExclusive("fn-claim-liveness-argv");
+        });
+        expect(result).toEqual({ heldBy: SID_A });
+        expect(existsSync(markerFor(proj.home, SID_B))).toBe(false);
+      } finally {
+        process.kill(priorPid, "SIGKILL");
+        if (priorHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = priorHome;
+        }
+        if (priorSid === undefined) {
+          delete process.env.CLAUDE_CODE_SESSION_ID;
+        } else {
+          process.env.CLAUDE_CODE_SESSION_ID = priorSid;
+        }
+      }
+    },
+  );
 
   test("a probe error is inconclusive and never dismisses a fresh holder", () => {
     const proj = getProj();
