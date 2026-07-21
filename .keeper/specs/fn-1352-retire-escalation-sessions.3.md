@@ -36,5 +36,5 @@ Both lint gates green; a grep sweep proving no doc surface names the retired ses
 - [ ] No doc surface outside docs/adr names the retired session kinds
 
 ## Done summary
-
+Reshaped CLAUDE.md, README.md, CONTEXT.md, plugin-composition-map.md, and problem-codes.md to describe only the landed in-session incident/grant model; moved the four fully superseded ADRs (0007, both 0017s, 0039) to superseded/ with pointers to ADR 0089 and amended 0049/0070. Discovered task 2's collapse commit had landed on its own unmerged lane; fast-forwarded it in before writing docs so the glossary reflects actual code, not stale plan-state claims.
 ## Evidence
