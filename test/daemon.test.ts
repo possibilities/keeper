@@ -7287,6 +7287,7 @@ function trunkLeaseSweepHarness(initialRequests: SpooledTrunkLeaseRequest[]) {
       residues.push({ repo: leaf.repo_root, detail }),
     now: () => 1_700_000_001_000,
     ttlMs: 60_000,
+    residueState: new Map(),
   };
   return { requests, leases, removed, residues, deps };
 }
@@ -7410,6 +7411,36 @@ test("a live trunk owner retains its lease while merge residue becomes an incide
     fencing_token: 1,
   });
   expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+});
+
+test("a persisting merge residue mints exactly once across successive sweep ticks", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+
+  const first = runTrunkLeaseSweep(h.deps);
+  expect(first.residues).toBe(1);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+
+  const second = runTrunkLeaseSweep(h.deps);
+  const third = runTrunkLeaseSweep(h.deps);
+  expect(second.residues).toBe(0);
+  expect(third.residues).toBe(0);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+
+  h.deps.probeResidue = () => null;
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+  const reappeared = runTrunkLeaseSweep(h.deps);
+  expect(reappeared.residues).toBe(1);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
     { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
   ]);
 });
