@@ -28,5 +28,5 @@ intact.
       env states; the `KEEPER_RESTART_LEDGER` override still wins when set.
 
 ## Done summary
-
+Extracted resolveKeeperStateDir (honoring XDG_STATE_HOME, matching install.sh's fingerprint_dir) and rebuilt resolveRestartLedgerPath on top of it, so the operator-reload attribution leaf reader and install.sh writer now agree under both default and non-default XDG_STATE_HOME; added a deterministic test pinning the resolution across both env states plus KEEPER_RESTART_LEDGER override precedence.
 ## Evidence
