@@ -88,6 +88,7 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   openDb,
 } from "./db";
+import { parsePlanRef } from "./derivers";
 import {
   assertNever,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
@@ -640,6 +641,41 @@ export function laneFailuresToClear(
   for (const row of openLaneFailures) {
     const key = normalizeLanePath(row.dir);
     if (resolvedLanePaths.has(key) && !wedgedLanePaths.has(key)) {
+      cleared.push({ verb: row.verb, id: row.id });
+    }
+  }
+  return cleared;
+}
+
+/**
+ * POSITIVE-EVIDENCE level-clear for the MERGE-ESCALATION stickies — a bare
+ * `close::<epic>` conflict (recover pass-2 escalation / close-sink genuine conflict)
+ * or a `work::<taskId>` fan-in `worktree-merge-conflict` row, the pre-minted
+ * `pending owner integration` class included. A row clears ONLY when its epic is in
+ * `landedEpicIds` — the per-epic MERGED evidence ({@link computeMergedLaneEntries}:
+ * the epic base is an ancestor of local default, or definitively absent-and-torn-down
+ * with its work done, conservative-degrading to NOT-merged on an inconclusive probe,
+ * unioned with this cycle's recover pass-2 base→default resolutions) — AND its epic is
+ * NOT in `blockedEpicIds` (a fresh conflict/degrade re-surfaced this cycle: never clear
+ * what still conflicts). Absence from `landedEpicIds` RETAINS the row: a done-but-
+ * unmerged epic or task is NOT merged evidence (done != merged), so reaching a terminal
+ * status never clears the sticky — only the fan-in genuinely landing does. The epic of
+ * a `close::<epic>` id is the id itself; a `work::<taskId>` id resolves through {@link
+ * parsePlanRef}; an unparseable id is skipped. Emitted through the same
+ * `emitDispatchCleared` gate as the recover/lane clears, so `handleDispatchClearedMint`'s
+ * incident-only fence leaves a live claimant's attempt-owned state untouched. Pure — a
+ * function of the inputs, no git, no clock.
+ */
+export function mergeEscalationFailuresToClear(
+  openRows: readonly { verb: Verb; id: string }[],
+  landedEpicIds: ReadonlySet<string>,
+  blockedEpicIds: ReadonlySet<string>,
+): { verb: Verb; id: string }[] {
+  const cleared: { verb: Verb; id: string }[] = [];
+  for (const row of openRows) {
+    const epicId = parsePlanRef(row.id)?.epic_id ?? null;
+    if (epicId === null) continue;
+    if (landedEpicIds.has(epicId) && !blockedEpicIds.has(epicId)) {
       cleared.push({ verb: row.verb, id: row.id });
     }
   }
@@ -10520,6 +10556,11 @@ export async function loadReconcileSnapshot(
   // so the recover pass's level-clear reaches a `work::<taskId>` row the typed router
   // would short-circuit to `work-task` — cleared by lane path, never the dead arm.
   const laneFailures: { verb: Verb; id: string; dir: string }[] = [];
+  // The `(verb, id)` of every OPEN merge-escalation row — a bare `close::<epic>`
+  // conflict or a `work::<taskId>` fan-in `worktree-merge-conflict` (pre-minted
+  // `pending owner integration` included). Fed into the reconcile loop's positive-
+  // evidence level-clear keyed by the row's epic's merged-landed evidence.
+  const mergeEscalationFailures: { verb: Verb; id: string }[] = [];
   // The lane PATHS with an OPEN per-lane wedge distress row — the level-clear set the
   // recover pass's lane grace tracker clears against (a lane ready/gone this cycle).
   const laneWedgeDistressDirs = new Set<string>();
@@ -10725,12 +10766,17 @@ export async function loadReconcileSnapshot(
           finalizeFailureIds.add(id);
           break;
         case "work-task":
-        // A work-verb fan-in `worktree-merge-conflict` row is a sticky like its
-        // close-path `merge-escalation` sibling — NEITHER recover- nor finalize-scoped,
-        // so it is never auto-cleared here (only `retry_dispatch` drops it), exactly as
-        // when it routed to `work-task` before the divert.
+          break;
+        // A work-verb fan-in `worktree-merge-conflict` row and its close-path
+        // `merge-escalation` sibling are NEITHER recover- nor finalize-scoped, so the
+        // typed switch never touches them. Collected here (VERB-carrying) for the
+        // reconcile loop's positive-evidence level-clear: each drops when its epic's
+        // fan-in genuinely LANDS (merged into local default / torn down), never on
+        // task/epic terminal status. A `retry_dispatch` still drops one early.
         case "work-merge-conflict":
         case "merge-escalation":
+          mergeEscalationFailures.push({ verb: verb as Verb, id });
+          break;
         case "close-plain":
         case "unknown":
           break;
@@ -11215,6 +11261,7 @@ export async function loadReconcileSnapshot(
     openZombieSessionDistresses,
     zombieSessionClearActions,
     laneFailures,
+    mergeEscalationFailures,
     laneWedgeDistressDirs,
     laneTeardownDistressDirs,
     laneBackupDistressDirs,
@@ -12190,6 +12237,43 @@ function main(): void {
               snapshot.laneFailures ?? [],
               wedgedLaneKeys,
               resolvedLanes,
+            )) {
+              deps.emitDispatchCleared(
+                dispatchClearedPayload(
+                  snapshot.dispatchFailureFences,
+                  c.verb,
+                  c.id,
+                ),
+              );
+            }
+            // POSITIVE-EVIDENCE level-clear for the MERGE-ESCALATION stickies: a bare
+            // `close::<epic>` conflict or a `work::<taskId>` fan-in
+            // `worktree-merge-conflict` (the pre-minted `pending owner integration`
+            // class included) clears ONLY when its epic's fan-in genuinely LANDED —
+            // the epic base is an ancestor of local default or was torn down after
+            // merging (`snapshot.landedLaneEntries`, conservative-degrading to
+            // NOT-merged on an inconclusive probe), UNIONED with this cycle's recover
+            // pass-2 base→default resolutions so a same-cycle recover merge clears
+            // without a cycle's lag. NEVER on task/epic terminal status (done !=
+            // merged, the incident-defect this replaces). A fresh conflict/degrade for
+            // the epic this cycle blocks its clear. Routed through the SAME
+            // `emitDispatchCleared` gate, so `handleDispatchClearedMint`'s incident-only
+            // fence leaves a live claimant's attempt-owned state untouched.
+            const landedEpicIds = new Set<string>(
+              (snapshot.landedLaneEntries ?? []).map((e) => e.epic_id),
+            );
+            for (const r of resolved) {
+              if (r.epicId !== null) landedEpicIds.add(r.epicId);
+            }
+            const blockedEpicIds = new Set<string>();
+            for (const e of escalations) blockedEpicIds.add(e.epicId);
+            for (const f of failures) {
+              if (f.epicId !== null) blockedEpicIds.add(f.epicId);
+            }
+            for (const c of mergeEscalationFailuresToClear(
+              snapshot.mergeEscalationFailures ?? [],
+              landedEpicIds,
+              blockedEpicIds,
             )) {
               deps.emitDispatchCleared(
                 dispatchClearedPayload(

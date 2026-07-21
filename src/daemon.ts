@@ -4267,47 +4267,6 @@ export function expireIncidentGrants(
   }
 }
 
-/** Whether a claimed merge incident's owning entity has reached its resolved
- *  terminal state, observed WITHOUT git from the deterministic projections: a
- *  `close::<epic>` whose epic is closed (`status === "done"`) or a `work::<task>`
- *  whose task is `runtime_status === "done"`. Both are positive evidence the
- *  fan-in/close integration landed (finalize gates the close on it; the worker
- *  runs on the integrated base), so the sticky can clear on its own — no operator
- *  `retry_dispatch`. Any parse miss or unknown verb answers false (leave sticky). */
-export function mergeIncidentEntityResolved(
-  db: Database,
-  verb: string,
-  id: string,
-): boolean {
-  try {
-    if (verb === "close") {
-      const row = db
-        .query("SELECT status FROM epics WHERE epic_id = ?")
-        .get(id) as { status: string | null } | null;
-      return row?.status === "done";
-    }
-    if (verb === "work") {
-      const epicId = parsePlanRef(id)?.epic_id ?? "";
-      if (epicId === "") return false;
-      const row = db
-        .query("SELECT tasks FROM epics WHERE epic_id = ?")
-        .get(epicId) as { tasks: string } | null;
-      if (row == null) return false;
-      const tasks = JSON.parse(row.tasks) as {
-        task_id?: unknown;
-        runtime_status?: unknown;
-      }[];
-      const el = tasks.find((t) => t.task_id === id);
-      return el != null && el.runtime_status === "done";
-    }
-  } catch {
-    // A foreign-process `tasks` blob that will not parse, or an unreadable row,
-    // is not positive evidence — leave the sticky for its existing clear path.
-    return false;
-  }
-  return false;
-}
-
 // ---------------------------------------------------------------------------
 // Ownerless merge-incident attachment + page router.
 // ---------------------------------------------------------------------------
@@ -15746,45 +15705,6 @@ function startDaemonWithExitAttribution(
     noteLine: (line) => console.error(`[keeperd] ${line}`),
   };
 
-  /** Positive-evidence, git-free clear of a resolved merge incident: a closed
-   *  `close::<epic>` or a done `work::<task>` clears its own sticky through an
-   *  INCIDENT-ONLY fence (attempt fence null), so it can never release a live
-   *  worker's attempt-owned state and never depends on operator `retry_dispatch`. */
-  function clearResolvedMergeIncidents(): void {
-    let rows: Array<{
-      verb: string;
-      id: string;
-      reason: string;
-      instance_event_id: number;
-    }>;
-    try {
-      rows = db
-        .query(
-          `SELECT verb, id, reason, instance_event_id FROM dispatch_failures
-            WHERE verb IN ('work','close') AND instance_event_id IS NOT NULL`,
-        )
-        .all() as typeof rows;
-    } catch {
-      return;
-    }
-    for (const row of rows) {
-      if (!isMergeEscalationReason(row.reason)) continue;
-      if (!mergeIncidentEntityResolved(db, row.verb, row.id)) continue;
-      try {
-        mintDispatchClearedEvent(row.verb, row.id, {
-          expected_attempt_id: null,
-          expected_instance_event_id: row.instance_event_id,
-        });
-      } catch (err) {
-        console.error(
-          `[keeperd] resolved merge-incident clear ${row.verb}::${row.id} threw (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
-  }
-
   function runIncidentClaimSweepTick(): void {
     if (shuttingDown) return;
     runIncidentClaimSweep({
@@ -15881,10 +15801,6 @@ function startDaemonWithExitAttribution(
       now: () => Date.now() / 1000,
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
-    // Positive-evidence clear of any resolved merge incident (epic closed / task
-    // done) rides the same 3s tick — git-free, incident-only fenced, so a
-    // resolved-then-idle incident clears on its own without operator retry.
-    clearResolvedMergeIncidents();
   }
   // Main owns this spool producer regardless of the optional worker selector:
   // claim/release is a daemon data surface, not an autopilot-worker actuation.

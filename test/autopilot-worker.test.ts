@@ -148,6 +148,7 @@ import {
   logWrappedDelegationSkip,
   type MergeSuiteProbe,
   type MergeSuiteVerdict,
+  mergeEscalationFailuresToClear,
   mergeLaneBaseIntoDefault,
   planTipBaselineRequests,
   prepareWorktreeGeometry,
@@ -21731,6 +21732,86 @@ test("laneFailuresToClear is verb-agnostic — a work AND a close lane row both 
     { verb: "work", id: "fn-1-foo.2" },
     { verb: "close", id: "fn-1-foo" },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// mergeEscalationFailuresToClear — the positive-evidence level-clear for the bare
+// `close::<epic>` and `work::<taskId>` merge-escalation stickies (the pre-minted
+// `pending owner integration` class included). Clears ONLY on its epic's MERGED-landed
+// evidence — never on task/epic terminal status (done != merged), the exact incident
+// defect it replaces.
+// ---------------------------------------------------------------------------
+
+test("mergeEscalationFailuresToClear: a close::<epic> merge-escalation clears ONLY on its epic's landed evidence, never on a done-but-unmerged base", () => {
+  const closeRow = { verb: "close" as const, id: "fn-3-widget" };
+  // Epic base landed (an ancestor of local default, or torn down after merging) →
+  // cleared.
+  expect(
+    mergeEscalationFailuresToClear(
+      [closeRow],
+      new Set(["fn-3-widget"]),
+      new Set(),
+    ),
+  ).toEqual([{ verb: "close", id: "fn-3-widget" }]);
+  // No landed evidence this cycle — a done-but-unmerged epic base (the finalize-
+  // pending state) is NOT merged, and an inconclusive merge probe degrades to
+  // NOT-merged → absent from the landed set → RETAINED. Done != merged.
+  expect(
+    mergeEscalationFailuresToClear([closeRow], new Set(), new Set()),
+  ).toEqual([]);
+});
+
+test("mergeEscalationFailuresToClear: a work::<taskId> pending-owner-integration sticky clears on its EPIC's landed evidence, resolving the id through parsePlanRef", () => {
+  // The done-but-never-fanned-in upstream task's pre-mint keys on `work::<taskId>`.
+  const workRow = { verb: "work" as const, id: "fn-3-widget.2" };
+  // The upstream's epic has NOT landed → the dependent lane still starves → RETAINED.
+  // Clearing here off the task's terminal status is the exact silent-starve defect.
+  expect(
+    mergeEscalationFailuresToClear([workRow], new Set(), new Set()),
+  ).toEqual([]);
+  // The epic's fan-in genuinely landed (its base reached local default) → the rib is
+  // subsumed into default → cleared.
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(["fn-3-widget"]),
+      new Set(),
+    ),
+  ).toEqual([{ verb: "work", id: "fn-3-widget.2" }]);
+});
+
+test("mergeEscalationFailuresToClear: a fresh conflict/degrade for the epic this cycle BLOCKS its clear even with landed evidence (never clear what still conflicts)", () => {
+  const rows = [
+    { verb: "close" as const, id: "fn-4-thing" },
+    { verb: "work" as const, id: "fn-4-thing.1" },
+  ];
+  // Landed AND blocked → RETAINED for both verbs.
+  expect(
+    mergeEscalationFailuresToClear(
+      rows,
+      new Set(["fn-4-thing"]),
+      new Set(["fn-4-thing"]),
+    ),
+  ).toEqual([]);
+  // Landed and NOT blocked → both clear (epic resolved for the close row, epic-of-task
+  // resolved for the work row).
+  expect(
+    mergeEscalationFailuresToClear(rows, new Set(["fn-4-thing"]), new Set()),
+  ).toEqual([
+    { verb: "close", id: "fn-4-thing" },
+    { verb: "work", id: "fn-4-thing.1" },
+  ]);
+});
+
+test("mergeEscalationFailuresToClear: an unparseable id is skipped (never cleared off a malformed ref)", () => {
+  const junk = { verb: "close" as const, id: "not a plan ref" };
+  expect(
+    mergeEscalationFailuresToClear(
+      [junk],
+      new Set(["not a plan ref"]),
+      new Set(),
+    ),
+  ).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

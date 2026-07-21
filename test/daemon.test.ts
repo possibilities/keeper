@@ -138,7 +138,6 @@ import {
   maintenanceEpicTitle,
   matchCrashReportToBoot,
   matchOperatorReloadAttribution,
-  mergeIncidentEntityResolved,
   OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -6842,6 +6841,54 @@ test("internalIncidentClearFences: a payload with no attempt fence is already in
   ).toEqual({ expected_attempt_id: null, expected_instance_event_id: 51 });
 });
 
+test("a merge-escalation incident clear composes through the incident-only fence: a LIVE matching attempt's sticky drops while its claim, pending lease, and mint gate survive", () => {
+  const { db } = freshMemDb();
+  const verb = "close";
+  const id = "fn-1-foo";
+  const key = `${verb}::${id}`;
+  // A bare `close::<epic>` MERGE-ESCALATION sticky — the class the reconcile loop's
+  // positive-evidence (merged-landed) level-clear targets — armed with a fully-live
+  // bound attempt. The clear routes through the SAME emit → handleDispatchClearedMint
+  // gate as the recover/lane clears, so a live claimant's attempt-owned state must
+  // survive exactly as the generic recover case above.
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES (?, ?,
+       'worktree-merge-conflict: merging keeper/epic/fn-1-foo--fn-1-foo.1 into keeper/epic/fn-1-foo',
+       '/repo', 1, ?, 1, 1, ?, ?)`,
+  ).run(
+    verb,
+    id,
+    INCIDENT_CLEAR_EVENT_ID,
+    INCIDENT_CLEAR_ATTEMPT_ID,
+    INCIDENT_CLEAR_EVENT_ID,
+  );
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, acquired_at, bound_at,
+        last_event_id, updated_at)
+     VALUES (?, ?, ?, 'bound', 'sess-live', 1, 2, ?, 2)`,
+  ).run(verb, id, INCIDENT_CLEAR_ATTEMPT_ID, INCIDENT_CLEAR_EVENT_ID);
+  db.query(
+    `INSERT INTO pending_dispatches
+       (verb, id, dir, dispatched_at, last_event_id, attempt_id)
+     VALUES (?, ?, '/repo', 2, ?, ?)`,
+  ).run(verb, id, INCIDENT_CLEAR_EVENT_ID, INCIDENT_CLEAR_ATTEMPT_ID);
+  upsertDispatchMintGate(db, key, 2, INCIDENT_CLEAR_ATTEMPT_ID);
+
+  // The producer names the currently-bound attempt; a LIVE claimant degrades it to an
+  // incident-only clear.
+  foldIncidentClear(db, verb, id, "matching");
+
+  expect(incidentRowsLeft(db, verb, id)).toBe(0);
+  expect(claimStateOf(db, verb, id)).toBe("bound");
+  expect(pendingRowsLeft(db, verb, id)).toBe(1);
+  expect(readDispatchMintGate(db, key)).toBe(2);
+  db.close();
+});
+
 test("clearDispatchMintGate: the low-level key-wide helper still removes its target row", () => {
   const { db } = freshMemDb();
   const key = "close::fn-1-foo";
@@ -7766,54 +7813,6 @@ test("the pending-owner-integration fan-in reason is the same merge-escalation c
   expect(
     deriveGrantLeafPath("/g", "sess", INCIDENT_RESOLVE_AGENT_TYPE),
   ).not.toBe(deriveGrantLeafPath("/g", "sess", INCIDENT_DECONFLICT_AGENT_TYPE));
-});
-
-test("mergeIncidentEntityResolved reads terminal entity state git-free (epic closed / task done)", () => {
-  const { db } = freshMemDb();
-  const cols =
-    "epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, last_validated_at";
-  const insert = db.query(
-    `INSERT INTO epics (${cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  insert.run(
-    "fn-8-done",
-    8,
-    "e",
-    "/repo",
-    "done",
-    0,
-    0,
-    JSON.stringify([
-      { task_id: "fn-8-done.1", runtime_status: "done" },
-      { task_id: "fn-8-done.2", runtime_status: "in_progress" },
-    ]),
-    "[]",
-    "[]",
-    "[]",
-    "2026-01-01T00:00:00Z",
-  );
-  insert.run(
-    "fn-8-open",
-    9,
-    "e",
-    "/repo",
-    "open",
-    0,
-    0,
-    "[]",
-    "[]",
-    "[]",
-    "[]",
-    "2026-01-01T00:00:00Z",
-  );
-
-  expect(mergeIncidentEntityResolved(db, "close", "fn-8-done")).toBe(true);
-  expect(mergeIncidentEntityResolved(db, "close", "fn-8-open")).toBe(false);
-  expect(mergeIncidentEntityResolved(db, "work", "fn-8-done.1")).toBe(true);
-  expect(mergeIncidentEntityResolved(db, "work", "fn-8-done.2")).toBe(false);
-  expect(mergeIncidentEntityResolved(db, "close", "fn-8-missing")).toBe(false);
-  expect(mergeIncidentEntityResolved(db, "block", "fn-8-done.1")).toBe(false);
-  db.close();
 });
 
 // ---------------------------------------------------------------------------

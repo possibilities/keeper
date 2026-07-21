@@ -866,6 +866,18 @@ export interface ReconcileSnapshot {
    */
   laneFailures?: { verb: Verb; id: string; dir: string }[];
   /**
+   * The `(verb, id)` of every OPEN MERGE-ESCALATION `dispatch_failures` row — a bare
+   * `close::<epic>` conflict (recover pass-2 escalation / close-sink genuine conflict)
+   * or a `work::<taskId>` fan-in `worktree-merge-conflict` row (a rib conflict or the
+   * pre-minted `pending owner integration` class), collected off the router's
+   * `merge-escalation` / `work-merge-conflict` classes. The reconcile loop's
+   * positive-evidence level-clear ({@link mergeEscalationFailuresToClear}) drops any
+   * whose epic's fan-in genuinely LANDED this cycle (merged into local default / torn
+   * down) — never on task/epic terminal status. Optional for call-site back-compat; an
+   * absent field is empty.
+   */
+  mergeEscalationFailures?: { verb: Verb; id: string }[];
+  /**
    * The lane worktree PATHS that currently have an OPEN per-lane wedge distress row
    * (synthetic `daemon::worktree-lane-wedge:<laneHash>`, collected off the row's
    * `dir`). PRODUCER-ONLY: read by the recover pass's lane grace tracker to
