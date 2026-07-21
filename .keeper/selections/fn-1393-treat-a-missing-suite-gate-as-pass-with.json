@@ -6,10 +6,10 @@
   },
   "cells": [
     {
-      "confidence": 0.6,
+      "confidence": 0.72,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Threads a new pass-with-note classification through the autopilot dispatch-failure taxonomy (recover/finalize) plus the baseline analogue, and must validate/extend the subtle positive-evidence level-clear invariant in a safety-critical, human-paging path under re-fold determinism constraints. Contract-shaped classification change where a wrong abstraction either spuriously pages humans or silently swallows real test failures \u2014 clears the opus gate on validating a subtle correctness invariant across a multi-file cascade; xhigh for the contract-touching blast radius.",
+      "rationale": "Introducing a new pass-with-note verdict while fixing the confirmed orphan-gap requires deriving and validating a subtle correctness invariant in the recover-cycle's positive-evidence level-clear and operator-paging lifecycle under fold-determinism constraints, a nameable intelligence-bound reason for opus at the contract-touching xhigh band rather than the max debugging ceiling since the hypothesis is already named.",
       "spark_exclusion": "subtle-invariant-reasoning",
       "spark_fit": false,
       "task_id": "fn-1393-treat-a-missing-suite-gate-as-pass-with.1",
@@ -17,15 +17,15 @@
     }
   ],
   "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
-  "created_at": "2026-07-21T06:21:16.742000Z",
+  "created_at": "2026-07-21T15:14:02.418000Z",
   "epic_id": "fn-1393-treat-a-missing-suite-gate-as-pass-with",
-  "input_hash": "43606b01d9febd35e66b32cfc8ca8e2147bcff21e239fb998233d9a760d2952c",
+  "input_hash": "99170634b8576eb66b41d8c1d5ed676d101790d5daa8b7b946bdd408bb48690c",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 1130392321,
-  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1393-treat-a-missing-suite-gate-as-pass-with.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Threads a new pass-with-note classification through the autopilot dispatch-failure taxonomy (recover/finalize) plus the baseline analogue, and must validate/extend the subtle positive-evidence level-clear invariant in a safety-critical, human-paging path under re-fold determinism constraints. Contract-shaped classification change where a wrong abstraction either spuriously pages humans or silently swallows real test failures \\u2014 clears the opus gate on validating a subtle correctness invariant across a multi-file cascade; xhigh for the contract-touching blast radius.\", \"confidence\": 0.6, \"spark_fit\": false, \"spark_exclusion\": \"subtle-invariant-reasoning\"}]}"
+  "shuffle_seed": 2568422964,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1393-treat-a-missing-suite-gate-as-pass-with.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Introducing a new pass-with-note verdict while fixing the confirmed orphan-gap requires deriving and validating a subtle correctness invariant in the recover-cycle's positive-evidence level-clear and operator-paging lifecycle under fold-determinism constraints, a nameable intelligence-bound reason for opus at the contract-touching xhigh band rather than the max debugging ceiling since the hypothesis is already named.\",\"confidence\":0.72,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"}]}\n"
 }
