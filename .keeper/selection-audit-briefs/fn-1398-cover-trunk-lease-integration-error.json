@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "medium",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 1,
+        "insertions": 51
+      },
+      "done_summary": "Added three saga cases (requestLease request_failed/pending, lockOk:false) covering the relocated TRUNK_LEASE_REQUEST_FAILED, TRUNK_LEASE_PENDING, and TRUNK_INTEGRATION_LOCK_TIMEOUT exits over the existing makeFakeTrunkDeps harness.",
+      "input_hash": "354b2b9bb6da2ec9bb0bb1ce20442a33d9ffec0b34b7f91c92e61b438a1d7c64",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1715,
+      "spec_md": "## Description\n\nCompletes finding F2 from the fn-1386-harden-trunk-lease-integration close\naudit. Task .1 relocated three error-emission branches out of\n`requestTrunkLease` into `integrateRepoUnderLease`\n(`plugins/plan/src/verbs/close_finalize.ts`, ~:200-215 and ~:860-877) but\nthe saga suite `plugins/plan/test/saga-close-finalize.test.ts` leaves them\nuncovered: `makeFakeTrunkDeps` (line ~1896) always returns\n`requestLease: {ok:true}` (line 1927) and no case sets its `lockOk` option\n(declared line 1888) to `false`. Add three saga cases over the existing\nharness:\n\n- `requestLease: () => ({ok:false, reason:\"request_failed\"})` asserting the\n  `TRUNK_LEASE_REQUEST_FAILED` error code.\n- `requestLease: () => ({ok:false, reason:\"pending\"})` asserting the\n  `TRUNK_LEASE_PENDING` error code.\n- `lockOk:false` asserting the lock-contention exit code.\n\nFiles: `plugins/plan/test/saga-close-finalize.test.ts` (extend the harness's\n`FakeTrunkDepsOptions` to script `requestLease` if needed; no production\ncode change).\n\n## Acceptance\n\n- [ ] A saga case injects `requestLease \u2192 {ok:false, reason:\"request_failed\"}` and asserts the `TRUNK_LEASE_REQUEST_FAILED` emit.\n- [ ] A saga case injects `requestLease \u2192 {ok:false, reason:\"pending\"}` and asserts the `TRUNK_LEASE_PENDING` emit.\n- [ ] A saga case sets `lockOk:false` and asserts the lock-contention exit code.\n- [ ] No production source under `plugins/plan/src/` is modified; the named test gate passes.\n\n## Done summary\nAdded three saga cases (requestLease request_failed/pending, lockOk:false) covering the relocated TRUNK_LEASE_REQUEST_FAILED, TRUNK_LEASE_PENDING, and TRUNK_INTEGRATION_LOCK_TIMEOUT exits over the existing makeFakeTrunkDeps harness.\n## Evidence\n",
+      "task_id": "fn-1398-cover-trunk-lease-integration-error.1",
+      "tier": "medium",
+      "title": "Cover trunk-lease error exits"
+    }
+  ],
+  "created_at": "2026-07-21T09:04:34.626000Z",
+  "epic_id": "fn-1398-cover-trunk-lease-integration-error",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "354b2b9bb6da2ec9bb0bb1ce20442a33d9ffec0b34b7f91c92e61b438a1d7c64",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
