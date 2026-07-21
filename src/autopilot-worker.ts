@@ -44,6 +44,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { clearDeadSessionMarker } from "../plugins/plan/src/session_markers.ts";
 import { loadMatrixV2, MatrixConfigError } from "./agent/matrix";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
@@ -2411,6 +2412,15 @@ export function runZombieSessionReaperStep(
     return decision;
   } catch {
     return { action: "page", reason: "signal-failed" };
+  }
+}
+
+export function clearDeadZombieSessionMarker(
+  sessionId: string,
+  decision: ZombieSessionReaperDecision,
+): void {
+  if (decision.action === "none" && decision.reason === "pid-dead") {
+    clearDeadSessionMarker(sessionId);
   }
 }
 
@@ -12510,6 +12520,7 @@ function main(): void {
                 }
                 continue;
               }
+              clearDeadZombieSessionMarker(job.job_id, reapDecision);
               const paneId = candidate.paneId;
               const paneOnlyReap =
                 candidate.reapClass === "occupancy" &&

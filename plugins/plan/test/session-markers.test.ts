@@ -19,10 +19,21 @@
 // session_markers.ts deliberately has no reader — that lives in plugin/hooks/lib).
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { SessionMarkerProcessProbe } from "../src/session_markers.ts";
+import {
+  clearDeadSessionMarker,
+  type SessionMarkerProcessProbe,
+} from "../src/session_markers.ts";
 import {
   type CliResult,
   parseCliOutput,
@@ -51,8 +62,19 @@ function cli(args: string[], proj: Proj): CliResult {
   });
 }
 
+function markerFileFor(home: string, sessionId: string): string {
+  return join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+}
+
 function markerFile(home: string): string {
-  return join(home, ".local", "state", "keeper", "sessions", `${SID}.json`);
+  return markerFileFor(home, SID);
 }
 
 function markerPresent(home: string): boolean {
@@ -61,6 +83,22 @@ function markerPresent(home: string): boolean {
 
 function readMarker(home: string): Record<string, unknown> {
   return JSON.parse(readFileSync(markerFile(home), "utf-8"));
+}
+
+function withDeadMarkerHome<T>(callback: (home: string) => T): T {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), "keeper-plan-dead-marker-"));
+  process.env.HOME = home;
+  try {
+    return callback(home);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 function scaffold(
@@ -130,6 +168,66 @@ function preflightReady(proj: Proj, title: string): string {
   expect(pf.code).toBe(0);
   return epicId;
 }
+
+describe("dead-session marker clear", () => {
+  test("clears the exact marker regardless of its recorded kind or target", () => {
+    withDeadMarkerHome((home) => {
+      const sessionId = "dead-close-session";
+      const path = markerFileFor(home, sessionId);
+      mkdirSync(join(home, ".local", "state", "keeper", "sessions"), {
+        recursive: true,
+      });
+      writeFileSync(
+        path,
+        JSON.stringify({
+          kind: "close",
+          epic_id: "fn-1394-marker",
+          session_id: sessionId,
+        }),
+      );
+
+      clearDeadSessionMarker(sessionId);
+
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+
+  test("does nothing when the exact marker is absent", () => {
+    withDeadMarkerHome((home) => {
+      expect(() => clearDeadSessionMarker("missing-session")).not.toThrow();
+      expect(existsSync(markerFileFor(home, "missing-session"))).toBe(false);
+    });
+  });
+
+  test("swallows and bounds logs for a marker filesystem error", () => {
+    withDeadMarkerHome((home) => {
+      const sessionId = "dead-marker-error";
+      const path = markerFileFor(home, sessionId);
+      mkdirSync(path, { recursive: true });
+      const previousWrite = process.stderr.write;
+      const writes: string[] = [];
+      process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        writes.push(
+          typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(),
+        );
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        expect(() => clearDeadSessionMarker(sessionId)).not.toThrow();
+      } finally {
+        process.stderr.write = previousWrite;
+      }
+
+      expect(existsSync(path)).toBe(true);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.length).toBeLessThanOrEqual(512);
+      expect(JSON.parse(writes[0] as string)).toMatchObject({
+        event: "dead_session_marker_clear_failed",
+        session_id: sessionId,
+      });
+    });
+  });
+});
 
 describe("marker writer schema", () => {
   const getProj = withProject("keeper-plan-marker-write-");

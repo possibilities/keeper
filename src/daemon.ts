@@ -33,6 +33,7 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import { clearDeadSessionMarker } from "../plugins/plan/src/session_markers.ts";
 import {
   type NonFableFocusDelivery,
   type NonFableFocusLeaf,
@@ -7341,6 +7342,9 @@ function releaseSettledProviderLegAttempts(
         session_id: row.wrapper_job_id,
       },
     );
+    if (row.wrapper_state === "ended" || row.wrapper_state === "killed") {
+      clearDeadSessionMarker(row.wrapper_job_id);
+    }
     acted = true;
   }
   return acted;

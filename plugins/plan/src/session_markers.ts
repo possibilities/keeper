@@ -36,7 +36,7 @@ const SCHEMA_VERSION = 2;
 // This is only a backstop for un-probeable markers; recycle-safe holders are
 // retained while live and discarded as soon as their process identity is dead.
 const CLOSE_CLAIM_STALE_MS = 24 * 60 * 60 * 1000;
-const ABANDONED_LOG_MAX_BYTES = 512;
+const MARKER_LOG_MAX_BYTES = 512;
 
 export type CloseClaimHolderLiveness = "alive" | "dead" | "unknown";
 
@@ -214,6 +214,36 @@ export function clearCloseMarker(epicId: string): void {
   clearIfMatches("epic_id", epicId);
 }
 
+function logDeadMarkerClearFailure(sessionId: string): void {
+  const boundedSessionId = sessionId
+    .replace(/[^\x20-\x7e]/g, "?")
+    .slice(0, 128);
+  const line = JSON.stringify({
+    level: "warn",
+    event: "dead_session_marker_clear_failed",
+    session_id: boundedSessionId,
+  });
+  try {
+    process.stderr.write(`${line.slice(0, MARKER_LOG_MAX_BYTES - 1)}\n`);
+  } catch {
+    // Logging must not affect terminal cleanup.
+  }
+}
+
+/** A caller that has confirmed a session terminal may release its marker. */
+export function clearDeadSessionMarker(sessionId: string): void {
+  try {
+    const path = markerPath(sessionId);
+    if (existsSync(path)) {
+      unlinkSync(path);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logDeadMarkerClearFailure(sessionId);
+    }
+  }
+}
+
 /** One close claim discovered on disk. */
 interface CloseClaim {
   sessionId: string;
@@ -231,7 +261,7 @@ function logAbandonedCloseClaim(sessionId: string, pid: number): void {
     pid,
   });
   try {
-    process.stderr.write(`${line.slice(0, ABANDONED_LOG_MAX_BYTES - 1)}\n`);
+    process.stderr.write(`${line.slice(0, MARKER_LOG_MAX_BYTES - 1)}\n`);
   } catch {
     // Logging must not affect close arbitration.
   }

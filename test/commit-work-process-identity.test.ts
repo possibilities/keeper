@@ -1,9 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
   isHarnessProcessCommand,
+  type SessionTerminationResult,
   type TerminationProcessObservation,
   terminateSessionProcess,
 } from "../cli/agent";
+import type { EnvelopeSink } from "../cli/envelope";
+import { type TerminateMainDeps, terminateMain } from "../cli/session";
+import type { LoadedTrackedSessionResolution } from "../cli/session-reference";
 import type { GitRunner } from "../src/commit-work/git-exec";
 import {
   invocationDescendsFrom,
@@ -316,6 +329,129 @@ describe("session terminate process discipline", () => {
       });
       expect(result.ok).toBe(false);
       expect(signals).toEqual([]);
+    }
+  });
+});
+
+type RefusalReason = Extract<SessionTerminationResult, { ok: false }>["reason"];
+
+class TerminateExit extends Error {
+  constructor(readonly code: number) {
+    super(`terminate exited ${code}`);
+  }
+}
+
+function markerPath(home: string, sessionId: string): string {
+  return join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+}
+
+async function withSessionMarker<T>(
+  sessionId: string,
+  callback: (home: string) => Promise<T>,
+): Promise<T> {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), "keeper-session-terminate-"));
+  const path = markerPath(home, sessionId);
+  mkdirSync(join(home, ".local", "state", "keeper", "sessions"), {
+    recursive: true,
+  });
+  writeFileSync(path, JSON.stringify({ session_id: sessionId, kind: "close" }));
+  process.env.HOME = home;
+  try {
+    return await callback(home);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function resolvedTerminationSession(
+  sessionId: string,
+): LoadedTrackedSessionResolution {
+  return {
+    kind: "resolved",
+    job: {
+      jobId: sessionId,
+      harness: "claude",
+      state: "stopped",
+      pid: 4242,
+      startTime: "linux:4242",
+    },
+  } as LoadedTrackedSessionResolution;
+}
+
+async function invokeTerminateMain(
+  result: SessionTerminationResult,
+): Promise<string> {
+  let stdout = "";
+  const sink: EnvelopeSink = {
+    writeStdout: (value) => {
+      stdout += value;
+    },
+    exit: (code): never => {
+      throw new TerminateExit(code);
+    },
+  };
+  const deps: TerminateMainDeps = {
+    resolveTrackedCliSession: () => resolvedTerminationSession("dead-session"),
+    terminateSessionProcess: async () => result,
+    sink,
+  };
+  try {
+    await terminateMain(["dead-session"], deps);
+  } catch (err) {
+    if (err instanceof TerminateExit) {
+      expect(err.code).toBe(result.ok ? 0 : 1);
+    } else {
+      throw err;
+    }
+  }
+  return stdout;
+}
+
+describe("session terminate marker cleanup", () => {
+  test("clears the marker after every confirmed-death outcome", async () => {
+    for (const result of [
+      { ok: true, signal: "SIGTERM", exited: true },
+      { ok: true, signal: "SIGKILL", exited: false },
+    ] as const) {
+      await withSessionMarker("dead-session", async (home) => {
+        const output = await invokeTerminateMain(result);
+        expect(existsSync(markerPath(home, "dead-session"))).toBe(false);
+        expect(JSON.parse(output)).toMatchObject({ ok: true });
+      });
+    }
+  });
+
+  test("retains the marker for every terminate refusal", async () => {
+    const reasons: readonly RefusalReason[] = [
+      "working",
+      "identity_unproven",
+      "command_unowned",
+      "signal_failed",
+    ];
+    for (const reason of reasons) {
+      await withSessionMarker("dead-session", async (home) => {
+        const output = await invokeTerminateMain({ ok: false, reason });
+        expect(existsSync(markerPath(home, "dead-session"))).toBe(true);
+        expect(JSON.parse(output)).toMatchObject({
+          ok: false,
+          error: {
+            code: `session_${reason}`,
+          },
+        });
+      });
     }
   });
 });
