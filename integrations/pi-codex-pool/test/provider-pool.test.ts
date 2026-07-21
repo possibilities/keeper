@@ -387,6 +387,8 @@ describe("provider registration and compatibility", () => {
       process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(aliases);
       process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING =
         routeState(aliases).binding;
+      delete process.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY;
+      delete process.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING;
       let openaiStream: any;
       const providers: string[] = [];
       installCodexPool({
@@ -2054,6 +2056,40 @@ describe("credential and route state", () => {
         exhausted: true,
       }),
     );
+  });
+
+  test("newer healthy usage clears an older scoped exhaustion cooldown", () => {
+    const aliases = ["keeper-codex-a"];
+    let now = 100;
+    const routes = routeState(aliases, () => now);
+
+    applyScopedUsage(routes, "keeper-codex-a", 100, null, now);
+    let scope = accountSnapshot(routes).quota_scopes.find(
+      (entry) => entry.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
+    );
+    expect(scope).toEqual(
+      expect.objectContaining({
+        observed_at_ms: 100,
+        used_percent: 100,
+        exhausted: true,
+      }),
+    );
+    expect(scope?.cooldown_until_ms).toBeGreaterThan(now);
+
+    now = 200;
+    applyScopedUsage(routes, "keeper-codex-a", 0, null, now);
+    scope = accountSnapshot(routes).quota_scopes.find(
+      (entry) => entry.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
+    );
+    expect(scope).toEqual(
+      expect.objectContaining({
+        observed_at_ms: 200,
+        used_percent: 0,
+        cooldown_until_ms: 0,
+        exhausted: false,
+      }),
+    );
+    expect(routes.select("recovered-session")).toBe("keeper-codex-a");
   });
 
   test("success does not clear a newer scoped or shared cooldown", () => {

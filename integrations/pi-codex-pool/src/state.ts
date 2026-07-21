@@ -512,12 +512,19 @@ function mergeScopeObservation(
   incoming: ScopeQuotaState,
   now: number,
 ): ScopeQuotaState {
-  const selected =
-    incoming.observed_at_ms > current.observed_at_ms
-      ? cloneScope(incoming)
-      : incoming.observed_at_ms < current.observed_at_ms
-        ? cloneScope(current)
-        : mergeEqualObservation(current, incoming);
+  if (incoming.observed_at_ms !== current.observed_at_ms) {
+    const selected =
+      incoming.observed_at_ms > current.observed_at_ms
+        ? cloneScope(incoming)
+        : cloneScope(current);
+    selected.cooldown_until_ms = activeUntil(
+      selected.cooldown_until_ms,
+      now,
+      PROVIDER_RESET_HORIZON_MS,
+    );
+    return selected;
+  }
+  const selected = mergeEqualObservation(current, incoming);
   selected.cooldown_until_ms = activeMaxUntil(
     current.cooldown_until_ms,
     incoming.cooldown_until_ms,
