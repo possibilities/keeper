@@ -77,6 +77,7 @@ const TRUNK_LEASE_REQUEST_DIRNAME = "requests";
 const TRUNK_LEASE_LEAF_DIRNAME = "leases";
 const MAX_TRUNK_LEASE_BYTES = 16 * 1024;
 const MAX_TRUNK_LEASE_REQUESTS = 256;
+const MAX_GRANT_REAP_INSPECTIONS = 256;
 
 function trunkLeaseRepoDigest(repoRoot: string): string {
   return createHash("sha256").update(repoRoot).digest("hex").slice(0, 32);
@@ -797,50 +798,150 @@ export function readGrantLeaf(
 
 const MAX_GRANT_BYTES = 8192;
 
-/** Read a bounded snapshot of valid owner-private grant leaves. Malformed,
- *  raced, or insecure leaves are omitted; callers still apply incident/expiry
- *  filters before treating a leaf as authority. */
-export function listGrantLeaves(grantsDir: string): GrantLeaf[] {
+interface GrantLeafRecord {
+  path: string;
+  grant: GrantLeaf;
+}
+
+function scanGrantLeafRecords(grantsDir: string): {
+  complete: boolean;
+  records: GrantLeafRecord[];
+} {
   if (
     grantsDir === "" ||
     !isAbsolute(grantsDir) ||
     !plainPrivateDir(grantsDir)
   ) {
-    return [];
+    return { complete: false, records: [] };
   }
-  const leaves: GrantLeaf[] = [];
+  const records: GrantLeafRecord[] = [];
+  let complete = false;
   let dir: ReturnType<typeof opendirSync> | null = null;
   try {
     dir = opendirSync(grantsDir);
-    for (
-      let inspected = 0;
-      inspected < MAX_TRUNK_LEASE_REQUESTS;
-      inspected += 1
-    ) {
+    while (true) {
       const entry = dir.readSync();
       if (entry === null) break;
       if (!entry.name.startsWith("grant-") || !entry.name.endsWith(".json")) {
         continue;
       }
-      const read = readOwnerPrivateLeaf(join(grantsDir, entry.name));
+      const path = join(grantsDir, entry.name);
+      const read = readOwnerPrivateLeaf(path);
       if ("verdict" in read) continue;
       const grant = parseGrant(read.bytes);
-      if (grant !== null) leaves.push(grant);
+      if (grant !== null) records.push({ path, grant });
     }
+    complete = true;
   } catch {
-    return leaves;
+    // A partial scan remains useful to read-only callers, never to the reaper.
   } finally {
     try {
       dir?.closeSync();
     } catch {
-      // A completed bounded read needs no recovery action.
+      // Directory closure does not change the completed snapshot.
     }
   }
-  return leaves.sort(
-    (a, b) =>
-      a.fencing_token - b.fencing_token ||
-      a.parent_job_id.localeCompare(b.parent_job_id),
+  return { complete, records };
+}
+
+/** Read every valid owner-private grant leaf. Malformed, raced, or insecure
+ *  leaves are omitted; callers still apply incident/expiry filters before
+ *  treating a leaf as authority. */
+export function listGrantLeaves(grantsDir: string): GrantLeaf[] {
+  return scanGrantLeafRecords(grantsDir)
+    .records.map(({ grant }) => grant)
+    .sort(
+      (a, b) =>
+        a.fencing_token - b.fencing_token ||
+        a.parent_job_id.localeCompare(b.parent_job_id),
+    );
+}
+
+export interface GrantReapCursor {
+  fencingToken: number;
+  path: string;
+}
+
+export interface GrantReapResult {
+  reaped: number;
+  nextCursor: GrantReapCursor | null;
+}
+
+/** Reap at most one bounded batch while retaining the greatest fencing token
+ *  as the crash-safe floor for the next grant publication. */
+export function reapGrantLeaves(
+  grantsDir: string,
+  shouldReap: (grant: GrantLeaf) => boolean,
+  cursor: GrantReapCursor | null = null,
+): GrantReapResult {
+  const scanned = scanGrantLeafRecords(grantsDir);
+  if (!scanned.complete) return { reaped: 0, nextCursor: cursor };
+  if (scanned.records.length === 0) return { reaped: 0, nextCursor: null };
+  const fencingFloor = scanned.records.reduce(
+    (max, { grant }) => Math.max(max, grant.fencing_token),
+    0,
   );
+  const records = scanned.records.sort(
+    (a, b) =>
+      a.grant.fencing_token - b.grant.fencing_token ||
+      a.path.localeCompare(b.path),
+  );
+  let start = 0;
+  if (cursor !== null) {
+    start = records.findIndex(
+      (record) =>
+        record.grant.fencing_token > cursor.fencingToken ||
+        (record.grant.fencing_token === cursor.fencingToken &&
+          record.path.localeCompare(cursor.path) > 0),
+    );
+    if (start < 0) return { reaped: 0, nextCursor: null };
+  }
+  const end = Math.min(start + MAX_GRANT_REAP_INSPECTIONS, records.length);
+  let reaped = 0;
+  for (let index = start; index < end; index += 1) {
+    const record = records[index] as GrantLeafRecord;
+    if (record.grant.fencing_token >= fencingFloor) continue;
+    if (
+      record.path !==
+      deriveGrantLeafPath(
+        grantsDir,
+        record.grant.parent_job_id,
+        record.grant.agent_type,
+      )
+    ) {
+      continue;
+    }
+    const read = readOwnerPrivateLeaf(record.path);
+    if ("verdict" in read) continue;
+    const current = parseGrant(read.bytes);
+    if (
+      current === null ||
+      current.fencing_token !== record.grant.fencing_token
+    ) {
+      continue;
+    }
+    let eligible = false;
+    try {
+      eligible = shouldReap(current);
+    } catch {
+      continue;
+    }
+    if (!eligible) continue;
+    try {
+      unlinkSync(record.path);
+      reaped += 1;
+    } catch {
+      // A raced or failed reap retries on a later sweep.
+    }
+  }
+  const last = records[end - 1] as GrantLeafRecord;
+  return {
+    reaped,
+    nextCursor:
+      end < records.length
+        ? { fencingToken: last.grant.fencing_token, path: last.path }
+        : null,
+  };
 }
 
 /** Publish `grant` under `grantsDir` (created 0o700 if absent). Writes a fresh

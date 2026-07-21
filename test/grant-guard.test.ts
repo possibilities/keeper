@@ -41,6 +41,7 @@ import {
   isGrantProtectedPath,
   listGrantLeaves,
   readGrantLeaf,
+  reapGrantLeaves,
   writableRootCovers,
   writeGrantLeaf,
 } from "../src/grant-leaf.ts";
@@ -1116,6 +1117,104 @@ describe("grant enumeration and in-session owner discovery", () => {
       ).toEqual([
         ["job-1", 7],
         ["job-2", 9],
+      ]);
+    });
+  });
+
+  test("listGrantLeaves finds the active holder beyond 256 entries", () => {
+    withGrantTmp((dir) => {
+      for (let token = 1; token <= 256; token += 1) {
+        const grant = makeGrant({
+          parent_job_id: `job-expired-${token}`,
+          expires_at: 4_000,
+          fencing_token: token,
+        });
+        writeFileSync(
+          deriveGrantLeafPath(dir, grant.parent_job_id, grant.agent_type),
+          JSON.stringify(grant),
+          { mode: 0o600 },
+        );
+      }
+      expect(listGrantLeaves(dir)).toHaveLength(256);
+
+      const active = makeGrant({
+        parent_job_id: "job-active-after-cap",
+        expires_at: 20_000,
+        fencing_token: 257,
+      });
+      writeFileSync(
+        deriveGrantLeafPath(dir, active.parent_job_id, active.agent_type),
+        JSON.stringify(active),
+        { mode: 0o600 },
+      );
+
+      const leaves = listGrantLeaves(dir);
+      expect(leaves).toHaveLength(257);
+      expect(
+        leaves
+          .filter((grant) => 5_000 < grant.expires_at)
+          .map((grant) => grant.parent_job_id),
+      ).toEqual(["job-active-after-cap"]);
+    });
+  });
+
+  test("reapGrantLeaves drains expired dead owners in bounded batches and retains the fencing floor", () => {
+    withGrantTmp((dir) => {
+      const deadOwners = new Set<string>();
+      for (let token = 1; token <= 258; token += 1) {
+        const parentJobId = `job-dead-${token}`;
+        deadOwners.add(parentJobId);
+        const grant = makeGrant({
+          parent_job_id: parentJobId,
+          expires_at: 4_000,
+          fencing_token: token,
+        });
+        writeFileSync(
+          deriveGrantLeafPath(dir, grant.parent_job_id, grant.agent_type),
+          JSON.stringify(grant),
+          { mode: 0o600 },
+        );
+      }
+      const expiredDeadOwner = (grant: GrantLeaf) =>
+        grant.expires_at <= 5_000 && deadOwners.has(grant.parent_job_id);
+
+      const first = reapGrantLeaves(dir, expiredDeadOwner);
+      expect(first.reaped).toBe(256);
+      expect(listGrantLeaves(dir).map((grant) => grant.fencing_token)).toEqual([
+        257, 258,
+      ]);
+      const second = reapGrantLeaves(dir, expiredDeadOwner, first.nextCursor);
+      expect(second.reaped).toBe(1);
+      expect(listGrantLeaves(dir).map((grant) => grant.fencing_token)).toEqual([
+        258,
+      ]);
+      expect(
+        reapGrantLeaves(dir, expiredDeadOwner, second.nextCursor).reaped,
+      ).toBe(0);
+    });
+  });
+
+  test("reapGrantLeaves fails open when its owner probe throws", () => {
+    withGrantTmp((dir) => {
+      for (const token of [7, 8]) {
+        const grant = makeGrant({
+          parent_job_id: `job-${token}`,
+          expires_at: 4_000,
+          fencing_token: token,
+        });
+        writeFileSync(
+          deriveGrantLeafPath(dir, grant.parent_job_id, grant.agent_type),
+          JSON.stringify(grant),
+          { mode: 0o600 },
+        );
+      }
+      expect(
+        reapGrantLeaves(dir, () => {
+          throw new Error("liveness unavailable");
+        }).reaped,
+      ).toBe(0);
+      expect(listGrantLeaves(dir).map((grant) => grant.fencing_token)).toEqual([
+        7, 8,
       ]);
     });
   });

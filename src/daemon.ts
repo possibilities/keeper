@@ -274,10 +274,12 @@ import type {
 import {
   GRANT_LEAF_SCHEMA_VERSION,
   type GrantLeaf,
+  type GrantReapCursor,
   listGrantLeaves,
   listTrunkLeaseLeaves,
   readTrunkLeaseLeaf,
   readTrunkLeaseRequests,
+  reapGrantLeaves,
   removeTrunkLeaseRequest,
   type SpooledTrunkLeaseRequest,
   TRUNK_LEASE_SCHEMA_VERSION,
@@ -14503,6 +14505,7 @@ function startDaemonWithExitAttribution(
   // CLI's `currentToolchain()`, so all compose the identical key for one (repo, tip).
   const baselineToolchain = currentToolchain();
   const repairGrantsDir = join(keeperStateDir(), "grants");
+  let repairGrantReapCursor: GrantReapCursor | null = null;
 
   // Read a repo's current default-branch tip off the `git_status` projection (the
   // git-worker's feed) — the sha half of the newest-tip baseline key. Null when no seeded
@@ -15044,6 +15047,23 @@ function startDaemonWithExitAttribution(
       mintMaintenanceTask: (group) => mintMaintenanceTask(group),
       noteLine: note,
     });
+    const reapNowMs = Date.now();
+    try {
+      const result = reapGrantLeaves(
+        repairGrantsDir,
+        (grant) =>
+          reapNowMs >= grant.expires_at &&
+          repairGrantHolderLiveness(grant) === "dead",
+        repairGrantReapCursor,
+      );
+      repairGrantReapCursor = result.nextCursor;
+    } catch (err) {
+      note(
+        `# warn: repair grant reap threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
 
     // Sustained-dirt distress step — the LIVE producer for the `shared-checkout-dirty`
     // family. Runs AFTER the sweep so a row minted this tick names itself on the NEXT
