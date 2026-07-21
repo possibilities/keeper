@@ -7803,6 +7803,11 @@ export async function runMergeSuiteGate(
       };
     }
     const notes: string[] = [];
+    // Universal provisioning (docs/adr/0074): share the source checkout's
+    // installed stores — root AND nested package dirs — before any gate runs.
+    // Without the nested links, every test file importing a sub-package crashes
+    // at module resolution and the gate reads as an empty-digest red.
+    await gitEnsureWorktreeDepLink(args.repoDir, scratchPath);
     const rootVerdict = await runPackageSuiteGate(scratchPath, {
       installTimeoutMs,
       suiteDeadlineMs,
