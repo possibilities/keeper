@@ -196,10 +196,12 @@ interface ResultBase {
   computedAt: number;
 }
 
-/** The suite ran clean — the ONLY status a reader may treat as "no pre-existing failures". */
+/** The configured suite passed, or no suite was configured for this repo. */
 export interface GreenResult extends ResultBase {
   status: "green";
   runs: SuiteRun[];
+  /** Present only when green means there was no configured suite to run. */
+  note?: string;
 }
 
 /** The suite ran and tests failed, with derived flaky-suspect marks. */
@@ -282,12 +284,13 @@ export function buildRequest(
 // ── verdict logic (pure) ─────────────────────────────────────────────────────
 
 /**
- * The result of ATTEMPTING to compute a baseline. The discriminant forces the
- * caller through one branch — an infra failure or a timeout can never be handed
- * to the "ran" path, so {@link deriveResult} cannot classify a non-run as green.
+ * The result of ATTEMPTING to compute a baseline. The discriminant keeps an infra
+ * failure or timeout out of the positive paths; `pass-with-note` is the explicit
+ * positive verdict for a repo with no configured suite.
  */
 export type BaselineOutcome =
   | { kind: "ran"; runs: SuiteRun[] }
+  | { kind: "pass-with-note"; note: string }
   | { kind: "timeout"; deadlineMs: number; runs: SuiteRun[] }
   | { kind: "infra"; infra: InfraKind; message: string };
 
@@ -342,10 +345,11 @@ export function classifyFailures(runs: SuiteRun[]): FailingTest[] {
 
 /**
  * Classify a completed computation into the durable envelope. The infra and
- * timeout branches return WITHOUT ever reaching the green/red decision, so an
- * "the run could not happen" outcome is structurally unable to type-check or
- * evaluate to green. A "ran" outcome is green ONLY when zero tests failed; any
- * failing test yields suite-red with derived flaky marks. PURE.
+ * timeout branches return WITHOUT ever reaching the green/red decision, so a
+ * configured run that could not happen is structurally unable to evaluate to green.
+ * `pass-with-note` derives a green envelope with its bounded annotation and no
+ * synthetic run. A "ran" outcome is green ONLY when zero tests failed; any failing
+ * test yields suite-red with derived flaky marks. PURE.
  *
  * Caller contract: `kind: "ran"` carries at least one completed run. A suite that
  * could not start at all is an `infra`/`spawn` outcome, not an empty "ran".
@@ -360,6 +364,14 @@ export function deriveResult(params: {
   const { key, sha, toolchain, computedAt, outcome } = params;
   const base: ResultBase = { key, sha, toolchain, computedAt };
 
+  if (outcome.kind === "pass-with-note") {
+    return {
+      ...base,
+      status: "green",
+      runs: [],
+      note: boundString(outcome.note, MAX_MESSAGE_LEN),
+    };
+  }
   if (outcome.kind === "infra") {
     return {
       ...base,
@@ -592,7 +604,17 @@ function coerceResult(v: unknown): BaselineResult | null {
   switch (v.status) {
     case "green": {
       const runs = coerceRuns(v.runs);
-      return runs ? { ...base, status: "green", runs } : null;
+      if (!runs || (v.note !== undefined && typeof v.note !== "string")) {
+        return null;
+      }
+      return {
+        ...base,
+        status: "green",
+        runs,
+        ...(typeof v.note === "string"
+          ? { note: boundString(v.note, MAX_MESSAGE_LEN) }
+          : {}),
+      };
     }
     case "suite-red": {
       const runs = coerceRuns(v.runs);

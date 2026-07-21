@@ -180,6 +180,20 @@ test("a clean 'ran' outcome derives green", () => {
   expect(res.status).toBe("green");
 });
 
+test("a pass-with-note outcome derives a durable green result with no synthetic run", () => {
+  const res = deriveResult({
+    ...DERIVE_BASE,
+    outcome: { kind: "pass-with-note", note: "no suite configured" },
+  });
+  expect(res).toEqual({
+    ...DERIVE_BASE,
+    status: "green",
+    runs: [],
+    note: "no suite configured",
+  });
+  expect(parseLeaf(JSON.stringify(res))).toEqual(res);
+});
+
 test("a red run with a same-sha retry marks fail-then-pass as flaky-suspect", () => {
   // run1 fails A and B; the retry fails only A → B passed on retry (flaky), A hard.
   const res = deriveResult({
