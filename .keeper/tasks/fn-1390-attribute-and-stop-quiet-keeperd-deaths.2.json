@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add OS kill evidence and RSS ramp to the enrich verdict",
-  "updated_at": "2026-07-20T20:26:03.020000Z"
+  "updated_at": "2026-07-21T06:32:08.840000Z",
+  "worker_done_at": "2026-07-21T06:32:08.840000Z"
 }
