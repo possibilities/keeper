@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-21T19:06:12.669000Z",
+  "created_by_close_of": "fn-1394-probe-close-claim-holder-liveness-and",
+  "depends_on_epics": [
+    "fn-1394-probe-close-claim-holder-liveness-and"
+  ],
+  "id": "fn-1401-fix-close-claim-liveness-probe-buffer",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix close-claim liveness probe buffer cap",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-21T19:06:12.669000Z"
+}

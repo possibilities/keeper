@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-21T19:06:12.669000Z",
+  "depends_on": [],
+  "epic": "fn-1401-fix-close-claim-liveness-probe-buffer",
+  "id": "fn-1401-fix-close-claim-liveness-probe-buffer.1",
+  "model": "gpt-5.3-codex-spark",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Raise darwin start-time probe buffer",
+  "updated_at": "2026-07-21T19:06:12.669000Z"
+}
