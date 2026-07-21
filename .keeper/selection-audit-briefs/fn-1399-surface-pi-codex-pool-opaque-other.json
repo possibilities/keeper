@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 5,
+        "insertions": 414
+      },
+      "done_summary": "Widened the auth classifier regex for login/session-expiry and credential invalid/expired/missing phrasings, made pre-substantive other-classified pool failures failover once via the existing attempt/exclusion machinery, and added a bounded private NDJSON failure log capturing the real upstream message while the sanitized event stream keeps carrying only the code.",
+      "input_hash": "811508d15d02a76e134ef724a1fb24fff26a10e074aaf7401d4f2c5ce545ca73",
+      "model": "sonnet",
+      "spec_chars": 3139,
+      "spec_md": "## Description\n\nIn integrations/pi-codex-pool/src/pool.ts (with tests beside the\nexisting test/provider-pool.test.ts and test/seams.test.ts):\n\n- Private failure record (visibility): on every terminal classified\n  pool failure, write ONE bounded private JSON record carrying the\n  REAL upstream error text (currently captured as `lastErrorMessage`\n  and then discarded by `sanitizedErrorEvent`), keyed by\n  session/attempt, alias/route, and failure class, to a private file\n  under the pool's existing state directory (see src/state.ts for the\n  resolution seam). The file must be size- or count-bounded (cap and\n  truncate/rotate; never unbounded growth). Attacker-influenced\n  payload rules apply: one bounded JSON line per record, length-capped\n  message text, no shell/NDJSON injection. The sanitized event stream\n  visible to the harness keeps carrying ONLY the code\n  (`pool-other-failure` etc.) exactly as today.\n- Failover eligibility (the dead-request fix): an `other`-classified\n  failure that occurs BEFORE any substantive output (the existing\n  `substantive()` seam, pool.ts:193-204) becomes failover-eligible\n  exactly once - ride the existing `delegatedAttempts < 2` bound and\n  route-exclusion machinery rather than inventing a new counter. An\n  `other` failure AFTER substantive output keeps today's non-retryable\n  behavior (a mid-stream resend could duplicate side effects).\n- Auth regex widening (the known miss): extend the auth class regex\n  (pool.ts:157-163) with login/credential-expiry phrasings the current\n  pattern misses (e.g. \"not logged in\", \"login expired\",\n  \"session expired\", \"please run .* login\", \"credentials? (are )?\n  (invalid|expired|missing)\") - anchor each added alternative to a\n  real codex CLI phrasing where a specimen is recoverable (the new\n  private failure log is the forward corpus; keep additions\n  conservative, no catch-alls that would swallow genuine other-class\n  text).\n\nThis surface is NOT daemon-resident (integrations/ is outside every\ndaemon-load-root), so no daemon restart is owed on landing.\n\n## Acceptance\n\n- [ ] A pre-substantive `other` failure attempts exactly one failover\n      to an eligible alternate route; a post-substantive `other`\n      failure does not retry (tests through the existing pool seams).\n- [ ] Every terminal pool failure writes one bounded private record\n      carrying the real upstream message; the sanitized event stream\n      still carries only the sanitized code.\n- [ ] The private failure log is bounded (cap enforced by test) and\n      each record's message text is length-capped.\n- [ ] A login/credential-expiry phrasing outside today's auth regex\n      classifies as `auth` (regression test), and all existing\n      classifier tests stay green.\n\n## Done summary\nWidened the auth classifier regex for login/session-expiry and credential invalid/expired/missing phrasings, made pre-substantive other-classified pool failures failover once via the existing attempt/exclusion machinery, and added a bounded private NDJSON failure log capturing the real upstream message while the sanitized event stream keeps carrying only the code.\n## Evidence\n",
+      "task_id": "fn-1399-surface-pi-codex-pool-opaque-other.1",
+      "tier": "xhigh",
+      "title": "Log real pool failure text privately and failover pre-substantive other failures once"
+    }
+  ],
+  "created_at": "2026-07-21T14:06:48.649000Z",
+  "epic_id": "fn-1399-surface-pi-codex-pool-opaque-other",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "811508d15d02a76e134ef724a1fb24fff26a10e074aaf7401d4f2c5ce545ca73",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
