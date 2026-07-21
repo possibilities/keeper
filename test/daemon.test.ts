@@ -93,6 +93,8 @@ import {
   collapseRestartLedger,
   compactRestartLedger,
   createExitAttributionRecorder,
+  createMaintenanceMintGate,
+  createNonReentrantRepairSweepTick,
   DEAD_LETTER_RETENTION_MS,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
@@ -9411,6 +9413,109 @@ test("runRepairEscalationSweep: an already-open maintenance task suppresses re-m
   await runRepairEscalationSweep(deps);
   expect(maintenanceProbed).toEqual(["repo-abc"]);
   expect(maintenanceMinted).toEqual([]);
+});
+
+test("maintenance mint gate suppresses a second sweep before the minted epic folds", async () => {
+  const fixture = fakeRepairSweepDeps({
+    candidates: [repairCandidate("", "baseline-tip::repo-abc")],
+    rows: [repairRow()],
+  });
+  const gate = createMaintenanceMintGate();
+  const projectionProbe = fixture.deps.hasOpenMaintenanceTask;
+  const mint = fixture.deps.mintMaintenanceTask;
+  const deps: RepairEscalationSweepDeps = {
+    ...fixture.deps,
+    hasOpenMaintenanceTask: (group) =>
+      gate.hasOpen(
+        group,
+        projectionProbe(group)
+          ? [{ epicId: "existing-maintenance", open: true }]
+          : [],
+      ),
+    mintMaintenanceTask: (group) =>
+      gate.mint(group, async (recordEpicId) => {
+        recordEpicId("minted-maintenance");
+        return mint(group);
+      }),
+  };
+
+  await runRepairEscalationSweep(deps);
+  await runRepairEscalationSweep(deps);
+
+  expect(fixture.maintenanceProbed).toEqual(["repo-abc", "repo-abc"]);
+  expect(fixture.maintenanceMinted).toEqual(["repo-abc"]);
+});
+
+test("maintenance mint gate ignores historical done epics while a new mint is pending", async () => {
+  const gate = createMaintenanceMintGate();
+  const group = repairCandidate("", "baseline-tip::repo-abc");
+  const historical = [{ epicId: "old-maintenance", open: false }];
+  let attempts = 0;
+
+  expect(gate.hasOpen(group, historical)).toBe(false);
+  expect(
+    await gate.mint(group, async (recordEpicId) => {
+      attempts += 1;
+      recordEpicId("new-maintenance");
+      return "minted";
+    }),
+  ).toBe("minted");
+  expect(gate.hasOpen(group, historical)).toBe(true);
+  expect(
+    await gate.mint(group, async () => {
+      attempts += 1;
+      return "minted";
+    }),
+  ).toBe("minted");
+  expect(attempts).toBe(1);
+  expect(
+    gate.hasOpen(group, [
+      ...historical,
+      { epicId: "new-maintenance", open: true },
+    ]),
+  ).toBe(true);
+  expect(
+    gate.hasOpen(group, [
+      ...historical,
+      { epicId: "new-maintenance", open: false },
+    ]),
+  ).toBe(false);
+});
+
+test("repair escalation sweep tick is non-reentrant", async () => {
+  let calls = 0;
+  let releaseFirst = () => {};
+  const firstBlocked = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const tick = createNonReentrantRepairSweepTick(async () => {
+    calls += 1;
+    if (calls === 1) await firstBlocked;
+  });
+
+  const first = tick();
+  await tick();
+  expect(calls).toBe(1);
+
+  releaseFirst();
+  await first;
+  await tick();
+  expect(calls).toBe(2);
+});
+
+test("maintenance mint gate releases a failed mint for fail-open retry", async () => {
+  const gate = createMaintenanceMintGate();
+  const group = repairCandidate("", "baseline-tip::repo-abc");
+  let attempts = 0;
+  const mint = () => {
+    attempts += 1;
+    return Promise.resolve("mint_failed" as const);
+  };
+
+  expect(await gate.mint(group, mint)).toBe("mint_failed");
+  expect(gate.hasOpen(group, [])).toBe(false);
+  expect(await gate.mint(group, mint)).toBe("mint_failed");
+  expect(attempts).toBe(2);
 });
 
 test("runRepairEscalationSweep: a failed maintenance mint pages exactly once", async () => {
