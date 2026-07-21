@@ -30,5 +30,5 @@ seams; assert on injected sinks, never on wall time.
 - [ ] `bun test ./test/tmux-control-worker.test.ts` and `bun run typecheck` green
 
 ## Done summary
-
+Fixed the wip loop-level reconnect-cap regression test: routed supervise's connect gate through the already-injectable ctx.readJobs seam and corrected the scripted 11th-connection transcript's double-escaped newlines/tabs that left the parser handshake unsettled. bun test ./test/tmux-control-worker.test.ts and bun run typecheck are green.
 ## Evidence

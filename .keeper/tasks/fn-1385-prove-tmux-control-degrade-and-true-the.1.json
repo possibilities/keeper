@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Prove degrade-in-place at loop level",
-  "updated_at": "2026-07-20T12:18:22.395000Z"
+  "updated_at": "2026-07-21T13:00:25.943000Z",
+  "worker_done_at": "2026-07-21T13:00:25.943000Z"
 }
