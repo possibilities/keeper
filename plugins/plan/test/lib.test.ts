@@ -55,19 +55,23 @@ describe("readMarker", () => {
     expect(await readMarker("")).toBeNull();
   });
 
-  test("reads a fresh work marker honoring the schema-1 fields", async () => {
+  test("reads a fresh work marker honoring the schema-2 fields", async () => {
     writeMarker(SESSION, {
       schema_version: SCHEMA_VERSION,
       session_id: SESSION,
       kind: "work",
       task_id: "fn-1-x.2",
       created_at: "2026-06-11T00:00:00Z",
+      pid: 4242,
+      start_time: "test:process-start",
     });
     const marker = await readMarker(SESSION);
     expect(marker).not.toBeNull();
     expect(marker?.kind).toBe("work");
     expect(marker?.task_id).toBe("fn-1-x.2");
-    expect(marker?.schema_version).toBe(1);
+    expect(marker?.schema_version).toBe(2);
+    expect(marker?.pid).toBe(4242);
+    expect(marker?.start_time).toBe("test:process-start");
   });
 
   test("reads a close marker carrying epic_id", async () => {

@@ -3,7 +3,7 @@
 // (translated | cited | drop-with-reason). 28 inventory nodes.
 //
 // The marker file is one JSON per session at
-// <HOME>/.local/state/keeper/sessions/<sid>.json (schema_version 1). Every CLI
+// <HOME>/.local/state/keeper/sessions/<sid>.json (schema_version 2). Every CLI
 // call here pins CLAUDE_CODE_SESSION_ID to a fixed value via `cli()`, so the
 // writer side (claim / worker resume write a work marker; done / block /
 // close-finalize clear a matching one; close-preflight writes a close marker) is
@@ -19,15 +19,28 @@
 // session_markers.ts deliberately has no reader — that lives in plugin/hooks/lib).
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  clearDeadSessionMarker,
+  type SessionMarkerProcessProbe,
+} from "../src/session_markers.ts";
 import {
   type CliResult,
   parseCliOutput,
   runCli,
   scaffoldEpic,
   seedRuntime,
+  TEST_SESSION_MARKER_START_TIME,
   withProject,
 } from "./harness.ts";
 
@@ -49,8 +62,19 @@ function cli(args: string[], proj: Proj): CliResult {
   });
 }
 
+function markerFileFor(home: string, sessionId: string): string {
+  return join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+}
+
 function markerFile(home: string): string {
-  return join(home, ".local", "state", "keeper", "sessions", `${SID}.json`);
+  return markerFileFor(home, SID);
 }
 
 function markerPresent(home: string): boolean {
@@ -59,6 +83,22 @@ function markerPresent(home: string): boolean {
 
 function readMarker(home: string): Record<string, unknown> {
   return JSON.parse(readFileSync(markerFile(home), "utf-8"));
+}
+
+function withDeadMarkerHome<T>(callback: (home: string) => T): T {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), "keeper-plan-dead-marker-"));
+  process.env.HOME = home;
+  try {
+    return callback(home);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 
 function scaffold(
@@ -74,7 +114,7 @@ function scaffold(
 
 // In-process helper unit nodes — CITED, not re-translated. -------------------
 // test_session_markers.py::test_read_marker_roundtrip
-//   -> CITED lib.test.ts "reads a fresh work marker honoring the schema-1 fields".
+//   -> CITED lib.test.ts "reads a fresh work marker honoring the schema-2 fields".
 // test_session_markers.py::test_read_marker_missing_returns_none
 //   -> CITED lib.test.ts "returns null for an absent marker".
 // test_session_markers.py::test_read_marker_unlinks_stale
@@ -129,20 +169,82 @@ function preflightReady(proj: Proj, title: string): string {
   return epicId;
 }
 
+describe("dead-session marker clear", () => {
+  test("clears the exact marker regardless of its recorded kind or target", () => {
+    withDeadMarkerHome((home) => {
+      const sessionId = "dead-close-session";
+      const path = markerFileFor(home, sessionId);
+      mkdirSync(join(home, ".local", "state", "keeper", "sessions"), {
+        recursive: true,
+      });
+      writeFileSync(
+        path,
+        JSON.stringify({
+          kind: "close",
+          epic_id: "fn-1394-marker",
+          session_id: sessionId,
+        }),
+      );
+
+      clearDeadSessionMarker(sessionId);
+
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+
+  test("does nothing when the exact marker is absent", () => {
+    withDeadMarkerHome((home) => {
+      expect(() => clearDeadSessionMarker("missing-session")).not.toThrow();
+      expect(existsSync(markerFileFor(home, "missing-session"))).toBe(false);
+    });
+  });
+
+  test("swallows and bounds logs for a marker filesystem error", () => {
+    withDeadMarkerHome((home) => {
+      const sessionId = "dead-marker-error";
+      const path = markerFileFor(home, sessionId);
+      mkdirSync(path, { recursive: true });
+      const previousWrite = process.stderr.write;
+      const writes: string[] = [];
+      process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+        writes.push(
+          typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(),
+        );
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        expect(() => clearDeadSessionMarker(sessionId)).not.toThrow();
+      } finally {
+        process.stderr.write = previousWrite;
+      }
+
+      expect(existsSync(path)).toBe(true);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.length).toBeLessThanOrEqual(512);
+      expect(JSON.parse(writes[0] as string)).toMatchObject({
+        event: "dead_session_marker_clear_failed",
+        session_id: sessionId,
+      });
+    });
+  });
+});
+
 describe("marker writer schema", () => {
   const getProj = withProject("keeper-plan-marker-write-");
 
   // test_session_markers.py::test_write_work_marker_schema
-  test("claim writes a schema-1 work marker naming the task", () => {
+  test("claim writes a schema-2 work marker with process identity", () => {
     const proj = getProj();
     const { taskIds } = claimFirst(proj);
     const rec = readMarker(proj.home);
-    expect(rec.schema_version).toBe(1);
+    expect(rec.schema_version).toBe(2);
     expect(rec.session_id).toBe(SID);
     expect(rec.kind).toBe("work");
     expect(rec.task_id).toBe(taskIds[0]);
     expect(typeof rec.created_at).toBe("string");
     expect((rec.created_at as string).length).toBeGreaterThan(0);
+    expect(rec.pid).toBe(process.pid);
+    expect(rec.start_time).toBe(TEST_SESSION_MARKER_START_TIME);
   });
 
   test("a tracked Pi job owns its work marker", () => {
@@ -172,14 +274,16 @@ describe("marker writer schema", () => {
   });
 
   // test_session_markers.py::test_write_close_marker_schema
-  test("close-preflight writes a schema-1 close marker carrying epic_id", () => {
+  test("close-preflight writes a schema-2 close marker carrying epic_id", () => {
     const proj = getProj();
     const epicId = preflightReady(proj, "Close marker epic");
     const rec = readMarker(proj.home);
-    expect(rec.schema_version).toBe(1);
+    expect(rec.schema_version).toBe(2);
     expect(rec.session_id).toBe(SID);
     expect(rec.kind).toBe("close");
     expect(rec.epic_id).toBe(epicId);
+    expect(rec.pid).toBe(process.pid);
+    expect(rec.start_time).toBe(TEST_SESSION_MARKER_START_TIME);
     expect("task_id" in rec).toBe(false);
   });
 });
@@ -370,11 +474,23 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
   const SID_A = "close-session-a";
   const SID_B = "close-session-b";
 
-  function preflight(proj: Proj, epicId: string, sid: string): CliResult {
+  function preflight(
+    proj: Proj,
+    epicId: string,
+    sid: string,
+    opts: {
+      probe?: SessionMarkerProcessProbe;
+      now?: string;
+    } = {},
+  ): CliResult {
     return runCli(["close-preflight", epicId, "--project", proj.root], {
       cwd: proj.root,
       home: proj.home,
-      env: { CLAUDE_CODE_SESSION_ID: sid },
+      env: {
+        CLAUDE_CODE_SESSION_ID: sid,
+        ...(opts.now === undefined ? {} : { KEEPER_PLAN_NOW: opts.now }),
+      },
+      sessionMarkerProcessProbe: opts.probe,
     });
   }
 
@@ -394,99 +510,153 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
     return epicId;
   }
 
-  /** Re-stamp a marker's recorded pid. The preflight CLI subprocess has exited
-   * by the time the rival scans, so a "live rival" scenario pins the marker to
-   * a pid that is genuinely alive (this test runner's own). */
-  function stampMarkerPid(home: string, sid: string, pid: number): void {
+  function rewriteMarker(
+    home: string,
+    sid: string,
+    mutate: (record: Record<string, unknown>) => void,
+  ): void {
     const path = markerFor(home, sid);
     const record = JSON.parse(readFileSync(path, "utf-8")) as Record<
       string,
       unknown
     >;
-    record.pid = pid;
+    mutate(record);
     writeFileSync(path, JSON.stringify(record));
   }
 
-  /** A pid that is dead right now, found by pure ESRCH probing — no process is
-   * ever launched (fast-tier policy). High pids are scanned downward; macOS
-   * allocates sequentially, so a just-freed high pid stays free for the test's
-   * lifetime. */
-  function deadPid(): number {
-    for (let pid = 99990; pid > 90000; pid--) {
-      try {
-        process.kill(pid, 0);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ESRCH") return pid;
-      }
-    }
-    throw new Error("no dead pid found in probe range");
+  function processProbe(
+    holderLiveness: SessionMarkerProcessProbe["holderLiveness"],
+  ): SessionMarkerProcessProbe {
+    return {
+      readStartTime: () => TEST_SESSION_MARKER_START_TIME,
+      holderLiveness,
+    };
   }
 
-  test("a second concurrent close claim fails loud; the first is unaffected", () => {
+  function isoAt(epochMs: number): string {
+    return new Date(epochMs).toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");
+  }
+
+  test("a live holder wins oldest-first even beyond the stale backstop", () => {
     const proj = getProj();
     const epicId = readyEpic(proj, "Exclusive close epic");
+    const old = isoAt(Date.now() - 48 * 60 * 60 * 1000);
 
-    // Session A claims first — succeeds and holds the marker. Pin A's marker
-    // to a live pid so it reads as a live rival to B.
+    expect(preflight(proj, epicId, SID_B, { now: old }).code).toBe(0);
     const a = preflight(proj, epicId, SID_A);
-    expect(a.code).toBe(0);
-    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
-    stampMarkerPid(proj.home, SID_A, process.pid);
-
-    // Session B races the same epic — loses, fails loud with the typed
-    // CLOSE_ALREADY_CLAIMED error, and leaves no marker of its own.
-    const b = preflight(proj, epicId, SID_B);
-    expect(b.code).not.toBe(0);
-    const env = parseCliOutput(b.output);
+    expect(a.code).not.toBe(0);
+    const env = parseCliOutput(a.output);
     expect(env.success).toBe(false);
     const error = env.error as {
       code: string;
       details?: Record<string, unknown>;
     };
     expect(error.code).toBe("CLOSE_ALREADY_CLAIMED");
-    expect(error.details?.held_by_session).toBe(SID_A);
-    expect(existsSync(markerFor(proj.home, SID_B))).toBe(false);
+    expect(error.details?.held_by_session).toBe(SID_B);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(false);
+    expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
+  });
 
-    // A's claim survives B's failed attempt.
+  test("live claim timestamp ties break on session id", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Close claim tie epic");
+    const tie = isoAt(Date.now());
+
+    expect(preflight(proj, epicId, SID_B, { now: tie }).code).toBe(0);
+    expect(preflight(proj, epicId, SID_A, { now: tie }).code).toBe(0);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+    expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
+  });
+
+  test("a dead holder loses in the same pass and its marker is removed with one bounded log", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Dead holder epic");
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+
+    const calls: Array<{ pid: number; startTime: string }> = [];
+    const deadProbe = processProbe((pid, startTime) => {
+      calls.push({ pid, startTime });
+      return "dead";
+    });
+    const b = preflight(proj, epicId, SID_B, { probe: deadProbe });
+
+    expect(b.code).toBe(0);
+    expect(calls).toEqual([
+      { pid: process.pid, startTime: TEST_SESSION_MARKER_START_TIME },
+    ]);
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(false);
+    expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
+    const logLines = b.stderr
+      .trim()
+      .split("\n")
+      .filter((line) => line.includes("abandoned_close_claim_removed"));
+    expect(logLines).toHaveLength(1);
+    expect(Buffer.byteLength(logLines[0] as string)).toBeLessThanOrEqual(512);
+    expect(JSON.parse(logLines[0] as string)).toMatchObject({
+      event: "abandoned_close_claim_removed",
+      session_id: SID_A,
+      pid: process.pid,
+    });
+  });
+
+  test("an old-schema marker stays authoritative within the 24-hour backstop", () => {
+    const proj = getProj();
+    const epicId = readyEpic(proj, "Legacy marker epic");
+    expect(preflight(proj, epicId, SID_A).code).toBe(0);
+    rewriteMarker(proj.home, SID_A, (record) => {
+      record.schema_version = 1;
+      record.created_at = isoAt(Date.now() - 23 * 60 * 60 * 1000);
+      delete record.pid;
+      delete record.start_time;
+    });
+
+    let probeCalls = 0;
+    const b = preflight(proj, epicId, SID_B, {
+      probe: processProbe(() => {
+        probeCalls++;
+        return "dead";
+      }),
+    });
+    expect(b.code).not.toBe(0);
+    expect(probeCalls).toBe(0);
+    expect((parseCliOutput(b.output).error as { code: string }).code).toBe(
+      "CLOSE_ALREADY_CLAIMED",
+    );
     expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
   });
 
-  test("a dead holder's close claim never blocks a re-close (killed-closer leak)", () => {
+  test("an unprobeable old-schema marker expires after the 24-hour backstop", () => {
     const proj = getProj();
-    const epicId = readyEpic(proj, "Dead holder epic");
-
-    // Session A claims, then its process "dies" — the marker survives (a
-    // killed closer never clears its own marker) but records a dead pid.
+    const epicId = readyEpic(proj, "Expired legacy marker epic");
     expect(preflight(proj, epicId, SID_A).code).toBe(0);
-    stampMarkerPid(proj.home, SID_A, deadPid());
+    rewriteMarker(proj.home, SID_A, (record) => {
+      record.schema_version = 1;
+      record.created_at = isoAt(Date.now() - 25 * 60 * 60 * 1000);
+      delete record.pid;
+      delete record.start_time;
+    });
 
-    // Session B claims the same epic — the dead holder's marker is a crash
-    // leak, skipped by the liveness probe; B wins without manual clearing.
     const b = preflight(proj, epicId, SID_B);
     expect(b.code).toBe(0);
     expect(existsSync(markerFor(proj.home, SID_B))).toBe(true);
   });
 
-  test("a legacy pid-less close marker still blocks within the staleness window", () => {
+  test("a probe error is inconclusive and never dismisses a fresh holder", () => {
     const proj = getProj();
-    const epicId = readyEpic(proj, "Legacy marker epic");
-
+    const epicId = readyEpic(proj, "Inconclusive holder epic");
     expect(preflight(proj, epicId, SID_A).code).toBe(0);
-    const path = markerFor(proj.home, SID_A);
-    const record = JSON.parse(readFileSync(path, "utf-8")) as Record<
-      string,
-      unknown
-    >;
-    delete record.pid;
-    writeFileSync(path, JSON.stringify(record));
 
-    // Without a recorded pid there is nothing to probe — the fresh marker
-    // keeps its claim and B fails loud exactly as before the pid field.
-    const b = preflight(proj, epicId, SID_B);
+    const b = preflight(proj, epicId, SID_B, {
+      probe: processProbe(() => {
+        throw new Error("injected probe failure");
+      }),
+    });
     expect(b.code).not.toBe(0);
-    const env = parseCliOutput(b.output);
-    expect(env.success).toBe(false);
-    expect((env.error as { code: string }).code).toBe("CLOSE_ALREADY_CLAIMED");
+    expect((parseCliOutput(b.output).error as { code: string }).code).toBe(
+      "CLOSE_ALREADY_CLAIMED",
+    );
+    expect(existsSync(markerFor(proj.home, SID_A))).toBe(true);
+    expect(b.stderr).not.toContain("abandoned_close_claim_removed");
   });
 
   test("the same session re-running preflight re-claims its own epic (no self-block)", () => {

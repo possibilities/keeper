@@ -1,5 +1,14 @@
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { HarnessProcessObservation } from "../src/commit-work/process-identity";
 import {
   classifyProviderLegProbe,
@@ -203,6 +212,48 @@ function ownership(id: string) {
     .get(id) as Record<string, unknown>;
 }
 
+async function withSessionMarker<T>(
+  sessionId: string,
+  callback: (home: string) => Promise<T>,
+): Promise<T> {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), "keeper-provider-marker-"));
+  const path = join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+  mkdirSync(join(home, ".local", "state", "keeper", "sessions"), {
+    recursive: true,
+  });
+  writeFileSync(path, JSON.stringify({ session_id: sessionId, kind: "work" }));
+  process.env.HOME = home;
+  try {
+    return await callback(home);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function sessionMarkerPath(home: string, sessionId: string): string {
+  return join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+}
+
 test("terminal owner cascades TERM then KILL, confirms exit, and releases after restart boundaries", async () => {
   seedAttempt({
     task: "fn-1300-cascade.1",
@@ -260,6 +311,93 @@ test("terminal owner cascades TERM then KILL, confirms exit, and releases after 
   expect(
     db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 10").get(),
   ).toEqual({ state: "released" });
+});
+
+for (const wrapperState of ["ended", "killed"] as const) {
+  test(`terminal ${wrapperState} wrapper release clears its marker`, async () => {
+    const wrapper = `wrapper-marker-${wrapperState}`;
+    await withSessionMarker(wrapper, async (home) => {
+      seedAttempt({
+        task: `fn-1300-marker-${wrapperState}.1`,
+        attempt: wrapperState === "ended" ? 81 : 82,
+        wrapper,
+        wrapperState,
+        legs: [
+          {
+            id: `leg-marker-${wrapperState}`,
+            session: `leg-session-marker-${wrapperState}`,
+            pid: wrapperState === "ended" ? 1_181 : 1_182,
+          },
+        ],
+      });
+      const d = deps({
+        probe: () => ({
+          identity: "gone",
+          identityReason: "esrch",
+          observedStartTime: null,
+          command: null,
+        }),
+      });
+
+      await runProviderLegCascadeSweep(db, d); // arm
+      expect(existsSync(sessionMarkerPath(home, wrapper))).toBe(true);
+      await runProviderLegCascadeSweep(db, d); // settle and release
+
+      expect(
+        db
+          .query("SELECT state FROM dispatch_claims WHERE attempt_id = ?")
+          .get(wrapperState === "ended" ? 81 : 82),
+      ).toEqual({ state: "released" });
+      expect(existsSync(sessionMarkerPath(home, wrapper))).toBe(false);
+    });
+  });
+}
+
+test("superseding a live wrapper retains its marker", async () => {
+  const wrapper = "wrapper-marker-superseded";
+  await withSessionMarker(wrapper, async (home) => {
+    seedAttempt({
+      task: "fn-1300-marker-super.1",
+      attempt: 83,
+      wrapper,
+      legs: [
+        {
+          id: "leg-marker-super",
+          session: "leg-session-marker-super",
+          pid: 1_183,
+        },
+      ],
+    });
+    event({
+      hook: "DispatchClaimSuperseded",
+      data: {
+        verb: "work",
+        id: "fn-1300-marker-super.1",
+        expected_attempt_id: 83,
+        next_attempt_id: 84,
+        dir: "/repo",
+      },
+    });
+    drainAll();
+    seedAttempt({
+      task: "fn-1300-marker-super.1",
+      attempt: 84,
+      wrapper: "wrapper-marker-replacement",
+      legs: [
+        {
+          id: "leg-marker-replacement",
+          session: "leg-session-marker-replacement",
+          pid: 1_184,
+        },
+      ],
+    });
+
+    const d = deps();
+    await runProviderLegCascadeSweep(db, d);
+    await runProviderLegCascadeSweep(db, d);
+
+    expect(existsSync(sessionMarkerPath(home, wrapper))).toBe(true);
+  });
 });
 
 test("write-ahead interruption never loses teardown and duplicate ticks preserve ordinals", async () => {

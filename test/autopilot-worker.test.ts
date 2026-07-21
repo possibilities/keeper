@@ -66,6 +66,7 @@ import {
   classifyCloseRecoveryStampExit,
   classifyResolverOutcome,
   classifyWorktreeRepos,
+  clearDeadZombieSessionMarker,
   clearPushTimeoutStreak,
   closerJobFinished,
   computeBaseDriftEntries,
@@ -533,6 +534,55 @@ test("zombie-session decision partitions signals, pages, backstop, and no-op sta
     expect(decideZombieSessionReaper(zombieDecisionInput(row.input))).toEqual(
       row.expected,
     );
+  }
+});
+
+test("zombie-session reaper clears a marker after pid-dead confirmation", () => {
+  const previousHome = process.env.HOME;
+  const home = mkdtempSync(join(tmpdir(), "keeper-zombie-marker-"));
+  const sessionId = "zombie-dead-marker";
+  const path = join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+  mkdirSync(join(home, ".local", "state", "keeper", "sessions"), {
+    recursive: true,
+  });
+  writeFileSync(path, JSON.stringify({ session_id: sessionId, kind: "work" }));
+  process.env.HOME = home;
+  try {
+    const { process: _process, ...input } = zombieDecisionInput();
+    const decision = runZombieSessionReaperStep(
+      input,
+      {
+        probe: () => ({
+          alive: false,
+          startTime: null,
+          commandOwned: false,
+          defunct: false,
+        }),
+        signal: () => {
+          throw new Error("dead process must not be signalled");
+        },
+      },
+      "work",
+      "fn-1-foo.1",
+    );
+
+    expect(decision).toEqual({ action: "none", reason: "pid-dead" });
+    clearDeadZombieSessionMarker(sessionId, decision);
+    expect(existsSync(path)).toBe(false);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

@@ -3,16 +3,16 @@
 // names their task).
 //
 // One JSON file per session at `~/.local/state/keeper/sessions/<sid>.json`,
-// schema_version 1: {schema_version, session_id, kind, task_id|epic_id,
-// created_at, pid}. The TS hook dispatchers (plugin/hooks/lib.ts) read these
-// files; the field names + `kind` values are the contract (`pid` is additive —
-// readers that do not probe liveness ignore it).
+// schema_version 2: {schema_version, session_id, kind, task_id|epic_id,
+// created_at, pid, start_time}. The TS hook dispatchers (plugin/hooks/lib.ts)
+// read these files; the field names + `kind` values are the contract.
 //
 // Fail OPEN: an absent tracked harness identity makes every helper a silent
 // no-op. All filesystem errors are swallowed: marker IO
 // never fails the verb. Callers invoke these strictly on the success path (a
 // marker for an unclaimed task would lock out commits).
 
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -24,30 +24,84 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import {
+  parseLinuxStarttime,
+  splitArgsLstart,
+} from "../../../src/proc-starttime.ts";
 import { resolvePlanSessionId } from "./session_id.ts";
 import { nowIso } from "./store.ts";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
-/** A close claim older than this is treated as abandoned (a hard-killed session
- * that never cleared its marker) so a re-close is never blocked forever. Matches
- * the hook reader's staleness window (plugin/hooks/lib.ts) — one contract. A
- * genuinely-longer close (a closer paused on a planner QUESTION) stays within it,
- * and a clean termination clears the marker outright. The rival scan's pid
- * liveness probe dismisses a killed holder's claim the moment its process dies;
- * this window is the backstop for legacy pid-less markers and pid reuse. */
-const CLOSE_CLAIM_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+// This is only a backstop for un-probeable markers; recycle-safe holders are
+// retained while live and discarded as soon as their process identity is dead.
+const CLOSE_CLAIM_STALE_MS = 24 * 60 * 60 * 1000;
+const MARKER_LOG_MAX_BYTES = 512;
 
-/** True iff `pid` maps to a live process. EPERM (signal not permitted) still
- * proves liveness; only ESRCH (no such process) is death. Any other failure
- * fails open (assume live) so a probe error never dismisses a real rival. */
-function pidIsLive(pid: number): boolean {
+export type CloseClaimHolderLiveness = "alive" | "dead" | "unknown";
+
+export interface SessionMarkerProcessProbe {
+  readStartTime(pid: number): string | null;
+  holderLiveness(pid: number, startTime: string): CloseClaimHolderLiveness;
+}
+
+function readProcessStartTime(pid: number): string | null {
+  try {
+    if (process.platform === "darwin") {
+      const result = spawnSync(
+        "ps",
+        ["-ww", "-p", String(pid), "-o", "lstart=,args="],
+        { encoding: "utf8", timeout: 500, maxBuffer: 4096 },
+      );
+      if (result.error !== undefined || result.status !== 0) {
+        return null;
+      }
+      const split = splitArgsLstart(result.stdout ?? "");
+      return split === null ? null : `darwin:${split.lstart}`;
+    }
+    if (process.platform === "linux") {
+      const raw = parseLinuxStarttime(
+        readFileSync(`/proc/${pid}/stat`, "utf8"),
+      );
+      return raw === null ? null : `linux:${raw}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function probeHolderLiveness(
+  pid: number,
+  expectedStartTime: string,
+): CloseClaimHolderLiveness {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "unknown";
   }
+  const currentStartTime = readProcessStartTime(pid);
+  if (currentStartTime === null) {
+    return "unknown";
+  }
+  return currentStartTime === expectedStartTime ? "alive" : "dead";
+}
+
+const realProcessProbe: SessionMarkerProcessProbe = {
+  readStartTime: readProcessStartTime,
+  holderLiveness: probeHolderLiveness,
+};
+
+let installedProcessProbe = realProcessProbe;
+
+export function setSessionMarkerProcessProbe(
+  probe: SessionMarkerProcessProbe,
+): void {
+  installedProcessProbe = probe;
+}
+
+export function resetSessionMarkerProcessProbe(): void {
+  installedProcessProbe = realProcessProbe;
 }
 
 /** Resolve the session id from the env, fail-open (empty/absent → null). */
@@ -73,12 +127,19 @@ function writeMarker(
   kind: string,
   idField: string,
   targetId: string,
+  processProbe: SessionMarkerProcessProbe = installedProcessProbe,
 ): string | null {
   const sid = sessionId();
   if (sid === null) {
     return null;
   }
   const createdAt = nowIso();
+  let startTime: string | null = null;
+  try {
+    startTime = processProbe.readStartTime(process.pid);
+  } catch {
+    // An unprobeable writer still leaves a stale-bounded marker.
+  }
   const record: Record<string, unknown> = {
     schema_version: SCHEMA_VERSION,
     session_id: sid,
@@ -86,6 +147,7 @@ function writeMarker(
     [idField]: targetId,
     created_at: createdAt,
     pid: process.pid,
+    start_time: startTime,
   };
   try {
     const path = markerPath(sid);
@@ -152,22 +214,80 @@ export function clearCloseMarker(epicId: string): void {
   clearIfMatches("epic_id", epicId);
 }
 
+function logDeadMarkerClearFailure(sessionId: string): void {
+  const boundedSessionId = sessionId
+    .replace(/[^\x20-\x7e]/g, "?")
+    .slice(0, 128);
+  const line = JSON.stringify({
+    level: "warn",
+    event: "dead_session_marker_clear_failed",
+    session_id: boundedSessionId,
+  });
+  try {
+    process.stderr.write(`${line.slice(0, MARKER_LOG_MAX_BYTES - 1)}\n`);
+  } catch {
+    // Logging must not affect terminal cleanup.
+  }
+}
+
+/** A caller that has confirmed a session terminal may release its marker. */
+export function clearDeadSessionMarker(sessionId: string): void {
+  try {
+    const path = markerPath(sessionId);
+    if (existsSync(path)) {
+      unlinkSync(path);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logDeadMarkerClearFailure(sessionId);
+    }
+  }
+}
+
 /** One close claim discovered on disk. */
 interface CloseClaim {
   sessionId: string;
   createdAt: string;
 }
 
-/** Read every OTHER session's LIVE close claim on `epicId` — a fresh close
- * marker naming this epic, excluding `selfSid`. Stale (crash-leaked),
- * unparseable, and dead-holder markers are skipped so a dead claim never blocks
- * a re-close: a marker carrying a `pid` whose process is gone is a crash leak
- * regardless of age (a killed closer never clears its own marker). All
- * filesystem errors are swallowed (fail-open → no competitor seen). */
+function logAbandonedCloseClaim(sessionId: string, pid: number): void {
+  const boundedSessionId = sessionId
+    .replace(/[^\x20-\x7e]/g, "?")
+    .slice(0, 128);
+  const line = JSON.stringify({
+    level: "warn",
+    event: "abandoned_close_claim_removed",
+    session_id: boundedSessionId,
+    pid,
+  });
+  try {
+    process.stderr.write(`${line.slice(0, MARKER_LOG_MAX_BYTES - 1)}\n`);
+  } catch {
+    // Logging must not affect close arbitration.
+  }
+}
+
+function removeAbandonedCloseClaim(
+  path: string,
+  sessionId: string,
+  pid: number,
+): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // The dead holder still loses when best-effort cleanup cannot unlink it.
+  }
+  logAbandonedCloseClaim(sessionId, pid);
+}
+
+/** Read every other session's close claim on `epicId`, excluding `selfSid`.
+ * Recycle-safe live holders remain rivals regardless of age. Dead holders are
+ * removed immediately; un-probeable holders retain the stale-bound behavior.
+ * All filesystem errors are swallowed (fail-open → no competitor seen). */
 function readRivalCloseClaims(
   epicId: string,
   selfSid: string,
-  isLive: (pid: number) => boolean = pidIsLive,
+  probeHolder: (pid: number, startTime: string) => CloseClaimHolderLiveness,
 ): CloseClaim[] {
   let files: string[];
   try {
@@ -181,9 +301,10 @@ function readRivalCloseClaims(
     if (!file.endsWith(".json")) {
       continue;
     }
+    const path = join(sessionsDir(), file);
     let record: unknown;
     try {
-      record = JSON.parse(readFileSync(join(sessionsDir(), file), "utf-8"));
+      record = JSON.parse(readFileSync(path, "utf-8"));
     } catch {
       continue;
     }
@@ -201,16 +322,31 @@ function readRivalCloseClaims(
       continue;
     }
     const ts = Date.parse(r.created_at);
-    if (Number.isNaN(ts) || now - ts > CLOSE_CLAIM_STALE_MS) {
+    if (Number.isNaN(ts)) {
       continue;
     }
+
     const pid = r.pid;
+    const startTime = r.start_time;
+    let liveness: CloseClaimHolderLiveness = "unknown";
     if (
       typeof pid === "number" &&
       Number.isInteger(pid) &&
       pid > 0 &&
-      !isLive(pid)
+      typeof startTime === "string" &&
+      startTime.length > 0
     ) {
+      try {
+        liveness = probeHolder(pid, startTime);
+      } catch {
+        liveness = "unknown";
+      }
+    }
+    if (liveness === "dead") {
+      removeAbandonedCloseClaim(path, r.session_id, pid as number);
+      continue;
+    }
+    if (liveness === "unknown" && now - ts > CLOSE_CLAIM_STALE_MS) {
       continue;
     }
     out.push({ sessionId: r.session_id, createdAt: r.created_at });
@@ -235,19 +371,23 @@ function readRivalCloseClaims(
  * close-finalize is idempotent, so a slipped duplicate never corrupts. */
 export function claimCloseExclusive(
   epicId: string,
-  isLive: (pid: number) => boolean = pidIsLive,
+  processProbe: SessionMarkerProcessProbe = installedProcessProbe,
 ): { heldBy: string } | null {
   const sid = sessionId();
   if (sid === null) {
     return null;
   }
-  const myCreatedAt = writeMarker("close", "epic_id", epicId);
+  const myCreatedAt = writeMarker("close", "epic_id", epicId, processProbe);
   if (myCreatedAt === null) {
     return null;
   }
   let winnerSid = sid;
   let winnerCreatedAt = myCreatedAt;
-  for (const rival of readRivalCloseClaims(epicId, sid, isLive)) {
+  for (const rival of readRivalCloseClaims(
+    epicId,
+    sid,
+    processProbe.holderLiveness,
+  )) {
     if (
       rival.createdAt < winnerCreatedAt ||
       (rival.createdAt === winnerCreatedAt && rival.sessionId < winnerSid)

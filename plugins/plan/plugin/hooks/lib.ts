@@ -10,7 +10,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** Marker schema version — must track the `keeper plan` session-marker writer. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Markers older than this are unlinked on read (matches the Python 7-day window). */
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -24,6 +24,8 @@ export interface Marker {
   task_id?: string;
   epic_id?: string;
   created_at: string;
+  pid?: number;
+  start_time?: string | null;
 }
 
 /** Read all of stdin as text. `Bun.stdin.stream()` avoids the macOS

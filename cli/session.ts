@@ -12,7 +12,9 @@
  * unknown verb is an argument fault (exit 2).
  */
 
+import { clearDeadSessionMarker } from "../plugins/plan/src/session_markers.ts";
 import type { OwnershipClaim } from "../src/commit-work/surface";
+import type { SessionTerminationResult, TerminableSession } from "./agent";
 import {
   type EnvelopeSink,
   emitEnvelope,
@@ -20,6 +22,7 @@ import {
   processEnvelopeSink,
   successEnvelope,
 } from "./envelope";
+import type { LoadedTrackedSessionResolution } from "./session-reference";
 
 interface Subverb {
   readonly summary: string;
@@ -89,7 +92,20 @@ pid, start time, and harness command before TERM and before bounded KILL.
 This signals only the process and never writes keeper.db.
 `;
 
-export async function terminateMain(argv: string[]): Promise<void> {
+export interface TerminateMainDeps {
+  resolveTrackedCliSession?: (
+    reference: string,
+  ) => LoadedTrackedSessionResolution;
+  terminateSessionProcess?: (
+    session: TerminableSession,
+  ) => Promise<SessionTerminationResult>;
+  sink?: EnvelopeSink;
+}
+
+export async function terminateMain(
+  argv: string[],
+  deps: TerminateMainDeps = {},
+): Promise<void> {
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
     process.stdout.write(TERMINATE_HELP);
     return;
@@ -103,16 +119,20 @@ export async function terminateMain(argv: string[]): Promise<void> {
   const { resolveTrackedCliSession, trackedSessionProblem } = await import(
     "./session-reference"
   );
-  const resolution = resolveTrackedCliSession(argv[0] as string);
+  const resolution =
+    deps.resolveTrackedCliSession?.(argv[0] as string) ??
+    resolveTrackedCliSession(argv[0] as string);
   if (resolution.kind !== "resolved") {
     emitEnvelope(
       errorEnvelope(1, trackedSessionProblem(resolution)),
-      processEnvelopeSink,
+      deps.sink ?? processEnvelopeSink,
     );
     return;
   }
   const { terminateSessionProcess } = await import("./agent");
-  const result = await terminateSessionProcess({
+  const result = await (
+    deps.terminateSessionProcess ?? terminateSessionProcess
+  )({
     jobId: resolution.job.jobId,
     state: resolution.job.state,
     harness: resolution.job.harness,
@@ -120,6 +140,7 @@ export async function terminateMain(argv: string[]): Promise<void> {
     startTime: resolution.job.startTime,
   });
   if (result.ok) {
+    clearDeadSessionMarker(resolution.job.jobId);
     emitEnvelope(
       successEnvelope(1, {
         job_id: resolution.job.jobId,
@@ -128,7 +149,7 @@ export async function terminateMain(argv: string[]): Promise<void> {
         exited: result.exited,
         database_written: false,
       }),
-      processEnvelopeSink,
+      deps.sink ?? processEnvelopeSink,
     );
     return;
   }
@@ -159,7 +180,10 @@ export async function terminateMain(argv: string[]): Promise<void> {
         "Check process permissions and current identity, then retry from a fresh Session resolution.",
     },
   } as const;
-  emitEnvelope(errorEnvelope(1, problems[result.reason]), processEnvelopeSink);
+  emitEnvelope(
+    errorEnvelope(1, problems[result.reason]),
+    deps.sink ?? processEnvelopeSink,
+  );
 }
 
 const RELEASE_HELP = `keeper session release <path> [<path>...] [--session-id <uuid>] [--worktree <path>]
