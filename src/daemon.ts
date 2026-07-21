@@ -772,6 +772,37 @@ export function probeDispatchClearClaimLiveness(
   return recordedProcessIdentityFn(job.pid, job.start_time);
 }
 
+/**
+ * Fences for an INTERNAL, level-triggered incident-resolution clear — the
+ * recover/reconciler auto-clears routed through {@link handleDispatchClearedMint}.
+ * Those producers read `expected_attempt_id` from live projection state, so it
+ * names the CURRENTLY bound attempt; passing it straight into the fold would
+ * release a HEALTHY live worker's claim / pending row / mint gate the instant its
+ * incident resolved. An incident-resolution clear may touch attempt-owned state
+ * ONLY behind positive terminal proof of the bound session, mirroring the operator
+ * path: a `gone` probe (the recorded claimant is provably dead) keeps the attempt
+ * fence so an orphaned claim releases fully; `matching` (live) and `inconclusive`
+ * (uncertain) both degrade to incident-only — the sticky row still drops via
+ * `expected_instance_event_id`, but every attempt-owned effect is left untouched.
+ * Over-preserving is the safe direction and there is no internal `--force` analog.
+ * A payload with no attempt fence is already incident-only and never probes.
+ */
+export function internalIncidentClearFences(
+  payload: DispatchClearFences,
+  probeLiveness: () => RecordedProcessIdentityVerdict,
+): DispatchClearFences {
+  if (payload.expected_attempt_id == null || probeLiveness() !== "gone") {
+    return {
+      expected_attempt_id: null,
+      expected_instance_event_id: payload.expected_instance_event_id,
+    };
+  }
+  return {
+    expected_attempt_id: payload.expected_attempt_id,
+    expected_instance_event_id: payload.expected_instance_event_id,
+  };
+}
+
 function buildRetryDispatchRefusedLiveError(
   verb: RetryDispatchVerb,
   dispatchId: string,
@@ -12725,17 +12756,43 @@ function startDaemonWithExitAttribution(
    * Mint a synthetic `DispatchCleared` event on behalf of the recover glue's
    * level-triggered auto-clear, symmetric with {@link handleDispatchFailedMint}.
    * Reuses {@link mintDispatchClearedEvent} — the EXACT path the `retry_dispatch`
-   * RPC drives — so the clear round-trips through one event arm. NON-FATAL on
-   * insert failure: the row stays sticky and the next recover cycle re-clears.
+   * RPC drives — so the clear round-trips through one event arm. Every producer
+   * routed here is an incident-resolution level-clear, so the attempt fence is
+   * gated on the operator path's own claimant-liveness probe
+   * ({@link internalIncidentClearFences}): the clear drops the sticky row but
+   * NEVER releases a live worker's attempt-owned state absent positive terminal
+   * proof. NON-FATAL on insert failure: the row stays sticky and the next recover
+   * cycle re-clears.
    */
   function handleDispatchClearedMint(
     payload: DispatchClearedMessage["payload"],
   ): void {
     try {
-      mintDispatchClearedEvent(payload.verb, payload.id, {
-        expected_attempt_id: payload.expected_attempt_id,
-        expected_instance_event_id: payload.expected_instance_event_id,
-      });
+      const probeLiveness = (): RecordedProcessIdentityVerdict => {
+        const claim = db
+          .query(
+            "SELECT session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+          )
+          .get(payload.verb, payload.id) as {
+          session_id: string | null;
+        } | null;
+        const sid = claim?.session_id;
+        const job =
+          sid == null || sid.length === 0
+            ? null
+            : (db
+                .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+                .get(sid) as {
+                pid: number | null;
+                start_time: string | null;
+              } | null);
+        return probeDispatchClearClaimLiveness(claim ?? undefined, job);
+      };
+      mintDispatchClearedEvent(
+        payload.verb,
+        payload.id,
+        internalIncidentClearFences(payload, probeLiveness),
+      );
       wakePending = true;
       pumpWakes();
     } catch (err) {

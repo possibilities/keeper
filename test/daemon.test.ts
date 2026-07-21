@@ -121,6 +121,7 @@ import {
   INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
   type IncidentClaimSweepDeps,
   type IncidentOwnerPageSweepDeps,
+  internalIncidentClearFences,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
@@ -6654,6 +6655,176 @@ test("regression: an internal orphan sweep clearing a stale failure row never de
   expect(appends).toBe(0);
   expect(readDispatchMintGate(db, key)).toBe(99);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// internalIncidentClearFences — the recover/reconciler auto-clear's attempt-fence
+// gate. An incident-resolution level-clear names the CURRENTLY bound attempt (it
+// reads it from live projection state), so the attempt fence is admitted ONLY
+// behind positive terminal proof of the claimant; a live or uncertain probe
+// degrades to an incident-only clear that drops the sticky row WITHOUT releasing
+// attempt-owned state. Composed end-to-end through the REAL fold: seed a fully-
+// armed live attempt (failure row + bound claim + pending lease + mint gate),
+// compute the fences the producer would emit, fold the `DispatchCleared`, and
+// assert the survivor set.
+// ---------------------------------------------------------------------------
+
+const INCIDENT_CLEAR_ATTEMPT_ID = 41;
+const INCIDENT_CLEAR_EVENT_ID = 51;
+
+function seedArmedLiveAttempt(
+  db: ReturnType<typeof freshMemDb>["db"],
+  verb: string,
+  id: string,
+): void {
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES (?, ?, 'worktree-recover:e', '/repo', 1, ?, 1, 1, ?, ?)`,
+  ).run(
+    verb,
+    id,
+    INCIDENT_CLEAR_EVENT_ID,
+    INCIDENT_CLEAR_ATTEMPT_ID,
+    INCIDENT_CLEAR_EVENT_ID,
+  );
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, acquired_at, bound_at,
+        last_event_id, updated_at)
+     VALUES (?, ?, ?, 'bound', 'sess-live', 1, 2, ?, 2)`,
+  ).run(verb, id, INCIDENT_CLEAR_ATTEMPT_ID, INCIDENT_CLEAR_EVENT_ID);
+  db.query(
+    `INSERT INTO pending_dispatches
+       (verb, id, dir, dispatched_at, last_event_id, attempt_id)
+     VALUES (?, ?, '/repo', 2, ?, ?)`,
+  ).run(verb, id, INCIDENT_CLEAR_EVENT_ID, INCIDENT_CLEAR_ATTEMPT_ID);
+  upsertDispatchMintGate(db, `${verb}::${id}`, 2, INCIDENT_CLEAR_ATTEMPT_ID);
+}
+
+function foldIncidentClear(
+  db: ReturnType<typeof freshMemDb>["db"],
+  verb: string,
+  id: string,
+  probe: RecordedProcessIdentityVerdict,
+): void {
+  // The producer names the CURRENTLY bound attempt in the payload; the gate
+  // decides whether the fold may act on it, given the claimant liveness verdict.
+  const fences = internalIncidentClearFences(
+    {
+      expected_attempt_id: INCIDENT_CLEAR_ATTEMPT_ID,
+      expected_instance_event_id: INCIDENT_CLEAR_EVENT_ID,
+    },
+    () => probe,
+  );
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (1, ?, NULL, 'DispatchCleared', 'dispatch_failures', ?)`,
+    [`${verb}::${id}`, buildDispatchClearedData(verb, id, fences)],
+  );
+  drainToCompletion(db);
+}
+
+const incidentRowsLeft = (
+  db: ReturnType<typeof freshMemDb>["db"],
+  verb: string,
+  id: string,
+): number =>
+  (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM dispatch_failures WHERE verb = ? AND id = ?",
+      )
+      .get(verb, id) as { n: number }
+  ).n;
+const pendingRowsLeft = (
+  db: ReturnType<typeof freshMemDb>["db"],
+  verb: string,
+  id: string,
+): number =>
+  (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM pending_dispatches WHERE verb = ? AND id = ?",
+      )
+      .get(verb, id) as { n: number }
+  ).n;
+const claimStateOf = (
+  db: ReturnType<typeof freshMemDb>["db"],
+  verb: string,
+  id: string,
+): string | null =>
+  (
+    db
+      .query("SELECT state FROM dispatch_claims WHERE verb = ? AND id = ?")
+      .get(verb, id) as { state: string } | null
+  )?.state ?? null;
+
+test("internalIncidentClearFences: a LIVE matching attempt — the incident row drops but the claim, pending lease, and mint gate ALL survive", () => {
+  const { db } = freshMemDb();
+  const verb = "close";
+  const id = "fn-1-foo";
+  const key = `${verb}::${id}`;
+  seedArmedLiveAttempt(db, verb, id);
+
+  foldIncidentClear(db, verb, id, "matching");
+
+  // The sticky incident row is gone (its condition resolved this cycle)...
+  expect(incidentRowsLeft(db, verb, id)).toBe(0);
+  // ...but nothing attempt-owned was touched: a healthy live worker keeps its
+  // claim, its pending lease, and its mint gate. No double-dispatch window opens.
+  expect(claimStateOf(db, verb, id)).toBe("bound");
+  expect(pendingRowsLeft(db, verb, id)).toBe(1);
+  expect(readDispatchMintGate(db, key)).toBe(2);
+  db.close();
+});
+
+test("internalIncidentClearFences: a terminal-proven (gone) attempt — the authorized clear releases claim, pending lease, and mint gate fully", () => {
+  const { db } = freshMemDb();
+  const verb = "close";
+  const id = "fn-1-foo";
+  const key = `${verb}::${id}`;
+  seedArmedLiveAttempt(db, verb, id);
+
+  foldIncidentClear(db, verb, id, "gone");
+
+  // Positive terminal proof of the bound session admits the attempt fence, so the
+  // orphaned attempt's state releases fully alongside the incident row.
+  expect(incidentRowsLeft(db, verb, id)).toBe(0);
+  expect(claimStateOf(db, verb, id)).toBe("released");
+  expect(pendingRowsLeft(db, verb, id)).toBe(0);
+  expect(readDispatchMintGate(db, key)).toBeNull();
+  db.close();
+});
+
+test("internalIncidentClearFences: an inconclusive liveness verdict — no attempt-owned effect (safe over-preservation)", () => {
+  const { db } = freshMemDb();
+  const verb = "close";
+  const id = "fn-1-foo";
+  const key = `${verb}::${id}`;
+  seedArmedLiveAttempt(db, verb, id);
+
+  foldIncidentClear(db, verb, id, "inconclusive");
+
+  // Uncertain claimant identity refuses the attempt fence exactly like a live one:
+  // the incident drops, the attempt survives untouched.
+  expect(incidentRowsLeft(db, verb, id)).toBe(0);
+  expect(claimStateOf(db, verb, id)).toBe("bound");
+  expect(pendingRowsLeft(db, verb, id)).toBe(1);
+  expect(readDispatchMintGate(db, key)).toBe(2);
+  db.close();
+});
+
+test("internalIncidentClearFences: a payload with no attempt fence is already incident-only and NEVER probes", () => {
+  // The lazy short-circuit — an attempt-less clear touches no attempt-owned state
+  // and must not spend a claimant probe deciding that.
+  expect(
+    internalIncidentClearFences(
+      { expected_attempt_id: null, expected_instance_event_id: 51 },
+      PROBE_NEVER,
+    ),
+  ).toEqual({ expected_attempt_id: null, expected_instance_event_id: 51 });
 });
 
 test("clearDispatchMintGate: the low-level key-wide helper still removes its target row", () => {
