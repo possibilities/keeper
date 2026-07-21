@@ -12,7 +12,7 @@
 // zero drift. The outcome-exhaustiveness node imports CLOSE_OUTCOMES from src;
 // the retired `epic followup-of` node asserts the unknown-subcommand error.
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -25,6 +25,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import {
+  TRUNK_LEASE_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+} from "../../../src/grant-leaf.ts";
 import {
   AUDIT_SCHEMA_VERSION,
   computeCommitSetHash,
@@ -39,6 +43,10 @@ import {
 import {
   CLOSE_OUTCOMES,
   type CloseOutcome,
+  integrateEpicBases,
+  integrateRepoUnderLease,
+  type TrunkGitResult,
+  type TrunkIntegrationDeps,
 } from "../src/verbs/close_finalize.ts";
 import {
   armInProgressOp,
@@ -55,6 +63,7 @@ import {
   runCli,
   scaffoldEpic,
   withProject,
+  withTmpdir,
 } from "./harness.ts";
 
 // The set of outcomes the /plan:close coordinator switches on (mirrors the saga).
@@ -1771,5 +1780,630 @@ describe("close-finalize gates + exhaustiveness + retired verb", () => {
     });
     expect(r.code).not.toBe(0);
     expect(r.output.toLowerCase().includes("no such command")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Trunk-lease integration saga — integrateRepoUnderLease / integrateEpicBases,
+// driven directly (not through runCli/close-finalize) behind the pure
+// TrunkIntegrationDeps git+lease seam. No real git spawn, no real daemon
+// round-trip: every git call and every lease request/release is a scripted
+// fake, so the fenced retry saga's typed exits are asserted deterministically.
+// ---------------------------------------------------------------------------
+
+const TRUNK_EPIC_ID = "fn-1-demo";
+const TRUNK_SOURCE_BRANCH = `keeper/epic/${TRUNK_EPIC_ID}`;
+const TRUNK_DEFAULT_BRANCH = "main";
+const TRUNK_CLAIMANT = "test-session-fixture";
+const TRUNK_REPO_ROOT = "/repo-a";
+
+function gitOk(stdout = ""): TrunkGitResult {
+  return { code: 0, stdout, stderr: "" };
+}
+
+function gitFail(code = 1, stderr = ""): TrunkGitResult {
+  return { code, stdout: "", stderr };
+}
+
+function baseLeaseFor(overrides: Partial<TrunkLeaseLeaf> = {}): TrunkLeaseLeaf {
+  return {
+    schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+    active: true,
+    epic_id: TRUNK_EPIC_ID,
+    claimant_session_id: TRUNK_CLAIMANT,
+    claimant_pid: 4242,
+    claimant_start_time: "0",
+    acquisition_id: "acq-1",
+    repo_root: TRUNK_REPO_ROOT,
+    writable_root: TRUNK_REPO_ROOT,
+    source_branch: TRUNK_SOURCE_BRANCH,
+    default_branch: TRUNK_DEFAULT_BRANCH,
+    observed_default_tip: "base000",
+    expires_at: Date.now() + 120_000,
+    fencing_token: 1,
+    ...overrides,
+  };
+}
+
+/** Private carrier the patched process.exit throws, so a typed
+ * emitFinalizeError exit unwinds to runTrunkVerb's catch instead of killing
+ * the test process — the same technique runCli uses for the compiled CLI. */
+class TrunkExitSignal {
+  constructor(readonly code: number) {}
+}
+
+/** Call `fn` with process.exit/process.stdout.write patched, returning the
+ * exit code (null when fn returned normally, with no typed exit) plus the
+ * captured stdout for the typed-error envelope. */
+function runTrunkVerb(fn: () => void): { code: number | null; stdout: string } {
+  const priorExit = process.exit;
+  const priorWrite = process.stdout.write;
+  let stdout = "";
+  process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
+    stdout +=
+      typeof chunk === "string"
+        ? chunk
+        : Buffer.from(chunk as Uint8Array).toString("utf-8");
+    const cb = rest.find((r) => typeof r === "function") as
+      | ((err?: Error | null) => void)
+      | undefined;
+    cb?.(null);
+    return true;
+  }) as typeof process.stdout.write;
+  process.exit = ((c?: number): never => {
+    throw new TrunkExitSignal(c ?? 0);
+  }) as typeof process.exit;
+
+  let code: number | null = null;
+  try {
+    fn();
+  } catch (exc) {
+    if (exc instanceof TrunkExitSignal) {
+      code = exc.code;
+    } else {
+      throw exc;
+    }
+  } finally {
+    process.exit = priorExit;
+    process.stdout.write = priorWrite;
+  }
+  return { code, stdout };
+}
+
+function trunkErrorCode(stdout: string): string {
+  const payload = parseCliOutput(stdout) as {
+    error?: { code?: string };
+  };
+  return payload.error?.code ?? "";
+}
+
+interface FakeTrunkDepsOptions {
+  git: TrunkIntegrationDeps["git"];
+  /** Lease minted per acquire attempt (0-based). Defaults to a fresh
+   * baseLeaseFor with an incrementing fencing_token. */
+  leaseFor?: (attempt: number) => TrunkLeaseLeaf;
+  /** release() return value — false exercises TRUNK_LEASE_RELEASE_FAILED. */
+  releaseOk?: boolean;
+  /** acquireLock() returns null (lock contention) when false. */
+  lockOk?: boolean;
+}
+
+/** Build a scripted TrunkIntegrationDeps: the caller supplies only the git
+ * responder (the thing under test), while lock/lease plumbing defaults to an
+ * always-succeeding fake that mirrors whatever lease it last minted back
+ * through readLeaseLeaf — the in-fence "is my lease still valid" re-check
+ * `integrateRepoUnderLease` performs every attempt. */
+function makeFakeTrunkDeps(opts: FakeTrunkDepsOptions): {
+  deps: TrunkIntegrationDeps;
+  releasedLeases: TrunkLeaseLeaf[];
+  requestAttempts: () => number;
+} {
+  let attempt = 0;
+  let lastLease: TrunkLeaseLeaf | null = null;
+  const releasedLeases: TrunkLeaseLeaf[] = [];
+  const deps: TrunkIntegrationDeps = {
+    git: opts.git,
+    acquireLock: () => (opts.lockOk === false ? null : { release: () => {} }),
+    requestLease: (
+      _stateDir,
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+    ) => {
+      const currentAttempt = attempt;
+      attempt += 1;
+      const lease = opts.leaseFor
+        ? opts.leaseFor(currentAttempt)
+        : baseLeaseFor({
+            epic_id: epicId,
+            repo_root: repoRoot,
+            writable_root: repoRoot,
+            source_branch: sourceBranch,
+            claimant_session_id: claimantSessionId,
+            fencing_token: currentAttempt + 1,
+          });
+      lastLease = lease;
+      return { ok: true, lease };
+    },
+    releaseLease: (_stateDir, lease) => {
+      releasedLeases.push(lease);
+      return opts.releaseOk ?? true;
+    },
+    readLeaseLeaf: () => lastLease,
+  };
+  return { deps, releasedLeases, requestAttempts: () => attempt };
+}
+
+describe("integrateRepoUnderLease saga (pure git seam)", () => {
+  test("merges the source branch into local default and releases the lease", () => {
+    // F1: the merge exit — reprobe finds not-yet-ancestor, live tip matches
+    // the leased observation, merge succeeds, the objective re-probe confirms
+    // containment.
+    let mergeBaseCalls = 0;
+    let mergeAttempted = false;
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitFail(1);
+      }
+      if (args[0] === "status") return gitOk("");
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+      ) {
+        return gitOk("base000");
+      }
+      if (args[0] === "merge-base") {
+        mergeBaseCalls += 1;
+        // Pre-merge reprobe: not yet an ancestor. Post-merge objective check:
+        // now contained.
+        return mergeBaseCalls === 1 ? gitFail(1) : gitOk();
+      }
+      if (args[0] === "merge") {
+        mergeAttempted = true;
+        return gitOk();
+      }
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBeNull();
+    expect(mergeAttempted).toBe(true);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("ancestor-skip: an in-fence reprobe already ancestor releases without merging", () => {
+    // F1: the already-integrated exit — decideTrunkIntegrationFence grades
+    // "already-integrated" before any merge is attempted.
+    let mergeAttempted = false;
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitFail(1);
+      }
+      if (args[0] === "status") return gitOk("");
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+      ) {
+        return gitOk("base000");
+      }
+      if (args[0] === "merge-base") return gitOk(); // already an ancestor
+      if (args[0] === "merge") {
+        mergeAttempted = true;
+        return gitOk();
+      }
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBeNull();
+    expect(mergeAttempted).toBe(false);
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("conflict-retains-lease: TRUNK_INTEGRATION_CONFLICT exits without releasing", () => {
+    // F1: the conflict exit — MERGE_HEAD appears only AFTER the failed merge
+    // (absent on the pre-merge residue check), and the lease is never released
+    // so a live closer keeps its fenced trunk ownership through resolution.
+    let mergeHeadCalls = 0;
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        mergeHeadCalls += 1;
+        return mergeHeadCalls === 1 ? gitFail(1) : gitOk("deadbeef1234");
+      }
+      if (args[0] === "status") return gitOk("");
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+      ) {
+        return gitOk("base000");
+      }
+      if (args[0] === "merge-base") return gitFail(1); // not yet an ancestor
+      if (args[0] === "merge") return gitFail(1, "CONFLICT (content)");
+      if (args[0] === "diff") return gitOk("path/one.ts\npath/two.ts\n");
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_CONFLICT");
+    const payload = parseCliOutput(result.stdout) as {
+      error: { details: { conflicted_files: string[] } };
+    };
+    expect(payload.error.details.conflicted_files).toEqual([
+      "path/one.ts",
+      "path/two.ts",
+    ]);
+    expect(releasedLeases.length).toBe(0);
+  });
+
+  test("off-branch: HEAD on the wrong branch exits and releases the lease", () => {
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk("some-other-branch");
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_OFF_BRANCH");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("dirty: an unclean checkout exits and releases the lease", () => {
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitFail(1);
+      }
+      if (args[0] === "status") return gitOk(" M some/file.ts\n");
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_DIRTY");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("residue: a pre-existing MERGE_HEAD exits and releases the lease", () => {
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitOk("existingmergehead");
+      }
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({ git });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_INTEGRATION_RESIDUE");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("tip-drift: default advancing every fenced attempt exhausts the 3-try loop", () => {
+    // F1: the tip-drift exit — the live default tip never matches the leased
+    // observation, so every attempt defers and the loop exhausts without ever
+    // attempting a merge.
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitFail(1);
+      }
+      if (args[0] === "status") return gitOk("");
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+      ) {
+        return gitOk("drifted-tip");
+      }
+      if (args[0] === "merge-base") return gitFail(1); // not yet an ancestor
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases, requestAttempts } = makeFakeTrunkDeps({
+      git,
+      leaseFor: (attempt) =>
+        baseLeaseFor({
+          fencing_token: attempt + 1,
+          observed_default_tip: "base000",
+        }),
+    });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_TIP_DRIFT");
+    expect(requestAttempts()).toBe(3);
+    expect(releasedLeases.length).toBe(3);
+  });
+
+  test("release-fail: a successful merge whose release the daemon never acks exits TRUNK_LEASE_RELEASE_FAILED", () => {
+    let mergeBaseCalls = 0;
+    const git: TrunkIntegrationDeps["git"] = (args) => {
+      if (args[0] === "symbolic-ref") return gitOk(TRUNK_DEFAULT_BRANCH);
+      if (args[0] === "rev-parse" && args.includes("MERGE_HEAD")) {
+        return gitFail(1);
+      }
+      if (args[0] === "status") return gitOk("");
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_DEFAULT_BRANCH}^{commit}`)
+      ) {
+        return gitOk("base000");
+      }
+      if (args[0] === "merge-base") {
+        mergeBaseCalls += 1;
+        return mergeBaseCalls === 1 ? gitFail(1) : gitOk();
+      }
+      if (args[0] === "merge") return gitOk();
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+    const { deps, releasedLeases } = makeFakeTrunkDeps({
+      git,
+      releaseOk: false,
+    });
+
+    const result = runTrunkVerb(() =>
+      integrateRepoUnderLease(
+        TRUNK_EPIC_ID,
+        TRUNK_REPO_ROOT,
+        TRUNK_SOURCE_BRANCH,
+        TRUNK_CLAIMANT,
+        "json",
+        deps,
+      ),
+    );
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_RELEASE_FAILED");
+    expect(releasedLeases.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2: the ancestor re-grade path reconciled with the SKILL.md recovery
+// contract — a lingering active lease from a resolved conflict is adopted
+// and released rather than left for daemon claimant-death reclaim.
+// ---------------------------------------------------------------------------
+
+describe("integrateEpicBases ancestor re-grade lease adoption (F2)", () => {
+  const getRepo = withTmpdir("trunk-lease-adopt-");
+  let priorWorktree: string | undefined;
+  let priorSession: string | undefined;
+
+  beforeEach(() => {
+    priorWorktree = process.env.KEEPER_PLAN_WORKTREE;
+    priorSession = process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.KEEPER_PLAN_WORKTREE = "worktree-lane-active";
+    process.env.CLAUDE_CODE_SESSION_ID = TRUNK_CLAIMANT;
+  });
+
+  afterEach(() => {
+    if (priorWorktree === undefined) {
+      delete process.env.KEEPER_PLAN_WORKTREE;
+    } else {
+      process.env.KEEPER_PLAN_WORKTREE = priorWorktree;
+    }
+    if (priorSession === undefined) {
+      delete process.env.CLAUDE_CODE_SESSION_ID;
+    } else {
+      process.env.CLAUDE_CODE_SESSION_ID = priorSession;
+    }
+  });
+
+  function ancestorRegradeGit(repoRoot: string): TrunkIntegrationDeps["git"] {
+    return (args) => {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return gitOk(`${repoRoot}\n`);
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "symbolic-ref" &&
+        args.includes("refs/remotes/origin/HEAD")
+      ) {
+        return gitOk(`origin/${TRUNK_DEFAULT_BRANCH}\n`);
+      }
+      if (args[0] === "merge-base") return gitOk(); // already an ancestor
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+  }
+
+  test("adopts and releases a lingering active lease matching this closer", () => {
+    const repoRoot = getRepo();
+    const lease = baseLeaseFor({
+      repo_root: repoRoot,
+      writable_root: repoRoot,
+    });
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => lease,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases).toEqual([lease]);
+  });
+
+  test("leaves an absent lease alone (no adoption when nothing is lingering)", () => {
+    const repoRoot = getRepo();
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => null,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases.length).toBe(0);
+  });
+
+  test("leaves a lease held by a different claimant alone", () => {
+    const repoRoot = getRepo();
+    const lease = baseLeaseFor({
+      repo_root: repoRoot,
+      writable_root: repoRoot,
+      claimant_session_id: "some-other-session",
+    });
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: ancestorRegradeGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not be called on the ancestor re-grade path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => lease,
+    };
+
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+
+    expect(result.code).toBeNull();
+    expect(releasedLeases.length).toBe(0);
   });
 });
