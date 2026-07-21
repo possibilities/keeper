@@ -112,5 +112,5 @@ updated. Named gates.
       re-pinned; all suites green via named gates
 
 ## Done summary
-
+Collapsed the block_escalations table and the two merge once-markers into the per-key dispatch_failures incident projection (v142 migration, fingerprint re-pinned): block latches are now ('block', task_id) rows and the owner-attachment lease is owner_redispatch_attempts. Re-pointed every consumer/producer off the dropped shape; page-once carry-forward proven by a migration-fixture test and determinism by the equivalence + projection suites.
 ## Evidence
