@@ -6,7 +6,7 @@
     "fn-1386-harden-trunk-lease-integration"
   ],
   "id": "fn-1392-integrate-trunk-merges-in-a-private",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T06:31:56.331000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T06:31:54.614000Z"
+  "updated_at": "2026-07-21T06:31:56.331000Z"
 }
