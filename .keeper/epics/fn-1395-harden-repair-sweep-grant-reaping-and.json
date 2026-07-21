@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-21T18:24:10.248000Z",
   "created_at": "2026-07-21T06:19:22.114000Z",
   "created_by_close_of": "fn-1351-repair-under-write-grant",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "last_validated_at": "2026-07-21T06:56:43.355000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Harden repair-sweep grant reaping and mint idempotence",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T06:56:43.355000Z"
+  "updated_at": "2026-07-21T18:24:10.248000Z"
 }
