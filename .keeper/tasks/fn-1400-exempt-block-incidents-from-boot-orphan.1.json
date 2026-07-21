@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Guard block rows in boot-GC",
-  "updated_at": "2026-07-21T18:04:04.361000Z"
+  "updated_at": "2026-07-21T18:58:31.696000Z",
+  "worker_done_at": "2026-07-21T18:58:31.696000Z"
 }

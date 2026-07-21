@@ -57,5 +57,5 @@ comment).
       row set (regression covering the F3 phantom-count witness).
 
 ## Done summary
-
+Exempted live verb='block' incidents from the boot orphan-GC sweep (mirroring the repair guard), corrected the retired CREATE_BLOCK_ESCALATIONS doc comment to note it survives only for fresh-DB migration ordering, and added a regression proving a seeded block row survives the sweep and that the needs-human block count equals the live block row set.
 ## Evidence
