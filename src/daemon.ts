@@ -5165,6 +5165,19 @@ export interface TrunkLeaseSweepDeps {
   now: () => number;
   ttlMs?: number;
   noteLine?: (line: string) => void;
+  /**
+   * Cross-tick memory of every `(repo_root, fencing_token)` pair with a
+   * currently-open residue incident, keyed `${repo_root}\0${fencing_token}`.
+   * Owned by the CALLER and reused byte-identically across sweep ticks —
+   * this is the durable/live-derived signal that turns "residue detected"
+   * into "residue NEWLY appeared", so {@link recordResidue} mints once per
+   * transition rather than once per tick a live `MERGE_HEAD` persists.
+   * Entries are removed the moment residue clears or the token retires
+   * (dead/released), so a later reappearance under the SAME token mints
+   * again. Omitting it (or passing a fresh Map every call) reverts to
+   * per-tick-only gating — only safe for a single-shot call.
+   */
+  residueState?: Map<string, true>;
 }
 
 export interface TrunkLeaseSweepResult {
@@ -5199,7 +5212,12 @@ export function runTrunkLeaseSweep(
   const note = deps.noteLine ?? (() => {});
   const now = deps.now();
   const ttlMs = deps.ttlMs ?? TRUNK_LEASE_TTL_MS;
-  const residueRecorded = new Set<string>();
+  // Durable across ticks (owned by the caller) — gates recordResidue to a
+  // residue-state TRANSITION. `handledResidue` stays per-call: it only
+  // prevents the release-request loop below from re-probing a lease already
+  // resolved by the active-lease loop this same tick.
+  const residueState = deps.residueState ?? new Map<string, true>();
+  const handledResidue = new Set<string>();
 
   let leases: TrunkLeaseLeaf[];
   try {
@@ -5216,12 +5234,18 @@ export function runTrunkLeaseSweep(
   );
   for (const lease of leases) {
     if (!lease.active) continue;
+    const residueKey = `${lease.repo_root}\0${lease.fencing_token}`;
     try {
       const residue = deps.probeResidue(lease);
+      handledResidue.add(residueKey);
       if (residue !== null) {
-        deps.recordResidue(lease, residue);
-        residueRecorded.add(`${lease.repo_root}\0${lease.fencing_token}`);
-        result.residues += 1;
+        if (!residueState.has(residueKey)) {
+          deps.recordResidue(lease, residue);
+          residueState.set(residueKey, true);
+          result.residues += 1;
+        }
+      } else {
+        residueState.delete(residueKey);
       }
     } catch (err) {
       note(
@@ -5240,6 +5264,7 @@ export function runTrunkLeaseSweep(
     if (live) continue;
     if (deps.publishLease({ ...lease, active: false, expires_at: now })) {
       result.dead += 1;
+      residueState.delete(residueKey);
     }
   }
 
@@ -5269,13 +5294,17 @@ export function runTrunkLeaseSweep(
           continue;
         }
         const residueKey = `${current.repo_root}\0${current.fencing_token}`;
-        if (!residueRecorded.has(residueKey)) {
+        if (!handledResidue.has(residueKey)) {
           try {
             const residue = deps.probeResidue(current);
             if (residue !== null) {
-              deps.recordResidue(current, residue);
-              residueRecorded.add(residueKey);
-              result.residues += 1;
+              if (!residueState.has(residueKey)) {
+                deps.recordResidue(current, residue);
+                residueState.set(residueKey, true);
+                result.residues += 1;
+              }
+            } else {
+              residueState.delete(residueKey);
             }
           } catch (err) {
             note(
@@ -5285,6 +5314,7 @@ export function runTrunkLeaseSweep(
         }
         if (deps.publishLease({ ...current, active: false, expires_at: now })) {
           result.released += 1;
+          residueState.delete(residueKey);
           deps.removeRequest(entry.path);
         }
         continue;
@@ -17435,9 +17465,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (tip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(defaultTip)) return null;
     return { repoRoot, defaultBranch, defaultTip };
   };
+  // Persists across sweep ticks (module-scoped closure, one instance for the
+  // process lifetime) so `runTrunkLeaseSweep` mints a residue DispatchFailed
+  // only when MERGE_HEAD newly appears, never once per 3s tick it persists.
+  const trunkLeaseResidueState = new Map<string, true>();
   function runTrunkLeaseSweepTick(): void {
     if (shuttingDown) return;
     runTrunkLeaseSweep({
+      residueState: trunkLeaseResidueState,
       readRequests: () => readTrunkLeaseRequests(trunkLeaseStateDir),
       removeRequest: (path) => removeTrunkLeaseRequest(path),
       readLeases: () => listTrunkLeaseLeaves(trunkLeaseStateDir),
