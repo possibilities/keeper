@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 77,
+        "files_changed": 3,
+        "insertions": 581
+      },
+      "done_summary": "Instrumented every keeperd main exit path (fatalExit, uncaught/unhandled hooks, TERM/INT/HUP signals) to synchronously write one bounded attribution record to a dedicated exit-attribution leaf before process end. The boot-time enrich pass reads that leaf first for the prior boot, falls back to native-crash-report matching, then a typed hard-kill-or-SIGKILL verdict when neither is available (never empty), writing at most once per un-attributed prior boot. Deterministic tests pin each soft exit path's leaf record shape and the leaf-over-crash-report-over-empty enrich precedence.",
+      "input_hash": "4130df4b0cb6c2eb1d805f660e447ec1d94b72456de8035c22c4ce72b5826e6a",
+      "model": "sonnet",
+      "spec_chars": 1471,
+      "spec_md": "## Description\n\nInstrument every way keeperd main can end \u2014 fatalExit, uncaught\nexception/rejection, received signals (TERM/INT/HUP), and normal\nreturn \u2014 with one bounded, synchronously-flushed attribution line to a\ndedicated exit-attribution leaf (not stderr, which loses tail writes on\nabrupt ends). The restart ledger's enrich pass reads that leaf first\nand records its verdict.\n\n## Acceptance\n\n- Signal handlers, the fatalExit path, and process-level\n  uncaught/unhandled hooks each write one bounded attribution record\n  with a synchronous flush before exit; a SIGKILL obviously cannot, and\n  the enrich pass treats leaf-absent as \"hard kill or SIGKILL\" rather\n  than empty.\n- Deterministic tests drive each soft exit path in-process and assert\n  the leaf's record shape; the enrich consumer's precedence (leaf >\n  crash report > empty) is test-pinned.\n\n## Done summary\nInstrumented every keeperd main exit path (fatalExit, uncaught/unhandled hooks, TERM/INT/HUP signals) to synchronously write one bounded attribution record to a dedicated exit-attribution leaf before process end. The boot-time enrich pass reads that leaf first for the prior boot, falls back to native-crash-report matching, then a typed hard-kill-or-SIGKILL verdict when neither is available (never empty), writing at most once per un-attributed prior boot. Deterministic tests pin each soft exit path's leaf record shape and the leaf-over-crash-report-over-empty enrich precedence.\n## Evidence\n",
+      "task_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.1",
+      "tier": "high",
+      "title": "Log every daemon exit path with flushed attribution"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 24,
+        "files_changed": 4,
+        "insertions": 885
+      },
+      "done_summary": "Extended the enrich probe with a typed exit verdict (watchdog/operator/soft-exit-leaf/os-memory-kill/signal/no-evidence) backed by a bounded async unified-log jetsam probe and install.sh's operator-reload attribution leaf, plus main-RSS history persisted every serve-health tick for the enrich pass. Classifier tested against fixture leaf/native-crash/operator/jetsam inputs.\n\nForensic pass on the four recorded 07-20 quiet ends (EDT):\n1. boot 272f1b94 (pid 13095, died ~04:50:32) -> OPERATOR: install.sh reload (plist FSEvent 2.4s before the successor boot, the confirmed reload signature).\n2. boot b1856fa0 (pid 92251, died ~08:14:54) -> OPERATOR: install.sh reload (same FSEvent signature, ~2s before successor).\n3. boot 27a0b574 (pid 53298, died ~16:15:25, 31.2min runtime) -> OPERATOR: install.sh reload (full unified-log chain: \"Setting service ... enabled (initiated by launchctl<-bash<-python3.14)\" then plist FSEvent then \"removing service\", 2s before death).\n4. boot bb356594 (pid 56332, died ~16:21:46, 6.35min runtime) -> NO-EVIDENCE, genuinely unattributed. Ruled out: native crash report (probe exhausted, no match), OS-level jetsam/memory-pressure kill (unified-log scan of the full lifetime window: zero matches), operator reload (no plist FSEvent or leaf timestamp in-window), watchdog (no fatalExit reason recorded). Per epic requirement, also ruled out: 73a71722e (status: stop walking the events b-tree for event_count, landed 15:43:45, rode both afternoon boots) -- inspection shows the diff only deletes a try/catched COUNT(*) query and substitutes an already-computed value, adding no new throwable path, and is load-reducing; and #88 main-thread ingest-starvation (~/docs/keeper-phase2-backlog.md) -- its signature (TERM-unresponsive SIGKILL escalation, rpc_unreachable, dark boot) is a MORNING-only phenomenon (~08:44-10:12 EDT) whose fixes (33ad317a2 @ 12:04, 07dddd86a @ 13:38) landed hours before this afternoon pair, and bb356594's window shows none of its symptoms. Best remaining read (unconfirmable): a soft exit predating this epic's exit-attribution leaf instrumentation (landed 20:07:40, after all four deaths) on a boot freshly reloaded by #3's install.sh run -- no forensic trace survives past the bare boot row. A repeat of this shape now carries a leaf, an OS-memory verdict, or an operator match.\n\nTally: 3/4 operator (install.sh reload), 1/4 no-evidence after exhausting every available forensic source, with both of the epic's named suspects explicitly ruled out for the unattributed one.",
+      "input_hash": "4130df4b0cb6c2eb1d805f660e447ec1d94b72456de8035c22c4ce72b5826e6a",
+      "model": "sonnet",
+      "spec_chars": 3653,
+      "spec_md": "## Description\n\nExtend the enrich probe to consult OS-level evidence for the dead pid\n(unified log jetsam/memory-pressure records inside the boot's lifetime\nwindow) and to record a typed verdict enum instead of an empty reason.\nSample main RSS into the periodic serve-health report so a\nmemory-growth death leaves a visible ramp in the last reports before\nthe end, then run the forensic pass over the four recorded quiet ends\nand write the per-end verdicts.\n\n## Acceptance\n\n- The enrich row for a daemon end carries a typed verdict (one of\n  watchdog / operator / soft-exit-leaf / os-memory-kill / signal /\n  no-evidence) with the supporting probe output bounded inline; tests\n  cover the classifier over fixture probe outputs.\n- serve-health reports carry main RSS; the ledger keeps the last N\n  reports' RSS values accessible for the enrich pass.\n- The four historical quiet ends each have a written verdict in the\n  epic Done summary, including ruling the 73a71722e serve-path change\n  and #88 starvation in or out for the afternoon pair.\n\n## Done summary\nExtended the enrich probe with a typed exit verdict (watchdog/operator/soft-exit-leaf/os-memory-kill/signal/no-evidence) backed by a bounded async unified-log jetsam probe and install.sh's operator-reload attribution leaf, plus main-RSS history persisted every serve-health tick for the enrich pass. Classifier tested against fixture leaf/native-crash/operator/jetsam inputs.\n\nForensic pass on the four recorded 07-20 quiet ends (EDT):\n1. boot 272f1b94 (pid 13095, died ~04:50:32) -> OPERATOR: install.sh reload (plist FSEvent 2.4s before the successor boot, the confirmed reload signature).\n2. boot b1856fa0 (pid 92251, died ~08:14:54) -> OPERATOR: install.sh reload (same FSEvent signature, ~2s before successor).\n3. boot 27a0b574 (pid 53298, died ~16:15:25, 31.2min runtime) -> OPERATOR: install.sh reload (full unified-log chain: \"Setting service ... enabled (initiated by launchctl<-bash<-python3.14)\" then plist FSEvent then \"removing service\", 2s before death).\n4. boot bb356594 (pid 56332, died ~16:21:46, 6.35min runtime) -> NO-EVIDENCE, genuinely unattributed. Ruled out: native crash report (probe exhausted, no match), OS-level jetsam/memory-pressure kill (unified-log scan of the full lifetime window: zero matches), operator reload (no plist FSEvent or leaf timestamp in-window), watchdog (no fatalExit reason recorded). Per epic requirement, also ruled out: 73a71722e (status: stop walking the events b-tree for event_count, landed 15:43:45, rode both afternoon boots) -- inspection shows the diff only deletes a try/catched COUNT(*) query and substitutes an already-computed value, adding no new throwable path, and is load-reducing; and #88 main-thread ingest-starvation (~/docs/keeper-phase2-backlog.md) -- its signature (TERM-unresponsive SIGKILL escalation, rpc_unreachable, dark boot) is a MORNING-only phenomenon (~08:44-10:12 EDT) whose fixes (33ad317a2 @ 12:04, 07dddd86a @ 13:38) landed hours before this afternoon pair, and bb356594's window shows none of its symptoms. Best remaining read (unconfirmable): a soft exit predating this epic's exit-attribution leaf instrumentation (landed 20:07:40, after all four deaths) on a boot freshly reloaded by #3's install.sh run -- no forensic trace survives past the bare boot row. A repeat of this shape now carries a leaf, an OS-memory verdict, or an operator match.\n\nTally: 3/4 operator (install.sh reload), 1/4 no-evidence after exhausting every available forensic source, with both of the epic's named suspects explicitly ruled out for the unattributed one.\n## Evidence\n- Commits: c53d7502bf2a2b2b9d05f099a7e1d6867c660de1",
+      "task_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths.2",
+      "tier": "xhigh",
+      "title": "Add OS kill evidence and RSS ramp to the enrich verdict"
+    }
+  ],
+  "created_at": "2026-07-21T06:49:08.967000Z",
+  "epic_id": "fn-1390-attribute-and-stop-quiet-keeperd-deaths",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "4130df4b0cb6c2eb1d805f660e447ec1d94b72456de8035c22c4ce72b5826e6a",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
