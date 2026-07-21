@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Idempotent maintenance-task mint",
-  "updated_at": "2026-07-21T06:19:22.114000Z"
+  "updated_at": "2026-07-21T18:15:32.128000Z",
+  "worker_done_at": "2026-07-21T18:15:32.128000Z"
 }

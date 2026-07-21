@@ -25,5 +25,5 @@ mintMaintenanceTask), test/daemon.test.ts.
 - [ ] The fail-open mint path (mint_failed pages once) is preserved.
 
 ## Done summary
-
+Made the repair maintenance mint idempotence probe reentrancy-safe: a non-reentrant sweep-tick guard plus a pending-mint memo keyed by deterministic maintenance title prevent a not-yet-folded mint or an overlapping tick from double-minting a maintenance epic for the same trunk-red group; the fail-open mint_failed page-once path is preserved.
 ## Evidence
