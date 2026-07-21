@@ -95,12 +95,14 @@ import {
   collapseRestartLedger,
   compactRestartLedger,
   countLiveEscalationSessions,
+  createExitAttributionRecorder,
   DEAD_LETTER_RETENTION_MS,
   type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
   decideDispatchClearLiveness,
+  decideExitAttribution,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
@@ -112,6 +114,7 @@ import {
   drainToCompletion,
   type EscalationDispatchDeps,
   type EscalationDispatchOutcome,
+  type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
   epicHasLiveUnblock,
   escalationCheckoutOccupiedBy,
@@ -120,6 +123,7 @@ import {
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
+  HARD_KILL_EXIT_ATTRIBUTION_REASON,
   INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
   type IncidentClaimSweepDeps,
   type IncidentOwnerPageSweepDeps,
@@ -178,6 +182,7 @@ import {
   type RestartBootLine,
   type RestartLedgerLine,
   type RestartProvenance,
+  readExitAttribution,
   readRestartLedger,
   readSpillDocument,
   readTaskBlockedReason,
@@ -187,6 +192,7 @@ import {
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolveExitAttributionPath,
   resolvePoisonDeadLetter,
   resolveProbeArming,
   routeBlockedCategory,
@@ -234,6 +240,7 @@ import {
   selectWorkerNames,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
+  shouldEnrichPriorExitAttribution,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   type TrunkLeaseSweepDeps,
@@ -3183,6 +3190,178 @@ test("readRestartLedger / writeRestartLedger: NDJSON round-trip through a real f
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("exit-attribution records each soft exit path once with a bounded synced leaf", () => {
+  const stateDir = join(tmpDir, "state");
+  const restartLedgerPath = join(stateDir, "restart-ledger.json");
+  const cases: Array<{
+    name: string;
+    attribution: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+    expected: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+  }> = [
+    {
+      name: "fatal",
+      attribution: { kind: "fatal_exit", reason: "x".repeat(1_000) },
+      expected: {
+        kind: "fatal_exit",
+        reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+      },
+    },
+    {
+      name: "uncaught",
+      attribution: { kind: "uncaught_exception", reason: "uncaught" },
+      expected: { kind: "uncaught_exception", reason: "uncaught" },
+    },
+    {
+      name: "rejection",
+      attribution: { kind: "unhandled_rejection", reason: "rejected" },
+      expected: { kind: "unhandled_rejection", reason: "rejected" },
+    },
+    {
+      name: "term",
+      attribution: { kind: "signal", signal: "SIGTERM" },
+      expected: { kind: "signal", signal: "SIGTERM" },
+    },
+    {
+      name: "int",
+      attribution: { kind: "signal", signal: "SIGINT" },
+      expected: { kind: "signal", signal: "SIGINT" },
+    },
+    {
+      name: "hup",
+      attribution: { kind: "signal", signal: "SIGHUP" },
+      expected: { kind: "signal", signal: "SIGHUP" },
+    },
+    {
+      name: "clean",
+      attribution: { kind: "clean_shutdown" },
+      expected: { kind: "clean_shutdown" },
+    },
+  ];
+
+  expect(resolveExitAttributionPath(restartLedgerPath)).toBe(
+    join(stateDir, "exit-attribution.json"),
+  );
+  for (const { name, attribution, expected } of cases) {
+    const path = join(stateDir, `${name}.json`);
+    const recorder = createExitAttributionRecorder({
+      bootId: `boot-${name}`,
+      path,
+      nowMs: () => 123,
+    });
+    recorder.record(attribution);
+    recorder.record({ kind: "clean_shutdown" });
+    expect(readExitAttribution(path)).toEqual({
+      boot_id: `boot-${name}`,
+      ts: 123,
+      ...expected,
+    });
+    expect(readFileSync(path, "utf8").endsWith("\n")).toBe(true);
+  }
+});
+
+test("decideExitAttribution prefers the leaf, then native evidence, then hard kill", () => {
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 10,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+  const nativeCrash = {
+    native_crash_signal: "SIGSEGV",
+    native_crash_report_id: "report-prior",
+  };
+
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: leaf,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "signal: SIGTERM",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    ...nativeCrash,
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash: null,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  });
+});
+
+test("prior exit attribution skips boots already attributed in the restart ledger", () => {
+  const prior = {
+    ...bootLine("prior", 1, "launchd", null),
+    pid: 1,
+    start_time: "darwin:2025-01-01T00:00:00.000Z",
+  };
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 2,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, reason: "clean shutdown" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, native_crash_signal: "SIGSEGV" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: leaf,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(true);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(true);
 });
 
 test("appendRestartLedgerLine: appends one line without overwriting existing content", () => {
