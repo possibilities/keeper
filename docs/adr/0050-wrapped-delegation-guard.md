@@ -23,8 +23,9 @@ Jurisdiction requires both a non-empty marker and subagent identity in the tool
 payload; human and orchestrator turns remain inert.
 
 `wrapped-guard` is a fail-closed
-`PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash)` guard. Edit, MultiEdit, and
-NotebookEdit are always denied. A handoff Write is eligible only for a fresh
+`PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash|SendMessage)` guard. Edit,
+MultiEdit, and NotebookEdit are always denied. A handoff Write is eligible only for
+a fresh
 `.json`, `.txt`, or `.md` leaf in a newly created owner-private system-temp
 directory. The guard writes the bounded content itself with exclusive, no-follow,
 close-on-exec descriptor flags, then denies the host Write with an
@@ -50,7 +51,11 @@ The wrapper is a dumb courier. It sends implementation, test, and lint iteration
 back to the same provider leg, treats provider output as bounded untrusted data,
 derives the actual path set from Git, and supplies fresh descriptor-written
 manifest/message files to `commit-work`. It never authors source or executes
-repository code itself.
+repository code itself. Because it reads no inbound messages, its SendMessage tool
+is a constant total deny — any target, no grant lifts it — so a message escalation
+never silently hangs the worker; the subagent returns a typed BLOCKED category to
+the parent instead, while an identity-less orchestrator turn's SendMessage stays
+inert.
 
 ## Consequences
 

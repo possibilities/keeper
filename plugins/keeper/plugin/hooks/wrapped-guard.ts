@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash) wrapped-cell total-edit-denial guard.
+// PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash|SendMessage) wrapped-cell total-edit-denial guard.
 //
 // Fourth sibling of branch-guard / grant-guard / wrong-tree-guard. A WRAPPED
 // worker cell's `work:worker` is a claude wrapper that delegates ALL implementation
@@ -1359,10 +1359,12 @@ function writeTargetInTree(
 /**
  * Pure decision: the deny envelope for this (payload, env), or null to allow (no
  * output). The jurisdiction is two-condition (marker non-empty AND subagent
- * `agent_id`); a marked session fails CLOSED on anything it cannot positively
- * clear, an unmarked one is inert (fail open). A non-Write edit tool is denied
- * outright; a Write is denied only in-tree; a Bash command must clear the
- * delegation + close-out allowlist.
+ * `agent_id` OR `agent_type` — either anchors it); a marked session fails CLOSED
+ * on anything it cannot positively clear, an unmarked one is inert (fail open).
+ * SendMessage is a constant total deny that no grant lifts, steering the subagent
+ * to return a typed BLOCKED category instead (an identity-less caller stays
+ * inert); a non-Write edit tool is denied outright; a Write is denied only
+ * in-tree; a Bash command must clear the delegation + close-out allowlist.
  */
 export function decideWrappedGuard(
   payload: unknown,

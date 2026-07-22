@@ -6,11 +6,13 @@
 // the denied source-editing vectors, the re-entrant wrappers, and the documented
 // CVE-2025-66032 shell-bypass corpus as deny vectors; (2) the `decideWrappedGuard`
 // decision ladder — the two-condition jurisdiction (marker non-empty AND subagent
-// agent_id), the total edit-denial (Edit/MultiEdit/NotebookEdit + in-tree Write),
-// the out-of-tree Write allowance, the fail-closed-when-marked / inert-otherwise
-// inversion, the parse-ambiguity fail-closed, and the deny-precedence / single-
-// state intent. The Write tree check runs against an injected fake TreeProbe over
-// a virtual repo layout.
+// agent_id OR agent_type, either anchoring it), the SendMessage constant total
+// deny (no grant lifts it, a typed BLOCKED category returns to the parent, an
+// identity-less caller stays inert), the total edit-denial (Edit/MultiEdit/
+// NotebookEdit + in-tree Write), the out-of-tree Write allowance, the
+// fail-closed-when-marked / inert-otherwise inversion, the parse-ambiguity
+// fail-closed, and the deny-precedence / single-state intent. The Write tree
+// check runs against an injected fake TreeProbe over a virtual repo layout.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
