@@ -6159,6 +6159,15 @@ export async function confirmRunning(
   // pre-launch `Dispatched` event data — present only for a cell-bearing `work`
   // launch. Optional trailing arg so existing call sites are unaffected.
   launchCell?: DispatchedPayload["cell"],
+  // EXACT positive launch-side-effect signal: fired ONCE, immediately after `launch()`
+  // returns ok — i.e. the closer process/window was spawned — REGARDLESS of whether the
+  // SessionStart binds before the ceiling. So it fires for `ok`, `aborted-postlaunch`, AND
+  // the POST-launch-ceiling `indoubt` (the late-binding cold worker), but NEVER for a
+  // pre-launch abort / claim-fold timeout / retryable-or-permanent launch failure (those
+  // ran no closer). The fatal-audit lift consume rides this, so UNKNOWN post-launch HOLDS
+  // (the token is spent) instead of re-arming into a second launch under one retry. Optional
+  // — existing call sites (tests) omit it and are unaffected.
+  onLaunchFired?: () => void,
 ): Promise<ConfirmOutcome> {
   const key = dispatchKey(verb, id);
   const launchWindow = spec.claudeName ?? key;
@@ -6320,6 +6329,11 @@ export async function confirmRunning(
     });
     return "failed";
   }
+  // `launch()` returned ok — the side effect POSITIVELY fired (the closer was spawned). Fire
+  // the launch-fired signal ONCE here, so every subsequent return (ok / aborted-postlaunch /
+  // post-launch ceiling indoubt) counts as a real launch. NEVER reached for any pre-launch
+  // return above.
+  onLaunchFired?.();
   if (signal.aborted) {
     // Shutdown observed right after a SUCCESSFUL launch — the worker is live
     // (or booting). Post-launch: keep the stamps so a fold-lag re-dispatch
@@ -7319,6 +7333,12 @@ export async function runReconcileCycle(
         signal,
         deps,
         launchCell,
+        // CONSUME the fatal-audit one-shot lift at the EXACT launch side effect — the
+        // callback fires iff `launch()` ran the closer (ok / aborted-postlaunch / late-bind
+        // post-launch indoubt), never on a pre-launch skip. A `work` launch is a no-op here.
+        plan.verb === "close"
+          ? () => consumeFatalAuditLift(state.fatalAuditFenceMemo, [plan.id])
+          : undefined,
       );
       // CLEAR the cooldown only when nothing actually launched: a definitive
       // launch failure (`"failed"`) or a pre-launch abort
@@ -7373,15 +7393,9 @@ export async function runReconcileCycle(
           controller: new AbortController(),
         });
       }
-      // CONSUME the fatal-audit one-shot lift at the EXACT launch side-effect seam — only
-      // `ok` (SessionStart bound) or `aborted-postlaunch` (launch fired, then shutdown)
-      // POSITIVELY prove `launch()` ran the closer. Every other outcome (failed /
-      // aborted-prelaunch / suppressed-dup / no-claim, and the CONFLATED `indoubt` —
-      // pre-launch claim-fold timeout OR transient launch fail OR post-launch ceiling) did
-      // NOT run a closer, so it leaves the token armed for the operator's single retry.
-      if (fatalAuditLiftConsumedByOutcome(plan.verb, outcome)) {
-        consumeFatalAuditLift(state.fatalAuditFenceMemo, [plan.id]);
-      }
+      // (The fatal-audit lift consume rides the `onLaunchFired` callback passed to
+      // `confirmRunning` above — the exact post-`launch()` side-effect seam, so a late-binding
+      // post-launch `indoubt` still consumes while every pre-launch skip does not.)
       // Other outcomes (failed / indoubt / aborted-*) record no live entry; see
       // the ConfirmOutcome doc and the stamp handling above. `inFlight` is
       // released for all in the `finally`.
@@ -12169,34 +12183,23 @@ export interface CloseReceiptRead {
   trusted: boolean;
 }
 
-/** Whether a close-finalize event's OUTER `data` is READABLE (parses to a non-null object) —
- *  a DEFINITIVE close-finalize result even when it carries no fatal outcome (e.g. a
- *  `{success:false}` typed error supersedes an older fatal). An UNREADABLE event — null/empty
- *  data (a relocated blob) or a JSON parse error — is UNKNOWN, so the durable receipt scan
- *  falls back PAST it to the most-recent readable close-finalize, never erasing a prior
- *  standing fatal verdict for fence purposes. Pure; NEVER throws. */
-function closeFinalizeOuterReadable(data: string | null): boolean {
-  if (data == null || data.length === 0) return false;
-  try {
-    const outer = JSON.parse(data) as unknown;
-    return outer != null && typeof outer === "object";
-  } catch {
-    return false;
-  }
-}
-
-/** How far back the durable receipt scan looks past UNREADABLE close-finalize events for the
- *  most-recent DEFINITIVE one — generous, since consecutive unreadable receipts are rare. */
-const DURABLE_RECEIPT_SCAN_DEPTH = 8;
+/** Chunk size + hard cap for the durable receipt scan. Most epics resolve on the first row of
+ *  the first chunk (a valid receipt); only a pathological run of invalid events scans deeper.
+ *  Exhausting the cap without a valid receipt resolves to UNKNOWN (no receipt) — HELD by the
+ *  other fence arms, NEVER fail-open. */
+const DURABLE_RECEIPT_SCAN_CHUNK = 16;
+const DURABLE_RECEIPT_SCAN_CAP = 256;
 
 /**
- * Join each close target to its most-recent DEFINITIVE close-finalize receipt — DURABLE: the
- * scan skips UNREADABLE latest events (a relocated blob / a parse error — UNKNOWN) and uses
- * the most-recent READABLE one, so a malformed LATEST receipt never erases a prior standing
- * fatal verdict (the fence survives a restart from durable receipt history). A readable
- * NON-fatal result (`closed_clean`, a `{success:false}` error, …) still SUPERSEDES an older
- * fatal (it is definitive, so the scan stops there with no fatal receipt). A QUERY THROW
- * marks the read UNTRUSTED so the caller arms a retry; a bounded per-epic scan.
+ * Join each close target to its most-recent VALID close-finalize receipt — DURABLE. The scan
+ * advances DESC past ANY event that does NOT yield a valid parsed receipt (a real `outcome`):
+ * a relocated/null blob, a JSON parse error, a missing/empty `stdout`, a `{success:false}`
+ * failed-close-attempt, or a missing `outcome` are ALL UNKNOWN and NEVER erase a prior
+ * standing fatal verdict. It stops ONLY on a valid receipt — a `fatal_halt` fences the epic,
+ * a real non-fatal outcome (`closed_clean`, …) definitively supersedes. A bounded chunked scan
+ * to the first valid receipt / history end / hard cap; cap exhaustion resolves conservatively
+ * to UNKNOWN (never fail-open). A QUERY THROW marks the read UNTRUSTED so the caller arms a
+ * retry.
  */
 export function loadLatestCloseReceipts(
   db: Parameters<typeof runQuery>[0],
@@ -12221,29 +12224,36 @@ export function loadLatestCloseReceipts(
       if (epicId != null && epicId !== "") epicIds.add(epicId);
     }
   }
+  const stmt = db.query(
+    `SELECT id, ts, data
+       FROM events
+      WHERE plan_target = ? AND plan_op = 'close-finalize'
+      ORDER BY id DESC LIMIT ? OFFSET ?`,
+  );
   const receipts = new Map<string, CloseReceipt>();
   let trusted = true;
   for (const epicId of [...epicIds].sort()) {
     try {
-      const rows = db
-        .query(
-          `SELECT id, ts, data
-             FROM events
-            WHERE plan_target = ? AND plan_op = 'close-finalize'
-            ORDER BY id DESC LIMIT ?`,
-        )
-        .all(epicId, DURABLE_RECEIPT_SCAN_DEPTH) as {
-        id: number;
-        ts: number;
-        data: string | null;
-      }[];
-      for (const row of rows) {
-        if (!closeFinalizeOuterReadable(row.data)) continue; // UNKNOWN → fall back
-        // The most-recent READABLE close-finalize is DEFINITIVE: a fatal outcome yields a
-        // receipt; a readable non-fatal yields none (superseding any older fatal). Stop here.
-        const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
-        if (receipt != null) receipts.set(epicId, receipt);
-        break;
+      let offset = 0;
+      let found = false;
+      while (offset < DURABLE_RECEIPT_SCAN_CAP && !found) {
+        const rows = stmt.all(epicId, DURABLE_RECEIPT_SCAN_CHUNK, offset) as {
+          id: number;
+          ts: number;
+          data: string | null;
+        }[];
+        if (rows.length === 0) break; // history exhausted → UNKNOWN
+        for (const row of rows) {
+          const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
+          if (receipt != null) {
+            receipts.set(epicId, receipt); // first VALID receipt → definitive, stop
+            found = true;
+            break;
+          }
+          // else advance PAST this invalid event (unparseable / no outcome / failed attempt)
+        }
+        if (rows.length < DURABLE_RECEIPT_SCAN_CHUNK) break; // history end
+        offset += DURABLE_RECEIPT_SCAN_CHUNK;
       }
     } catch {
       // A transient read error is UNTRUSTED (not a known-absence) → arm a retry.
@@ -12361,24 +12371,6 @@ export function consumeFatalAuditLift(
 }
 
 /**
- * Whether a `confirmRunning` {@link ConfirmOutcome} for a CLOSE launch is a POSITIVE
- * launch-side-effect — `launch()` actually ran the closer — and so consumes the one-shot
- * fatal-audit lift. ONLY `ok` (SessionStart bound) and `aborted-postlaunch` (launch fired,
- * then shutdown) qualify. Every runtime skip (`failed`, `aborted-prelaunch`, `suppressed-dup`,
- * `no-claim`, and the CONFLATED `indoubt` — a pre-launch claim-fold timeout / transient launch
- * fail / post-launch ceiling) ran NO closer, so it leaves the token armed for the single
- * operator retry. Pure; NEVER throws.
- */
-export function fatalAuditLiftConsumedByOutcome(
-  verb: Verb,
-  outcome: ConfirmOutcome,
-): boolean {
-  return (
-    verb === "close" && (outcome === "ok" || outcome === "aborted-postlaunch")
-  );
-}
-
-/**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
  * client subscriptions with, so the reconciler's view matches the board's
@@ -12423,6 +12415,12 @@ export async function loadReconcileSnapshot(
   pidAlive: (pid: number) => boolean = isPidAlive,
   readinessQuery: ReadinessQuery = runQuery,
   nowSec: number = Math.floor(Date.now() / 1000),
+  // The CONSUMED fatal-audit memo episodes (epic ids) — threaded from producer state so their
+  // resolution is graded even WITHOUT an open synthetic row: after a retry-clear + launch, a
+  // valid nonfatal receipt / task-done drift can land BEFORE the ordinary fatal row re-mints,
+  // so `fatalAuditResolvedEpicIds` must cover them or the memo never releases and the fence
+  // holds forever. Empty/absent in tests that don't exercise the consumed lifecycle.
+  reholdEpicIds?: Iterable<string>,
 ): Promise<FencedReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -12455,12 +12453,17 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery, nowSec);
-  // Widen the receipt scan to every OPEN epic (not just live-close-job epics): the
-  // fatal-audit fence must engage after the halting closer stopped and was slot-reaped.
+  // Widen the receipt scan to every OPEN epic (not just live-close-job epics) PLUS the
+  // consumed-memo rehold episodes (so their reclassification is graded without an open row):
+  // the fatal-audit fence must engage after the halting closer stopped / was slot-reaped.
   const openEpicIds = epics
     .filter((e) => e.status !== "done")
     .map((e) => e.epic_id);
-  const closeReceiptRead = loadLatestCloseReceipts(db, jobs, openEpicIds);
+  const reholdEpicIdSet = new Set<string>(reholdEpicIds ?? []);
+  const closeReceiptRead = loadLatestCloseReceipts(db, jobs, [
+    ...openEpicIds,
+    ...reholdEpicIdSet,
+  ]);
   const latestCloseReceiptByEpicId = closeReceiptRead.receipts;
 
   // The shared jobs descriptor intentionally omits the live-only generation
@@ -13314,11 +13317,13 @@ export async function loadReconcileSnapshot(
   const fatalHaltEpicIds = [...latestCloseReceiptByEpicId.entries()]
     .filter(([, r]) => r.outcome === "fatal_halt")
     .map(([id]) => id);
-  // Grade drift over BOTH the fatal-receipt epics and the OPEN fatal-audit ROW epics (an
-  // open row may need a drift-clear even after its receipt turned non-fatal/unreadable).
+  // Grade drift over the fatal-receipt epics, the OPEN fatal-audit ROW epics, AND the
+  // consumed-memo rehold episodes (a consumed epic with NO open row still needs its drift /
+  // nonfatal reclassification graded so the memo can release).
   const fatalAuditGradeEpicIds = new Set<string>([
     ...fatalHaltEpicIds,
     ...openFatalAuditIds,
+    ...reholdEpicIdSet,
   ]);
   const taskDoneRead = loadEpicTaskDoneWatermarks(db, fatalAuditGradeEpicIds);
   const fatalAuditTaskDoneWatermarks = taskDoneRead.watermarks;
@@ -13344,10 +13349,14 @@ export async function loadReconcileSnapshot(
       );
     }
   }
-  // Positive resolution evidence for each OPEN fatal-audit row. UNKNOWN (an open epic whose
-  // receipt read failed, or a still-fatal-current verdict) is NOT added → the row is retained.
+  // Positive resolution evidence for each OPEN fatal-audit row OR consumed-memo rehold episode
+  // (graded even WITHOUT an open row, so a consumed episode can release). UNKNOWN (receipt read
+  // failed, or a still-fatal-current verdict) is NOT added → retained.
   const fatalAuditResolvedEpicIds = new Set<string>();
-  for (const epicId of openFatalAuditIds) {
+  for (const epicId of new Set<string>([
+    ...openFatalAuditIds,
+    ...reholdEpicIdSet,
+  ])) {
     const receipt = latestCloseReceiptByEpicId.get(epicId);
     const resolved =
       // positively done (the close landed elsewhere)
@@ -14066,9 +14075,20 @@ function main(): void {
           );
         }
         await driveTerminalPaneSweep(observedPanes);
+        // The CONSUMED memo episodes — threaded in so their reclassification is graded even
+        // without an open synthetic row (a fresh nonfatal receipt / task-done drift landing
+        // after the retry-launch must release the memo, else the fence holds forever).
+        const reholdEpicIds: string[] = [];
+        for (const [epicId, entry] of state.fatalAuditFenceMemo) {
+          if (entry.lift === "consumed") reholdEpicIds.push(epicId);
+        }
         const snapshot = await loadReconcileSnapshot(
           db,
           async () => observedPanes,
+          undefined,
+          undefined,
+          undefined,
+          reholdEpicIds,
         );
         if (snapshot.readinessDegraded) {
           // A DB-degraded cycle derives no trustworthy decision. The SLOT arm may disarm while

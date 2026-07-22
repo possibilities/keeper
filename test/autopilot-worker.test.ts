@@ -68,7 +68,6 @@ import {
   CLOSE_RECOVERY_MARKER,
   type ClaimAcquireObservation,
   type CloseRecoveryStampResult,
-  type ConfirmOutcome,
   type ConfirmRunningDeps,
   classifyCloseRecoveryStampExit,
   classifyOriginContainment,
@@ -126,7 +125,6 @@ import {
   FINALIZE_PUSH_PER_COMMIT_MS,
   FINALIZER_GUARD_S,
   type FoundJob,
-  fatalAuditLiftConsumedByOutcome,
   fatalHaltReceiptIsCurrent,
   finalizePushDeadlineMs,
   findShadowingWorkManifest,
@@ -7679,7 +7677,7 @@ test("close-finalize receipt parser accepts the hook envelope and rejects malfor
   ).toBeNull();
 });
 
-test("latest close receipts join by epic and do not leak an older fatal past a newer failed receipt", async () => {
+test("latest close receipts join by epic; a failed attempt keeps the fatal, a valid non-fatal supersedes", async () => {
   await withSeededDb((db) => {
     db.run(
       `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
@@ -7722,6 +7720,9 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
     );
     expect(receipt?.commitSetHash).toBeNull();
 
+    // A newer FAILED close attempt ({success:false} — NO outcome) is UNKNOWN, not a valid
+    // receipt and not positive resolution, so the durable scan advances PAST it and the prior
+    // fatal STILL stands (the fence must not drop on a failed re-close attempt).
     db.run(
       `INSERT INTO events
          (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
@@ -7740,7 +7741,20 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
         }),
       ],
     ]);
-    expect(loadLatestCloseReceipts(db, jobs).receipts.size).toBe(0);
+    expect(
+      loadLatestCloseReceipts(db, jobs).receipts.get("fn-1-close")?.outcome,
+    ).toBe("fatal_halt");
+    // A VALID non-fatal outcome, by contrast, DEFINITIVELY supersedes the fatal.
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (32, 'close-job', 'PostToolUse', 'post_tool_use', ?,
+               'close-finalize', 'fn-1-close')`,
+      [hookData(JSON.stringify({ outcome: "closed_clean" }))],
+    );
+    expect(
+      loadLatestCloseReceipts(db, jobs).receipts.get("fn-1-close")?.outcome,
+    ).toBe("closed_clean");
   });
 });
 
@@ -7891,24 +7905,28 @@ test("consumeFatalAuditLift: only an armed token is consumed by a launch; a with
   expect(memo.get("held")?.lift).toBe("none"); // never launched → untouched
 });
 
-// The lift lifecycle driven through the REAL producer-glue functions (stepFatalAuditFenceMemo
-// → gate reset on toForget → isFatalAuditHeld → consumeFatalAuditLift), NEVER an injected
+// The lift lifecycle exercised by composing the exported producer seam functions
+// (stepFatalAuditFenceMemo → gate.forget → isFatalAuditHeld → consumeFatalAuditLift) in the
+// producer's order — a faithful model, NOT the real runReconcileCycle, and NEVER an injected
 // fatalAuditFenceLifted flag. `open`/`current`/`resolved` are the snapshot sets.
 type FenceMemo = Map<
   string,
   { observedInstance: number | null; lift: "none" | "armed" | "consumed" }
 >;
-// One real producer cycle: step the memo → gate.forget(toForget) → derive the consumed set →
-// isFatalAuditHeld → (reconcile plans a launch iff not held) → CONSUME only at the launch
-// SIDE-EFFECT (an `ok` outcome), never on the pre-launch plan. `launchOutcome` models
-// confirmRunning: "ok" fired the closer (consumes); "aborted-prelaunch" is a runtime skip.
-function glueCycle(
+// A faithful MODEL of one producer cycle — it composes the INDIVIDUAL exported seam functions
+// in the SAME order the drive loop + runReconcileCycle glue runs them; it is NOT the real
+// runReconcileCycle. Order: step the memo → gate.forget(toForget) → derive the consumed set →
+// isFatalAuditHeld → (reconcile plans a close iff not held) → consume ONLY on the launch SIDE
+// EFFECT. `launchFired` models confirmRunning's onLaunchFired callback: true iff `launch()`
+// ran the closer (ok / aborted-postlaunch / late-bind post-launch indoubt); false for any
+// pre-launch skip (abort / no-claim / preclose defer / retryable-or-permanent launch fail).
+function simulateFatalAuditCycle(
   memo: FenceMemo,
   gate: ReturnType<typeof createDispatchFailedGate>,
   openInstance: ReadonlyMap<string, number>,
   current: ReadonlyMap<string, string>,
   resolved: ReadonlySet<string>,
-  launchOutcome: ConfirmOutcome = "ok",
+  launchFired = true,
 ): { held: boolean; launched: boolean } {
   const step = stepFatalAuditFenceMemo(openInstance, memo);
   for (const e of step.toForget) gate.forget("close", fatalAuditDispatchId(e));
@@ -7925,9 +7943,7 @@ function glueCycle(
     consumed,
   );
   const launched = !held; // reconcile plans a close iff not held
-  if (launched && fatalAuditLiftConsumedByOutcome("close", launchOutcome)) {
-    consumeFatalAuditLift(memo, ["e"]);
-  }
+  if (launched && launchFired) consumeFatalAuditLift(memo, ["e"]);
   return { held, launched };
 }
 
@@ -7946,14 +7962,22 @@ test("LOCKED (a): malformed receipt + open row → retry → ONE launch + same-f
   // Cycle 1 — malformed latest receipt (current EMPTY), but the OPEN ROW is observed. HELD via
   // arm (b), NOT launched.
   expect(
-    glueCycle(memo, gate, new Map([["e", 10]]), new Map(), new Set()),
+    simulateFatalAuditCycle(
+      memo,
+      gate,
+      new Map([["e", 10]]),
+      new Map(),
+      new Set(),
+    ),
   ).toEqual({
     held: true,
     launched: false,
   });
   // Cycle 2 — operator retry cleared the row (gone): observed open→gone → armed + gate reset →
   // NOT held → ONE launch (consumes the token).
-  expect(glueCycle(memo, gate, new Map(), new Map(), new Set())).toEqual({
+  expect(
+    simulateFatalAuditCycle(memo, gate, new Map(), new Map(), new Set()),
+  ).toEqual({
     held: false,
     launched: true,
   });
@@ -7968,42 +7992,96 @@ test("LOCKED (b): valid receipt + retry → first launch consumes → closer ter
   const cur = new Map([["e", "boom"]]);
   // Cycle 1 — valid current receipt + open row: HELD (arm a), not launched.
   expect(
-    glueCycle(memo, gate, new Map([["e", 10]]), cur, new Set()).launched,
+    simulateFatalAuditCycle(memo, gate, new Map([["e", 10]]), cur, new Set())
+      .launched,
   ).toBe(false);
   // Cycle 2 — retry cleared the row: armed → NOT held → ONE launch (consumes token).
-  expect(glueCycle(memo, gate, new Map(), cur, new Set()).launched).toBe(true);
+  expect(
+    simulateFatalAuditCycle(memo, gate, new Map(), cur, new Set()).launched,
+  ).toBe(true);
   // Cycle 3 — the closer terminated with NO new receipt: the VALID receipt is still current →
   // token consumed (not lifted) → arm (a) RESTORES the fence → NO second launch.
-  expect(glueCycle(memo, gate, new Map(), cur, new Set())).toEqual({
+  expect(
+    simulateFatalAuditCycle(memo, gate, new Map(), cur, new Set()),
+  ).toEqual({
     held: true,
     launched: false,
   });
 });
 
-test("LOCKED (c): a pre-launch runtime skip (abort / no-claim / preclose defer) does NOT consume the token", () => {
-  // The consume trigger is ONLY a positive launch side effect.
-  expect(fatalAuditLiftConsumedByOutcome("close", "ok")).toBe(true);
-  expect(fatalAuditLiftConsumedByOutcome("close", "aborted-postlaunch")).toBe(
-    true,
-  );
-  for (const skip of [
-    "failed",
-    "aborted-prelaunch",
-    "suppressed-dup",
-    "no-claim",
-    "indoubt",
-  ] as const) {
-    expect(fatalAuditLiftConsumedByOutcome("close", skip)).toBe(false);
-  }
-  // Driven through the glue: an armed epic whose launch is a pre-launch abort keeps the token
-  // armed (the single retry survives) — a cap/occupancy withhold is likewise never a launch.
+test("LOCKED (c): a launch that did NOT fire (pre-launch skip) does NOT consume the token; the single retry survives", () => {
   const memo: FenceMemo = new Map();
   const gate = createDispatchFailedGate();
-  glueCycle(memo, gate, new Map([["e", 10]]), new Map(), new Set()); // observe
-  glueCycle(memo, gate, new Map(), new Map(), new Set(), "aborted-prelaunch"); // retry → armed, launch aborts
+  simulateFatalAuditCycle(
+    memo,
+    gate,
+    new Map([["e", 10]]),
+    new Map(),
+    new Set(),
+  ); // observe
+  // retry → armed → planned launch, but launch() did NOT fire (a pre-launch abort / no-claim
+  // / preclose-defer): launchFired=false → NOT consumed.
+  simulateFatalAuditCycle(memo, gate, new Map(), new Map(), new Set(), false);
   expect(memo.get("e")?.lift).toBe("armed"); // NOT consumed
   // Next cycle the same single retry is still pending a real launch.
   expect(stepFatalAuditFenceMemo(new Map(), memo).lifted.has("e")).toBe(true);
+});
+
+test("LOCKED (c/1): confirmRunning.onLaunchFired fires for a POST-launch indoubt (launch ran) but NOT a pre-launch indoubt", async () => {
+  const spec = { prompt: "/plan:close fn", claudeName: "close::fn" };
+  // POST-launch ceiling indoubt: launch() SUCCEEDS, no SessionStart before the tight ceiling.
+  // launchFired must be TRUE (the closer ran) → the lift is consumed, UNKNOWN HOLDS.
+  {
+    const { deps } = makeFakeDeps({
+      maxEventId: 100,
+      pollIntervalMs: 5,
+      ceilingMs: 20,
+    });
+    let fired = false;
+    const outcome = await confirmRunning(
+      "close",
+      "fn-post",
+      "/r",
+      ["sh", "-c", "true"],
+      spec,
+      new AbortController().signal,
+      deps,
+      undefined,
+      () => {
+        fired = true;
+      },
+    );
+    expect(outcome).toBe("indoubt");
+    expect(fired).toBe(true);
+  }
+  // PRE-launch indoubt: the claim-verify never observes the acquired claim (cursor never
+  // passes the mint) → confirmRunning returns indoubt BEFORE launch(). launchFired FALSE.
+  {
+    const { deps } = makeFakeDeps({
+      claimObservation: () => ({
+        cursor: 0,
+        claim: null,
+        pendingAttemptId: null,
+      }),
+      claimVerifyCeilingMs: 20,
+    });
+    let fired = false;
+    const outcome = await confirmRunning(
+      "close",
+      "fn-pre",
+      "/r",
+      ["sh", "-c", "true"],
+      spec,
+      new AbortController().signal,
+      deps,
+      undefined,
+      () => {
+        fired = true;
+      },
+    );
+    expect(outcome).toBe("indoubt");
+    expect(fired).toBe(false);
+  }
 });
 
 test("LOCKED (d): the lift + gate reset fire ONCE, not every cycle (multi-cycle)", () => {
@@ -8464,6 +8542,64 @@ test("fatal-audit restart-safe: an empty memo + operator-cleared row + malformed
     const decision = reconcile(snap, makeState(), 0);
     expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
     expect(decision.withholds.get(epicId)?.code).toBe("fatal-audit");
+  });
+});
+
+test("fatal-audit consumed episode RESOLVES without an open row (nonfatal receipt / task-done drift graded via reholdEpicIds)", async () => {
+  await withSeededDb(async (db) => {
+    // A consumed-memo episode: NO open synthetic row, but a fresh VALID NON-FATAL receipt
+    // landed after the retry-launch. Graded via reholdEpicIds so the memo can release.
+    const clean = "fn-70-clean";
+    seedEpicRow(db, clean, {
+      epic_number: 70,
+      status: "open",
+      tasks: [makeTask({ task_id: `${clean}.1`, epic_id: clean })],
+    });
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (100, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "closed_clean" }), clean],
+    );
+    // A consumed episode drifted by a task-done (still fatal receipt, but a newer done fact).
+    const drift = "fn-71-drift";
+    seedEpicRow(db, drift, {
+      epic_number: 71,
+      status: "open",
+      tasks: [makeTask({ task_id: `${drift}.1`, epic_id: drift })],
+    });
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (101, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt" }), drift],
+    );
+    // Capture the fatal receipt's event id, then land a NEWER task-done fact.
+    const fatalEventId = (
+      db
+        .query(
+          "SELECT id FROM events WHERE plan_target = ? AND plan_op = 'close-finalize'",
+        )
+        .get(drift) as { id: number }
+    ).id;
+    db.run(
+      `INSERT INTO commit_trailer_facts
+         (event_id, committer_session_id, plan_op, plan_target, plan_epic_id, committed_at_ms)
+       VALUES (?, 'sess', 'done', ?, ?, 5000)`,
+      [fatalEventId + 1000, `${drift}.2`, drift],
+    );
+
+    // NO open fatal-audit rows exist (the row was cleared) — pass both epics as consumed
+    // rehold episodes. Both must land in the resolved set so the drive loop GCs the memo.
+    const snap = await loadReconcileSnapshot(
+      db,
+      async () => null,
+      undefined,
+      undefined,
+      undefined,
+      [clean, drift],
+    );
+    expect(snap.openFatalAuditIds?.has(clean)).toBe(false); // no open row
+    expect(snap.fatalAuditResolvedEpicIds?.has(clean)).toBe(true); // nonfatal → resolved
+    expect(snap.fatalAuditResolvedEpicIds?.has(drift)).toBe(true); // task-done drift → resolved
   });
 });
 
