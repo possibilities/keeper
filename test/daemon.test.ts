@@ -11647,6 +11647,7 @@ function routerState(paused = false): ReconcileState {
     finalizerGuard: new Map(),
     maxConcurrentJobs: null,
     maxConcurrentPerRoot: 1,
+    fatalAuditFenceMemo: new Map(),
   };
 }
 

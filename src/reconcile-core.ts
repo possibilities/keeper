@@ -227,7 +227,8 @@ export type WithholdReasonCode =
   | "cooldown"
   | "finalizer-guard"
   | "data-bug-missing-cwd"
-  | "budget-exhausted";
+  | "budget-exhausted"
+  | "fatal-audit";
 
 /** One current, replace-merge withhold observation for a task or close target. */
 export interface WithholdReason {
@@ -962,6 +963,27 @@ export interface ReconcileSnapshot {
   /** Latest close-finalize receipt per epic, read from durable event receipts. */
   latestCloseReceiptByEpicId?: ReadonlyMap<string, CloseReceipt>;
   /**
+   * Epic id → BOUNDED fatal-audit finding excerpt for every epic whose latest close
+   * receipt is a STILL-CURRENT `fatal_halt` verdict ({@link fatalHaltReceiptIsCurrent}
+   * — the receipt's commit set has not drifted). Assembled producer-side in
+   * {@link loadReconcileSnapshot} from {@link latestCloseReceiptByEpicId} + the per-epic
+   * commit-fact watermark; NEVER a fold input. The reconciler WITHHOLDS the close re-mint
+   * for these epics (a fatal verdict stands — re-dispatching only re-halts) and mints ONE
+   * durable `close::<epic>` `fatal-audit` needs-human row carrying the excerpt.
+   */
+  currentFatalAuditEpicIds?: ReadonlyMap<string, string>;
+  /** The epic ids with an OPEN `fatal-audit` `close::<epic>` `dispatch_failures` row —
+   *  the mint-idempotency + positive-drift-clear set (an open row whose epic dropped out
+   *  of {@link currentFatalAuditEpicIds} level-clears). Collected off the reason in
+   *  {@link loadReconcileSnapshot}. */
+  openFatalAuditIds?: ReadonlySet<string>;
+  /** The epic ids whose fatal-audit fence the operator LIFTED via `retry_dispatch` (the
+   *  row was cleared while the verdict is still current), so the withhold releases for ONE
+   *  closer re-run. Producer-tracked in-memory across cycles ({@link
+   *  loadReconcileSnapshot}); re-armed once the re-dispatched closer writes a fresh
+   *  receipt. Empty for a fresh detection so the first observation withholds + mints. */
+  fatalAuditFenceLifted?: ReadonlySet<string>;
+  /**
    * The open `pending_dispatches` rows projected into the {@link PendingDispatch}[]
    * shape `computeReadiness` consumes for the cross-sibling `dispatch-pending`
    * occupant. Built by the SAME `projectPendingDispatches` helper the board/CLI
@@ -1374,6 +1396,22 @@ export interface ReconcileState {
    * straight off the snapshot) for the same reason as `maxConcurrentJobs`.
    */
   maxConcurrentPerRoot: number;
+  /**
+   * The in-process fatal-audit fence memo (EPIC ID → `{eventId, observedOpen}`) — the
+   * producer state that distinguishes a mint→fold lag from an operator `retry_dispatch`
+   * (the row observed-then-gone). Read/mutated ONLY in the cycle glue
+   * (`stepFatalAuditFenceMemo`), never in the pure `reconcile`; the derived
+   * `fatalAuditFenceLifted` set rides the snapshot. IN-MEMORY ONLY; boots EMPTY (a fresh
+   * boot re-withholds a mid-retry epic once, an operator re-retries — matching the
+   * shared-checkout grace-tracker restart contract).
+   */
+  fatalAuditFenceMemo: Map<string, FatalAuditFenceMemoEntry>;
+}
+
+/** One fatal-audit fence memo entry — see {@link ReconcileState.fatalAuditFenceMemo}. */
+export interface FatalAuditFenceMemoEntry {
+  eventId: number;
+  observedOpen: boolean;
 }
 
 /**
@@ -1700,6 +1738,27 @@ export interface ReconcileDecision {
    * reason-scoped upstream so it never touches a genuine `close::<epic>` conflict.
    */
   slotOccupancyClears: { verb: Verb; id: string }[];
+  /**
+   * The fatal-audit needs-human rows to MINT this cycle — one per epic whose latest
+   * close receipt is a still-current `fatal_halt` verdict with NO open `fatal-audit` row
+   * yet AND no operator fence-lift. The producer emits a `close::<epic>` `DispatchFailed`
+   * carrying `fatal-audit: <excerpt>`; the row lands in `failedKeys` and withholds every
+   * later close re-mint (breaking the ~21s re-halt hot-loop) until `retry_dispatch` or a
+   * commit-set drift clears it.
+   */
+  fatalAuditMints: {
+    id: string;
+    excerpt: string;
+    commitSetHash: string | null;
+  }[];
+  /**
+   * The fatal-audit rows to CLEAR this cycle — one per OPEN `fatal-audit` row whose epic
+   * is absent from {@link ReconcileSnapshot.currentFatalAuditEpicIds} (the verdict's
+   * commit set drifted, or the receipt is gone). The producer emits a `DispatchCleared`
+   * so the withhold fence lifts and the re-dispatched closer re-audits the fresh tree.
+   * POSITIVE-EVIDENCE ONLY (the snapshot set is drift-graded), never a bare-absence clear.
+   */
+  fatalAuditClears: { id: string }[];
   /**
    * The earliest wall-clock second a held stopped-live occupant crosses into
    * reap-eligibility (from {@link computeSlotOccupancy}), or `null` when nothing is
@@ -2187,6 +2246,69 @@ export interface SlotOccupancySignal {
 export interface CloseReceipt {
   outcome: string;
   ts: number;
+  /** The `events.id` of the close-finalize receipt row — a global monotone event id
+   *  the fatal-audit staleness grade compares against the epic's newest commit-trailer
+   *  fact (a commit landing AFTER the receipt id drifts the commit set). Optional for
+   *  call-site back-compat; absent → the grade treats the verdict as current (UNKNOWN
+   *  never lifts the fence). */
+  eventId?: number;
+  /** For a `fatal_halt` receipt: the provable finding excerpt (BOUNDED at emission —
+   *  {@link FATAL_AUDIT_EXCERPT_MAX}) the reconciler carries into the durable needs-human
+   *  row so an operator sees WHY the close halted without reading the gitignored audit
+   *  artifact. Empty/absent on every non-fatal receipt. */
+  fatalReason?: string;
+  /** For a `fatal_halt` receipt: the canonical `commit_set_hash` the halting verdict was
+   *  authored over (the provenance pin close-finalize re-derives for its STALE_ARTIFACTS
+   *  gate). Carried for verdict identity; the fence's live staleness grade keys on the
+   *  cheaper monotone {@link CloseReceipt.eventId} vs commit-fact watermark. */
+  commitSetHash?: string | null;
+}
+
+/** Hard bound on the fatal-audit finding excerpt the reconciler embeds in the durable
+ *  `dispatch_failures` reason. The full reasoning lives in the audit artifact; the row
+ *  carries only a scannable head so the bounded incident projection never grows a
+ *  history-sized blob per re-mint. */
+export const FATAL_AUDIT_EXCERPT_MAX = 240;
+
+/** Clamp a fatal-audit finding to the bounded excerpt the durable row carries: collapse
+ *  interior whitespace/newlines to single spaces, trim, and hard-cap at
+ *  {@link FATAL_AUDIT_EXCERPT_MAX} with an ellipsis. Pure; a null/empty finding yields
+ *  a stable placeholder so the row's reason is never a bare token. */
+export function boundFatalAuditExcerpt(
+  reason: string | null | undefined,
+): string {
+  const collapsed = (reason ?? "").replace(/\s+/g, " ").trim();
+  if (collapsed === "")
+    return "fatal close-audit verdict (no finding text captured)";
+  return collapsed.length <= FATAL_AUDIT_EXCERPT_MAX
+    ? collapsed
+    : `${collapsed.slice(0, FATAL_AUDIT_EXCERPT_MAX - 1).trimEnd()}…`;
+}
+
+/**
+ * Grade whether a `fatal_halt` close receipt STILL applies to the epic's current commit
+ * set — the positive-evidence staleness gate. A fatal verdict is authored over a frozen
+ * commit set; close-finalize's STALE_ARTIFACTS gate re-halts a re-close only while the
+ * re-derived `commit_set_hash` still matches, so the reconciler mirrors that with a
+ * cheaper monotone proxy: the receipt is CURRENT unless a commit-trailer fact for the
+ * epic landed AFTER the receipt's own event id (`commitWatermark > receipt.eventId` — new
+ * source commits, e.g. an auto-filed follow-up task, drift the hash). POSITIVE-EVIDENCE
+ * ONLY: a null receipt/watermark (UNKNOWN — no fresh commit evidence) keeps the verdict
+ * current so the fence never lifts on missing data. Pure; NEVER throws.
+ */
+export function fatalHaltReceiptIsCurrent(
+  receipt: CloseReceipt | undefined,
+  commitWatermark: number | null | undefined,
+): boolean {
+  if (receipt === undefined || receipt.outcome !== "fatal_halt") return false;
+  if (
+    receipt.eventId == null ||
+    commitWatermark == null ||
+    !Number.isFinite(commitWatermark)
+  ) {
+    return true; // UNKNOWN — hold the fence, never a positive drift clear.
+  }
+  return commitWatermark <= receipt.eventId;
 }
 
 /** The pure inputs the slot-occupancy pass reads — all liveness enters via the
@@ -2543,6 +2665,8 @@ export function reconcile(
       preCloseFenceClears: [],
       slotOccupancy: [],
       slotOccupancyClears: [],
+      fatalAuditMints: [],
+      fatalAuditClears: [],
       slotNextExpiryAt: null,
       // A DB-degraded cycle is UNKNOWN, not a positive no-candidate — the producer preserves
       // its wake / arms a bounded retry (paused still wins to disarm, decided by the producer).
@@ -2982,6 +3106,19 @@ export function reconcile(
         closeWithhold = withhold("dispatch-in-flight");
       } else if (snapshot.failedKeys.has(closeKey) && !routesCloseIncident) {
         closeWithhold = withhold("failed-key");
+      } else if (
+        snapshot.currentFatalAuditEpicIds?.has(epicId) === true &&
+        snapshot.fatalAuditFenceLifted?.has(epicId) !== true &&
+        !routesCloseIncident
+      ) {
+        // A still-current fatal close-audit verdict stands: re-dispatching only re-halts
+        // (~21s) and reaps a slot. WITHHOLD on the receipt itself (this fires the FIRST
+        // cycle, before the durable row folds — the mint rides the same decision), and
+        // keep withholding once the row is in `failedKeys` above. `retry_dispatch` clears
+        // the row + sets `fatalAuditFenceLifted` so this arm releases for exactly one
+        // re-run; a commit-set drift drops the epic from `currentFatalAuditEpicIds` so
+        // the arm and the mint both stop.
+        closeWithhold = withhold("fatal-audit");
       } else {
         const ownershipCode = dispatchTargetWithholdCode(
           snapshot,
@@ -3257,6 +3394,39 @@ export function reconcile(
     preCloseFenceClears.sort();
   }
 
+  // ── Fatal-audit fence: mint one durable needs-human row per still-current
+  //    `fatal_halt` verdict, and positive-drift-clear a row whose commit set moved.
+  //    Set-difference of the drift-graded current set against the open-row set; a
+  //    fence-lifted (operator retry) epic mints nothing so its one re-run proceeds.
+  const fatalAuditMints: {
+    id: string;
+    excerpt: string;
+    commitSetHash: string | null;
+  }[] = [];
+  const fatalAuditClears: { id: string }[] = [];
+  const currentFatalAudit = snapshot.currentFatalAuditEpicIds;
+  const openFatalAudit = snapshot.openFatalAuditIds ?? new Set<string>();
+  if (currentFatalAudit !== undefined && currentFatalAudit.size > 0) {
+    for (const [epicId, excerpt] of [...currentFatalAudit.entries()].sort(
+      (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
+    )) {
+      if (openFatalAudit.has(epicId)) continue;
+      if (snapshot.fatalAuditFenceLifted?.has(epicId) === true) continue;
+      fatalAuditMints.push({
+        id: epicId,
+        excerpt,
+        commitSetHash:
+          snapshot.latestCloseReceiptByEpicId?.get(epicId)?.commitSetHash ??
+          null,
+      });
+    }
+  }
+  for (const epicId of [...openFatalAudit].sort()) {
+    if (currentFatalAudit?.has(epicId) !== true) {
+      fatalAuditClears.push({ id: epicId });
+    }
+  }
+
   return {
     launches,
     closeRecoveryStamps,
@@ -3272,6 +3442,8 @@ export function reconcile(
     preCloseFenceClears,
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
+    fatalAuditMints,
+    fatalAuditClears,
     slotNextExpiryAt: slot.nextExpiryAt,
     slotNextExpiryTrusted: slot.nextExpiryTrusted,
   };

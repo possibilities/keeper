@@ -28,6 +28,33 @@
 export const MERGE_ESCALATION_REASON_TOKEN = "worktree-merge-conflict";
 
 /**
+ * The EXACT leading reason token a WITHHELD close mints when the epic's latest
+ * close receipt is a still-current `fatal_halt` audit verdict (`fatal-audit: <bounded
+ * finding excerpt>`). The reconciler mints it on `close::<epic>` (the natural close
+ * key) so the ordinary {@link WORKTREE_FINALIZE_ID_PREFIX} / {@link
+ * WORKTREE_RECOVER_REASON_PREFIX} / {@link MERGE_ESCALATION_REASON_TOKEN} arms all
+ * miss it and it routes {@link routeDispatchFailure} `close-plain` — a retryable
+ * sticky in `failedKeys` (so it withholds the close re-mint) that ONLY
+ * `retry_dispatch` OR the reconciler's positive-evidence commit-set-drift level-clear
+ * drops. Distinct leading token from every sibling above, so it never cross-classifies.
+ * A PAGING operator jam (in {@link isJamReason}): a fatal audit finding is
+ * operator-attention-worthy, so it surfaces through needs-human and pages once.
+ */
+export const FATAL_AUDIT_REASON_TOKEN = "fatal-audit";
+
+/**
+ * Whether a `dispatch_failures.reason` is a withheld-close fatal-audit verdict — the
+ * EXACT leading-token gate ({@link FATAL_AUDIT_REASON_TOKEN}). Scopes the reconciler's
+ * positive-evidence level-clear to fatal-audit rows ONLY (a genuine close-plain
+ * failure sharing the key is never auto-dismissed — the same reason-scope discipline
+ * {@link isWorktreeRecoverReason} / {@link isSlotOccupancyReason} enforce), and the
+ * needs-human / page surfaces. Pure; a null/colon-less/non-matching reason yields false.
+ */
+export function isFatalAuditReason(reason: string): boolean {
+  return leadingReasonToken(reason) === FATAL_AUDIT_REASON_TOKEN;
+}
+
+/**
  * The `reason` a block incident carries on its `('block', task_id)`
  * `dispatch_failures` row — the collapsed home of the retired `block_escalations`
  * latch. A block incident is keyed off the `block` verb (never `work` / `close`),
@@ -713,7 +740,8 @@ export type DispatchFailureDisplayKind =
   | "lane-wedge"
   | "stale-base"
   | "dup-epic-number"
-  | "stuck-sentinel";
+  | "stuck-sentinel"
+  | "fatal-audit";
 
 /**
  * The reason→display-KIND map, MOST-SPECIFIC-FIRST. Prefix-matched (not
@@ -769,6 +797,10 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // The stuck-state-sentinel anomaly (`stuck-sentinel`) — prefix-disjoint from
   // every rule above, so ordering is not load-bearing; appended last, own kind.
   { prefix: STUCK_SENTINEL_DISTRESS_REASON, kind: "stuck-sentinel" },
+  // The withheld-close fatal-audit verdict (`fatal-audit`) — prefix-disjoint from
+  // every rule above, so ordering is not load-bearing; its own kind so the board
+  // pill reads a fatal audit distinctly from a merge conflict.
+  { prefix: FATAL_AUDIT_REASON_TOKEN, kind: "fatal-audit" },
 ];
 
 // ── Exhaustiveness tripwire ────────────────────────────────────────────────

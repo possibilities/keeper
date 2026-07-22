@@ -2017,6 +2017,9 @@ test("isJamReason: finalize-non-ff + merge-conflict are jams; recover* is NOT", 
   // The auto-clear prefix is excluded even though it shares the namespace.
   expect(isJamReason("worktree-recover-conflict")).toBe(false);
   expect(isJamReason("worktree-recover-push-failed")).toBe(false);
+  // A withheld-close fatal-audit verdict is an operator jam (it pages + surfaces through
+  // needs-human), matched on its leading token so the bounded excerpt tail never matters.
+  expect(isJamReason("fatal-audit: data loss in the migration")).toBe(true);
   // Unrelated reasons never count.
   expect(isJamReason("job-rejected")).toBe(false);
   expect(isJamReason("worktree-merge-local-timeout")).toBe(false);

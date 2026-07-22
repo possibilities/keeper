@@ -2124,10 +2124,15 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   //     authored over an incomplete tree cannot drive an irreversible close.
   assertDoneTaskAncestry(epicId, stateCtx, primaryRepo, format);
 
-  // 6. fatal verdict → halt. No close, no scaffold; the epic stays open.
+  // 6. fatal verdict → halt. No close, no scaffold; the epic stays open. Stamp the
+  //    fresh commit_set_hash (the SAME provenance pin the STALE_ARTIFACTS gate above
+  //    re-derived) into the terminal receipt: the daemon reconciler reads it to grade
+  //    whether the halting verdict still applies to the current commit set (a follow-up
+  //    task landing new source commits drifts the hash and lifts the withhold fence).
   if (verdict.fatal === true) {
     emitOutcome(CLOSE_OUTCOMES.FATAL_HALT, epicId, ctx, format, stateCtx, {
       fatalReason: (verdict.fatal_reason as string | undefined) ?? "",
+      commitSetHash: freshHash,
     });
     return;
   }
@@ -2281,6 +2286,7 @@ function emitOutcome(
   extra?: {
     newEpicId?: string;
     fatalReason?: string;
+    commitSetHash?: string | null;
     expectedTasks?: number;
     actualTasks?: number;
   },
@@ -2297,6 +2303,9 @@ function emitOutcome(
   }
   if (extra?.fatalReason !== undefined) {
     data.fatal_reason = extra.fatalReason;
+  }
+  if (extra?.commitSetHash != null) {
+    data.commit_set_hash = extra.commitSetHash;
   }
   if (extra?.expectedTasks !== undefined) {
     data.expected_tasks = extra.expectedTasks;

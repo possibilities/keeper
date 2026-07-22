@@ -711,6 +711,7 @@ describe("single vocabulary source", () => {
       ["stale-base-lane", "stale-base"],
       ["dup-epic-number", "dup-epic-number"],
       ["stuck-sentinel", "stuck-sentinel"],
+      ["fatal-audit", "fatal-audit"],
     ]);
   });
 });

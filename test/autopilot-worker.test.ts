@@ -56,6 +56,7 @@ import {
   BASE_REFRESH_COOLDOWN_SEC,
   type BaseDriftEntry,
   beginContainmentCycle,
+  boundFatalAuditExcerpt,
   buildCloseRecoveryStampArgv,
   buildLaunchArgv,
   buildPlannedLaunchSpec,
@@ -112,6 +113,7 @@ import {
   decideTerminalPaneTeardowns,
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
+  dispatchKey,
   dupEpicNumberDistressId,
   EXPIRY_WAKE_UNKNOWN_RETRY_SEC,
   type ExpiryWakeClock,
@@ -123,6 +125,7 @@ import {
   FINALIZE_PUSH_PER_COMMIT_MS,
   FINALIZER_GUARD_S,
   type FoundJob,
+  fatalHaltReceiptIsCurrent,
   finalizePushDeadlineMs,
   findShadowingWorkManifest,
   findWrappedDelegationSkips,
@@ -158,6 +161,7 @@ import {
   laneFailuresToClear,
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
+  loadEpicCommitWatermarks,
   loadLatestCloseReceipts,
   loadReconcileSnapshot,
   loadTerminalPaneTeardownJobs,
@@ -230,6 +234,7 @@ import {
   sharedWedgeDistressId,
   slotWakeArm,
   staleBaseLaneDistressId,
+  stepFatalAuditFenceMemo,
   stuckSentinelJobId,
   stuckSentinelOrphansToClear,
   sweepFinalizerGuard,
@@ -832,6 +837,8 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
     maxConcurrentJobs: null,
     // fn-954: per-root count N. Default 1 = the one-task-per-root mutex.
     maxConcurrentPerRoot: 1,
+    // Fatal-audit fence memo — boots empty; the drive loop maintains it.
+    fatalAuditFenceMemo: new Map(),
     ...overrides,
   };
 }
@@ -7623,9 +7630,39 @@ test("close-finalize receipt parser accepts the hook envelope and rejects malfor
       stdout: JSON.stringify({ success: true, outcome: "fatal_halt" }),
     },
   });
+  // A fatal_halt receipt yields the bounded finding placeholder (no fatal_reason in
+  // this payload) + a null commit_set_hash; the event id rides only when passed.
   expect(extractCloseFinalizeReceipt(data, 42)).toEqual({
     outcome: "fatal_halt",
     ts: 42,
+    fatalReason: "fatal close-audit verdict (no finding text captured)",
+    commitSetHash: null,
+  });
+  // A non-fatal receipt carries no fatal fields; the passed event id rides through.
+  const clean = JSON.stringify({
+    tool_response: { stdout: JSON.stringify({ outcome: "closed_clean" }) },
+  });
+  expect(extractCloseFinalizeReceipt(clean, 42, 99)).toEqual({
+    outcome: "closed_clean",
+    ts: 42,
+    eventId: 99,
+  });
+  // A fatal_halt with a real finding + commit_set_hash carries both, bounded.
+  const fatal = JSON.stringify({
+    tool_response: {
+      stdout: JSON.stringify({
+        outcome: "fatal_halt",
+        fatal_reason: "  data loss: the migration drops a\n column   ",
+        commit_set_hash: "abc123",
+      }),
+    },
+  });
+  expect(extractCloseFinalizeReceipt(fatal, 7, 5)).toEqual({
+    outcome: "fatal_halt",
+    ts: 7,
+    eventId: 5,
+    fatalReason: "data loss: the migration drops a column",
+    commitSetHash: "abc123",
   });
   expect(extractCloseFinalizeReceipt("{", 42)).toBeNull();
   expect(
@@ -7651,24 +7688,32 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
                'close-finalize', 'fn-1-close')`,
       [hookData(JSON.stringify({ outcome: "fatal_halt" }))],
     );
-    expect(
-      loadLatestCloseReceipts(
-        db,
-        new Map([
-          [
-            "close-job",
-            makeJob({
-              job_id: "close-job",
-              created_at: 10,
-              updated_at: 20,
-              state: "stopped",
-              plan_verb: "close",
-              plan_ref: "fn-1-close",
-            }),
-          ],
-        ]),
-      ),
-    ).toEqual(new Map([["fn-1-close", { outcome: "fatal_halt", ts: 30 }]]));
+    const receipts = loadLatestCloseReceipts(
+      db,
+      new Map([
+        [
+          "close-job",
+          makeJob({
+            job_id: "close-job",
+            created_at: 10,
+            updated_at: 20,
+            state: "stopped",
+            plan_verb: "close",
+            plan_ref: "fn-1-close",
+          }),
+        ],
+      ]),
+    );
+    const receipt = receipts.get("fn-1-close");
+    expect(receipt?.outcome).toBe("fatal_halt");
+    expect(receipt?.ts).toBe(30);
+    // The receipt now carries its own event id (the staleness watermark) + the bounded
+    // fatal placeholder (no fatal_reason in this payload) + a null commit_set_hash.
+    expect(typeof receipt?.eventId).toBe("number");
+    expect(receipt?.fatalReason).toBe(
+      "fatal close-audit verdict (no finding text captured)",
+    );
+    expect(receipt?.commitSetHash).toBeNull();
 
     db.run(
       `INSERT INTO events
@@ -7689,6 +7734,191 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
       ],
     ]);
     expect(loadLatestCloseReceipts(db, jobs).size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fatal close-audit fence — the loop-stop for a re-halting closer.
+// ---------------------------------------------------------------------------
+
+test("boundFatalAuditExcerpt collapses whitespace, trims, hard-caps, and placeholders empty", () => {
+  expect(boundFatalAuditExcerpt("  a\n\n  b  ")).toBe("a b");
+  expect(boundFatalAuditExcerpt(null)).toBe(
+    "fatal close-audit verdict (no finding text captured)",
+  );
+  expect(boundFatalAuditExcerpt("   ")).toBe(
+    "fatal close-audit verdict (no finding text captured)",
+  );
+  const long = "x".repeat(500);
+  const bounded = boundFatalAuditExcerpt(long);
+  expect(bounded.length).toBeLessThanOrEqual(240);
+  expect(bounded.endsWith("…")).toBe(true);
+});
+
+test("fatalHaltReceiptIsCurrent: positive-evidence-only staleness grade", () => {
+  const receipt = {
+    outcome: "fatal_halt",
+    ts: 1,
+    eventId: 100,
+  } as const;
+  // No new commits after the receipt id → current.
+  expect(fatalHaltReceiptIsCurrent(receipt, 100)).toBe(true);
+  expect(fatalHaltReceiptIsCurrent(receipt, 50)).toBe(true);
+  // A commit landed AFTER the receipt → drifted → NOT current.
+  expect(fatalHaltReceiptIsCurrent(receipt, 101)).toBe(false);
+  // UNKNOWN (missing watermark or missing receipt event id) → hold the fence (current).
+  expect(fatalHaltReceiptIsCurrent(receipt, null)).toBe(true);
+  expect(fatalHaltReceiptIsCurrent({ outcome: "fatal_halt", ts: 1 }, 999)).toBe(
+    true,
+  );
+  // A non-fatal receipt is never a fatal-audit fence.
+  expect(
+    fatalHaltReceiptIsCurrent(
+      { outcome: "closed_clean", ts: 1, eventId: 1 },
+      1,
+    ),
+  ).toBe(false);
+  expect(fatalHaltReceiptIsCurrent(undefined, 1)).toBe(false);
+});
+
+test("stepFatalAuditFenceMemo: startup holds, fold-lag holds, operator retry lifts, re-arm", () => {
+  const memo = new Map<string, { eventId: number; observedOpen: boolean }>();
+  const cur = new Map([["fn-1", 100]]);
+  // Cycle 1 — minted this cycle, row not folded yet (openIds empty): NOT lifted (fold-lag,
+  // not a retry). The memo records the mint pending the fold.
+  memo.set("fn-1", { eventId: 100, observedOpen: false });
+  expect([...stepFatalAuditFenceMemo(cur, new Set(), memo)]).toEqual([]);
+  // Cycle 2 — row folded (open): observed, never lifted.
+  expect([...stepFatalAuditFenceMemo(cur, new Set(["fn-1"]), memo)]).toEqual(
+    [],
+  );
+  expect(memo.get("fn-1")).toEqual({ eventId: 100, observedOpen: true });
+  // Cycle 3 — operator retry_dispatch cleared the row (observed-then-gone) → LIFTED.
+  expect([...stepFatalAuditFenceMemo(cur, new Set(), memo)]).toEqual(["fn-1"]);
+  // Cycle 4 — the re-dispatched closer re-halted with a FRESH receipt id → re-arm (drop
+  // the stale entry) so the next cycle re-mints + re-withholds.
+  const cur2 = new Map([["fn-1", 200]]);
+  expect([...stepFatalAuditFenceMemo(cur2, new Set(), memo)]).toEqual([]);
+  expect(memo.has("fn-1")).toBe(false);
+  // A drift-cleared (no-longer-current) epic is GC'd from the memo.
+  memo.set("fn-2", { eventId: 5, observedOpen: true });
+  stepFatalAuditFenceMemo(new Map(), new Set(), memo);
+  expect(memo.has("fn-2")).toBe(false);
+});
+
+// A close-ready epic whose latest close receipt is a still-current fatal_halt verdict.
+function fatalAuditSnapshot(
+  overrides: Partial<ReconcileSnapshot> = {},
+): ReconcileSnapshot {
+  const epic = makeEpic({
+    epic_id: "fn-2-close",
+    epic_number: 2,
+    project_dir: "/repo-close",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-close.1",
+        epic_id: "fn-2-close",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  return makeSnapshot({
+    epics: [epic],
+    currentFatalAuditEpicIds: new Map([["fn-2-close", "data loss finding"]]),
+    latestCloseReceiptByEpicId: new Map([
+      [
+        "fn-2-close",
+        {
+          outcome: "fatal_halt",
+          ts: 10,
+          eventId: 100,
+          fatalReason: "data loss finding",
+          commitSetHash: "hash-a",
+        },
+      ],
+    ]),
+    ...overrides,
+  });
+}
+
+test("fatal-audit: a current fatal_halt verdict WITHHOLDS the close and mints exactly one row", () => {
+  const decision = reconcile(fatalAuditSnapshot(), makeState(), 0);
+  // The close is withheld with the fatal-audit code — no re-dispatch of a re-halting closer.
+  expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
+  expect(decision.withholds.get("fn-2-close")?.code).toBe("fatal-audit");
+  // Exactly one durable needs-human row minted, carrying the bounded excerpt + hash.
+  expect(decision.fatalAuditMints).toEqual([
+    { id: "fn-2-close", excerpt: "data loss finding", commitSetHash: "hash-a" },
+  ]);
+  expect(decision.fatalAuditClears).toEqual([]);
+});
+
+test("fatal-audit: a lifted fence (operator retry) lets the closer re-run once, minting nothing", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({ fatalAuditFenceLifted: new Set(["fn-2-close"]) }),
+    makeState(),
+    0,
+  );
+  // The fence is lifted → the close re-dispatches (verdict re-audited) and mints no row.
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
+  expect(decision.fatalAuditMints).toEqual([]);
+});
+
+test("fatal-audit: a standing row is not re-minted (fold-safe) but STILL withholds the close", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({
+      openFatalAuditIds: new Set(["fn-2-close"]),
+      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
+    }),
+    makeState(),
+    0,
+  );
+  expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
+  // Row already open → no second mint (the fold-safety property: two mints, one row).
+  expect(decision.fatalAuditMints).toEqual([]);
+  expect(decision.fatalAuditClears).toEqual([]);
+});
+
+test("fatal-audit: a commit-set drift (no longer current) level-CLEARS an open row", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({
+      // The verdict drifted: the epic dropped out of the current set, but a row is open.
+      currentFatalAuditEpicIds: new Map(),
+      openFatalAuditIds: new Set(["fn-2-close"]),
+      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
+    }),
+    makeState(),
+    0,
+  );
+  expect(decision.fatalAuditClears).toEqual([{ id: "fn-2-close" }]);
+  expect(decision.fatalAuditMints).toEqual([]);
+});
+
+test("fatal-audit: a non-current / non-fatal receipt does NOT withhold or mint", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({ currentFatalAuditEpicIds: new Map() }),
+    makeState(),
+    0,
+  );
+  // No current fatal verdict → the close proceeds normally, no fence, no row.
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
+  expect(decision.withholds.get("fn-2-close")?.code).not.toBe("fatal-audit");
+  expect(decision.fatalAuditMints).toEqual([]);
+  expect(decision.fatalAuditClears).toEqual([]);
+});
+
+test("loadEpicCommitWatermarks: max commit-trailer-fact id per epic, absent on no rows", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO commit_trailer_facts
+         (event_id, committer_session_id, plan_op, plan_target, plan_epic_id, committed_at_ms)
+       VALUES (5, 's', 'commit', 'fn-1-foo.1', 'fn-1-foo', 1000),
+              (9, 's', 'commit', 'fn-1-foo.2', 'fn-1-foo', 2000)`,
+    );
+    const w = loadEpicCommitWatermarks(db, ["fn-1-foo", "fn-2-none"]);
+    expect(w.get("fn-1-foo")).toBe(9);
+    expect(w.has("fn-2-none")).toBe(false);
   });
 });
 

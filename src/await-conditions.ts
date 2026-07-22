@@ -83,6 +83,7 @@
 
 import type { MonitorEntry } from "./derivers";
 import {
+  FATAL_AUDIT_REASON_TOKEN,
   LANE_BACKUP_DISTRESS_REASON,
   LANE_TEARDOWN_DISTRESS_REASON,
   MERGE_ESCALATION_REASON_TOKEN,
@@ -1295,7 +1296,8 @@ export function monitorRunningState(
  * class: `worktree-finalize-non-fast-forward` (an origin-ahead non-ff needing an operator
  * to reconcile origin), `worktree-finalize-suite-red` (the prospective merge result's
  * fast suite failed — a semantic merge conflict an operator must reconcile), a
- * `worktree-merge-conflict` close-sink content conflict, and the two shared-checkout
+ * `worktree-merge-conflict` close-sink content conflict, a `fatal-audit` withheld-close
+ * verdict (a still-current fatal close-audit finding holding the epic open), and the two shared-checkout
  * hygiene distress families — `shared-checkout-dirty` / `shared-checkout-desync` (a
  * shared MAIN checkout left dirty or trailing landed history; a commit made from it can
  * mass-revert landed work, so an operator must reconcile the checkout). The minted dirty
@@ -1318,6 +1320,7 @@ export function isJamReason(reason: string): boolean {
     reason === WORKTREE_FINALIZE_NON_FF_REASON ||
     reason === WORKTREE_FINALIZE_SUITE_RED_REASON ||
     reason.startsWith(MERGE_ESCALATION_REASON_TOKEN) ||
+    reason.startsWith(FATAL_AUDIT_REASON_TOKEN) ||
     reason.startsWith(SHARED_DIRTY_DISTRESS_REASON) ||
     reason.startsWith(SHARED_DESYNC_DISTRESS_REASON) ||
     reason.startsWith(ORIGIN_CONTAINMENT_DISTRESS_REASON) ||

@@ -202,6 +202,7 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_ID,
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
+  FATAL_AUDIT_REASON_TOKEN,
   isBusDegradedDistressKey,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
@@ -15574,6 +15575,39 @@ function startDaemonWithExitAttribution(
     }
   }
 
+  // The OPEN, not-yet-paged fatal-audit rows — a `close::<epic>` `dispatch_failures`
+  // row whose reason leads with FATAL_AUDIT_REASON_TOKEN (a still-current fatal
+  // close-audit verdict holding the epic open). Reuses the generic page-once sweep +
+  // the `MergeHumanNotified{verb:close}` once-marker; the producer (reconcile) owns the
+  // mint + the drift/retry level-clear, this only pages a standing row ONCE.
+  function selectUnpagedFatalAuditRows(): SharedCheckoutPageRow[] {
+    try {
+      return db
+        .query(
+          `SELECT id, dir, reason FROM dispatch_failures
+             WHERE verb = 'close' AND reason LIKE ? AND human_notified_at IS NULL`,
+        )
+        .all(`${FATAL_AUDIT_REASON_TOKEN}:%`) as SharedCheckoutPageRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  async function notifyHumanOfFatalAudit(
+    row: SharedCheckoutPageRow,
+  ): Promise<SharedCheckoutNotifiedOutcome> {
+    return notifyHuman(
+      [
+        `🔴 keeper: close::${row.id} halted — a fatal close-audit verdict stands.`,
+        `The closer will not re-run while it holds; land a follow-up (its commits`,
+        `re-audit the tree and lift the fence) or, once addressed, clear it:`,
+        `  keeper autopilot retry close::${row.id}`,
+        ``,
+        `Finding: ${row.reason.trim()}`,
+      ].join("\n"),
+    );
+  }
+
   function selectSharedCheckoutWriters(
     checkoutDir: string,
   ): SharedCheckoutWriter[] {
@@ -16037,6 +16071,17 @@ function startDaemonWithExitAttribution(
       notifyHuman: (row) => notifyHumanOfSharedCheckout(row),
       mintNotified: (id, outcome) =>
         mintSharedCheckoutHumanNotifiedEvent(id, outcome),
+      noteLine: note,
+    });
+    // Page each OPEN, not-yet-paged fatal-audit row ONCE — reuses the generic page-once
+    // sweep, stamping the `MergeHumanNotified{verb:close}` once-marker (retry_dispatch /
+    // drift clears the row, re-arming the marker at NULL). Inherits this tick's not-paused
+    // gating; the producer owns the mint + level-clear.
+    await runSharedCheckoutPageSweep({
+      selectUnpaged: selectUnpagedFatalAuditRows,
+      notifyHuman: (row) => notifyHumanOfFatalAudit(row),
+      mintNotified: (id, outcome) =>
+        mintMergeHumanNotifiedEvent(id, outcome, "close"),
       noteLine: note,
     });
   }

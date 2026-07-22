@@ -540,6 +540,9 @@ describe("close-finalize fatal_halt", () => {
     expect(code).toBe(0);
     expect(env.outcome).toBe("fatal_halt");
     expect(env.fatal_reason).toBe("ships a data-loss bug");
+    // The receipt stamps the fresh commit_set_hash so the daemon reconciler can grade
+    // whether the halting verdict still applies to the epic's current commit set.
+    expect(env.commit_set_hash).toBe(emptySetHash());
     expect(epicStatus(proj.root, epicId)).toBe("open");
   });
 });

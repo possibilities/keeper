@@ -93,7 +93,9 @@ import {
   assertNever,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
+  FATAL_AUDIT_REASON_TOKEN,
   isDupEpicNumberDistressKey,
+  isFatalAuditReason,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
@@ -165,6 +167,7 @@ import {
 } from "./readiness-inputs";
 import {
   type BaseDriftEntry,
+  boundFatalAuditExcerpt,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   type CloseReceipt,
@@ -174,7 +177,9 @@ import {
   type EpicRecoverVerdict,
   epicHasOccupyingJob,
   epicResourceTeardownBlocked,
+  type FatalAuditFenceMemoEntry,
   FINALIZER_GUARD_S,
+  fatalHaltReceiptIsCurrent,
   type HostMatrixSnapshot,
   isBareShellCommand,
   isFinalizerVerb,
@@ -386,6 +391,7 @@ export type {
 // after the extraction. The impure remainder — snapshot loading, the git drivers,
 // recover/finalize, the message pump — stays in this module.
 export {
+  boundFatalAuditExcerpt,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   classifyResolverOutcome,
@@ -395,6 +401,7 @@ export {
   epicHasOccupyingJob,
   epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
+  fatalHaltReceiptIsCurrent,
   isBareShellCommand,
   isEpicInFlight,
   isFinalizerGuarded,
@@ -6675,6 +6682,32 @@ export async function runReconcileCycle(
       dispatchClearedPayload(dispatchFailureFences, clr.verb, clr.id),
     );
   }
+  // Fatal-audit fence: mint one durable `close::<epic>` needs-human row per still-current
+  // fatal verdict (breaking the ~21s re-halt hot-loop — `failedKeys` then withholds every
+  // re-mint), and positive-drift-clear a row whose commit set moved so the re-dispatched
+  // closer re-audits the fresh tree. The change-gate + reducer UPSERT make a re-emit of a
+  // standing row idempotent (fold-safe: two mints, one row).
+  for (const mint of decision.fatalAuditMints) {
+    if (signal.aborted) {
+      return;
+    }
+    deps.emitDispatchFailed({
+      verb: "close",
+      id: mint.id,
+      reason: `${FATAL_AUDIT_REASON_TOKEN}: ${mint.excerpt}`,
+      dir: null,
+      conflictedFiles: null,
+      ts: deps.now(),
+    });
+  }
+  for (const clr of decision.fatalAuditClears) {
+    if (signal.aborted) {
+      return;
+    }
+    deps.emitDispatchCleared(
+      dispatchClearedPayload(dispatchFailureFences, "close", clr.id),
+    );
+  }
   // Refresh drifted bases before dispatching new work. This is a producer sibling
   // of recover/finalize: it mutates only the lane's own linked worktree and never
   // runs from the observational snapshot probe. A null attribution snapshot is
@@ -12059,10 +12092,14 @@ export function deriveResourceHoldObservations(
   return out;
 }
 
-/** Parse one durable close-finalize tool receipt without trusting its shape. */
+/** Parse one durable close-finalize tool receipt without trusting its shape. The
+ *  `eventId` (the receipt's own `events.id`) is the monotone watermark the fatal-audit
+ *  staleness grade compares against the epic's newest commit-trailer fact; a `fatal_halt`
+ *  receipt additionally yields its BOUNDED `fatal_reason` excerpt + `commit_set_hash`. */
 export function extractCloseFinalizeReceipt(
   data: string | null,
   ts: number,
+  eventId?: number,
 ): CloseReceipt | null {
   if (data == null || data.length === 0 || !Number.isFinite(ts)) return null;
   try {
@@ -12077,10 +12114,21 @@ export function extractCloseFinalizeReceipt(
       receipt = JSON.parse(stdout);
     }
     if (receipt == null || typeof receipt !== "object") return null;
-    const outcome = (receipt as Record<string, unknown>).outcome;
-    return typeof outcome === "string" && outcome.length > 0
-      ? { outcome, ts }
-      : null;
+    const body = receipt as Record<string, unknown>;
+    const outcome = body.outcome;
+    if (typeof outcome !== "string" || outcome.length === 0) return null;
+    const out: CloseReceipt = { outcome, ts };
+    if (typeof eventId === "number" && Number.isSafeInteger(eventId)) {
+      out.eventId = eventId;
+    }
+    if (outcome === "fatal_halt") {
+      out.fatalReason = boundFatalAuditExcerpt(
+        typeof body.fatal_reason === "string" ? body.fatal_reason : null,
+      );
+      out.commitSetHash =
+        typeof body.commit_set_hash === "string" ? body.commit_set_hash : null;
+    }
+    return out;
   } catch {
     return null;
   }
@@ -12095,6 +12143,7 @@ export function extractCloseFinalizeReceipt(
 export function loadLatestCloseReceipts(
   db: Parameters<typeof runQuery>[0],
   jobs: ReadonlyMap<string, Job>,
+  additionalEpicIds?: Iterable<string>,
 ): Map<string, CloseReceipt> {
   const epicIds = new Set<string>();
   for (const job of jobs.values()) {
@@ -12107,25 +12156,108 @@ export function loadLatestCloseReceipts(
       epicIds.add(job.plan_ref);
     }
   }
+  // The fatal-audit fence must engage even after the halting closer stopped and was
+  // slot-reaped (no live close job), so the caller widens the scan to every OPEN epic.
+  if (additionalEpicIds !== undefined) {
+    for (const epicId of additionalEpicIds) {
+      if (epicId != null && epicId !== "") epicIds.add(epicId);
+    }
+  }
   const receipts = new Map<string, CloseReceipt>();
   for (const epicId of [...epicIds].sort()) {
     try {
       const row = db
         .query(
-          `SELECT ts, data
+          `SELECT id, ts, data
              FROM events
             WHERE plan_target = ? AND plan_op = 'close-finalize'
             ORDER BY id DESC LIMIT 1`,
         )
-        .get(epicId) as { ts: number; data: string | null } | null;
+        .get(epicId) as {
+        id: number;
+        ts: number;
+        data: string | null;
+      } | null;
       if (row == null) continue;
-      const receipt = extractCloseFinalizeReceipt(row.data, row.ts);
+      const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
       if (receipt != null) receipts.set(epicId, receipt);
     } catch {
       // Missing/inconclusive receipt evidence keeps the ordinary grace.
     }
   }
   return receipts;
+}
+
+/**
+ * The per-epic max `commit_trailer_facts.event_id` — the newest source commit landed for
+ * each epic, the monotone watermark {@link fatalHaltReceiptIsCurrent} compares against a
+ * fatal-audit receipt's own event id (a commit landing AFTER the receipt drifts the
+ * verdict's commit set). ONE bounded aggregate over the requested epics; a read edge
+ * degrades that epic to UNKNOWN (absent from the map → the grade holds the fence).
+ * Producer-side read, NEVER a fold.
+ */
+export function loadEpicCommitWatermarks(
+  db: Parameters<typeof runQuery>[0],
+  epicIds: Iterable<string>,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const epicId of epicIds) {
+    if (epicId == null || epicId === "") continue;
+    try {
+      const row = db
+        .query(
+          "SELECT MAX(event_id) AS m FROM commit_trailer_facts WHERE plan_epic_id = ?",
+        )
+        .get(epicId) as { m: number | null } | null;
+      if (row != null && typeof row.m === "number" && Number.isFinite(row.m)) {
+        out.set(epicId, row.m);
+      }
+    } catch {
+      // Read edge → UNKNOWN watermark → the staleness grade holds the fence.
+    }
+  }
+  return out;
+}
+
+/**
+ * Fold the producer's fatal-audit fence memo forward one cycle and return the epics whose
+ * fence is LIFTED (an operator cleared the row while the verdict stands current — the
+ * withhold releases for exactly one closer re-run). Pure over its inputs + the mutated
+ * memo:
+ *   - a CURRENT epic with an OPEN row → remember `(eventId, observedOpen:true)`; never lifted.
+ *   - a CURRENT epic, row ABSENT, memo pinned to THIS receipt AND already observed-open →
+ *     LIFTED (the row was cleared post-fold — an operator retry). Absent-but-never-observed
+ *     is mint→fold lag, NOT a lift.
+ *   - a receipt whose id advanced past the memo (the re-dispatched closer re-halted) →
+ *     re-arm: drop the stale entry so the next cycle re-mints + re-withholds.
+ *   - a NON-current epic → GC its entry (drift-cleared / receipt gone).
+ * NEVER throws.
+ */
+export function stepFatalAuditFenceMemo(
+  currentReceiptEventIdByEpic: ReadonlyMap<string, number>,
+  openFatalAuditIds: ReadonlySet<string>,
+  memo: Map<string, FatalAuditFenceMemoEntry>,
+): Set<string> {
+  const lifted = new Set<string>();
+  for (const epicId of [...memo.keys()]) {
+    if (!currentReceiptEventIdByEpic.has(epicId)) memo.delete(epicId); // GC
+  }
+  for (const [epicId, eventId] of currentReceiptEventIdByEpic) {
+    const entry = memo.get(epicId);
+    if (entry !== undefined && entry.eventId !== eventId) {
+      memo.delete(epicId); // closer re-halted with a fresh receipt → re-arm
+    }
+    const open = openFatalAuditIds.has(epicId);
+    if (open) {
+      memo.set(epicId, { eventId, observedOpen: true });
+      continue;
+    }
+    const cur = memo.get(epicId);
+    if (cur !== undefined && cur.eventId === eventId && cur.observedOpen) {
+      lifted.add(epicId); // observed-then-gone = operator retry
+    }
+  }
+  return lifted;
 }
 
 /**
@@ -12205,7 +12337,16 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery, nowSec);
-  const latestCloseReceiptByEpicId = loadLatestCloseReceipts(db, jobs);
+  // Widen the receipt scan to every OPEN epic (not just live-close-job epics): the
+  // fatal-audit fence must engage after the halting closer stopped and was slot-reaped.
+  const openEpicIds = epics
+    .filter((e) => e.status !== "done")
+    .map((e) => e.epic_id);
+  const latestCloseReceiptByEpicId = loadLatestCloseReceipts(
+    db,
+    jobs,
+    openEpicIds,
+  );
 
   // The shared jobs descriptor intentionally omits the live-only generation
   // column; exact Resource holds require it, so enrich the producer snapshot
@@ -12260,6 +12401,9 @@ export async function loadReconcileSnapshot(
   const openRecoverRows: NonNullable<ReconcileSnapshot["openRecoverRows"]> = [];
   const finalizeFailureIds = new Set<string>();
   const preCloseFenceFailureIds = new Set<string>();
+  // The epic ids with an OPEN `fatal-audit` `close::<epic>` row (reason leading token
+  // FATAL_AUDIT_REASON_TOKEN) — the mint-idempotency + positive-drift-clear set.
+  const openFatalAuditIds = new Set<string>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
   // The `repoDir`s with an OPEN shared-checkout-wedge distress row — the level-clear
   // set the recover pass's grace tracker clears against (a row whose checkout is
@@ -12511,6 +12655,13 @@ export async function loadReconcileSnapshot(
       // a durable row jamming the close's final drain.
       if (verb === "close" && id.startsWith(WORKTREE_PRECLOSE_ID_PREFIX)) {
         preCloseFenceFailureIds.add(id);
+      }
+      // An OPEN `fatal-audit` `close::<epic>` row (reason leading token, id is the bare
+      // epic) — collected for the mint-idempotency + drift level-clear. Routes
+      // `close-plain` (the typed switch never touches it), so this reason-scoped
+      // collection is the only handle on it.
+      if (verb === "close" && isFatalAuditReason(reasonStr)) {
+        openFatalAuditIds.add(id);
       }
       switch (route.kind) {
         case "worktree-recover": {
@@ -13017,6 +13168,34 @@ export async function loadReconcileSnapshot(
   // byte-identical.
   const worktreesRoot = worktreeMode ? `${homedir()}/worktrees` : undefined;
 
+  // Fatal-audit fence inputs: for every epic whose latest close receipt is a
+  // still-CURRENT `fatal_halt` verdict ({@link fatalHaltReceiptIsCurrent} — the receipt's
+  // commit set has not drifted past its own event id), carry the bounded finding excerpt.
+  // `fatalAuditFenceLifted` is stepped in the drive loop (it needs the persistent memo);
+  // the pure `reconcile` withholds the close re-mint + mints one durable needs-human row.
+  const fatalHaltEpicIds = [...latestCloseReceiptByEpicId.entries()]
+    .filter(([, r]) => r.outcome === "fatal_halt")
+    .map(([id]) => id);
+  const fatalAuditCommitWatermarks = loadEpicCommitWatermarks(
+    db,
+    fatalHaltEpicIds,
+  );
+  const currentFatalAuditEpicIds = new Map<string, string>();
+  for (const epicId of fatalHaltEpicIds) {
+    const receipt = latestCloseReceiptByEpicId.get(epicId);
+    if (
+      fatalHaltReceiptIsCurrent(
+        receipt,
+        fatalAuditCommitWatermarks.get(epicId) ?? null,
+      )
+    ) {
+      currentFatalAuditEpicIds.set(
+        epicId,
+        receipt?.fatalReason ?? boundFatalAuditExcerpt(null),
+      );
+    }
+  }
+
   return {
     readinessDegraded,
     epics,
@@ -13055,6 +13234,8 @@ export async function loadReconcileSnapshot(
     paneCommandById,
     provenDeadJobIds,
     latestCloseReceiptByEpicId,
+    currentFatalAuditEpicIds,
+    openFatalAuditIds,
     pendingDispatches,
     providerLegActivityByWrapperJobId,
     mode,
@@ -13134,6 +13315,9 @@ function main(): void {
     // Seed the in-memory per-root DEFAULT (= 1); the FIRST `driveCycle`
     // refreshes it from the projection before `reconcile` reads it.
     maxConcurrentPerRoot: DEFAULT_MAX_CONCURRENT_PER_ROOT,
+    // The fatal-audit fence memo boots EMPTY (in-memory only); the first cycle
+    // rebuilds it from the live projection + receipts.
+    fatalAuditFenceMemo: new Map(),
   };
   // In-flight surfaces this reconciler owns confirm/reap work for. Boots EMPTY:
   // a cold restart re-derives "already running" from the durable `jobs`
@@ -14445,6 +14629,22 @@ function main(): void {
             err,
           );
         }
+        // Step the fatal-audit fence memo (persistent producer state) so the pure
+        // `reconcile` sees which epics an operator `retry_dispatch` lifted (row
+        // observed-then-gone) vs a mint→fold lag. Keyed on each CURRENT fatal-audit
+        // receipt's own event id.
+        const fatalAuditReceiptEventIdByEpic = new Map<string, number>();
+        for (const epicId of snapshot.currentFatalAuditEpicIds?.keys() ?? []) {
+          const ev = snapshot.latestCloseReceiptByEpicId?.get(epicId)?.eventId;
+          if (typeof ev === "number") {
+            fatalAuditReceiptEventIdByEpic.set(epicId, ev);
+          }
+        }
+        snapshot.fatalAuditFenceLifted = stepFatalAuditFenceMemo(
+          fatalAuditReceiptEventIdByEpic,
+          snapshot.openFatalAuditIds ?? new Set<string>(),
+          state.fatalAuditFenceMemo,
+        );
         const decision = reconcile(snapshot, state, deps.now());
         // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;
         // a trusted no-candidate (or paused) disarms; a DEGRADED PANE probe (untrusted null,
