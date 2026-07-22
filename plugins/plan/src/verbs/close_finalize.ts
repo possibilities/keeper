@@ -1581,28 +1581,15 @@ export function integrateEpicBases(
   format: OutputFormat | null,
   deps: TrunkIntegrationDeps = realTrunkIntegrationDeps,
 ): void {
-  // A worktree-mode close owner-integrates every plan-state touched base (primary ∪
-  // `touched_repos`) into its LOCAL default under a fenced per-repo lease. Ordinarily
-  // it runs INSIDE a lane, so a non-empty KEEPER_PLAN_WORKTREE marks "worktree mode";
-  // an OFF-mode close (empty) no-ops (no epic bases to merge). A CLUSTERED epic's
-  // serial-primary close runs worktree-less on the primary shared checkout, so it
-  // carries KEEPER_PLAN_OWNER_INTEGRATE=1 to enable the SAME integration WITHOUT
-  // faking a lane it does not own — mechanically safe because the repo set comes from
-  // plan state (not cwd), the merge runs in a private scratch worktree (ADR 0102), the
-  // lease identity is KEEPER_PLAN_SESSION_ID (not the lane), and a repo lacking a
-  // `keeper/epic/<id>` base is skipped. Either signal enables it; neither → no-op.
-  const inLane = (process.env.KEEPER_PLAN_WORKTREE ?? "").trim() !== "";
-  const ownerIntegrateMarker =
-    (process.env.KEEPER_PLAN_OWNER_INTEGRATE ?? "").trim() === "1";
-  if (!inLane && !ownerIntegrateMarker) return;
-  const claimantSessionId = resolvePlanSessionId();
-  if (claimantSessionId === null) {
-    emitFinalizeError(
-      "TRUNK_LEASE_IDENTITY_MISSING",
-      `worktree close for ${epicId} has no tracked session identity; refusing ownerless trunk integration`,
-      format,
-    );
-  }
+  // STATE-DERIVED owner integration: probe the bounded plan-state repo set (primary ∪
+  // `touched_repos`) for THIS epic's exact `keeper/epic/<id>` base. ZERO bases → an
+  // ordinary OFF-mode close, a no-op that demands NO session identity. ANY base →
+  // require identity and owner-integrate every base-bearing repo into its LOCAL default
+  // under a fenced per-repo lease, REGARDLESS of lane or launch marker — so a REVIVED
+  // serial-primary close (whose env markers never survive the restart) STILL integrates.
+  // The merge runs in a private scratch worktree (ADR 0102) and the lease identity is
+  // KEEPER_PLAN_SESSION_ID, so integration never depends on a lane cwd the close may not
+  // own. An in-lane close is unchanged: its base resolves in the shared .git and grades.
   const stateDir = keeperStateDir();
   const sourceBranch = `keeper/epic/${epicId}`;
   const repos = new Set<string>([primaryRepo]);
@@ -1613,9 +1600,35 @@ export function integrateEpicBases(
       // The source probe below owns the typed defer for a usable repo.
     }
   }
+  // Session identity is demanded LAZILY — only the moment a base is actually found, so
+  // a no-base OFF-mode close never demands it. Resolved at most once, then required.
+  let resolvedSessionId: string | null = null;
+  let sessionResolved = false;
+  const requireIdentity = (): string => {
+    if (!sessionResolved) {
+      resolvedSessionId = resolvePlanSessionId();
+      sessionResolved = true;
+    }
+    const id = resolvedSessionId;
+    if (id === null) {
+      emitFinalizeError(
+        "TRUNK_LEASE_IDENTITY_MISSING",
+        `worktree close for ${epicId} has no tracked session identity; refusing ownerless trunk integration`,
+        format,
+      );
+    }
+    return id;
+  };
   for (const repoRoot of [...repos].sort()) {
     const toplevel = deps.git(["rev-parse", "--show-toplevel"], repoRoot);
     const observedRoot = toplevel.stdout.trim();
+    // A path git DEFINITIVELY reports is not a working tree (exit 128 — "not a git
+    // repository") holds no `keeper/epic/<id>` base by construction, so it contributes
+    // ZERO bases and is skipped. A plan close's repos are always real checkouts in
+    // production, so this only ever matches a non-git path; distinct from the DEFER
+    // below, which covers AMBIGUOUS states (a transient non-128 failure, empty output,
+    // or a resolved-but-mismatched toplevel) where grading "absent" would be unsafe.
+    if (toplevel.code === 128) continue;
     if (
       toplevel.code !== 0 ||
       observedRoot === "" ||
@@ -1637,7 +1650,7 @@ export function integrateEpicBases(
       ],
       repoRoot,
     );
-    if (source.code === 1) continue;
+    if (source.code === 1) continue; // no epic base in this repo — nothing to integrate
     if (source.code !== 0) {
       emitFinalizeError(
         "TRUNK_INTEGRATION_DEFERRED",
@@ -1646,6 +1659,8 @@ export function integrateEpicBases(
         { repo_root: repoRoot },
       );
     }
+    // A base exists here — this close MUST owner-integrate, so it needs identity.
+    const claimantSessionId = requireIdentity();
     const defaultBranch = resolveTrunkDefaultBranch(repoRoot, deps);
     if (defaultBranch === null) {
       emitFinalizeError(

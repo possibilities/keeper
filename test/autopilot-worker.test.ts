@@ -8278,6 +8278,19 @@ function makeFakeWorktreeDriver(opts?: {
   provisionPremerge?: (
     info: WorktreeLaunchInfo,
   ) => { reason: string; dir: string } | null;
+  // Pre-close assembly outcomes (the actual fan-in). `assembleDefer` wins first (a
+  // transient/not-ready fan-in → no sticky); `assembleConflict` is a genuine content
+  // conflict routed to the merge-escalation incident; `assembleFail` is a structural
+  // provision failure (a visible sticky). Default → `{ kind: "assembled" }`.
+  assembleDefer?: (info: WorktreeLaunchInfo) => string | null;
+  assembleConflict?: (info: WorktreeLaunchInfo) => {
+    sourceBranch: string;
+    baseBranch: string;
+    laneDir: string;
+    conflictedFiles: string[];
+    stderr: string;
+  } | null;
+  assembleFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeFail?: (info: WorktreeLaunchInfo) => string | null;
   finalizeConflictedFiles?: (info: WorktreeLaunchInfo) => string[];
   finalizeRetry?: (info: WorktreeLaunchInfo) => string | null;
@@ -8338,6 +8351,24 @@ function makeFakeWorktreeDriver(opts?: {
             cwd: info.assignment.worktreePath,
             pendingIntegration,
           };
+    },
+    async assembleBase(info, liveAttributedDirty) {
+      log.calls.push(`assemble:${info.assignment.nodeId}`);
+      log.provisions.push(info);
+      log.provisionAttributions.push(liveAttributedDirty);
+      const deferReason = opts?.assembleDefer?.(info) ?? null;
+      if (deferReason !== null) {
+        return { kind: "defer", reason: deferReason };
+      }
+      const conflict = opts?.assembleConflict?.(info) ?? null;
+      if (conflict !== null) {
+        return { kind: "conflict", ...conflict };
+      }
+      const failReason = opts?.assembleFail?.(info) ?? null;
+      if (failReason !== null) {
+        return { kind: "failed", reason: failReason };
+      }
+      return { kind: "assembled" };
     },
     async finalizeEpic(info) {
       log.calls.push(`finalize:${info.baseBranch}`);
@@ -9853,21 +9884,21 @@ function closeReadyPrimarylessEpic(): Epic {
   ]);
 }
 
-test("fn-16c reconcile: a serial-primary clustered close carries ownerIntegrate + pre-close-provisions EVERY worktree group before launch", () => {
+test("fn-16c reconcile: a serial-primary clustered close is worktree-less (STATE-DERIVED owner integration) + pre-close-provisions EVERY worktree group before launch", () => {
   const epic = closeReadyPrimarylessEpic();
   const decision = reconcile(multiRepoSnap([epic], abcResolve), makeState(), 0);
   const closeLaunch = decision.launches.find((l) => l.verb === "close");
   expect(closeLaunch).toBeDefined();
-  // Serial-primary close: no lane → it OWNER-INTEGRATES its bases from plan state.
+  // Serial-primary close: no lane. Its owner integration is STATE-DERIVED at
+  // close-finalize (no launch-time marker), so no `worktree` geometry rides it.
   expect(closeLaunch?.worktree).toBeUndefined();
-  expect(closeLaunch?.ownerIntegrate).toBe(true);
   // BOTH worktree groups are fanned in BEFORE the close launches (neither hosts it).
   expect(
     decision.worktreePreCloseProvision.map((s) => s.repoDir).sort(),
   ).toEqual(["/repo-a", "/repo-b"]);
 });
 
-test("fn-16c reconcile: an ordinary clustered close (primary worktree) does NOT ownerIntegrate; pre-close provision covers only the NON-close-host group", () => {
+test("fn-16c reconcile: an ordinary clustered close (primary worktree) keeps its lane; pre-close provision covers only the NON-close-host group", () => {
   const epic = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/repo-a", // primary hosts a task → worktree close-host
@@ -9891,10 +9922,9 @@ test("fn-16c reconcile: an ordinary clustered close (primary worktree) does NOT 
   const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
   const closeLaunch = decision.launches.find((l) => l.verb === "close");
   expect(closeLaunch).toBeDefined();
-  // The close dispatches INTO the primary lane, so its lane cwd enables
-  // integrateEpicBases the ordinary way — no marker.
+  // The close dispatches INTO the primary lane; close-finalize state-derives its
+  // integration from the base set either way.
   expect(closeLaunch?.worktree?.repoDir).toBe("/repo-a");
-  expect(closeLaunch?.ownerIntegrate).toBeUndefined();
   // Only the NON-close-host /repo-b is pre-close-provisioned; /repo-a's close worker
   // assembles its own base.
   expect(decision.worktreePreCloseProvision.map((s) => s.repoDir)).toEqual([
@@ -9902,7 +9932,7 @@ test("fn-16c reconcile: an ordinary clustered close (primary worktree) does NOT 
   ]);
 });
 
-test("fn-16c reconcile: a single-repo `ok` close carries no ownerIntegrate and no pre-close provision (byte-identical)", () => {
+test("fn-16c reconcile: a single-repo `ok` close keeps its base lane and has no pre-close provision (byte-identical)", () => {
   const epic = makeEpic({
     epic_id: "fn-1-solo",
     project_dir: "/repo-a",
@@ -9919,16 +9949,40 @@ test("fn-16c reconcile: a single-repo `ok` close carries no ownerIntegrate and n
   const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
   const closeLaunch = decision.launches.find((l) => l.verb === "close");
   expect(closeLaunch).toBeDefined();
-  expect(closeLaunch?.ownerIntegrate).toBeUndefined();
   expect(closeLaunch?.worktree?.repoDir).toBe("/repo-a"); // close in the base lane
   expect(decision.worktreePreCloseProvision).toEqual([]);
 });
 
-test("fn-16c runReconcileCycle: a pre-close provision FAILURE SUPPRESSES that cycle's close — no close launch, NO sticky (retry next cycle)", async () => {
+test("fn-16d reconcile: a close that ROUTES a merge-escalation incident is EXCLUDED from worktreePreCloseProvision (no deadlock — the owner-close resolves the conflict itself)", () => {
+  const epic = closeReadyPrimarylessEpic();
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abcResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    // The epic's close owns an open merge-escalation incident this cycle...
+    incidentOwnerKeys: new Set<DispatchKey>(["close::fn-1-anchor"]),
+    // ...and a sticky failed-key that the incident forces the close past.
+    failedKeys: new Set<DispatchKey>(["close::fn-1-anchor"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  // The close still LAUNCHES (the incident forces it, bypassing the failed-key gate)...
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
+  // ...but its non-close-host groups are NOT pre-close-provisioned — re-assembling
+  // would re-mint the conflict and re-suppress the very launch that must resolve it.
+  expect(decision.worktreePreCloseProvision).toEqual([]);
+});
+
+test("fn-16c runReconcileCycle: a pre-close assembly DEFER SUPPRESSES that cycle's close — no close launch, NO sticky (retry next cycle)", async () => {
   const { driver } = makeFakeWorktreeDriver({
-    provisionFail: (info) =>
+    assembleDefer: (info) =>
       info.repoDir === "/repo-a"
-        ? "worktree-premerge-not-ready: fan-in base not assembled"
+        ? "worktree-lane-premerge-not-ready: fan-in base not quiescent"
         : null,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
@@ -9951,7 +10005,44 @@ test("fn-16c runReconcileCycle: a pre-close provision FAILURE SUPPRESSES that cy
   ).toBeUndefined();
 });
 
-test("fn-16c runReconcileCycle: pre-close provision SUCCESS → the serial-primary close launches carrying the ownerIntegrate marker (KEEPER_PLAN_OWNER_INTEGRATE)", async () => {
+test("fn-16c runReconcileCycle: a pre-close assembly CONFLICT routes the worktree-merge-conflict incident on close::<epic> and does NOT launch", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    assembleConflict: (info) =>
+      info.repoDir === "/repo-a"
+        ? {
+            sourceBranch: "keeper/epic/fn-1-anchor--fn-1-anchor.1",
+            baseBranch: "keeper/epic/fn-1-anchor",
+            laneDir: "/repo-a.worktrees/keeper-epic-fn-1-anchor",
+            conflictedFiles: ["src/x.ts"],
+            stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+          }
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The close is SUPPRESSED this cycle...
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeUndefined();
+  // ...and a merge-escalation incident is minted on the BARE close::<epic> key with the
+  // exact leading token the router + fan-in resolver read (routes to merge-escalation).
+  const incident = depsLog.emissions.find(
+    (e) => e.verb === "close" && e.id === "fn-1-anchor",
+  );
+  expect(incident?.reason.startsWith("worktree-merge-conflict:")).toBe(true);
+  expect(incident?.conflictedFiles).toEqual(["src/x.ts"]);
+  expect(incident?.dir).toBe("/repo-a.worktrees/keeper-epic-fn-1-anchor");
+});
+
+test("fn-16c runReconcileCycle: a pre-close assembly SUCCESS → the serial-primary close launches (worktree-less, no marker)", async () => {
   const { driver } = makeFakeWorktreeDriver();
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
   const snap = multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve);
@@ -9967,7 +10058,6 @@ test("fn-16c runReconcileCycle: pre-close provision SUCCESS → the serial-prima
     (l) => l.name === "close::fn-1-anchor",
   );
   expect(closeLaunch).toBeDefined();
-  expect(closeLaunch?.spec?.ownerIntegrate).toBe(true);
 });
 
 // 28b — the TRI-STATE lane epoch + FRESH-EPOCH re-cut. A re-opened worktree group
@@ -13845,6 +13935,174 @@ test("createWorktreeDriver: an inconclusive ancestry probe never mints a pending
     reason:
       "worktree-lane-premerge-not-ready: ancestry probe for keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo exited 124 — deferring the fan-in",
   });
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// PRE-CLOSE assembly ACTUALLY merges each clean rib into the base (fn-16d) —
+// unlike provision, which only preps the first rib and returns its manifest.
+// ---------------------------------------------------------------------------
+
+/**
+ * A production-shaped GitRunner for `createWorktreeDriver.assembleBase`. The single
+ * rib `source` is NOT an ancestor of the base until the pass runs `merge --no-edit`;
+ * after a clean merge the fan-in re-probe reads it as an ancestor. `mergeCode` forces
+ * a content conflict (leaving MERGE_HEAD residue for the guarded abort).
+ */
+function makeAssembleFanInRun(opts: { source: string; mergeCode?: number }): {
+  run: Parameters<typeof createWorktreeDriver>[0];
+  cmds: string[];
+} {
+  const cmds: string[] = [];
+  let added = false;
+  let merged = false;
+  let midMerge = false;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    // MERGE_HEAD pseudo-ref: clean until a conflicting merge leaves residue.
+    if (joined.includes("MERGE_HEAD")) {
+      return midMerge
+        ? { code: 0, stdout: "deadbeef\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" }; // clean tree → mergeReadiness ready
+    }
+    // Source-ref existence probe (mergeBranchInto) — the rib resolves.
+    if (joined.includes("^{commit}")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    // Rib branch presence (probeFanInAssembly) — resolves.
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      // `<rib> HEAD` (mergeBranchInto): not yet merged → proceed to merge.
+      // `<rib> <base>` (probeFanInAssembly): ancestor IFF the merge landed.
+      const target = args[args.length - 1];
+      if (target === "HEAD") return { code: 1, stdout: "", stderr: "" };
+      return { code: merged ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (joined === "merge --abort") {
+      midMerge = false;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "merge") {
+      const code = opts.mergeCode ?? 0;
+      if (code === 0) {
+        merged = true;
+        return { code: 0, stdout: "Merge made\n", stderr: "" };
+      }
+      midMerge = true;
+      return {
+        code,
+        stdout: "",
+        stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+      };
+    }
+    if (joined.startsWith("diff --name-only")) {
+      return { code: 0, stdout: "src/x.ts\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, cmds };
+}
+
+/** A close-sink whose ONE real rib rides both `preMerges` (to merge) and
+ * `laneOrder` (so the fan-in re-probe actually grades it). */
+function makeAssembleSinkInfo(source: string): WorktreeLaunchInfo {
+  return {
+    assignment: {
+      nodeId: "fn-1-foo.close",
+      isCloseSink: true,
+      branch: "keeper/epic/fn-1-foo",
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [source],
+      assertBranch: "keeper/epic/fn-1-foo",
+    },
+    baseBranch: "keeper/epic/fn-1-foo",
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [
+      {
+        nodeId: "fn-1-foo.1",
+        branch: source,
+        worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo-fn-1-foo.1",
+      },
+      {
+        nodeId: "fn-1-foo.close",
+        branch: "keeper/epic/fn-1-foo",
+        worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      },
+    ],
+    parentBranch: "keeper/epic/fn-1-foo",
+  };
+}
+
+test("fn-16d createWorktreeDriver: assembleBase MERGES a real rib into the base, then re-probes ancestry → assembled (rib !ancestor before, ancestor after)", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const { run, cmds } = makeAssembleFanInRun({ source });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeAssembleSinkInfo(source), null);
+  expect(res).toEqual({ kind: "assembled" });
+  // It ACTUALLY merged the rib (provision would only prep a manifest)...
+  expect(cmds).toContain(`merge --no-edit ${source}`);
+  // ...then POSITIVELY re-probed the rib is an ancestor of the base — gate (c).
+  expect(cmds).toContain(
+    `merge-base --is-ancestor ${source} keeper/epic/fn-1-foo`,
+  );
+});
+
+test("fn-16d createWorktreeDriver: assembleBase surfaces a genuine content conflict (aborted), never assembled", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const { run, cmds } = makeAssembleFanInRun({ source, mergeCode: 1 });
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeAssembleSinkInfo(source), null);
+  expect(res).toEqual({
+    kind: "conflict",
+    sourceBranch: source,
+    baseBranch: "keeper/epic/fn-1-foo",
+    laneDir: "/repo.worktrees/keeper-epic-fn-1-foo",
+    conflictedFiles: ["src/x.ts"],
+    stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+  });
+  // The conflicting merge was aborted — the base is NOT advanced (rib stays !ancestor).
+  expect(cmds).toContain("merge --abort");
+});
+
+test("fn-16d createWorktreeDriver: assembleBase defers a lost commit-work lock (transient) — no merge, no false sticky", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const { run, cmds } = makeAssembleFanInRun({ source });
+  // acquireLock returns null → mergeBranchInto degrades to a lock-timeout retry-skip.
+  const res = await createWorktreeDriver(run, () => null).assembleBase(
+    makeAssembleSinkInfo(source),
+    null,
+  );
+  expect(res.kind).toBe("defer");
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 

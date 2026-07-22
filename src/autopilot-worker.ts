@@ -1508,6 +1508,34 @@ export function pendingIntegrationReason(
   );
 }
 
+/**
+ * The outcome of a PRODUCER-side pre-close base assembly ({@link
+ * WorktreeDriver.assembleBase}) — an ACTUAL fan-in, distinct from the
+ * owner-mediated {@link WorktreeDriver.provision} readiness prep:
+ *   - `assembled` — every clean source rib is merged into the group base AND a
+ *      positive re-probe confirms each is an ancestor; the close may launch.
+ *   - `conflict`  — a source rib hit a genuine content conflict (aborted). The
+ *      producer routes it through the EXISTING `worktree-merge-conflict` incident
+ *      machinery on the bare `close::<epic>` key (owner re-dispatch + claim chain),
+ *      never a silent retry.
+ *   - `defer`     — a transient / not-ready state (lock or local timeout, a
+ *      not-quiescent base, an inconclusive re-probe). Sticky-free retry next cycle.
+ *   - `failed`    — a STRUCTURAL provision failure (the worktree could not be
+ *      ensured / a HEAD mismatch / a guarded merge-abort wedge). A visible sticky.
+ */
+export type AssembleBaseResult =
+  | { kind: "assembled" }
+  | {
+      kind: "conflict";
+      sourceBranch: string;
+      baseBranch: string;
+      laneDir: string;
+      conflictedFiles: string[];
+      stderr: string;
+    }
+  | { kind: "defer"; reason: string }
+  | { kind: "failed"; reason: string };
+
 export interface WorktreeDriver {
   /**
    * Refresh one drifted, quiescent epic base by merging the local default branch
@@ -1550,6 +1578,20 @@ export interface WorktreeDriver {
         conflictedFiles?: string[];
       }
   >;
+  /**
+   * PRE-CLOSE fan-in for a NON-close-host worktree group of a clustered epic:
+   * ensure the sink base worktree, INTEGRATE every clean source rib into the base
+   * under the same commit-work lock + readiness discipline {@link provision} preps
+   * but never performs, then POSITIVELY re-probe that every source is an ancestor of
+   * the base. A serial-primary close hosts NO worker in these lanes, so the PRODUCER
+   * assembles the base here (reusing the shared pairwise merge routine, never a
+   * second merge path) before authorizing the close launch. See {@link
+   * AssembleBaseResult} for the four outcomes and their routing.
+   */
+  assembleBase(
+    info: WorktreeLaunchInfo,
+    liveAttributedDirty: ReadonlySet<string> | null,
+  ): Promise<AssembleBaseResult>;
   /**
    * After the epic closer reaches done: prove the epic base is contained in the
    * resolved local default, verify the shared checkout, push once, then tear the
@@ -6213,15 +6255,19 @@ export async function runReconcileCycle(
       });
   }
 
-  // Pre-close fan-in. Assemble EVERY non-close-host worktree group's base BEFORE its
-  // close launches, so the close's per-repo done-ancestry gate sees each foreign rib
-  // already merged into keeper/epic/<id>. A serial-primary close otherwise launches
-  // AHEAD of the fan-in it depends on — the ancestry gate aborts on the unmerged rib
-  // and the typed-error closer keeps occupying its slot: the close blocks the fan-in
-  // it needs (an autonomous wedge). A failed / deferred / pending provision SUPPRESSES
-  // that cycle's close (retry next cycle) — NO sticky, NO incident row: the fan-in is
-  // simply not ready yet (the finalize pass owns the genuine-conflict sticky, once the
-  // closer runs and reaches it). Gated not-paused like refreshBase/finalize.
+  // Pre-close fan-in — a REAL producer-side assembly, not provision readiness alone.
+  // A serial-primary close hosts NO worker in the non-close-host groups' lanes, so the
+  // PRODUCER integrates every clean rib into each group's base HERE (under the shared
+  // lock/readiness discipline), then positively re-probes ancestry, BEFORE the close
+  // may launch. Otherwise the close launches AHEAD of the fan-in it depends on — its
+  // ancestry gate aborts on the unmerged rib and the typed-error closer keeps occupying
+  // its slot (an autonomous wedge). Outcomes: `assembled` clears the close;
+  // `defer` (transient/not-ready) SUPPRESSES this cycle's close with NO sticky (retry
+  // next cycle, bounded log); a GENUINE content `conflict` routes through the EXISTING
+  // `worktree-merge-conflict` incident machinery on the bare `close::<epic>` key (owner
+  // re-dispatch resolves it — reconcile then drops the sink from this pass, so the
+  // owner-close is never re-suppressed) and suppresses this cycle; a STRUCTURAL `failed`
+  // mints a visible sticky. Gated not-paused like refreshBase/finalize.
   const preCloseProvisionBlocked = new Set<string>();
   if (deps.worktree !== undefined && !state.paused) {
     for (const sink of decision.worktreePreCloseProvision) {
@@ -6247,27 +6293,57 @@ export async function runReconcileCycle(
         );
         continue;
       }
-      const provisioned = await deps.worktree.provision(
+      const assembled = await deps.worktree.assembleBase(
         sink,
         liveAttrFor(sink),
       );
-      if (!provisioned.ok) {
-        preCloseProvisionBlocked.add(epicId);
-        logLaneMaintenanceDeferralOnce(
-          "worktree-preclose-provision-deferred",
-          sink.assignment.worktreePath,
-          provisioned.reason,
-          laneDeferralsSeen,
-        );
-      } else if (provisioned.pendingIntegration !== undefined) {
-        // Base provisioned but a fan-in is not yet an ancestor — NOT assembled.
-        preCloseProvisionBlocked.add(epicId);
-        logLaneMaintenanceDeferralOnce(
-          "worktree-preclose-provision-deferred",
-          sink.assignment.worktreePath,
-          pendingIntegrationReason(provisioned.pendingIntegration),
-          laneDeferralsSeen,
-        );
+      switch (assembled.kind) {
+        case "assembled":
+          break; // this group's base is fanned in — its close may launch
+        case "defer":
+          // A transient / not-ready fan-in — SUPPRESS this cycle's close, mint NO
+          // sticky, retry next cycle (bounded log).
+          preCloseProvisionBlocked.add(epicId);
+          logLaneMaintenanceDeferralOnce(
+            "worktree-preclose-provision-deferred",
+            sink.assignment.worktreePath,
+            assembled.reason,
+            laneDeferralsSeen,
+          );
+          break;
+        case "conflict":
+          // A GENUINE content conflict — mint/route the `worktree-merge-conflict`
+          // incident on the BARE `close::<epic>` key (leading-token → merge-escalation
+          // routing, the same reason the fan-in resolver parses) and SUPPRESS this
+          // cycle. The merge-escalation sweep re-dispatches the close to own + resolve
+          // it; reconcile drops this epic's sink from worktreePreCloseProvision while
+          // the incident is owner-routed, so the owner-close is never re-suppressed —
+          // never a silent eternal retry.
+          preCloseProvisionBlocked.add(epicId);
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: epicId,
+            reason: `${MERGE_ESCALATION_REASON_TOKEN}: merging ${assembled.sourceBranch} into ${assembled.baseBranch} — ${assembled.stderr}`,
+            dir: assembled.laneDir,
+            conflictedFiles: assembled.conflictedFiles,
+            ts: deps.now(),
+          });
+          break;
+        case "failed":
+          // A STRUCTURAL provision failure — a visible operator sticky (close-plain),
+          // never a silent retry. SUPPRESS this cycle's launch.
+          preCloseProvisionBlocked.add(epicId);
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: epicId,
+            reason: assembled.reason,
+            dir: sink.repoDir,
+            conflictedFiles: null,
+            ts: deps.now(),
+          });
+          break;
+        default:
+          assertNever(assembled);
       }
     }
   }
@@ -6603,10 +6679,6 @@ export async function runReconcileCycle(
       // native launch, overwriting any stale session-env marker).
       plan.wrappedCell ?? null,
       plan.wrappedEnvelope ?? null,
-      // Serial-primary clustered-close owner-integration marker — rides the spec as
-      // KEEPER_PLAN_OWNER_INTEGRATE so the close integrates its plan-state touched
-      // bases without a lane cwd (empty on every other launch).
-      plan.ownerIntegrate,
     );
     // The dispatched-cell forensics recorded on the `Dispatched` event (ADR
     // 0047) — {assigned, effective, constraint} for a cell-bearing `work` launch,
@@ -7226,6 +7298,131 @@ export function createWorktreeDriver(
         return {
           ok: false,
           reason: `worktree-provision-failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
+    async assembleBase(info, liveAttributedDirty) {
+      const { assignment, repoDir, parentBranch } = info;
+      const { branch, worktreePath, preMerges } = assignment;
+      try {
+        // Ensure the sink base worktree exists off the resolved default (a base
+        // lane's "parent" is its own not-yet-existing branch → fork off default),
+        // mirroring provision's ensure discipline exactly.
+        const forkSource =
+          parentBranch === branch
+            ? await gitResolveDefaultBranch(repoDir, run)
+            : parentBranch;
+        await gitEnsureWorktree(repoDir, worktreePath, branch, forkSource, run);
+        await gitEnsureWorktreeDepLink(repoDir, worktreePath);
+        // Assert the sink is a registered worktree on the derived base branch BEFORE
+        // any merge — a structural miss here is a visible `failed`, never a defer.
+        const registered = await gitListWorktrees(repoDir, run);
+        const entry = registered.find(
+          (e) =>
+            stripTrailingSlashPath(e.path) ===
+            stripTrailingSlashPath(worktreePath),
+        );
+        if (entry === undefined) {
+          return {
+            kind: "failed",
+            reason: `worktree-unregistered: ${worktreePath} is not a registered worktree`,
+          };
+        }
+        const head = await gitCurrentBranch(worktreePath, run);
+        if (head !== branch) {
+          return {
+            kind: "failed",
+            reason: `worktree-head-mismatch: ${worktreePath} HEAD is ${head}, expected ${branch}`,
+          };
+        }
+        // INTEGRATE every clean rib into the base under the commit-work lock — the
+        // SAME pairwise, lock-guarded routine refreshBase/finalize reuse, never a
+        // second merge path. A dirty base losslessly cleans only a provably-redundant
+        // rib leak (identical to provision); every other not-ready base defers.
+        for (const source of preMerges) {
+          const ready = await gitMergeReadiness(
+            worktreePath,
+            branch,
+            run,
+            source,
+            undefined,
+            repoDir,
+          );
+          if (ready.kind === "dirty") {
+            const cleaned = await gitLosslessPremergeClean(
+              worktreePath,
+              branch,
+              source,
+              liveAttributedDirty,
+              run,
+            );
+            if (cleaned.kind === "retry") {
+              return {
+                kind: "defer",
+                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the pre-close fan-in of ${source} into ${branch} — ${cleaned.reason}`,
+              };
+            }
+          } else if (ready.kind !== "ready") {
+            return {
+              kind: "defer",
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the pre-close fan-in`,
+            };
+          }
+          const merge = await gitMergeBranchInto(
+            worktreePath,
+            source,
+            run,
+            acquireLock,
+          );
+          switch (merge.kind) {
+            case "merged":
+            case "already-merged":
+            case "missing-source":
+              continue;
+            case "conflict":
+              return {
+                kind: "conflict",
+                sourceBranch: source,
+                baseBranch: branch,
+                laneDir: worktreePath,
+                conflictedFiles: merge.conflictedFiles,
+                stderr: merge.stderr,
+              };
+            case "abort-failed":
+              return {
+                kind: "failed",
+                reason: `worktree-preclose-abort-failed: the guarded git merge --abort left ${worktreePath} mid-merge while merging ${source} into ${branch} — ${merge.stderr}`,
+              };
+            case "lock-timeout":
+            case "local-timeout":
+              return {
+                kind: "defer",
+                reason: `worktree-preclose-${merge.kind}: deferring the pre-close fan-in of ${source} into ${branch}`,
+              };
+            default:
+              assertNever(merge);
+          }
+        }
+        // (c) POSITIVELY re-probe that EVERY source is an ancestor of the base before
+        // authorizing the close — the SAME assembly gate finalize verifies.
+        const assembly = await probeFanInAssembly(info, run);
+        if (assembly.kind === "assembled") {
+          return { kind: "assembled" };
+        }
+        if (assembly.kind === "pending") {
+          return {
+            kind: "defer",
+            reason: `worktree-preclose-pending-integration: ${assembly.sourceBranch} is not an ancestor of ${branch} after the fan-in`,
+          };
+        }
+        return {
+          kind: "defer",
+          reason: `worktree-preclose-pending-integration: could not prove ${assembly.sourceBranch} is integrated into ${branch} — ${assembly.detail}`,
+        };
+      } catch (err) {
+        return {
+          kind: "failed",
+          reason: `worktree-assemble-failed: ${err instanceof Error ? err.message : String(err)}`,
         };
       }
     },

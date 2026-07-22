@@ -3001,22 +3001,31 @@ describe("integrateEpicBases ancestor re-grade lease adoption (F2)", () => {
   });
 });
 
-// 16c — a CLUSTERED epic's serial-primary close runs worktree-less on the primary
-// shared checkout, so KEEPER_PLAN_WORKTREE is EMPTY. It carries
-// KEEPER_PLAN_OWNER_INTEGRATE=1 to still owner-integrate every plan-state touched
-// base (the repo set never came from the lane) — WITHOUT faking a lane it does not own.
-describe("integrateEpicBases owner-integrate marker (16c serial-primary close)", () => {
-  const getRepo = withTmpdir("trunk-lease-marker-");
+// 16d — owner integration is STATE-DERIVED, not marker-gated. A serial-primary close
+// runs worktree-less on the shared checkout (empty KEEPER_PLAN_WORKTREE, and its
+// launch marker never survives a restart), so integration is decided ENTIRELY by
+// whether the epic's `keeper/epic/<id>` base actually exists in the touched-repo set:
+// ANY base → require identity + integrate; ZERO bases → a no-op with NO identity demand.
+describe("integrateEpicBases state-derived owner integration (16d)", () => {
+  const getRepo = withTmpdir("trunk-state-derived-");
+  const IDENTITY_KEYS = [
+    "KEEPER_PLAN_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "KEEPER_JOB_ID",
+  ] as const;
   let priorWorktree: string | undefined;
-  let priorMarker: string | undefined;
-  let priorSession: string | undefined;
+  let priorIdentity: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     priorWorktree = process.env.KEEPER_PLAN_WORKTREE;
-    priorMarker = process.env.KEEPER_PLAN_OWNER_INTEGRATE;
-    priorSession = process.env.CLAUDE_CODE_SESSION_ID;
+    priorIdentity = {};
+    for (const k of IDENTITY_KEYS) priorIdentity[k] = process.env[k];
     // Serial-primary close: the lane path is EMPTY (it runs on the shared checkout).
     delete process.env.KEEPER_PLAN_WORKTREE;
+    // Exactly ONE identity source by default (delete the rest so the no-identity
+    // cases below can prove the demand is absent for a no-base close).
+    delete process.env.KEEPER_PLAN_SESSION_ID;
+    delete process.env.KEEPER_JOB_ID;
     process.env.CLAUDE_CODE_SESSION_ID = TRUNK_CLAIMANT;
   });
 
@@ -3029,11 +3038,10 @@ describe("integrateEpicBases owner-integrate marker (16c serial-primary close)",
       }
     };
     restore("KEEPER_PLAN_WORKTREE", priorWorktree);
-    restore("KEEPER_PLAN_OWNER_INTEGRATE", priorMarker);
-    restore("CLAUDE_CODE_SESSION_ID", priorSession);
+    for (const k of IDENTITY_KEYS) restore(k, priorIdentity[k]);
   });
 
-  // Reaches the ancestor re-grade + lease adoption (already-integrated base).
+  // Reaches the ancestor re-grade + lease adoption (a PRESENT, already-integrated base).
   function alreadyAncestorGit(repoRoot: string): TrunkIntegrationDeps["git"] {
     return (args) => {
       if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
@@ -3043,7 +3051,7 @@ describe("integrateEpicBases owner-integrate marker (16c serial-primary close)",
         args[0] === "rev-parse" &&
         args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
       ) {
-        return gitOk("abc1234");
+        return gitOk("abc1234"); // the epic base EXISTS here
       }
       if (
         args[0] === "symbolic-ref" &&
@@ -3056,8 +3064,24 @@ describe("integrateEpicBases owner-integrate marker (16c serial-primary close)",
     };
   }
 
-  test("empty lane + KEEPER_PLAN_OWNER_INTEGRATE=1 → OWNER-INTEGRATES (never early-returns)", () => {
-    process.env.KEEPER_PLAN_OWNER_INTEGRATE = "1";
+  // A verifiable checkout with NO `keeper/epic/<id>` base (source probe exits 1).
+  function noBaseGit(repoRoot: string): TrunkIntegrationDeps["git"] {
+    return (args) => {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return gitOk(`${repoRoot}\n`);
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitFail(1); // no epic base → nothing to integrate
+      }
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+  }
+
+  test("a marker-absent serial-primary close with a PRESENT base STILL integrates (state-derived, no marker anywhere)", () => {
+    // No KEEPER_PLAN_WORKTREE, no owner-integrate marker — exactly a REVIVED close.
     const repoRoot = getRepo();
     const lease = baseLeaseFor({
       repo_root: repoRoot,
@@ -3082,22 +3106,18 @@ describe("integrateEpicBases owner-integrate marker (16c serial-primary close)",
       integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
     );
     expect(result.code).toBeNull();
-    // Reached the lease adoption → it did NOT early-return on the empty lane gate.
+    // Reached the lease adoption → the present base drove integration, no marker needed.
     expect(releasedLeases).toEqual([lease]);
   });
 
-  test("empty lane + NO marker → NO-OP (never touches git or the lease)", () => {
-    delete process.env.KEEPER_PLAN_OWNER_INTEGRATE;
+  test("a PRESENT base with NO session identity → TRUNK_LEASE_IDENTITY_MISSING (any base demands identity)", () => {
+    for (const k of IDENTITY_KEYS) delete process.env[k];
     const repoRoot = getRepo();
-    let gitCalled = false;
     const deps: TrunkIntegrationDeps = {
-      git: () => {
-        gitCalled = true;
-        return gitOk();
-      },
+      git: alreadyAncestorGit(repoRoot),
       acquireLock: () => ({ release: () => {} }),
       requestLease: () => {
-        throw new Error("requestLease must not fire on a no-op close");
+        throw new Error("requestLease must not fire without identity");
       },
       releaseLease: () => true,
       readLeaseLeaf: () => null,
@@ -3105,8 +3125,30 @@ describe("integrateEpicBases owner-integrate marker (16c serial-primary close)",
     const result = runTrunkVerb(() =>
       integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
     );
-    expect(result.code).toBeNull();
-    // Empty lane + no marker → OFF-mode close semantics: early return before any git.
-    expect(gitCalled).toBe(false);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("TRUNK_LEASE_IDENTITY_MISSING");
+  });
+
+  test("a no-base OFF-mode close is a no-op with NO identity demand (probes, finds zero bases, returns clean)", () => {
+    // No identity at all — a no-base close must STILL be a clean no-op, never
+    // TRUNK_LEASE_IDENTITY_MISSING (identity is demanded only once a base is found).
+    for (const k of IDENTITY_KEYS) delete process.env[k];
+    const repoRoot = getRepo();
+    const deps: TrunkIntegrationDeps = {
+      git: noBaseGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error("requestLease must not fire on a no-base close");
+      },
+      releaseLease: () => {
+        throw new Error("releaseLease must not fire on a no-base close");
+      },
+      readLeaseLeaf: () => null,
+    };
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+    expect(result.code).toBeNull(); // clean no-op — never demanded identity
+    expect(result.stdout).toBe("");
   });
 });

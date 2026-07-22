@@ -646,18 +646,12 @@ export function buildPlannedLaunchSpec(
   dispatchConstraint?: WorkerProvider | null,
   wrappedCell?: string | null,
   wrappedEnvelope?: string | null,
-  ownerIntegrate?: boolean,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
     claudeName: dispatchKey(verb, id),
     model,
     effort,
-    // The serial-primary clustered-close owner-integration marker — set ONLY for a
-    // lane-less close that must still integrate every plan-state touched base. A
-    // lane-hosted / OFF-mode / task launch leaves it off (the exec builder emits it
-    // empty), so those launches stay byte-identical.
-    ...(ownerIntegrate === true ? { ownerIntegrate: true } : {}),
     ...(pluginDir != null && pluginDir !== "" ? { pluginDir } : {}),
     ...(worktreePath !== undefined && worktreePath !== ""
       ? { worktreePath }
@@ -1514,15 +1508,6 @@ export interface PlannedLaunch {
    * exclusive with {@link worktree}.
    */
   worktreeReject?: WorktreeReject;
-  /**
-   * Set IFF this is a CLUSTERED epic's serial-primary close — a close that runs
-   * worktree-less on the primary shared checkout (no {@link worktree} lane). The
-   * producer emits a `KEEPER_PLAN_OWNER_INTEGRATE` marker so the plan-side
-   * `integrateEpicBases` owner-integrates every plan-state touched base (primary ∪
-   * `touched_repos`) into its local default, instead of no-opping on the empty
-   * `KEEPER_PLAN_WORKTREE` lane gate. NEVER set on a lane-hosted or OFF-mode close.
-   */
-  ownerIntegrate?: boolean;
 }
 
 /**
@@ -2998,6 +2983,7 @@ export function reconcile(
       worktreeFinalize,
       worktreeSinkProvision,
       worktreePreCloseProvision,
+      snapshot.incidentOwnerKeys ?? new Set<DispatchKey>(),
       worktreeGeometry.byEpicId,
     );
     const epicById = new Map(
@@ -3347,6 +3333,7 @@ function attachWorktreeGeometry(
   worktreeFinalize: WorktreeLaunchInfo[],
   worktreeSinkProvision: WorktreeLaunchInfo[],
   worktreePreCloseProvision: WorktreeLaunchInfo[],
+  incidentOwnerCloseKeys: ReadonlySet<DispatchKey>,
   byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
 ): void {
   // Index launches by epic. A task launch belongs to the epic owning the task; a
@@ -3446,15 +3433,13 @@ function attachWorktreeGeometry(
       for (const l of epicLaunches) {
         if (l.verb === "close") {
           // The single close maps to the PRIMARY group's sink; a serial primary
-          // (no plan) leaves it worktree-less (runs on the shared checkout) and must
-          // OWNER-INTEGRATE its touched bases from plan state — it holds no lane cwd
-          // to enable integrateEpicBases the ordinary (KEEPER_PLAN_WORKTREE) way, and
-          // faking one to a lane it does not own is forbidden.
+          // (no plan) leaves it worktree-less (runs on the shared checkout). Its
+          // owner integration is STATE-DERIVED at close-finalize (it probes the
+          // touched-repo set for `keeper/epic/<id>` bases), so no lane cwd and no
+          // launch-time marker are needed — the marker was never restart-safe.
           const sink = primaryGroup?.byNode.get(CLOSE_SINK_ID);
           if (primaryGroup !== undefined && sink !== undefined) {
             l.worktree = primaryGroup.infoFor(sink);
-          } else {
-            l.ownerIntegrate = true;
           }
           // Fan-in EVERY non-close-host worktree group's base BEFORE this close may
           // launch, so its per-repo done-ancestry gate sees each foreign rib already
@@ -3462,13 +3447,20 @@ function attachWorktreeGeometry(
           // wedge: the close blocks the fan-in it needs). The close-host (the primary
           // group a worktree-primary close dispatches into) assembles its own base, so
           // it is excluded; a serial-primary close hosts none → every worktree group.
-          for (const stamp of worktreeGroups) {
-            if (stamp === primaryGroup) {
-              continue;
-            }
-            const groupSink = stamp.byNode.get(CLOSE_SINK_ID);
-            if (groupSink !== undefined) {
-              worktreePreCloseProvision.push(stamp.infoFor(groupSink));
+          // A close that ROUTES a merge-escalation incident is a re-dispatch to OWN
+          // and RESOLVE that conflict (it claims the incident + runs the merge-resolver
+          // in the named lane); pre-close-provisioning would re-mint the conflict and
+          // re-suppress the very launch that resolves it (a deadlock). Skip the pre-
+          // close fan-in for it — the SAME incident exclusion the finalize set applies.
+          if (!incidentOwnerCloseKeys.has(dispatchKey("close", epicId))) {
+            for (const stamp of worktreeGroups) {
+              if (stamp === primaryGroup) {
+                continue;
+              }
+              const groupSink = stamp.byNode.get(CLOSE_SINK_ID);
+              if (groupSink !== undefined) {
+                worktreePreCloseProvision.push(stamp.infoFor(groupSink));
+              }
             }
           }
           continue;

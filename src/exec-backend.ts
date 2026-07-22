@@ -183,16 +183,6 @@ export interface LaunchSpec {
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
   /**
-   * Owner-integration marker for a CLUSTERED epic's serial-primary close — a close
-   * that runs worktree-less on the primary shared checkout. The launch ALWAYS emits
-   * the `KEEPER_PLAN_OWNER_INTEGRATE` carrier (empty when absent, mirroring the
-   * `KEEPER_PLAN_WORKTREE_BRANCH` always-emit discipline) so a reused tmux session
-   * cannot inherit a stale marker; a non-empty value tells the plan-side
-   * `integrateEpicBases` to owner-integrate every plan-state touched base despite the
-   * empty `KEEPER_PLAN_WORKTREE` lane, WITHOUT faking a lane the close does not own.
-   */
-  readonly ownerIntegrate?: boolean;
-  /**
    * Handoff-ee result-envelope path. The launch ALWAYS emits the
    * `KEEPER_HANDOFF_ENVELOPE` carrier (EMPTY when absent) so a reused tmux
    * session cannot inherit a stale capture destination. Only the handoff-ee's
@@ -1269,15 +1259,6 @@ export interface KeeperAgentLaunchOpts {
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
   /**
-   * Owner-integration marker for a serial-primary clustered close. ALWAYS emitted as
-   * the repeated `--x-tmux-env KEEPER_PLAN_OWNER_INTEGRATE` carrier (`"1"` when set,
-   * else `""`), mirroring the {@link worktreeBranch} always-emit discipline so a
-   * reused tmux session OVERWRITES any stale marker; `"1"` tells the plan-side
-   * `integrateEpicBases` to owner-integrate every plan-state touched base despite the
-   * empty `KEEPER_PLAN_WORKTREE` lane.
-   */
-  readonly ownerIntegrate?: boolean;
-  /**
    * Handoff-ee result-envelope path. ALWAYS emitted as the trailing
    * `KEEPER_HANDOFF_ENVELOPE` carrier (`?? ""`) to overwrite a stale capture
    * destination in a reused tmux session. The launcher never writes this path.
@@ -1415,14 +1396,7 @@ export function buildKeeperAgentLaunchArgv(
     // hook's SessionStart capture.
     "--x-tmux-env",
     `KEEPER_PLAN_WORKTREE_BRANCH=${opts.worktreeBranch ?? ""}`,
-    // Owner-integration carrier — the FOURTH always-present repeated `--x-tmux-env`
-    // (keeper agent last-wins per dup key): "1" for a serial-primary clustered close
-    // that must owner-integrate its plan-state touched bases despite the empty lane
-    // above, EMPTY otherwise. Always present so the `-e` OVERWRITES any stale marker a
-    // prior launch left in a reused tmux session env; empty resolves as unset.
-    "--x-tmux-env",
-    `KEEPER_PLAN_OWNER_INTEGRATE=${opts.ownerIntegrate === true ? "1" : ""}`,
-    // Job-identity carrier — ALWAYS a FIFTH repeated `--x-tmux-env` (keeper agent
+    // Job-identity carrier — ALWAYS a FOURTH repeated `--x-tmux-env` (keeper agent
     // last-wins per dup key): the ORIGINAL keeper job id on a RESUME launch so the
     // revived non-claude harness folds onto its existing row instead of minting an
     // orphan, EMPTY on a prompt launch. Always present so the `-e` OVERWRITES any
@@ -1430,7 +1404,7 @@ export function buildKeeperAgentLaunchArgv(
     // fresh prompted launch can never inherit and fold onto someone else's row.
     "--x-tmux-env",
     `KEEPER_JOB_ID=${isResume ? (opts.jobId ?? "") : ""}`,
-    // Dispatched-cell carriers (ADR 0047) — the SIXTH/SEVENTH/EIGHTH repeated
+    // Dispatched-cell carriers (ADR 0047) — the FIFTH/SIXTH/SEVENTH repeated
     // `--x-tmux-env` (keeper agent last-wins per dup key): the model/tier the
     // `worker_provider` pin translated the assigned cell TO, plus the pin that
     // forced it, EMPTY when the assigned cell ran unconstrained. ALWAYS present so
@@ -1444,7 +1418,7 @@ export function buildKeeperAgentLaunchArgv(
     `KEEPER_PLAN_DISPATCHED_TIER=${opts.dispatchedTier ?? ""}`,
     "--x-tmux-env",
     `KEEPER_PLAN_DISPATCH_CONSTRAINT=${opts.dispatchConstraint ?? ""}`,
-    // Wrapped-cell guard carriers (task .1) — the NINTH/TENTH repeated `--x-tmux-env`
+    // Wrapped-cell guard carriers (task .1) — the EIGHTH/NINTH repeated `--x-tmux-env`
     // (keeper agent last-wins per dup key): the effective `<model>::<effort>` and the
     // provider-leg result-envelope path for a wrapped cell, EMPTY for a native cell.
     // ALWAYS present so the `-e` OVERWRITES any stale marker a prior wrapped launch
@@ -1701,9 +1675,6 @@ export async function keeperAgentLaunch(
         : {}),
       ...(deps.spec.wrappedEnvelope !== undefined
         ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
-        : {}),
-      ...(deps.spec.ownerIntegrate !== undefined
-        ? { ownerIntegrate: deps.spec.ownerIntegrate }
         : {}),
       ...(deps.spec.handoffEnvelope !== undefined
         ? { handoffEnvelope: deps.spec.handoffEnvelope }
