@@ -537,6 +537,49 @@ export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
 }
 
 /**
+ * The PER-REPO origin-containment fallback distress family. The periodic origin-containment
+ * reconcile re-pushes local default to origin when a finalize push never landed; when NO
+ * owner (finalize/recover) remains to re-trigger it, this is the ONLY surface that can page
+ * a repo whose origin is silently falling behind — a repeated push timeout/failure while
+ * local leads, or a TRUE divergence keeper cannot reconcile (no fetch/rebase/force). Mints
+ * on its OWN id/reason so it never cross-clears the finalize/recover push-stuck rows or the
+ * shared-checkout families: the un-retryable synthetic `daemon` verb (routes as {@link
+ * routeDispatchFailure}'s `unknown` arm — never in `failedKeys`, never
+ * `retry_dispatch`-clearable) with a per-repo `id` (`origin-containment-stuck:<repoHash>`)
+ * so two checkouts on a multi-repo board escalate independently. Its ONLY clear is the
+ * per-cycle probe observing origin CONTAIN local (pushed / already-contained / remote-ahead
+ * — POSITIVE evidence); the `reason` lives OUTSIDE {@link WORKTREE_RECOVER_REASON_PREFIX}.
+ * Like its shared-checkout siblings it IS boot orphan-GC-EXEMPT (a live level-trigger owns
+ * dropping it) and a PAGING operator jam: its minted reason startsWith {@link
+ * ORIGIN_CONTAINMENT_DISTRESS_REASON}, so `isJamReason` surfaces it through needs-human and
+ * the daemon page-once sweep pages the operator EXACTLY once per row instance
+ * (`human_notified_at`, re-armed at NULL by the producer level-clear). Prefix-disjoint from
+ * every existing family.
+ */
+export const ORIGIN_CONTAINMENT_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX =
+  "origin-containment-stuck:";
+export const ORIGIN_CONTAINMENT_DISTRESS_REASON = "origin-containment-stuck";
+
+/**
+ * True iff `(verb, id)` is an origin-containment-stuck distress key — the synthetic
+ * `daemon` verb plus the {@link ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX} per-repo id. The
+ * boot orphan-GC EXEMPTS it (like the shared-checkout / lane-wedge / stale-base + crash-loop
+ * keys) since a live level-trigger — not the operator surface — clears it; pure, dep-free,
+ * NEVER throws. Disjoint from every sibling distress family: the id prefixes never mutually
+ * match, so the rows never cross-classify or cross-clear.
+ */
+export function isOriginContainmentDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === ORIGIN_CONTAINMENT_DISTRESS_VERB &&
+    id.startsWith(ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX)
+  );
+}
+
+/**
  * A stopped, pid-alive worker-monitor occupant that has kept its dispatch root
  * reserved with canonical `resource-evidence-stale` activity past the producer's
  * paging horizon. This is a PAGING operator jam, never a release signal: the

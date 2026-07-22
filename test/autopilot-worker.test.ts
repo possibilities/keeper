@@ -68,6 +68,7 @@ import {
   type CloseRecoveryStampResult,
   type ConfirmRunningDeps,
   classifyCloseRecoveryStampExit,
+  classifyOriginContainment,
   classifyResolverOutcome,
   classifyWorktreeRepos,
   clearDeadZombieSessionMarker,
@@ -88,6 +89,7 @@ import {
   createLaneTeardownGraceTracker,
   createLaneWedgeTracker,
   createMergeSuiteLoadRetryTracker,
+  createOriginContainmentStuckTracker,
   createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
@@ -132,6 +134,7 @@ import {
   isKeeperLaunchedZombieCommand,
   isLaneWedgeDistressKey,
   isOccupyingJob,
+  isOriginContainmentDistressKey,
   isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
@@ -160,6 +163,11 @@ import {
   type MergeSuiteVerdict,
   mergeEscalationFailuresToClear,
   mergeLaneBaseIntoDefault,
+  ORIGIN_CONTAINMENT_DISTRESS_REASON,
+  ORIGIN_CONTAINMENT_STUCK_GRACE_SEC,
+  type OriginContainmentResult,
+  originContainmentDistressId,
+  originContainmentSweepEnabled,
   originDefaultRef,
   pendingIntegrationReason,
   planTipBaselineRequests,
@@ -243,7 +251,7 @@ import {
   ZOMBIE_SESSION_TERM_GRACE_SEC,
   type ZombieProcessEvidence,
 } from "../src/autopilot-worker";
-
+import { isJamReason } from "../src/await-conditions";
 import { readTestGateCommand, type SpawnFn } from "../src/baseline-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -25337,6 +25345,9 @@ function makeContainmentGit(
     headBranch?: string;
     originResolves?: boolean;
     originContainedExit?: number;
+    // The second divergence probe: is local <default> an ancestor of origin? exit 0 →
+    // origin strictly ahead (remote-ahead, healthy); exit 1 → true divergence. Default 1.
+    localBehindExit?: number;
     ffAncestorExit?: number;
     aheadCount?: string;
     aheadExit?: number;
@@ -25375,6 +25386,13 @@ function makeContainmentGit(
       `merge-base --is-ancestor ${originDefaultRef(def)} refs/heads/${def}`
     ) {
       return { code: opts.originContainedExit ?? 0, stdout: "", stderr: "" };
+    }
+    // Containment divergence classification: is local <default> an ancestor of origin?
+    if (
+      joined ===
+      `merge-base --is-ancestor refs/heads/${def} ${originDefaultRef(def)}`
+    ) {
+      return { code: opts.localBehindExit ?? 1, stdout: "", stderr: "" };
     }
     // pushDefaultToOrigin's non-ff precheck (bare <default>).
     if (joined === `merge-base --is-ancestor ${originDefaultRef(def)} ${def}`) {
@@ -25486,10 +25504,16 @@ test("fn-13 reconcileOriginContainment pushes on strictly-ahead + non-diverged p
   expect(g.calls.some((c) => c.args === "push origin main")).toBe(true);
 });
 
-test("fn-13 reconcileOriginContainment does NOT push a diverged/origin-ahead repo — sticky path preserved, never a force", async () => {
-  const g = makeContainmentGit({ originContainedExit: 1 });
+test("fn-13 reconcileOriginContainment reports true divergence (neither ancestor) — no push, never a force", async () => {
+  // origin NOT ancestor of local AND local NOT ancestor of origin → true divergence.
+  const g = makeContainmentGit({
+    originContainedExit: 1,
+    localBehindExit: 1,
+    aheadCount: "5",
+  });
   expect(await reconcileOriginContainment("/repo", "main", g.run)).toEqual({
     kind: "diverged",
+    ahead: 5,
   });
   expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
   expect(
@@ -25497,8 +25521,27 @@ test("fn-13 reconcileOriginContainment does NOT push a diverged/origin-ahead rep
       (c) => c.args.includes("--force") || c.args.split(" ").includes("-f"),
     ),
   ).toBe(false);
-  // It never counted commits ahead — divergence short-circuits before the push gate.
-  expect(g.calls.some((c) => c.args.startsWith("rev-list"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment classifies origin STRICTLY AHEAD as remote-ahead (healthy, not ours) — no push", async () => {
+  // origin NOT ancestor of local, but local IS an ancestor of origin → origin advanced
+  // past local (someone else pushed). Keeper never fetches, so it is not keeper's to
+  // reconcile — a HEALTHY-not-ours no-op, distinct from a true divergence.
+  const g = makeContainmentGit({ originContainedExit: 1, localBehindExit: 0 });
+  expect(await reconcileOriginContainment("/repo", "main", g.run)).toEqual({
+    kind: "remote-ahead",
+  });
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment DEFERS on an inconclusive divergence classification", async () => {
+  const g = makeContainmentGit({
+    originContainedExit: 1,
+    localBehindExit: GIT_SPAWN_TIMEOUT_CODE,
+  });
+  const res = await reconcileOriginContainment("/repo", "main", g.run);
+  expect(res.kind).toBe("deferred");
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
 });
 
 test("fn-13 reconcileOriginContainment DEFERS on an inconclusive non-divergence probe", async () => {
@@ -25569,7 +25612,11 @@ test("fn-13 driver.reconcileOrigin defers a repo already pushed this cycle — n
   if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
   const outcomes = await driver.reconcileOrigin([repo]);
   expect(outcomes).toEqual([
-    { dir: repo, result: { kind: "deferred", reason: expect.any(String) } },
+    {
+      dir: repo,
+      defaultBranch: "main",
+      result: { kind: "deferred", reason: expect.any(String) },
+    },
   ]);
   // Exactly ONE push origin this cycle — the finalize leg's, never a containment re-push.
   expect(g.calls.filter((c) => c.args === "push origin main").length).toBe(1);
@@ -25590,4 +25637,201 @@ test("fn-13 driver.reconcileOrigin handles each repo independently, per-repo ser
   // Each repo's push targeted its OWN cwd — the per-repo serialization boundary.
   const pushes = g.calls.filter((c) => c.args === "push origin main");
   expect(pushes.map((p) => p.cwd)).toEqual([repoA, repoB]);
+});
+
+// --- 13b: ordering, visible fallback, strict count, scope boundary ---
+
+test("commitsAheadOfOrigin STRICTLY rejects a non-decimal rev-list count", async () => {
+  // GATE 3: Number.parseInt would accept these; the strict /^\d+$/ gate returns null →
+  // the capped-generous deadline, never a fabricated backlog.
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadCount: "7junk" }).run,
+    ),
+  ).toBeNull();
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadCount: "3.5" }).run,
+    ),
+  ).toBeNull();
+  // A clean decimal still parses.
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadCount: "0" }).run,
+    ),
+  ).toBe(0);
+});
+
+test("13b ordering: an owner push that TIMED OUT this cycle still blocks a containment re-push — exactly ONE attempt", async () => {
+  // GATE 1 regression: production order is owner(finalize/recover) → containment. An owner
+  // push that timed out leaves origin behind, but the guard (stamped by pushDefaultToOrigin)
+  // must stop the later containment sweep re-pushing the same repo in the same cycle.
+  const repo = "/repo-13b-order";
+  const g = makeContainmentGit({
+    aheadCount: "9",
+    pushExit: GIT_SPAWN_TIMEOUT_CODE,
+  });
+  beginContainmentCycle();
+  // The owner leg pushes first and TIMES OUT (origin still behind).
+  expect(await pushDefaultToOrigin(repo, "main", g.run)).toEqual({
+    kind: "push-timeout",
+  });
+  const driver = createWorktreeDriver(g.run);
+  if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
+  const [outcome] = await driver.reconcileOrigin([repo]);
+  expect(outcome.result.kind).toBe("deferred"); // guard short-circuit — no second push
+  expect(g.calls.filter((c) => c.args === "push origin main").length).toBe(1);
+});
+
+test("13b ordering: beginContainmentCycle re-arms the guard so the NEXT cycle re-pushes a lagging repo", async () => {
+  const repo = "/repo-13b-rearm";
+  const g = makeContainmentGit({ aheadCount: "4" });
+  const driver = createWorktreeDriver(g.run);
+  if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
+  // Cycle 1: an owner push stamps the guard → containment defers.
+  beginContainmentCycle();
+  await pushDefaultToOrigin(repo, "main", g.run);
+  expect((await driver.reconcileOrigin([repo]))[0].result.kind).toBe(
+    "deferred",
+  );
+  // Cycle 2: the guard is cleared → no owner push → containment fires.
+  beginContainmentCycle();
+  expect((await driver.reconcileOrigin([repo]))[0].result.kind).toBe("pushed");
+});
+
+test("13b classifyOriginContainment: healthy / actionable / neutral partition", () => {
+  const h = (r: OriginContainmentResult) =>
+    classifyOriginContainment("/r", "main", r).class;
+  expect(h({ kind: "pushed" })).toBe("healthy");
+  expect(h({ kind: "already-contained" })).toBe("healthy");
+  expect(h({ kind: "remote-ahead" })).toBe("healthy");
+  expect(h({ kind: "push-timeout" })).toBe("actionable");
+  expect(h({ kind: "push-failed", detail: "x" })).toBe("actionable");
+  expect(h({ kind: "diverged", ahead: 3 })).toBe("actionable");
+  expect(h({ kind: "deferred", reason: "x" })).toBe("neutral");
+  expect(h({ kind: "off-branch", head: "feat" })).toBe("neutral");
+  expect(h({ kind: "not-turn-key", reason: { kind: "no-remote" } })).toBe(
+    "neutral",
+  );
+  // The actionable reason carries the paging token so isJamReason surfaces it.
+  const actionable = classifyOriginContainment("/r", "main", {
+    kind: "push-timeout",
+  });
+  if (actionable.class !== "actionable") throw new Error("expected actionable");
+  expect(actionable.reason.startsWith(ORIGIN_CONTAINMENT_DISTRESS_REASON)).toBe(
+    true,
+  );
+  expect(isJamReason(actionable.reason)).toBe(true);
+});
+
+test("13b origin-containment tracker mints past the grace and level-clears on positive evidence", () => {
+  const tracker = createOriginContainmentStuckTracker(600);
+  const dir = "/repo-13b-track";
+  const reason = `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: stuck`;
+  const unhealthy = new Map([[dir, reason]]);
+  const empty = new Set<string>();
+  // Before the grace: no mint.
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: 0,
+    }),
+  ).toEqual({ mint: [], clear: [] });
+  // Past the grace: mint exactly once, keyed per-repo.
+  const minted = tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 700,
+  });
+  expect(minted.mint).toEqual([
+    { id: originContainmentDistressId(dir), dir, reason },
+  ]);
+  // Still unhealthy next cycle: no DUPLICATE mint.
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: 800,
+    }).mint,
+  ).toEqual([]);
+  // POSITIVE evidence this cycle clears the open row.
+  const cleared = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set([dir]),
+    openDistressDirs: new Set([dir]),
+    nowSec: 900,
+  });
+  expect(cleared.clear).toEqual([
+    { id: originContainmentDistressId(dir), dir },
+  ]);
+});
+
+test("13b origin-containment tracker does NOT clear on an inconclusive (deferred/neutral) cycle", () => {
+  const tracker = createOriginContainmentStuckTracker(600);
+  const dir = "/repo-13b-defer";
+  // An open row exists (e.g. minted before a restart, in-memory latch empty). A cycle with
+  // NO positive evidence (neutral/deferred: dir absent from both unhealthy and healthy)
+  // must RETAIN the row — an unknown state is never a licence to dismiss a live jam.
+  const decision = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set<string>(),
+    openDistressDirs: new Set([dir]),
+    nowSec: 1000,
+  });
+  expect(decision).toEqual({ mint: [], clear: [] });
+});
+
+test("13b origin-containment tracker clears a PRE-RESTART open row on positive evidence (in-memory latch empty)", () => {
+  const tracker = createOriginContainmentStuckTracker(600);
+  const dir = "/repo-13b-restart";
+  // Fresh tracker (post-restart): the only knowledge of the row is the durable open set.
+  const decision = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set([dir]),
+    openDistressDirs: new Set([dir]),
+    nowSec: 5,
+  });
+  expect(decision.clear).toEqual([
+    { id: originContainmentDistressId(dir), dir },
+  ]);
+});
+
+test("13b origin-containment distress id/key are per-repo and prefix-disjoint", () => {
+  const a = originContainmentDistressId("/repo-a");
+  const b = originContainmentDistressId("/repo-b");
+  expect(a).not.toBe(b); // per-repo distinct on a multi-repo board
+  expect(isOriginContainmentDistressKey("daemon", a)).toBe(true);
+  // The synthetic non-retryable verb is required; a real verb never classifies.
+  expect(isOriginContainmentDistressKey("close", a)).toBe(false);
+  // Disjoint from a sibling family id (never cross-classifies).
+  expect(
+    isOriginContainmentDistressKey("daemon", sharedDesyncDistressId("/repo-a")),
+  ).toBe(false);
+});
+
+test("13b SCOPE BOUNDARY: the containment sweep is inert with worktree mode OFF", () => {
+  // The sweep is worktree-finalize publication hardening ONLY; a mode-OFF board commits
+  // directly on the shared default with no keeper push path (a pre-existing boundary).
+  expect(originContainmentSweepEnabled(false, false, true)).toBe(false);
+  expect(originContainmentSweepEnabled(undefined, false, true)).toBe(false);
+  // Also gated on not-paused and a driver that implements the sweep.
+  expect(originContainmentSweepEnabled(true, true, true)).toBe(false);
+  expect(originContainmentSweepEnabled(true, false, false)).toBe(false);
+  // Only worktree-mode ON + not paused + driver present runs it.
+  expect(originContainmentSweepEnabled(true, false, true)).toBe(true);
+});
+
+test("13b ORIGIN_CONTAINMENT_STUCK_GRACE_SEC is a bounded positive window", () => {
+  expect(ORIGIN_CONTAINMENT_STUCK_GRACE_SEC).toBeGreaterThan(0);
+  expect(Number.isFinite(ORIGIN_CONTAINMENT_STUCK_GRACE_SEC)).toBe(true);
 });

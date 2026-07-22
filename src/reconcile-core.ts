@@ -857,6 +857,16 @@ export interface ReconcileSnapshot {
    * is an empty set (no open desync distress).
    */
   sharedDesyncDistressDirs?: Set<string>;
+  /**
+   * The `repoDir`s that currently have an OPEN per-repo ORIGIN-CONTAINMENT-STUCK distress
+   * row (synthetic `daemon::origin-containment-stuck:<repoHash>`, collected off the row's
+   * `dir`). PRODUCER-ONLY: the periodic origin-containment fallback tracker re-seeds its
+   * clear from THIS durable set (so a restarted worker still clears — on positive
+   * containment — a distress it minted before the restart). A LIVE-producer sibling on its
+   * own id prefix so the surfaces never cross-clear. Optional for call-site back-compat; an
+   * absent field is an empty set (no open origin-containment distress).
+   */
+  originContainmentDistressDirs?: Set<string>;
   /** Producer-only monitor-slot page/level-clear actions derived from canonical
    * Harness activity plus a live pid probe. They never feed `reconcile`, release
    * capacity, or kill an occupant. */

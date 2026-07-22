@@ -97,6 +97,7 @@ import {
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
+  isOriginContainmentDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -115,6 +116,8 @@ import {
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_REASON,
   monitorSlotWedgeJobId,
+  ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
+  ORIGIN_CONTAINMENT_DISTRESS_REASON,
   parseMergeConflictReason,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
@@ -302,6 +305,7 @@ export {
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
+  isOriginContainmentDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -322,6 +326,9 @@ export {
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_REASON,
   MONITOR_SLOT_WEDGE_DISTRESS_VERB,
+  ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
+  ORIGIN_CONTAINMENT_DISTRESS_REASON,
+  ORIGIN_CONTAINMENT_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DESYNC_DISTRESS_VERB,
@@ -1741,11 +1748,17 @@ export interface WorktreeDriver {
    * repo already pushed this cycle; a diverged / origin-ahead repo keeps its existing
    * visible sticky path (never auto-reconciled, never a force). Reuses the SAME
    * {@link reconcileOriginContainment} probe + {@link pushDefaultToOrigin} path per repo,
-   * never a fold. Optional so existing driver fakes stay byte-compatible.
+   * never a fold. Returns the resolved `defaultBranch` per repo so the caller builds the
+   * fallback distress reason via {@link classifyOriginContainment}. Optional so existing
+   * driver fakes stay byte-compatible.
    */
-  reconcileOrigin?(
-    repos: readonly string[],
-  ): Promise<{ dir: string; result: OriginContainmentResult }[]>;
+  reconcileOrigin?(repos: readonly string[]): Promise<
+    {
+      dir: string;
+      defaultBranch: string;
+      result: OriginContainmentResult;
+    }[]
+  >;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -2095,6 +2108,20 @@ export function dupEpicNumberDistressId(
  */
 export function sharedDesyncDistressId(repoDir: string): string {
   return `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
+/**
+ * The `dispatch_failures` id a per-repo ORIGIN-CONTAINMENT-STUCK distress row keys on —
+ * `origin-containment-stuck:<repoDirHash(repoDir)>`. A SIBLING of the shared-checkout
+ * distress ids on a DISTINCT prefix, so it never cross-classifies / cross-clears them nor
+ * the epic-scoped `worktree-finalize-*` push-stuck rows. Per-repo stable across cycles (the
+ * grace mint and the positive-evidence level-clear hit the same row) and distinct across
+ * repos. The composite `daemon::origin-containment-stuck:<hash>` fails the `retry_dispatch`
+ * wire validator (synthetic `daemon` verb), so only the per-cycle containment probe's
+ * level-trigger clears it.
+ */
+export function originContainmentDistressId(repoDir: string): string {
+  return `${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
 }
 
 // ── Terminal autopilot pane teardown ───────────────────────────────────────
@@ -3935,6 +3962,83 @@ export function createSharedCheckoutDesyncTracker(
       for (const dir of openDistressDirs) {
         if (!desynced.has(dir)) {
           decision.clear.push({ id: sharedDesyncDistressId(dir), dir });
+        }
+      }
+      return decision;
+    },
+  };
+}
+
+/** Grace (producer-`ts` seconds) a repo may stay origin-containment-UNHEALTHY before the
+ *  fallback pages. Bounded so a transient network stall / brief divergence resolves inside
+ *  the window; sustained past it, origin is genuinely stuck falling behind and needs a human. */
+export const ORIGIN_CONTAINMENT_STUCK_GRACE_SEC = 10 * 60;
+
+/**
+ * Grace tracker escalating a repo whose periodic origin-containment reconcile cannot make
+ * origin reflect local default — a push that keeps timing out / failing while local leads
+ * (the silent-lag jam), or a TRUE divergence keeper cannot reconcile (no fetch/rebase/force)
+ * — past the grace into its OWN per-repo distress row. The fallback for the no-owner-left
+ * case: with lanes gone and no finalize to re-trigger, this is the only surface that pages a
+ * repo whose origin is silently frozen. A near-sibling of {@link
+ * createSharedCheckoutDesyncTracker} on its OWN id/reason ({@link originContainmentDistressId}
+ * + {@link ORIGIN_CONTAINMENT_DISTRESS_REASON}), never cross-clearing the shared-checkout or
+ * finalize push-stuck rows. Pure of keeper.db / IO / the wall clock (the producer `ts` is the
+ * only clock); in-memory grace + per-repo minted-latch; projection-driven clear robust across
+ * a restart.
+ *
+ * ONE divergence from the desync tracker's clear: it clears ONLY on POSITIVE evidence
+ * (`healthy` — pushed / already-contained / remote-ahead), NEVER on "not unhealthy" — an
+ * INCONCLUSIVE (`deferred`) cycle must not reset the jam clock nor dismiss a live row.
+ */
+export interface OriginContainmentStuckTracker {
+  step(input: {
+    /** This cycle's still-stuck repos: `repoDir` → the actionable reason (mint attribution). */
+    unhealthy: ReadonlyMap<string, string>;
+    /** This cycle's repos with POSITIVE containment evidence (pushed / already-contained /
+     *  remote-ahead) — re-arms the grace latch and level-clears any open row. */
+    healthy: ReadonlySet<string>;
+    /** `repoDir`s that currently have an OPEN origin-containment distress row. */
+    openDistressDirs: ReadonlySet<string>;
+    nowSec: number;
+  }): SharedWedgeDistressDecision;
+}
+
+export function createOriginContainmentStuckTracker(
+  graceSec: number = ORIGIN_CONTAINMENT_STUCK_GRACE_SEC,
+): OriginContainmentStuckTracker {
+  // repoDir → the first cycle-ts it was seen stuck + whether we minted for THIS continuous
+  // stuck episode. In-worker memory only; a restart re-seeds the clear off the open-row set.
+  const firstStuck = new Map<string, { sinceSec: number; minted: boolean }>();
+  return {
+    step({ unhealthy, healthy, openDistressDirs, nowSec }) {
+      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      // MINT layer: advance each stuck repo's grace clock; cross the watermark once.
+      for (const [dir, reason] of unhealthy) {
+        let entry = firstStuck.get(dir);
+        if (entry === undefined) {
+          entry = { sinceSec: nowSec, minted: false };
+          firstStuck.set(dir, entry);
+        }
+        if (!entry.minted && nowSec - entry.sinceSec >= graceSec) {
+          entry.minted = true;
+          decision.mint.push({
+            id: originContainmentDistressId(dir),
+            dir,
+            reason,
+          });
+        }
+      }
+      // Re-arm ONLY on POSITIVE evidence: a repo healthy this cycle closes its episode. An
+      // inconclusive (deferred) cycle is left untouched so the grace clock persists.
+      for (const dir of healthy) {
+        firstStuck.delete(dir);
+      }
+      // CLEAR layer: level-trigger off the durable open set — an open row whose repo shows
+      // POSITIVE containment this cycle clears (robust across a restart).
+      for (const dir of openDistressDirs) {
+        if (healthy.has(dir)) {
+          decision.clear.push({ id: originContainmentDistressId(dir), dir });
         }
       }
       return decision;
@@ -8229,7 +8333,11 @@ export function createWorktreeDriver(
       );
     },
     async reconcileOrigin(repos) {
-      const outcomes: { dir: string; result: OriginContainmentResult }[] = [];
+      const outcomes: {
+        dir: string;
+        defaultBranch: string;
+        result: OriginContainmentResult;
+      }[] = [];
       for (const repo of repos) {
         try {
           const defaultBranch = await gitResolveDefaultBranch(repo, run);
@@ -8239,11 +8347,12 @@ export function createWorktreeDriver(
             run,
             pushAttemptedThisCycleByRepo.has(repo),
           );
-          outcomes.push({ dir: repo, result });
+          outcomes.push({ dir: repo, defaultBranch, result });
         } catch (err) {
           // A producer git error must not wedge the cycle; degrade this repo to a defer.
           outcomes.push({
             dir: repo,
+            defaultBranch: "",
             result: {
               kind: "deferred",
               reason: err instanceof Error ? err.message : String(err),
@@ -8363,7 +8472,13 @@ export async function commitsAheadOfOrigin(
     { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
   if (r.code !== 0) return null;
-  const n = Number.parseInt(r.stdout.trim(), 10);
+  // STRICT parse: `rev-list --count` emits an EXACT nonnegative decimal. Number.parseInt
+  // would silently accept `7junk` (→7) or `3.5` (→3), fabricating a count from garbage —
+  // so validate the trimmed output as pure digits FIRST; anything else is null (→ the
+  // capped-generous deadline), never a bogus measured backlog.
+  const trimmed = r.stdout.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number.parseInt(trimmed, 10);
   return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
 
@@ -8458,21 +8573,30 @@ export async function pushDefaultToOrigin(
 }
 
 /**
- * The verdict of {@link reconcileOriginContainment}. `pushed` / `already-contained` /
- * `diverged` / `deferred` are the probe's own arms; every remaining member is a
- * non-`pushed` {@link PushDefaultResult} degrade returned straight (the containment
- * push reuses {@link pushDefaultToOrigin} verbatim).
+ * The verdict of {@link reconcileOriginContainment}, classified for the fallback
+ * distress tracker into HEALTHY (positive evidence — clears a distress row),
+ * ACTIONABLE (needs an operator — advances the grace clock), and NEUTRAL
+ * (inconclusive — neither). Every non-`pushed` {@link PushDefaultResult} degrade is
+ * returned straight (the containment push reuses {@link pushDefaultToOrigin} verbatim).
  */
 export type OriginContainmentResult =
+  // HEALTHY: the push landed this cycle.
   | { kind: "pushed" }
-  // Origin already contains local default (nothing to push) — the healthy steady state.
+  // HEALTHY: origin already contains local default (nothing to push) — steady state.
   | { kind: "already-contained" }
-  // Origin/<default> is NOT an ancestor of local default (diverged / origin-ahead) — NO
-  // push: the existing VISIBLE non-ff sticky path owns this, never a force, never here.
-  | { kind: "diverged" }
-  // An inconclusive probe (origin ref unresolved / a 124/128 read / an unparseable
-  // count) OR a push already attempted this cycle — DEFER, no push (tri-state discipline).
+  // HEALTHY-NOT-OURS: origin is STRICTLY AHEAD of local default (local is an ancestor of
+  // origin) — someone else advanced origin; keeper never fetches, so it is not keeper's to
+  // reconcile and is NOT an actionable jam. NO push, NO page.
+  | { kind: "remote-ahead" }
+  // ACTIONABLE: origin and local default have TRULY DIVERGED (neither is an ancestor of
+  // the other) — keeper cannot reconcile without a human (no fetch/rebase/force). NO push;
+  // sustained past the grace it pages the operator. `ahead` is the local lead for context.
+  | { kind: "diverged"; ahead: number }
+  // NEUTRAL: an inconclusive probe (origin ref unresolved / a 124/128 read / an
+  // unparseable count) OR a push already attempted this cycle — DEFER, no push, no page.
   | { kind: "deferred"; reason: string }
+  // The push-side degrades: `push-timeout` / `push-failed` are ACTIONABLE (local leads but
+  // the push will not land — the silent-lag jam); `not-turn-key` / `non-ff` are NEUTRAL.
   | Exclude<PushDefaultResult, { kind: "pushed" }>;
 
 /**
@@ -8487,15 +8611,18 @@ export type OriginContainmentResult =
  *  2. origin/<default> must RESOLVE locally (cached, NO fetch); a never-pushed default
  *     is the finalize FIRST-push case, not a containment re-push → defer.
  *  3. TRI-STATE non-divergence via `merge-base --is-ancestor origin/<default> <default>`:
- *     exit 0 → non-diverged (a push is a pure fast-forward); exit 1 → diverged /
- *     origin-ahead → `diverged`, NO push; any other exit → inconclusive → defer.
+ *     exit 0 → non-diverged (a push is a pure fast-forward); exit 1 → origin is not an
+ *     ancestor of local, so DISTINGUISH `remote-ahead` (local IS an ancestor of origin →
+ *     origin strictly ahead, healthy-not-ours) from true `diverged` (neither) via a
+ *     SECOND `merge-base --is-ancestor <default> origin/<default>`; any other exit →
+ *     inconclusive → defer.
  *  4. STRICTLY-ahead via {@link commitsAheadOfOrigin}: `null` → inconclusive → defer;
  *     0 → `already-contained`; > 0 → positive evidence → {@link pushDefaultToOrigin}
  *     (which re-verifies HEAD-safety + turn-key + non-ff before it touches origin).
  * Pure git side effects — never a fetch / rebase / force. The existing push-stuck
- * streak / sticky semantics are UNTOUCHED: this is a best-effort re-push; when its push
- * times out it simply defers, and the finalize / recover paths remain the sole owners
- * of the streak and the visible `worktree-finalize-push-stuck` escalation.
+ * streak / sticky semantics are UNTOUCHED: this is a best-effort re-push that owns its
+ * OWN per-repo visible fallback (via the caller's distress tracker), never the finalize /
+ * recover streak or the `worktree-finalize-push-stuck` escalation.
  */
 export async function reconcileOriginContainment(
   repo: string,
@@ -8510,6 +8637,7 @@ export async function reconcileOriginContainment(
     };
   }
   const remoteRef = originDefaultRef(defaultBranch);
+  const localRef = `refs/heads/${defaultBranch}`;
   const exists = await run(["rev-parse", "--verify", "--quiet", remoteRef], {
     cwd: repo,
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
@@ -8521,11 +8649,28 @@ export async function reconcileOriginContainment(
     };
   }
   const contains = await run(
-    ["merge-base", "--is-ancestor", remoteRef, `refs/heads/${defaultBranch}`],
+    ["merge-base", "--is-ancestor", remoteRef, localRef],
     { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
   if (contains.code === 1) {
-    return { kind: "diverged" };
+    // Origin is NOT an ancestor of local. Distinguish a healthy origin-strictly-ahead
+    // (local IS an ancestor of origin — not keeper's to reconcile) from a TRUE divergence
+    // (neither is an ancestor — needs a human) before any paging.
+    const behind = await run(
+      ["merge-base", "--is-ancestor", localRef, remoteRef],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (behind.code === 0) {
+      return { kind: "remote-ahead" };
+    }
+    if (behind.code !== 1) {
+      return {
+        kind: "deferred",
+        reason: `could not classify origin/${defaultBranch} divergence (exit ${behind.code})`,
+      };
+    }
+    const ahead = await commitsAheadOfOrigin(repo, defaultBranch, run);
+    return { kind: "diverged", ahead: ahead ?? 0 };
   }
   if (contains.code !== 0) {
     return {
@@ -8545,6 +8690,70 @@ export async function reconcileOriginContainment(
   }
   const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
   return pushed.kind === "pushed" ? { kind: "pushed" } : pushed;
+}
+
+/**
+ * Classify a containment outcome for the fallback distress tracker:
+ *  - `healthy` — POSITIVE evidence origin reflects (or is ahead of) local: `pushed`,
+ *    `already-contained`, `remote-ahead`. Clears any open distress row.
+ *  - `actionable` — origin is genuinely stuck falling behind and needs an operator: a
+ *    `push-timeout` / `push-failed` while local leads (silent-lag jam), or a true `diverged`.
+ *    Advances the grace clock, carrying the paging `reason`.
+ *  - `neutral` — inconclusive / transient (`deferred`, `off-branch`, `not-turn-key`,
+ *    `non-ff`): neither clears nor advances (tri-state discipline — an unknown state is never
+ *    a licence to page OR to dismiss a live row). Pure.
+ */
+export function classifyOriginContainment(
+  repo: string,
+  defaultBranch: string,
+  result: OriginContainmentResult,
+  graceSec: number = ORIGIN_CONTAINMENT_STUCK_GRACE_SEC,
+):
+  | { class: "healthy" }
+  | { class: "actionable"; reason: string }
+  | { class: "neutral" } {
+  const graceMin = Math.round(graceSec / 60);
+  switch (result.kind) {
+    case "pushed":
+    case "already-contained":
+    case "remote-ahead":
+      return { class: "healthy" };
+    case "push-timeout":
+    case "push-failed":
+      return {
+        class: "actionable",
+        reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: ${repo} local ${defaultBranch} leads origin/${defaultBranch} but the containment push has not landed past the ${graceMin}min grace (${result.kind}) — origin is silently falling behind; needs an operator to probe (git push --dry-run origin HEAD:${defaultBranch}) and reconcile (no fetch/rebase/force)`,
+      };
+    case "diverged":
+      return {
+        class: "actionable",
+        reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: ${repo} local ${defaultBranch} and origin/${defaultBranch} have DIVERGED past the ${graceMin}min grace (local leads by ${result.ahead}) — keeper cannot reconcile without a human (no fetch/rebase/force); reconcile origin/${defaultBranch}`,
+      };
+    case "deferred":
+    case "off-branch":
+    case "not-turn-key":
+    case "non-ff":
+      return { class: "neutral" };
+    default:
+      return assertNever(result);
+  }
+}
+
+/**
+ * Whether the periodic origin-containment sweep runs THIS cycle — the SINGLE source of the
+ * gate the driveCycle glue applies (an exported pure seam so the boundary is testable
+ * without booting the cycle). SCOPE: the sweep is worktree-finalize PUBLICATION HARDENING
+ * only, so it is gated on worktree mode — a mode-OFF board commits directly on the shared
+ * default with no keeper push path at all (a pre-existing design boundary, reported
+ * separately), so the sweep must be inert there. Also gated on not-paused (a push is a
+ * suppressed side effect while paused) and a driver that implements the sweep. Pure.
+ */
+export function originContainmentSweepEnabled(
+  worktreeMode: boolean | undefined,
+  paused: boolean,
+  driverImplementsSweep: boolean,
+): boolean {
+  return worktreeMode === true && !paused && driverImplementsSweep;
 }
 
 type OwnerIntegratedTeardownResult =
@@ -11777,6 +11986,11 @@ export async function loadReconcileSnapshot(
   // set + the desync grace tracker's clear set, so a restarted worker still probes +
   // clears a distress it minted before the restart.
   const sharedDesyncDistressDirs = new Set<string>();
+  // The `repoDir`s with an OPEN per-repo origin-containment-stuck distress row — a LIVE
+  // producer sibling on its own `origin-containment-stuck:` id prefix. Re-seeds the
+  // containment tracker's clear set so a restarted worker still clears (on positive
+  // containment) a distress it minted before the restart.
+  const originContainmentDistressDirs = new Set<string>();
   // OPEN per-occupant monitor-slot paging rows. Keyed by id so the producer can
   // suppress re-mint/page and level-clear the exact durable row after positive
   // settle/exit/fact-clear evidence.
@@ -11857,6 +12071,14 @@ export async function loadReconcileSnapshot(
         const dir = (row as { dir?: unknown }).dir;
         if (typeof dir === "string" && dir.length > 0) {
           sharedDesyncDistressDirs.add(dir);
+        }
+      }
+      if (isOriginContainmentDistressKey(verb, id)) {
+        // Off the row's `dir`; disjoint from every sibling set by the
+        // `origin-containment-stuck:` id prefix.
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          originContainmentDistressDirs.add(dir);
         }
       }
       if (isMonitorSlotWedgeDistressKey(verb, id)) {
@@ -12523,6 +12745,7 @@ export async function loadReconcileSnapshot(
     sharedWedgeDistressDirs,
     sharedDirtyDistressDirs,
     sharedDesyncDistressDirs,
+    originContainmentDistressDirs,
     monitorSlotWedgeActions,
     zombieSessionCandidates,
     openZombieSessionDistresses,
@@ -12710,6 +12933,13 @@ function main(): void {
   // every cycle. In-worker memory only; a restart re-arms it. Distinct surface so the rows
   // never cross-clear the shared-checkout / lane / stale-base siblings.
   const dupEpicNumberTracker = createDupEpicNumberTracker();
+  // Per-repo grace tracker for the periodic origin-containment fallback: escalates a repo
+  // whose local default silently leads a frozen origin — a containment push that keeps
+  // timing out/failing, or a true divergence — into its own per-repo distress row, the
+  // ONLY paging surface once no owner (finalize/recover) remains to re-trigger the push.
+  // In-worker memory only; a restart re-seeds the clear from the open-row set. Distinct
+  // surface so the rows never cross-clear the shared-checkout / lane / finalize siblings.
+  const originContainmentStuckTracker = createOriginContainmentStuckTracker();
   const pendingReapTerms = new Map<string, PendingReapTerm>();
   const zombieKillSent = new Set<string>();
   // The EVENT-SEEDED desync latch: repo dirs a base→default merge (finalize / recover
@@ -13125,6 +13355,10 @@ function main(): void {
         if (shutdown) {
           return;
         }
+        // Reset the per-cycle origin-push guard FIRST — before recover and finalize push
+        // (both stamp it), so the periodic origin-containment sweep (which runs LAST, after
+        // runReconcileCycle) skips every repo an owner push already attempted this cycle.
+        beginContainmentCycle();
         // Share one whole-server pane observation between the occupancy snapshot
         // and terminal-pane planner. A second observation happens only adjacent
         // to an authorized teardown action.
@@ -13293,10 +13527,6 @@ function main(): void {
         // Wrapped so a producer git failure can't wedge the wake loop.
         if (snapshot.worktreeMode && !state.paused && deps.worktree) {
           try {
-            // Reset the per-cycle push-attempt guard so the origin-containment probe
-            // below sees only THIS cycle's recover push attempts (stamped inside
-            // pushDefaultToOrigin), never a stale one — "no push in flight".
-            beginContainmentCycle();
             const openRecoverRows = snapshot.openRecoverRows ?? [];
             const repos = reposForRecovery(
               snapshot.epics,
@@ -13611,25 +13841,6 @@ function main(): void {
                   c.dir,
                 ),
               );
-            }
-            // PERIODIC ORIGIN-CONTAINMENT reconcile: after recover's lane-tied
-            // re-pushes, sweep every managed repo and re-push local default to origin
-            // on positive evidence alone (strictly ahead + non-diverged), so a repo
-            // whose finalize push never landed — and whose lanes are already gone —
-            // no longer leaves origin frozen while local leads. Producer-only, best
-            // effort: it fires the same push path, defers on any inconclusive probe or
-            // a push already attempted this cycle, and leaves the push-stuck streak /
-            // sticky ownership entirely with finalize / recover.
-            if (deps.worktree.reconcileOrigin) {
-              for (const { dir, result } of await deps.worktree.reconcileOrigin(
-                repos,
-              )) {
-                if (result.kind === "pushed") {
-                  console.error(
-                    `[autopilot-worker] origin-containment: re-pushed ${dir} — origin was behind local default`,
-                  );
-                }
-              }
             }
           } catch (err) {
             console.error(
@@ -14138,6 +14349,91 @@ function main(): void {
           snapshot.dispatchFailureFences,
           laneMaintenanceProbe,
         );
+        // PERIODIC ORIGIN-CONTAINMENT reconcile — runs LAST, AFTER recover + finalize have
+        // pushed for their epics this cycle (owner-priority: their pushes stamped the
+        // per-cycle guard, so a repo an owner already pushed is skipped here — exactly ONE
+        // push attempt per repo per cycle, finalize/recover keeping streak/sticky
+        // ownership). Fires the same push path ONLY on positive evidence for a repo NO
+        // owner touched — the no-owner-left gap where origin silently freezes. Its OWN
+        // per-repo distress fallback pages a repo sustained-stuck (repeated push
+        // timeout/failure, or a true divergence keeper cannot reconcile without a human),
+        // cleared on positive containment. SCOPE: worktree-finalize publication hardening
+        // ONLY — gated on `snapshot.worktreeMode`; a mode-OFF board commits directly on the
+        // shared default with no keeper push path at all (a pre-existing design boundary,
+        // reported separately to the human), so the sweep is inert there. Producer-only; a
+        // git error degrades to a defer and never wedges the cycle.
+        if (
+          deps.worktree?.reconcileOrigin &&
+          originContainmentSweepEnabled(
+            snapshot.worktreeMode,
+            state.paused,
+            true,
+          )
+        ) {
+          try {
+            const openRows = snapshot.openRecoverRows ?? [];
+            const containmentRepos = reposForRecovery(
+              snapshot.epics,
+              snapshot.worktreeRepoByEpicId,
+              [
+                ...(snapshot.worktreeKnownRoots ?? []),
+                ...openRows.map((row) => row.dir),
+              ],
+            );
+            const unhealthy = new Map<string, string>();
+            const healthy = new Set<string>();
+            for (const {
+              dir,
+              defaultBranch,
+              result,
+            } of await deps.worktree.reconcileOrigin(containmentRepos)) {
+              if (result.kind === "pushed") {
+                console.error(
+                  `[autopilot-worker] origin-containment: re-pushed ${dir} — origin was behind local default`,
+                );
+              }
+              const health = classifyOriginContainment(
+                dir,
+                defaultBranch,
+                result,
+              );
+              if (health.class === "healthy") {
+                healthy.add(dir);
+              } else if (health.class === "actionable") {
+                unhealthy.set(dir, health.reason);
+              }
+            }
+            const containmentDecision = originContainmentStuckTracker.step({
+              unhealthy,
+              healthy,
+              openDistressDirs:
+                snapshot.originContainmentDistressDirs ?? new Set<string>(),
+              nowSec: deps.now(),
+            });
+            for (const m of containmentDecision.mint) {
+              deps.emitSharedWedgeDistress?.({
+                id: m.id,
+                dir: m.dir,
+                reason: m.reason ?? ORIGIN_CONTAINMENT_DISTRESS_REASON,
+                ts: deps.now(),
+              });
+            }
+            for (const c of containmentDecision.clear) {
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  c.id,
+                  c.dir,
+                ),
+              );
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] origin-containment sweep threw (non-fatal):",
+              err,
+            );
+          }
+        }
       } while (wakePending && !shutdown);
     } catch (err) {
       // A reconcile/dispatch throw must not wedge the wake loop — log and let
