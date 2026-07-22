@@ -26310,17 +26310,20 @@ test("13c waker: a positive clear this cycle drops the retry wake (nothing left 
   expect(decision.nextWakeAt).toBeNull();
 });
 
-test("13c mode-off: a POSITIVE worktree-mode disable retires every open origin-containment row", () => {
-  // BLOCKER 3b: a deliberately-disabled feature clears its own rows; nothing stranded.
+test("13d mode-off: a POSITIVE worktree-mode disable retires every open row — REGARDLESS of paused", () => {
+  // A deliberately-disabled feature clears its own rows; nothing stranded. The disable is
+  // explicit config, so it retires the row even while paused (observational hygiene).
   const open = new Set(["/repo-a", "/repo-b"]);
-  expect(originContainmentModeOffClears(false, false, open)).toEqual([
+  const expected = [
     { id: originContainmentDistressId("/repo-a"), dir: "/repo-a" },
     { id: originContainmentDistressId("/repo-b"), dir: "/repo-b" },
-  ]);
-  // Mode ON or an UNKNOWN/degraded read never dismisses a live jam; paused never clears.
-  expect(originContainmentModeOffClears(true, false, open)).toEqual([]);
-  expect(originContainmentModeOffClears(undefined, false, open)).toEqual([]);
-  expect(originContainmentModeOffClears(false, true, open)).toEqual([]);
+  ];
+  expect(originContainmentModeOffClears(false, open)).toEqual(expected);
+  // Mode false + PAUSED still clears (ruling: pause suppresses pushes, not row retirement).
+  expect(originContainmentModeOffClears(false, open)).toEqual(expected);
+  // Mode ON or an UNKNOWN/degraded read never dismisses a live jam.
+  expect(originContainmentModeOffClears(true, open)).toEqual([]);
+  expect(originContainmentModeOffClears(undefined, open)).toEqual([]);
 });
 
 test("13c open-row union: a repo with an open row but no epic/root is still re-probed (via reposForRecovery union)", () => {
@@ -26467,4 +26470,88 @@ test("13d tracker.reset(): a MINTED episode whose row was cleared at mode-off ca
       nowSec: 20_000 + grace,
     }).mint,
   ).toHaveLength(1);
+});
+
+// --- 13d riders: zero-delay-spin guard + mode-off-while-paused ---
+
+test("13d tracker: an at/past-grace unminted episode does NOT arm a zero-delay wake (no git tight-loop)", () => {
+  const grace = 600;
+  const retry = 60;
+  const tracker = createOriginContainmentStuckTracker(grace, retry);
+  const dir = "/repo-13d-spin";
+  const reason = `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: x`;
+  const unhealthy = new Map([[dir, reason]]);
+  const empty = new Set<string>();
+  // t=0: actionable-before-grace → episode created, waker armed for the strictly-future deadline.
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: 0,
+    }).nextWakeAt,
+  ).toBe(grace);
+  // t=grace: the boundary fired but the probe came back transient DEFERRED (neutralRetry set,
+  // NOT unhealthy). The un-minted deadline is now AT/PAST — it must NOT re-enqueue grace (delay 0);
+  // the wake is the bounded retry cadence.
+  expect(
+    tracker.step({
+      unhealthy: new Map(),
+      healthy: empty,
+      neutralRetry: new Set([dir]),
+      openDistressDirs: empty,
+      nowSec: grace,
+    }).nextWakeAt,
+  ).toBe(grace + retry); // 660, NOT 600 (which would arm delay 0)
+  // Repeated neutral ADVANCES the cadence, never collapses to the past deadline.
+  expect(
+    tracker.step({
+      unhealthy: new Map(),
+      healthy: empty,
+      neutralRetry: new Set([dir]),
+      openDistressDirs: empty,
+      nowSec: grace + retry,
+    }).nextWakeAt,
+  ).toBe(grace + 2 * retry); // 720
+  // A LATER actionable result mints IMMEDIATELY off the preserved (at/past-deadline) episode.
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: grace + 100,
+    }).mint,
+  ).toEqual([{ id: originContainmentDistressId(dir), dir, reason }]);
+});
+
+test("13d mode-off-while-paused: clears + reset fire on explicit disable regardless of paused; nothing on mode-on+paused", () => {
+  // The clear side (helper) — mode false clears whether or not paused; mode on clears nothing.
+  const open = new Set(["/repo-mp"]);
+  expect(originContainmentModeOffClears(false, open)).toEqual([
+    { id: originContainmentDistressId("/repo-mp"), dir: "/repo-mp" },
+  ]);
+  expect(originContainmentModeOffClears(true, open)).toEqual([]);
+  // The reset side: the tracker resets an in-flight episode on the SAME explicit-disable gate.
+  const tracker = createOriginContainmentStuckTracker(600, 60);
+  const dir = "/repo-mp";
+  const unhealthy = new Map([
+    [dir, `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: x`],
+  ]);
+  const empty = new Set<string>();
+  tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 0,
+  });
+  tracker.reset(); // the glue calls this on worktreeMode===false (paused or not)
+  // Re-enabled + still actionable ⇒ a FRESH grace, no immediate mint from stale accounting.
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: 10_000,
+    }).mint,
+  ).toEqual([]);
 });

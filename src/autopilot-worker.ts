@@ -4220,7 +4220,15 @@ export function createOriginContainmentStuckTracker(
       let hasOpenAfterClear = false;
       for (const [, entry] of firstStuck) {
         if (!entry.minted) {
-          candidates.push(entry.sinceSec + graceSec);
+          // Enqueue an un-minted grace deadline ONLY while it is STRICTLY FUTURE. An at/past
+          // deadline that did NOT mint this cycle (the repo came back deferred/neutral rather
+          // than actionable, so the mint layer never saw it) must NOT arm a delay-0 timer — that
+          // tight-loops git. It relies solely on the bounded `neutralRetry` cadence below; a
+          // LATER actionable result mints immediately off the preserved episode (the mint layer
+          // already fires an at/past-deadline unhealthy).
+          if (entry.sinceSec + graceSec > nowSec) {
+            candidates.push(entry.sinceSec + graceSec);
+          }
         } else {
           hasOpenAfterClear = true;
         }
@@ -8992,18 +9000,19 @@ export function originContainmentSweepEnabled(
 }
 
 /**
- * BLOCKER 3b: the origin-containment rows a POSITIVE worktree-mode disable retires. A
- * deliberately-disabled feature must not strand its own paging jam, so when `worktreeMode` is
- * EXPLICITLY `false` (never an unknown / degraded read, which must not dismiss a live jam)
- * every OPEN row level-clears. Empty otherwise (mode on / unknown, or paused). Pure — the
- * caller emits the clears; the sweep itself never runs mode-off, so this is its ONLY retire path.
+ * The origin-containment rows a POSITIVE worktree-mode disable retires. A deliberately-disabled
+ * feature must not strand its own paging jam, so when `worktreeMode` is EXPLICITLY `false`
+ * (never an unknown / degraded read, which must not dismiss a live jam) every OPEN row
+ * level-clears — REGARDLESS of paused: the disable is explicit, independently-known config, and
+ * retiring an obsolete feature-owned row is observational hygiene (pause suppresses PUSHES, not
+ * this). NEVER clears for pause alone while mode stays on. Pure — the caller emits the clears;
+ * the sweep itself never runs mode-off, so this is its ONLY retire path.
  */
 export function originContainmentModeOffClears(
   worktreeMode: boolean | undefined,
-  paused: boolean,
   openDistressDirs: ReadonlySet<string>,
 ): { id: string; dir: string }[] {
-  if (worktreeMode !== false || paused) return [];
+  if (worktreeMode !== false) return [];
   return [...openDistressDirs].map((dir) => ({
     id: originContainmentDistressId(dir),
     dir,
@@ -14773,14 +14782,14 @@ function main(): void {
             );
           }
         } else {
-          // BLOCKER 3b: the sweep is disabled this cycle. A POSITIVE worktree-mode disable
-          // retires the feature's own rows (a deliberately-disabled feature must not strand a
-          // paging jam) — level-clear every OPEN row, keyed straight off the durable open set
-          // (the in-memory latch is irrelevant). Empty on an unknown/degraded mode read or
-          // while paused, so a live jam is never dismissed.
+          // The sweep is disabled this cycle. A POSITIVE worktree-mode disable retires the
+          // feature's own rows (a deliberately-disabled feature must not strand a paging jam) —
+          // level-clear every OPEN row, keyed straight off the durable open set (the in-memory
+          // latch is irrelevant). Fires on an explicit `false` REGARDLESS of paused (retiring an
+          // obsolete feature-owned row is observational hygiene — pause suppresses pushes, not
+          // this); empty on an unknown/degraded mode read, so a live jam is never dismissed.
           const modeOffClears = originContainmentModeOffClears(
             snapshot.worktreeMode,
-            state.paused,
             openContainmentDirs,
           );
           for (const { id, dir } of modeOffClears) {
@@ -14788,11 +14797,11 @@ function main(): void {
               claimlessDistressClear(snapshot.dispatchFailureFences, id, dir),
             );
           }
-          // A POSITIVE disable (mode explicitly false, not paused) must RESET the in-memory
+          // A POSITIVE disable (mode explicitly false, paused or not) must RESET the in-memory
           // episode latch alongside the durable row clears — else a re-enable mints immediately
           // from stale disabled-time accounting, or a minted-then-cleared episode never mints
-          // again. The helper already gates on exactly that condition, so reuse its verdict.
-          if (snapshot.worktreeMode === false && !state.paused) {
+          // again.
+          if (snapshot.worktreeMode === false) {
             originContainmentStuckTracker.reset();
           }
           // A DISABLED sweep (mode-off / paused / no driver) is a positive no-candidate — disarm
