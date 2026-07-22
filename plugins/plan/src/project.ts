@@ -5,8 +5,16 @@
 // matches Python's Path.resolve() symlink resolution (load-bearing on macOS,
 // where the pytest tmp tree resolves /var -> /private/var). resolveProject
 // hard-errors through emitError when no `.keeper/` data dir is present.
+//
+// resolveProject also detects a LANE VANTAGE: a cwd inside a linked git
+// worktree serves that lane's committed `.keeper` snapshot, which can lag the
+// authoritative state repo. Detection is positive-evidence — only a readable
+// `.git` FILE resolving through its gitdir/commondir to a main checkout that
+// positively carries a `.keeper/` redirects resolution there; anything weaker
+// keeps the cwd resolution and annotates on stderr, never redirecting on a
+// guess.
 
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
 import { resolveEpicGlobally } from "./discovery.ts";
@@ -71,16 +79,145 @@ export function contextForRoot(projectRoot: string): ProjectContext {
 }
 
 /** Resolve the current directory to a ProjectContext, erroring when no
- * `.keeper/` data dir is present. `format`
- * selects the error envelope's serialization. */
+ * `.keeper/` data dir is present. `format` selects the error envelope's
+ * serialization.
+ *
+ * When the cwd-discovered root is a LANE VANTAGE (a linked worktree serving a
+ * potentially stale committed `.keeper` snapshot), the resolution is corrected
+ * or annotated per `detectLaneVantage`'s positive-evidence tri-state:
+ *  - a positively derived main checkout carrying `.keeper` REDIRECTS resolution
+ *    there (the lane's snapshot is bypassed), even when the lane itself has no
+ *    data dir;
+ *  - a lane whose main checkout is derivable but carries no `.keeper`, and a lane
+ *    whose `.git` file is unreadable/malformed (main not derivable), keep the cwd
+ *    resolution and emit a stderr note — never a silent redirect on a guess.
+ *
+ * The note rides stderr, never stdout, so every read/inspection verb still emits
+ * exactly one top-level JSON value. Explicit `--project` never reaches here. */
 export function resolveProject(format: OutputFormat | null): ProjectContext {
   const projectRoot = findProjectRoot();
+  const vantage = detectLaneVantage(projectRoot);
+
+  if (vantage.kind === "redirect") {
+    annotateLane(
+      "plan: cwd is a lane worktree; resolving plan state against the state " +
+        `repo ${vantage.mainRoot}`,
+    );
+    return contextForRoot(vantage.mainRoot);
+  }
 
   if (!hasDataDir(projectRoot)) {
     emitError("No plan project found. Run 'keeper plan init' first.", format);
   }
 
+  if (vantage.kind === "lane_no_state") {
+    annotateLane(
+      "plan: cwd is a lane worktree; its committed .keeper snapshot may lag " +
+        `the state repo and ${vantage.mainRoot} carries no .keeper — pass ` +
+        "--project <state repo> for authoritative state",
+    );
+  } else if (vantage.kind === "inconclusive") {
+    annotateLane(
+      "plan: cwd's .git marks a linked worktree but the main checkout could " +
+        "not be resolved; this read may reflect a lagging snapshot — pass " +
+        "--project <state repo> if unexpected",
+    );
+  }
+
   return contextForRoot(projectRoot);
+}
+
+/** The lane-vantage outcome for a cwd-discovered project root. `not_lane` is an
+ * ordinary checkout (a `.git` directory, or no `.git`) — byte-identical current
+ * behavior. `redirect` positively derived a main checkout carrying `.keeper`.
+ * `lane_no_state` positively derived the main checkout but it lacks `.keeper`.
+ * `inconclusive` is a `.git` FILE whose worktree structure could not be read. */
+type LaneVantage =
+  | { kind: "not_lane" }
+  | { kind: "redirect"; mainRoot: string }
+  | { kind: "lane_no_state"; mainRoot: string }
+  | { kind: "inconclusive" };
+
+/** Classify `projectRoot`'s git vantage from the filesystem alone (no `git`
+ * subprocess). A `.git` DIRECTORY (or absent `.git`) is positively not a lane. A
+ * `.git` FILE marks a linked worktree: follow its `gitdir:` pointer to the
+ * worktree git dir, then its `commondir` to the main checkout's git dir, whose
+ * parent is the main toplevel. Only a positively derived main toplevel that
+ * carries `.keeper` justifies redirecting; a self-resolving or unreadable
+ * structure stays inconclusive. */
+function detectLaneVantage(projectRoot: string): LaneVantage {
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(join(projectRoot, ".git"));
+  } catch {
+    return { kind: "not_lane" };
+  }
+  if (st.isDirectory()) {
+    return { kind: "not_lane" };
+  }
+
+  const worktreeGitDir = readGitdirPointer(
+    join(projectRoot, ".git"),
+    projectRoot,
+  );
+  if (worktreeGitDir === null) {
+    return { kind: "inconclusive" };
+  }
+  const commonGitDir = readCommonDir(worktreeGitDir);
+  if (commonGitDir === null) {
+    return { kind: "inconclusive" };
+  }
+
+  // The common git dir is the main checkout's `.git`; its parent is that
+  // toplevel. A structure resolving back onto the lane is a no-op, not a lane.
+  const mainRoot = realpathOr(dirname(commonGitDir));
+  if (mainRoot === projectRoot) {
+    return { kind: "not_lane" };
+  }
+  return hasDataDir(mainRoot)
+    ? { kind: "redirect", mainRoot }
+    : { kind: "lane_no_state", mainRoot };
+}
+
+/** Follow a linked-worktree `.git` file's `gitdir:` line to the worktree git
+ * dir. A relative pointer resolves against the `.git` file's directory. Null
+ * when the file is unreadable or carries no `gitdir:` line. */
+function readGitdirPointer(gitFilePath: string, base: string): string | null {
+  let body: string;
+  try {
+    body = readFileSync(gitFilePath, "utf-8");
+  } catch {
+    return null;
+  }
+  const match = body.match(/^gitdir:\s*(.+?)\s*$/m);
+  if (match === null) {
+    return null;
+  }
+  const pointer = match[1] as string;
+  return pointer.startsWith("/") ? pointer : resolvePath(base, pointer);
+}
+
+/** Resolve the worktree git dir's `commondir` to the main checkout's git dir.
+ * Git writes it relative to the worktree git dir (usually `../..`). Null when
+ * the file is absent, unreadable, or empty. */
+function readCommonDir(worktreeGitDir: string): string | null {
+  let body: string;
+  try {
+    body = readFileSync(join(worktreeGitDir, "commondir"), "utf-8");
+  } catch {
+    return null;
+  }
+  const rel = body.trim();
+  if (rel.length === 0) {
+    return null;
+  }
+  return rel.startsWith("/") ? rel : resolvePath(worktreeGitDir, rel);
+}
+
+/** Emit a one-line lane-vantage note to stderr. Kept OFF stdout so every
+ * read/inspection verb still emits exactly one top-level JSON value there. */
+function annotateLane(msg: string): void {
+  process.stderr.write(`${msg}\n`);
 }
 
 /** A non-emitting owning-project resolution outcome: the resolved context, or a
