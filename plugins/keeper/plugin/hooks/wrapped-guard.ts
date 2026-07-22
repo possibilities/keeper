@@ -382,7 +382,22 @@ const RUN_GATE_STEER =
 export interface WrappedCommandContext {
   taskId?: string;
   envelopeReference?: string;
+  /** The harness-supplied payload `agent_type` of the marked subagent, threaded
+   *  from the PreToolUse payload (never env, never the command). It gates the
+   *  narrow per-task audit-submit carve-out below — the same unspoofable identity
+   *  anchor grant-guard keys the four escalation agents on. */
+  agentType?: string;
 }
+
+/** The static per-task audit gate's `plan:quality-auditor` subagent inherits its
+ *  wrapped parent's `KEEPER_WRAPPED_CELL` marker, so the guard fires on it — yet
+ *  its ONLY legitimate mutation is persisting findings via `keeper plan audit
+ *  submit-task`. `agent_type` is set by the harness, not the subagent (the same
+ *  trust anchor grant-guard uses for its escalation set), so admitting exactly
+ *  this value cannot be forged by the wrapped courier or any other marked
+ *  subagent, and the auditor authors no source (Edit/Write/Task are off in its
+ *  agent definition; the guard's other denials stay intact for it). */
+const WRAPPED_AUDIT_AGENT_TYPE = "plan:quality-auditor";
 
 /**
  * Strip the leading wrapper tokens (timeout/time/nice/nohup/stdbuf/bare xargs)
@@ -566,13 +581,92 @@ function wrappedCommitWorkHasTaskId(
   return false;
 }
 
+/**
+ * Narrow jurisdiction carve-out for the per-task audit gate. Admit the findings
+ * submit for ONLY the harness-identified `plan:quality-auditor` (see
+ * WRAPPED_AUDIT_AGENT_TYPE) and ONLY the `submit-task --file <path> --status <s>`
+ * shape. The `--file -`/stdin form is denied on purpose so the auditor uses a
+ * real path and the courier lexer's heredoc/redirect denial stays untouched;
+ * every other agent_type — the wrapped courier included — and every other
+ * `keeper plan audit` shape (submit, gate-check, …) stays denied.
+ */
+function wrappedAuditSubmitViolation(
+  tokens: string[],
+  context: WrappedCommandContext,
+): string | null {
+  if (context.agentType !== WRAPPED_AUDIT_AGENT_TYPE) {
+    return "wrapped `keeper plan audit` is permitted only for the quality-auditor's per-task findings submit";
+  }
+  if (tokens[3] !== "submit-task") {
+    return "wrapped `keeper plan audit` permits only the `submit-task` findings submit";
+  }
+  let sawFile = false;
+  let sawStatus = false;
+  let positionals = 0;
+  for (let index = 4; index < tokens.length; index += 1) {
+    const token = tokens[index] as string;
+    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
+    const flag = eq === -1 ? token : token.slice(0, eq);
+    const glued = eq === -1 ? undefined : token.slice(eq + 1);
+    if (flag === "--file") {
+      const value = glued ?? tokens[index + 1];
+      if (
+        value === undefined ||
+        value === "" ||
+        value === "-" ||
+        value.startsWith("--")
+      ) {
+        return "wrapped `keeper plan audit submit-task --file` requires a real file PATH (the `-`/stdin+heredoc form is denied — write the findings JSON to a scratch file, then submit that path)";
+      }
+      sawFile = true;
+      if (glued === undefined) index += 1;
+      continue;
+    }
+    if (flag === "--status") {
+      const value = glued ?? tokens[index + 1];
+      if (value !== "clean" && value !== "mild" && value !== "severe") {
+        return "wrapped `keeper plan audit submit-task --status` must be one of clean/mild/severe";
+      }
+      sawStatus = true;
+      if (glued === undefined) index += 1;
+      continue;
+    }
+    if (flag === "--project" || flag === "--format") {
+      const value = glued ?? tokens[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return `wrapped \`keeper plan audit submit-task ${flag}\` requires a value`;
+      }
+      if (glued === undefined) index += 1;
+      continue;
+    }
+    if (token.startsWith("--")) {
+      return `wrapped \`keeper plan audit submit-task\` rejects the unrecognized option '${token}'`;
+    }
+    positionals += 1;
+    if (positionals > 1) {
+      return "wrapped `keeper plan audit submit-task` permits exactly one TASK_ID positional";
+    }
+  }
+  if (positionals !== 1) {
+    return "wrapped `keeper plan audit submit-task` requires exactly one TASK_ID positional";
+  }
+  if (!sawFile) {
+    return "wrapped `keeper plan audit submit-task` requires --file <path>";
+  }
+  if (!sawStatus) {
+    return "wrapped `keeper plan audit submit-task` requires --status";
+  }
+  return null;
+}
+
 function wrappedPlanViolation(
   tokens: string[],
   context: WrappedCommandContext,
 ): string | null {
   const verb = tokens[2];
+  if (verb === "audit") return wrappedAuditSubmitViolation(tokens, context);
   if (verb === undefined || !WRAPPED_PLAN_VERBS.has(verb)) {
-    return "wrapped `keeper plan` permits only task-bound `done`/`block` and read-only status/tasks/show/cat/list/epics/reconcile verbs";
+    return "wrapped `keeper plan` permits only task-bound `done`/`block`, the quality-auditor's `audit submit-task`, and read-only status/tasks/show/cat/list/epics/reconcile verbs";
   }
   if (verb !== "done" && verb !== "block") return null;
   if (context.taskId === undefined || tokens[3] !== context.taskId) {
@@ -1264,7 +1358,12 @@ export function decideWrappedGuard(
   if (tool === "Bash") {
     const command = p.tool_input?.command;
     if (typeof command !== "string") return denyEnvelope(MALFORMED_REASON);
-    const violation = evaluateWrappedBash(command, wrappedCommandContext(env));
+    const context = wrappedCommandContext(env);
+    // Thread the harness-supplied payload identity so the audit-submit carve-out
+    // can gate on it (env carries the task/envelope binding; agent_type is the
+    // payload's, the same anchor grant-guard trusts for its escalation set).
+    if (typeof p.agent_type === "string") context.agentType = p.agent_type;
+    const violation = evaluateWrappedBash(command, context);
     if (violation === null) return null; // allowlisted → allow
     return denyEnvelope(bashReason(violation));
   }

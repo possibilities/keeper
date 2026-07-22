@@ -274,6 +274,92 @@ describe("evaluateWrappedBash — launch-bound AUDIT_READY block", () => {
   });
 });
 
+describe("evaluateWrappedBash — quality-auditor per-task submit carve-out", () => {
+  // The per-task audit gate's static `plan:quality-auditor` inherits the wrapped
+  // parent's marker; the carve-out admits ONLY its findings submit, ONLY in the
+  // `submit-task --file <path> --status <s>` shape, and ONLY for that agent_type.
+  const auditor = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+    agentType: "plan:quality-auditor",
+  };
+
+  const allow = [
+    "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild",
+    // option order is free; --status may precede --file
+    "keeper plan audit submit-task fn-1-x.2 --status clean --file /tmp/finding.json",
+    // --project pin + a claude scratchpad path + severe verdict
+    'keeper plan audit submit-task fn-1-x.2 --project "/repo" --status severe --file /private/tmp/claude-501/x/finding.json',
+    // glued option=value forms
+    "keeper plan audit submit-task fn-1-x.2 --file=/tmp/finding.json --status=mild",
+    // an explicit output format is a benign passthrough
+    "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild --format json",
+  ];
+  for (const cmd of allow) {
+    test(`allows for the quality-auditor: ${cmd}`, () => {
+      expect(evaluateWrappedBash(cmd, auditor)).toBeNull();
+    });
+  }
+
+  const denyShapes = [
+    // the stdin+heredoc form stays denied (the lexer is untouched) — a real path
+    // is mandatory
+    "keeper plan audit submit-task fn-1-x.2 --status mild --file -",
+    // required options missing
+    "keeper plan audit submit-task fn-1-x.2 --status mild",
+    "keeper plan audit submit-task fn-1-x.2 --file /tmp/f.json",
+    // out-of-enum status
+    "keeper plan audit submit-task fn-1-x.2 --file /tmp/f.json --status bogus",
+    // the epic-scoped submit (clobbers the close report) is never admitted
+    "keeper plan audit submit fn-1-x --file /tmp/r.md --findings 0 --risk Low",
+    // gate-check is the orchestrator's read, not the wrapped auditor's write
+    "keeper plan audit gate-check fn-1-x.2",
+    // stray extra positional / unknown option / forbidden --force
+    "keeper plan audit submit-task fn-1-x.2 extra --file /tmp/f.json --status mild",
+    "keeper plan audit submit-task fn-1-x.2 --file /tmp/f.json --status mild --force",
+  ];
+  for (const cmd of denyShapes) {
+    test(`denies an out-of-shape audit command even for the auditor: ${cmd}`, () => {
+      expect(evaluateWrappedBash(cmd, auditor)).not.toBeNull();
+    });
+  }
+
+  test("the carve-out grants ONLY audit submit-task — other mutating verbs stay denied", () => {
+    // a source-edit vector
+    expect(
+      evaluateWrappedBash("echo hacked > src/x.ts", auditor),
+    ).not.toBeNull();
+    // a plan mutation off the wrapped allowlist
+    expect(
+      evaluateWrappedBash("keeper plan claim fn-1-x.2", auditor),
+    ).not.toBeNull();
+    // an off-list keeper subcommand
+    expect(
+      evaluateWrappedBash("keeper dispatch work::fn-1-x.2", auditor),
+    ).not.toBeNull();
+  });
+
+  test("the identical audit submit is denied for any other agent_type (wrapper / sibling / absent)", () => {
+    const cmd =
+      "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild";
+    // the wrapped courier itself
+    expect(
+      evaluateWrappedBash(cmd, { ...auditor, agentType: "work:worker" }),
+    ).not.toBeNull();
+    // a sibling escalation subagent
+    expect(
+      evaluateWrappedBash(cmd, { ...auditor, agentType: "plan:unblocker" }),
+    ).not.toBeNull();
+    // agent_type absent entirely (an agent_id-only courier)
+    expect(
+      evaluateWrappedBash(cmd, {
+        taskId: "fn-1-x.2",
+        envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+      }),
+    ).not.toBeNull();
+  });
+});
+
 describe("evaluateWrappedBash — observed launch shapes and static POSIX word reference", () => {
   const context = {
     taskId: "fn-1-x.2",
@@ -626,6 +712,82 @@ describe("decideWrappedGuard — bounded bus chat send", () => {
       }
     });
   }
+});
+
+describe("decideWrappedGuard — quality-auditor audit-submit carve-out (full marked flow)", () => {
+  // The full wrapped max → AUDIT_READY → auditor-submit path at the decision seam:
+  // under the wrapped marker, the static auditor subagent (agent_type set by the
+  // harness) persists its findings; the wrapper and every sibling stay denied.
+  const submit =
+    "keeper plan audit submit-task fn-1-x.2 --file /private/tmp/claude-501/x/finding.json --status mild";
+
+  test("allows the marked quality-auditor's per-task submit (--file path form)", () => {
+    expect(
+      decide(bashPayload(submit, { agent_type: "plan:quality-auditor" })),
+    ).toBeNull();
+  });
+
+  test("still denies a NON-audit mutating verb for the marked quality-auditor", () => {
+    const decision = decide(
+      bashPayload("echo hacked > src/x.ts", {
+        agent_type: "plan:quality-auditor",
+      }),
+    );
+    expect(decision).not.toBeNull();
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("denies the identical submit for the wrapped courier and every other marked subagent", () => {
+    expect(
+      decide(bashPayload(submit, { agent_type: "work:worker" })),
+    ).not.toBeNull();
+    expect(
+      decide(bashPayload(submit, { agent_type: "repairer" })),
+    ).not.toBeNull();
+    // an agent_id-only courier: jurisdiction fires (marked + agent_id) but with no
+    // agent_type the carve-out never applies.
+    expect(decide(bashPayload(submit))).not.toBeNull();
+  });
+
+  test("denies the stdin+heredoc submit shape even for the marked auditor (lexer untouched)", () => {
+    const heredoc =
+      "keeper plan audit submit-task fn-1-x.2 --status mild --file - <<'FINDING_EOF'\n{}\nFINDING_EOF";
+    expect(
+      decide(bashPayload(heredoc, { agent_type: "plan:quality-auditor" })),
+    ).not.toBeNull();
+  });
+
+  test("stays inert for an UNMARKED auditor payload — a native close-audit is never blocked", () => {
+    expect(
+      decideWrappedGuard(
+        bashPayload(submit, { agent_type: "plan:quality-auditor" }),
+        {},
+        fakeProbe(),
+      ),
+    ).toBeNull();
+  });
+
+  // The Write path the auditor composes its findings file through is the existing
+  // carve-out: an inert out-of-tree scratch .json is allowed (materialized as the
+  // descriptor-bound atomic handoff in production), an in-tree write is denied —
+  // and those semantics hold for this agent_type exactly as for any marked cell.
+  test("ALLOWS the auditor's inert out-of-tree scratch .json Write (the findings file)", () => {
+    expect(
+      decide(
+        writePayload(`${OUTSIDE}/finding.json`, {
+          agent_type: "plan:quality-auditor",
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("DENIES the auditor's in-tree Write — the audit carve-out grants no source-write path", () => {
+    const decision = decide(
+      writePayload(`${REPO}/src/x.ts`, { agent_type: "plan:quality-auditor" }),
+    );
+    expect(decision).not.toBeNull();
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
 });
 
 describe("decideWrappedGuard — jurisdiction ladder", () => {

@@ -2,7 +2,11 @@
 name: quality-auditor
 description: Review recent changes for correctness, simplicity, security, and test coverage.
 model: {{ agent_model }}
-disallowedTools: Edit, Write, Task
+# The auditor already runs Bash, so an unwrapped shell-redirect write is reachable
+# regardless — enabling Write (Edit and Task stay off) merely makes the sanctioned,
+# guard-confined findings-file path first-class. Under a wrapped cell the guard
+# mechanically confines this Write to inert out-of-tree scratch .json.
+disallowedTools: Edit, Task
 effort: "{{ agent_effort }}"
 color: "#EC4899"
 ---
@@ -290,13 +294,15 @@ The closer parses this line mechanically. Do not wrap it in prose, fences, or ex
 
 ## Phase 4b — Persist findings and return one line (task mode)
 
-Never run Phase 4a in task mode — `audit submit` writes the epic-scoped report a later close reads, and a task-mode run clobbering it would corrupt that close's audit. Instead, pipe a JSON findings payload to `keeper plan audit submit-task` — a positional `TASK_ID`, `--project "$PRIMARY_REPO"`, and a required `--status` naming the artifact-level verdict (`clean` / `mild` / `severe`, never freeform prose):
+Never run Phase 4a in task mode — `audit submit` writes the epic-scoped report a later close reads, and a task-mode run clobbering it would corrupt that close's audit. Instead, persist a JSON findings payload through `keeper plan audit submit-task` — a positional `TASK_ID`, `--project "$PRIMARY_REPO"`, and a required `--status` naming the artifact-level verdict (`clean` / `mild` / `severe`, never freeform prose).
+
+Compose the payload as ONE inert `.json` file with the Write tool at an out-of-tree scratch path — your scratchpad or system temp, NEVER inside the repository working tree and never streamed through a heredoc — then hand that path to `--file`:
 
 ```bash
-keeper plan audit submit-task <TASK_ID> --project "$PRIMARY_REPO" --status <clean|mild|severe> --file - <<'FINDING_EOF'
-{"findings": [{"fingerprint": "<category>:<file>", "summary": "<one-line note>"}]}
-FINDING_EOF
+keeper plan audit submit-task <TASK_ID> --project "$PRIMARY_REPO" --status <clean|mild|severe> --file <scratch>/finding.json
 ```
+
+The scratch file holds `{"findings": [{"fingerprint": "<category>:<file>", "summary": "<one-line note>"}]}`. An in-tree write is forbidden: under a wrapped provider cell the guard mechanically confines your Write to inert out-of-tree scratch `.json`, and this prose rule is that guard's un-wrapped complement.
 
 Each entry in `findings` carries a `fingerprint` (`<category>:<file>`, the same fingerprint vocabulary Phase 3's Dedup section links against for a later epic-mode audit) and a short `summary`; the verb server-derives `commits` from your actual commit set and stamps `commit_set_hash` itself — you never pass either. `--status` is the single top-level verdict: `clean` (no findings kept), `mild` (findings kept but none gating), `severe` (a gating-grade finding survives).
 
