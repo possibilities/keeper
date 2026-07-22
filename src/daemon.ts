@@ -14194,7 +14194,15 @@ function startDaemonWithExitAttribution(
     id: string,
     outcome: MergeHumanNotifiedOutcome,
     verb: "close" | "work" = "close",
+    expectedInstanceEventId?: number,
   ): void {
+    // Keep the historical close/work data byte-identical when no instance fence is given
+    // (a fresh field only appears when a caller — the fatal-audit page sweep — passes it).
+    const data: Record<string, unknown> = { id, outcome };
+    if (verb !== "close") data.verb = verb;
+    if (expectedInstanceEventId != null) {
+      data.expectedInstanceEventId = expectedInstanceEventId;
+    }
     try {
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
@@ -14209,10 +14217,7 @@ function startDaemonWithExitAttribution(
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data:
-          verb === "close"
-            ? JSON.stringify({ id, outcome })
-            : JSON.stringify({ id, outcome, verb }),
+        $data: JSON.stringify(data),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,
@@ -15697,26 +15702,50 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // The OPEN, not-yet-paged fatal-audit rows — a `close::<epic>` `dispatch_failures`
-  // row whose reason leads with FATAL_AUDIT_REASON_TOKEN (a still-current fatal
-  // close-audit verdict holding the epic open). Reuses the generic page-once sweep +
-  // the `MergeHumanNotified{verb:close}` once-marker; the producer (reconcile) owns the
-  // mint + the drift/retry level-clear, this only pages a standing row ONCE.
-  function selectUnpagedFatalAuditRows(): SharedCheckoutPageRow[] {
+  // The OPEN, not-yet-paged fatal-audit rows — a `close::<epic>` `dispatch_failures` row
+  // whose reason leads with FATAL_AUDIT_REASON_TOKEN (a still-current fatal close-audit
+  // verdict holding the epic open). Carries `instance_event_id` so the page is fenced to the
+  // EXACT row instance: a clear + fresh re-mint (retry / re-halt) during the async notify
+  // must not let the stale completion stamp the replacement row and suppress ITS page.
+  type FatalAuditPageRow = {
+    id: string;
+    reason: string;
+    instance_event_id: number | null;
+  };
+  function selectUnpagedFatalAuditRows(): FatalAuditPageRow[] {
     try {
       return db
         .query(
-          `SELECT id, dir, reason FROM dispatch_failures
+          `SELECT id, reason, instance_event_id FROM dispatch_failures
              WHERE verb = 'close' AND reason LIKE ? AND human_notified_at IS NULL`,
         )
-        .all(`${FATAL_AUDIT_REASON_TOKEN}:%`) as SharedCheckoutPageRow[];
+        .all(`${FATAL_AUDIT_REASON_TOKEN}:%`) as Array<{
+        id: string;
+        reason: string;
+        instance_event_id: number | null;
+      }>;
     } catch {
       return [];
     }
   }
 
+  // Re-read the exact row's current `instance_event_id` right after the async notify — the
+  // fence input for both the producer skip and the `MergeHumanNotified` fold condition.
+  function currentFatalAuditInstance(id: string): number | null {
+    try {
+      const row = db
+        .query(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = 'close' AND id = ?",
+        )
+        .get(id) as { instance_event_id: number | null } | null;
+      return row?.instance_event_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async function notifyHumanOfFatalAudit(
-    row: SharedCheckoutPageRow,
+    row: FatalAuditPageRow,
   ): Promise<SharedCheckoutNotifiedOutcome> {
     return notifyHuman(
       [
@@ -15728,6 +15757,36 @@ function startDaemonWithExitAttribution(
         `Finding: ${row.reason.trim()}`,
       ].join("\n"),
     );
+  }
+
+  // Page each OPEN, not-yet-paged fatal-audit row ONCE, instance-fenced across the async
+  // notify. A dedicated sweep (not the generic shared-checkout one) because the fatal-audit
+  // row can be cleared + re-minted mid-send; the post-await instance re-check plus the
+  // `MergeHumanNotified{expectedInstanceEventId}` fold condition together guarantee a stale
+  // completion never stamps the replacement row.
+  async function runFatalAuditPageSweep(): Promise<void> {
+    let rows: FatalAuditPageRow[];
+    try {
+      rows = selectUnpagedFatalAuditRows();
+    } catch {
+      return;
+    }
+    for (const row of rows) {
+      let outcome: SharedCheckoutNotifiedOutcome;
+      try {
+        outcome = await notifyHumanOfFatalAudit(row);
+      } catch {
+        outcome = "notify_failed";
+      }
+      // Re-fence AFTER the yield: only stamp if the exact instance still stands.
+      if (currentFatalAuditInstance(row.id) !== row.instance_event_id) continue;
+      mintMergeHumanNotifiedEvent(
+        row.id,
+        outcome,
+        "close",
+        row.instance_event_id ?? undefined,
+      );
+    }
   }
 
   function selectSharedCheckoutWriters(
@@ -16195,17 +16254,11 @@ function startDaemonWithExitAttribution(
         mintSharedCheckoutHumanNotifiedEvent(id, outcome),
       noteLine: note,
     });
-    // Page each OPEN, not-yet-paged fatal-audit row ONCE — reuses the generic page-once
-    // sweep, stamping the `MergeHumanNotified{verb:close}` once-marker (retry_dispatch /
-    // drift clears the row, re-arming the marker at NULL). Inherits this tick's not-paused
-    // gating; the producer owns the mint + level-clear.
-    await runSharedCheckoutPageSweep({
-      selectUnpaged: selectUnpagedFatalAuditRows,
-      notifyHuman: (row) => notifyHumanOfFatalAudit(row),
-      mintNotified: (id, outcome) =>
-        mintMergeHumanNotifiedEvent(id, outcome, "close"),
-      noteLine: note,
-    });
+    // Page each OPEN, not-yet-paged fatal-audit row ONCE, INSTANCE-FENCED across the async
+    // notify (a clear + re-mint mid-send must not stamp the replacement row). Stamps the
+    // `MergeHumanNotified{verb:close, expectedInstanceEventId}` once-marker; retry_dispatch
+    // / drift clears the row, re-arming the marker at NULL. The producer owns mint + clear.
+    await runFatalAuditPageSweep();
   }
   const runRepairEscalationSweepTick = createNonReentrantRepairSweepTick(
     runRepairEscalationSweepTickImpl,

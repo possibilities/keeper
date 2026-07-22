@@ -1758,6 +1758,53 @@ test("MergeHumanNotified on a missing close row is a safe no-op (cursor still ad
   expect(getCursor()).toBe(id);
 });
 
+test("MergeHumanNotified instance fence: a STALE completion never stamps the REPLACEMENT row", () => {
+  // Row A (fatal-audit) minted → its instance is the first-appearance event id.
+  dispatchFailedEvent("close", "fn-if-1", "fatal-audit: boom", null, 1700);
+  drainAll();
+  const instanceA = getDispatchFailure("close", "fn-if-1")?.instance_event_id;
+  expect(typeof instanceA).toBe("number");
+
+  // Operator retry clears A, then the re-halt re-mints B (a NEW instance).
+  dispatchClearedEvent("close", "fn-if-1", "reconciler", {
+    expectedInstanceEventId: instanceA,
+  });
+  drainAll();
+  dispatchFailedEvent("close", "fn-if-1", "fatal-audit: boom", null, 1800);
+  drainAll();
+  const instanceB = getDispatchFailure("close", "fn-if-1")?.instance_event_id;
+  expect(instanceB).not.toBe(instanceA);
+
+  // A STALE page completion for A (sent before A was cleared) lands late — its instance
+  // fence must NOT stamp B, so B's required page is preserved.
+  insertEvent({
+    hook_event: "MergeHumanNotified",
+    session_id: "reconciler",
+    ts: 1850,
+    data: JSON.stringify({
+      id: "fn-if-1",
+      outcome: "notified",
+      expectedInstanceEventId: instanceA,
+    }),
+  });
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-if-1")).toBeNull();
+
+  // B's own page completion (matching instance) stamps it.
+  insertEvent({
+    hook_event: "MergeHumanNotified",
+    session_id: "reconciler",
+    ts: 1860,
+    data: JSON.stringify({
+      id: "fn-if-1",
+      outcome: "notified",
+      expectedInstanceEventId: instanceB,
+    }),
+  });
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-if-1")).toBe(1860);
+});
+
 test("human_notified_at is INDEPENDENT of owner_redispatch_attempts (both live on the same sticky)", () => {
   dispatchFailedEvent(
     "close",

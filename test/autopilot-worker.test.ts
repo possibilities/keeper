@@ -161,7 +161,7 @@ import {
   laneFailuresToClear,
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
-  loadEpicCommitWatermarks,
+  loadEpicTaskDoneWatermarks,
   loadLatestCloseReceipts,
   loadReconcileSnapshot,
   loadTerminalPaneTeardownJobs,
@@ -7880,12 +7880,14 @@ test("fatal-audit: a standing row is not re-minted (fold-safe) but STILL withhol
   expect(decision.fatalAuditClears).toEqual([]);
 });
 
-test("fatal-audit: a commit-set drift (no longer current) level-CLEARS an open row", () => {
+test("fatal-audit: POSITIVE resolution evidence level-CLEARS an open row", () => {
   const decision = reconcile(
     fatalAuditSnapshot({
-      // The verdict drifted: the epic dropped out of the current set, but a row is open.
+      // The verdict resolved (drift / non-fatal receipt / done): the producer graded the
+      // epic into the resolved set and the row is open.
       currentFatalAuditEpicIds: new Map(),
       openFatalAuditIds: new Set(["fn-2-close"]),
+      fatalAuditResolvedEpicIds: new Set(["fn-2-close"]),
       failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
     }),
     makeState(),
@@ -7893,6 +7895,23 @@ test("fatal-audit: a commit-set drift (no longer current) level-CLEARS an open r
   );
   expect(decision.fatalAuditClears).toEqual([{ id: "fn-2-close" }]);
   expect(decision.fatalAuditMints).toEqual([]);
+});
+
+test("fatal-audit: an open row with NO resolution evidence (UNKNOWN) is RETAINED, never fail-open cleared", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({
+      // Absent from BOTH current and resolved (e.g. a transient receipt read failure).
+      currentFatalAuditEpicIds: new Map(),
+      openFatalAuditIds: new Set(["fn-2-close"]),
+      fatalAuditResolvedEpicIds: new Set(),
+      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
+    }),
+    makeState(),
+    0,
+  );
+  // No positive evidence → the fence row is held (failedKeys still withholds the close).
+  expect(decision.fatalAuditClears).toEqual([]);
+  expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
 });
 
 test("fatal-audit: a non-current / non-fatal receipt does NOT withhold or mint", () => {
@@ -7908,18 +7927,151 @@ test("fatal-audit: a non-current / non-fatal receipt does NOT withhold or mint",
   expect(decision.fatalAuditClears).toEqual([]);
 });
 
-test("loadEpicCommitWatermarks: max commit-trailer-fact id per epic, absent on no rows", async () => {
+test("loadEpicTaskDoneWatermarks: max TASK-DONE fact id per epic, ignoring non-done ops", async () => {
   await withSeededDb((db) => {
     db.run(
       `INSERT INTO commit_trailer_facts
          (event_id, committer_session_id, plan_op, plan_target, plan_epic_id, committed_at_ms)
-       VALUES (5, 's', 'commit', 'fn-1-foo.1', 'fn-1-foo', 1000),
-              (9, 's', 'commit', 'fn-1-foo.2', 'fn-1-foo', 2000)`,
+       VALUES (5,  's', 'done',     'fn-1-foo.1', 'fn-1-foo', 1000),
+              (9,  's', 'done',     'fn-1-foo.2', 'fn-1-foo', 2000),
+              (20, 's', 'set-title','fn-1-foo',   'fn-1-foo', 3000)`,
     );
-    const w = loadEpicCommitWatermarks(db, ["fn-1-foo", "fn-2-none"]);
+    // Only 'done' ops count — the set-title plan-metadata commit (id 20) is IGNORED, so a
+    // validate/title churn never spuriously lifts the fence.
+    const w = loadEpicTaskDoneWatermarks(db, ["fn-1-foo", "fn-2-none"]);
     expect(w.get("fn-1-foo")).toBe(9);
     expect(w.has("fn-2-none")).toBe(false);
   });
+});
+
+const fatalHookData = (body: Record<string, unknown>): string =>
+  JSON.stringify({ tool_response: { stdout: JSON.stringify(body) } });
+
+test("loadReconcileSnapshot fatal-audit: open-scoped fence, task-done drift, phantom guard", async () => {
+  await withSeededDb(async (db) => {
+    // An OPEN, close-ready epic with a fatal_halt receipt → in the fence/mint set.
+    const open = "fn-30-open";
+    seedEpicRow(db, open, {
+      epic_number: 30,
+      status: "open",
+      tasks: [
+        makeTask({
+          task_id: `${open}.1`,
+          epic_id: open,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (100, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt", fatal_reason: "boom" }), open],
+    );
+    // A DONE epic carrying a RETAINED stopped close job + an old fatal receipt — the
+    // phantom the open-scope intersection must exclude (blocker 4).
+    const done = "fn-31-done";
+    seedEpicRow(db, done, {
+      epic_number: 31,
+      status: "done",
+      tasks: [
+        makeTask({
+          task_id: `${done}.1`,
+          epic_id: done,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
+       VALUES ('done-close-job', 10, 20, 'stopped', 'close', ?)`,
+      [done],
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (101, 'done-close-job', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt", fatal_reason: "stale" }), done],
+    );
+
+    const snap1 = await loadReconcileSnapshot(db);
+    // The open epic is fenced; the done epic's phantom is excluded.
+    expect(snap1.currentFatalAuditEpicIds?.has(open)).toBe(true);
+    expect(snap1.currentFatalAuditEpicIds?.get(open)).toBe("boom");
+    expect(snap1.currentFatalAuditEpicIds?.has(done)).toBe(false);
+
+    // Blocker 1: a TASK-DONE fact for the open epic newer than the receipt (id 100) drifts
+    // the verdict → the fence lifts (epic drops out of the current set).
+    db.run(
+      `INSERT INTO commit_trailer_facts
+         (event_id, committer_session_id, plan_op, plan_target, plan_epic_id, committed_at_ms)
+       VALUES (200, 'sess', 'done', ?, ?, 5000)`,
+      [`${open}.2`, open],
+    );
+    const snap2 = await loadReconcileSnapshot(db);
+    expect(snap2.currentFatalAuditEpicIds?.has(open)).toBe(false);
+  });
+});
+
+test("loadReconcileSnapshot fatal-audit: an open row RETAINS on an unreadable receipt, CLEARS on positive evidence", async () => {
+  await withSeededDb(async (db) => {
+    // An open fatal-audit ROW whose epic has NO readable close receipt (UNKNOWN) — must be
+    // retained (blocker 2), never in the resolved set.
+    const unknown = "fn-40-unknown";
+    seedEpicRow(db, unknown, {
+      epic_number: 40,
+      status: "open",
+      tasks: [makeTask({ task_id: `${unknown}.1`, epic_id: unknown })],
+    });
+    db.run(
+      `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at)
+       VALUES ('close', ?, 'fatal-audit: boom', 1, 1, 1, 1)`,
+      [unknown],
+    );
+    // A positively-DONE epic with an open fatal-audit row → resolved (clear).
+    const resolvedDone = "fn-41-done";
+    seedEpicRow(db, resolvedDone, {
+      epic_number: 41,
+      status: "done",
+      tasks: [
+        makeTask({
+          task_id: `${resolvedDone}.1`,
+          epic_id: resolvedDone,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    db.run(
+      `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at)
+       VALUES ('close', ?, 'fatal-audit: old', 1, 1, 1, 1)`,
+      [resolvedDone],
+    );
+
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.openFatalAuditIds?.has(unknown)).toBe(true);
+    expect(snap.fatalAuditResolvedEpicIds?.has(unknown)).toBe(false); // UNKNOWN → retain
+    expect(snap.fatalAuditResolvedEpicIds?.has(resolvedDone)).toBe(true); // done → clear
+  });
+});
+
+test("createDispatchFailedGate.forget resets the suppression memory for an externally-cleared key", () => {
+  const gate = createDispatchFailedGate();
+  const payload = {
+    verb: "close" as const,
+    id: "fn-9-x",
+    reason: "fatal-audit: boom",
+    dir: null,
+    conflictedFiles: null,
+    ts: 0,
+  };
+  expect(gate.shouldEmit(payload)).toBe(true);
+  // An identical re-emit is suppressed (the change-gate remembers it).
+  expect(gate.shouldEmit({ ...payload, ts: 1 })).toBe(false);
+  // An operator retry_dispatch cleared the row through the reducer → forget resets it, so
+  // the identical same-finding re-mint after the re-halt is emitted immediately (blocker 3).
+  gate.forget("close", "fn-9-x");
+  expect(gate.shouldEmit({ ...payload, ts: 2 })).toBe(true);
 });
 
 function errorReadinessQuery(collection: string): ReadinessQuery {

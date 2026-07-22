@@ -2061,6 +2061,11 @@ export interface DispatchFailedGate {
   noteClear(payload: DispatchClearedPayload): void;
   /** Reset only after the exact observed incident disappears; a replacement is stale. */
   observeProjection(fences: DispatchFailureFenceMap): void;
+  /** Immediately forget a `(verb, id)`'s last-emitted memory — the EXTERNAL-clear reset for
+   *  a row an operator cleared through the reducer (`retry_dispatch`), which never rode
+   *  `noteClear`. The producer calls it on a positive observed-then-gone lift so the
+   *  identical re-mint after a same-finding re-halt is NOT suppressed to the watermark. */
+  forget(verb: string, id: string): void;
 }
 
 /**
@@ -2111,6 +2116,11 @@ export function createDispatchFailedGate(
         pendingClear.delete(key);
         if (current === undefined) lastEmitted.delete(key);
       }
+    },
+    forget(verb, id) {
+      const key = keyOf(verb, id);
+      lastEmitted.delete(key);
+      pendingClear.delete(key);
     },
   };
 }
@@ -12189,14 +12199,18 @@ export function loadLatestCloseReceipts(
 }
 
 /**
- * The per-epic max `commit_trailer_facts.event_id` — the newest source commit landed for
- * each epic, the monotone watermark {@link fatalHaltReceiptIsCurrent} compares against a
- * fatal-audit receipt's own event id (a commit landing AFTER the receipt drifts the
- * verdict's commit set). ONE bounded aggregate over the requested epics; a read edge
- * degrades that epic to UNKNOWN (absent from the map → the grade holds the fence).
- * Producer-side read, NEVER a fold.
+ * The per-epic max `commit_trailer_facts.event_id` for a TASK-DONE plan fact
+ * (`plan_op = 'done'`) — the newest "a task under this epic was marked done" event, the
+ * monotone watermark {@link fatalHaltReceiptIsCurrent} compares against a fatal-audit
+ * receipt's own event id: a task-done LANDING AFTER the receipt is a follow-up acting on
+ * the epic (the positive, NARROWED drift trigger). Deliberately NOT the full
+ * `commit_trailer_facts` watermark — that channel churns on any plan-metadata commit
+ * (validate/title/scaffold) and MISSES a bare `Task:`-trailer source commit, so it is
+ * neither a superset nor an equivalent of the `commit_set_hash`. ONE bounded aggregate per
+ * epic; a read edge degrades that epic to UNKNOWN (absent from the map → the grade holds
+ * the fence). Producer-side read, NEVER a fold.
  */
-export function loadEpicCommitWatermarks(
+export function loadEpicTaskDoneWatermarks(
   db: Parameters<typeof runQuery>[0],
   epicIds: Iterable<string>,
 ): Map<string, number> {
@@ -12206,7 +12220,7 @@ export function loadEpicCommitWatermarks(
     try {
       const row = db
         .query(
-          "SELECT MAX(event_id) AS m FROM commit_trailer_facts WHERE plan_epic_id = ?",
+          "SELECT MAX(event_id) AS m FROM commit_trailer_facts WHERE plan_epic_id = ? AND plan_op = 'done'",
         )
         .get(epicId) as { m: number | null } | null;
       if (row != null && typeof row.m === "number" && Number.isFinite(row.m)) {
@@ -13168,25 +13182,38 @@ export async function loadReconcileSnapshot(
   // byte-identical.
   const worktreesRoot = worktreeMode ? `${homedir()}/worktrees` : undefined;
 
-  // Fatal-audit fence inputs: for every epic whose latest close receipt is a
-  // still-CURRENT `fatal_halt` verdict ({@link fatalHaltReceiptIsCurrent} — the receipt's
-  // commit set has not drifted past its own event id), carry the bounded finding excerpt.
-  // `fatalAuditFenceLifted` is stepped in the drive loop (it needs the persistent memo);
-  // the pure `reconcile` withholds the close re-mint + mints one durable needs-human row.
+  // Fatal-audit fence inputs. `fatalHaltReceiptIsCurrent` grades a fatal receipt against
+  // the epic's newest TASK-DONE fact (a follow-up acting on the epic). The fence + mint set
+  // is INTERSECTED with positively-OPEN epics so a recently-done / deleted epic carrying a
+  // stale stopped close job + old fatal receipt never mints a phantom row; the clear set is
+  // POSITIVE-EVIDENCE only (a non-fatal receipt, a drift, or a positively done/absent
+  // epic) so a transient receipt read failure RETAINS the open row rather than fail-open
+  // clearing it. `fatalAuditFenceLifted` is stepped in the drive loop (persistent memo).
+  const openEpicIdSet = new Set(openEpicIds);
+  const doneEpicIdSet = new Set(
+    epics.filter((e) => e.status === "done").map((e) => e.epic_id),
+  );
   const fatalHaltEpicIds = [...latestCloseReceiptByEpicId.entries()]
     .filter(([, r]) => r.outcome === "fatal_halt")
     .map(([id]) => id);
-  const fatalAuditCommitWatermarks = loadEpicCommitWatermarks(
+  // Grade drift over BOTH the fatal-receipt epics and the OPEN fatal-audit ROW epics (an
+  // open row may need a drift-clear even after its receipt turned non-fatal/unreadable).
+  const fatalAuditGradeEpicIds = new Set<string>([
+    ...fatalHaltEpicIds,
+    ...openFatalAuditIds,
+  ]);
+  const fatalAuditTaskDoneWatermarks = loadEpicTaskDoneWatermarks(
     db,
-    fatalHaltEpicIds,
+    fatalAuditGradeEpicIds,
   );
   const currentFatalAuditEpicIds = new Map<string, string>();
   for (const epicId of fatalHaltEpicIds) {
+    if (!openEpicIdSet.has(epicId)) continue; // scope the fence/mint to OPEN epics only
     const receipt = latestCloseReceiptByEpicId.get(epicId);
     if (
       fatalHaltReceiptIsCurrent(
         receipt,
-        fatalAuditCommitWatermarks.get(epicId) ?? null,
+        fatalAuditTaskDoneWatermarks.get(epicId) ?? null,
       )
     ) {
       currentFatalAuditEpicIds.set(
@@ -13194,6 +13221,29 @@ export async function loadReconcileSnapshot(
         receipt?.fatalReason ?? boundFatalAuditExcerpt(null),
       );
     }
+  }
+  // Positive resolution evidence for each OPEN fatal-audit row. UNKNOWN (an open epic whose
+  // receipt read failed, or a still-fatal-current verdict) is NOT added → the row is retained.
+  const fatalAuditResolvedEpicIds = new Set<string>();
+  for (const epicId of openFatalAuditIds) {
+    const receipt = latestCloseReceiptByEpicId.get(epicId);
+    const resolved =
+      // positively done (the close landed elsewhere)
+      doneEpicIdSet.has(epicId) ||
+      // a KNOWN non-fatal latest receipt (a real close outcome superseded the halt)
+      (receipt !== undefined && receipt.outcome !== "fatal_halt") ||
+      // a follow-up task-done drifted the fatal verdict off the current tree
+      (receipt !== undefined &&
+        receipt.outcome === "fatal_halt" &&
+        !fatalHaltReceiptIsCurrent(
+          receipt,
+          fatalAuditTaskDoneWatermarks.get(epicId) ?? null,
+        )) ||
+      // positively absent (a healthy read that no longer lists the epic → deleted/aged-out)
+      (!readinessDegraded &&
+        !openEpicIdSet.has(epicId) &&
+        !doneEpicIdSet.has(epicId));
+    if (resolved) fatalAuditResolvedEpicIds.add(epicId);
   }
 
   return {
@@ -13236,6 +13286,7 @@ export async function loadReconcileSnapshot(
     latestCloseReceiptByEpicId,
     currentFatalAuditEpicIds,
     openFatalAuditIds,
+    fatalAuditResolvedEpicIds,
     pendingDispatches,
     providerLegActivityByWrapperJobId,
     mode,
@@ -14645,6 +14696,14 @@ function main(): void {
           snapshot.openFatalAuditIds ?? new Set<string>(),
           state.fatalAuditFenceMemo,
         );
+        // An operator `retry_dispatch` clears the fatal-audit row through the reducer,
+        // NOT `emitDispatchCleared` → the change-gate never saw the clear and would
+        // suppress an identical same-finding re-mint to the watermark (~15m). Reset the
+        // gate on the positive observed-then-gone lift so the re-mint after the re-run's
+        // re-halt is emitted immediately.
+        for (const epicId of snapshot.fatalAuditFenceLifted) {
+          dispatchFailedGate.forget("close", epicId);
+        }
         const decision = reconcile(snapshot, state, deps.now());
         // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;
         // a trusted no-candidate (or paused) disarms; a DEGRADED PANE probe (untrusted null,

@@ -6467,7 +6467,19 @@ function extractMergeHumanNotifiedPayload(
       typeof parsed.verb === "string" && parsed.verb.length > 0
         ? parsed.verb
         : "close";
-    return { id: parsed.id, outcome: parsed.outcome, verb };
+    // `expectedInstanceEventId` is OPTIONAL: historical payloads carry none (no instance
+    // check), the fatal-audit page sweep mints it to fence the stamp to the exact row.
+    const expectedInstanceEventId =
+      typeof parsed.expectedInstanceEventId === "number" &&
+      Number.isSafeInteger(parsed.expectedInstanceEventId)
+        ? parsed.expectedInstanceEventId
+        : null;
+    return {
+      id: parsed.id,
+      outcome: parsed.outcome,
+      verb,
+      expectedInstanceEventId,
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse MergeHumanNotified payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -6502,6 +6514,20 @@ function foldMergeHumanNotified(db: Database, event: Event): void {
     return;
   }
   if (payload.outcome !== "notified") {
+    return;
+  }
+  // Optional instance fence: when the payload names the exact row instance the page was
+  // sent about, stamp ONLY if the current row still carries it — so a stale page completion
+  // (row A cleared + replacement B minted during the async send) never stamps B, preserving
+  // B's required page. Absent field → no extra predicate (byte-identical historical fold).
+  if (payload.expectedInstanceEventId != null) {
+    db.run(
+      `UPDATE dispatch_failures
+          SET human_notified_at = ?
+        WHERE verb = ? AND id = ? AND human_notified_at IS NULL
+          AND instance_event_id = ?`,
+      [event.ts, payload.verb, payload.id, payload.expectedInstanceEventId],
+    );
     return;
   }
   db.run(

@@ -1362,6 +1362,13 @@ export interface MergeHumanNotifiedPayload {
   outcome: string;
   /** Which `dispatch_failures` verb-row the marker stamps — `close` (default) or `work`. */
   verb: string;
+  /** OPTIONAL instance fence: the `dispatch_failures.instance_event_id` of the EXACT row
+   *  the page was sent about. When present, the fold stamps `human_notified_at` ONLY if the
+   *  current row's `instance_event_id` still matches — so a page sent about row A that
+   *  completed AFTER A was cleared and a REPLACEMENT row B minted (same `(verb,id)`) never
+   *  stamps B, suppressing B's required page. Absent (historical payloads) → no instance
+   *  check, byte-identical to the pre-fence fold. */
+  expectedInstanceEventId?: number | null;
 }
 
 /**
