@@ -1167,6 +1167,38 @@ export function liveKeyOf(descriptor: CollectionDescriptor, row: Row): string {
 }
 
 /**
+ * Build a live-key accessor for a `(pk, liveKeyColumns)` pair — byte-identical to
+ * {@link liveKeyOf}'s output for a well-formed row, but returning `null` when any
+ * key component is missing so a malformed row is dropped rather than keyed on the
+ * literal string `"undefined"`. The subscribe client (`readiness-client.ts`) keys
+ * `byId` / `order` / the per-row version cursor / direct-patch merges by this, so a
+ * composite-identity collection's same-`pk` sibling rows (e.g. one epic's two
+ * downgraded `worktree_repo_status` repo groups) never collapse onto one slot. Kept
+ * here so the identity contract has ONE home — the SQL side (`liveKeyExpr`), the
+ * server diff (`liveKeyOf`), and the client all agree on the same bytes.
+ */
+export function liveKeyAccessor(
+  pk: string,
+  liveKeyColumns?: readonly string[],
+): (row: Row) => string | null {
+  if (!liveKeyColumns || liveKeyColumns.length === 0) {
+    return (row) => {
+      const v = row[pk];
+      return v == null ? null : String(v);
+    };
+  }
+  return (row) => {
+    const parts: string[] = [];
+    for (const c of liveKeyColumns) {
+      const v = row[c];
+      if (v == null) return null;
+      parts.push(String(v));
+    }
+    return parts.join(LIVE_KEY_DELIM);
+  };
+}
+
+/**
  * Read a set of rows by primary key. Empty-set short-circuits to `[]` (a bare
  * `IN ()` is a SQL syntax error); over `MAX_IN_PARAMS` throws ("chunk the
  * caller"). Returns rows in SQLite's emission order (NOT input order). Trusted

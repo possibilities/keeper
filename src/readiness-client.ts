@@ -74,7 +74,7 @@ import {
   projectWorktreeMode,
   projectWorktreeMultiRepo,
 } from "./autopilot-projection";
-import { getCollection } from "./collections";
+import { getCollection, liveKeyAccessor } from "./collections";
 import { effectivePerRootCap } from "./db";
 import { parsePlanRef } from "./derivers";
 import {
@@ -548,6 +548,16 @@ interface CollectionState {
   readonly subId: string;
   readonly pk: string;
   /**
+   * The row's live-diff IDENTITY accessor — byte-identical to the server's
+   * `liveKeyExpr` / `liveKeyOf` (the composite `col || char(31) || col …` when the
+   * descriptor declares `liveKeyColumns`, else the scalar `pk`). `byId`, `order`,
+   * the per-row version cursor, AND the direct-patch merge all key by THIS, so a
+   * composite-identity collection's same-`pk` sibling rows (e.g. one epic's two
+   * downgraded `worktree_repo_status` groups) never collapse onto one slot / one
+   * version cursor. Returns `null` for a row missing a key component (dropped).
+   */
+  readonly liveKey: (row: Record<string, unknown>) => string | null;
+  /**
    * The descriptor's monotonic per-row version column (`last_event_id`, or
    * `dl_written_at` for `dead_letters`), driving the direct-merge version
    * guard. Empty string for an unknown collection — the guard then degrades to
@@ -594,12 +604,17 @@ function makeState(
   subId: string,
   pk: string,
   query: QueryFrame,
-  opts?: { version?: string; directMergePatch?: boolean },
+  opts?: {
+    version?: string;
+    directMergePatch?: boolean;
+    liveKeyColumns?: readonly string[];
+  },
 ): CollectionState {
   return {
     collection,
     subId,
     pk,
+    liveKey: liveKeyAccessor(pk, opts?.liveKeyColumns),
     version: opts?.version ?? "",
     directMergePatch: opts?.directMergePatch ?? false,
     query,
@@ -1359,11 +1374,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     state: CollectionState,
     row: Record<string, unknown>,
   ): boolean {
-    const pkVal = row[state.pk];
-    if (pkVal === undefined || pkVal === null) {
+    // Key by the composite live identity, NOT the scalar wire pk — else a
+    // clustered epic's two sibling `worktree_repo_status` rows collapse: the
+    // second sibling's patch would replace the first, and (sharing the epic's one
+    // version cursor) a same-event sibling patch would be dropped.
+    const id = state.liveKey(row);
+    if (id === null) {
       return false;
     }
-    const id = String(pkVal);
     // Membership guard: an id we don't already track is off-page noise — drop
     // it rather than blind-append (a `meta` carries a genuine membership change).
     if (!state.byId.has(id)) {
@@ -1465,7 +1483,11 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       // Re-snapshot `rows` from this frame — see module docstring.
       state.rows = frame.rows.slice();
       for (const row of frame.rows) {
-        const id = String(row[state.pk]);
+        // Seed by the composite live identity so same-`pk` sibling rows keep
+        // DISTINCT `byId` / `order` / version-cursor slots (matching the direct
+        // patch merge). A malformed row (null key — never for a NOT-NULL composite
+        // PK) falls back to the scalar pk so `order` stays index-aligned with `rows`.
+        const id = state.liveKey(row) ?? String(row[state.pk]);
         state.order.push(id);
         state.byId.set(id, row);
         // Re-arm the per-pk version cursor from the authoritative page so a
@@ -2012,15 +2034,21 @@ export function subscribeCollection(
     ...(opts.sort === undefined ? {} : { sort: opts.sort }),
     ...(opts.filter === undefined ? {} : { filter: opts.filter }),
   };
-  // Thread the descriptor's REAL pk + version column so the direct-merge path
-  // keys correctly — it upserts into `byId`/`order`/`rows` by pk and the
-  // version guard compares the `version` column. An unknown collection keeps
-  // pk="" / version="": the merge no-ops on a missing pk and the version guard
-  // is inert, so it still rides the refetch path harmlessly.
+  // Thread the descriptor's REAL pk + COMPOSITE live identity + version column so
+  // the direct-merge path keys correctly — it upserts into `byId`/`order`/`rows` by
+  // the live key (composite `liveKeyColumns` when declared, else the scalar pk) and
+  // the version guard compares the `version` column. A composite collection's
+  // same-pk siblings therefore stay DISTINCT under direct-patch merging (fixing the
+  // clustered `worktree_repo_status` collapse). An unknown collection keeps pk="" /
+  // version="": the merge no-ops on a null live key and the version guard is inert,
+  // so it still rides the refetch path harmlessly.
   const descriptor = getCollection(opts.collection);
   const state = makeState(opts.collection, subId, descriptor?.pk ?? "", query, {
     version: descriptor?.version ?? "",
     directMergePatch: true,
+    ...(descriptor?.liveKeyColumns === undefined
+      ? {}
+      : { liveKeyColumns: descriptor.liveKeyColumns }),
   });
   return subscribeMulti({
     sockPath: opts.sockPath,

@@ -2933,6 +2933,136 @@ test("subscribeCollection: patch merges the row and renders via onRows with NO r
   handle.dispose();
 });
 
+// ---------------------------------------------------------------------------
+// fn-28 part 4d — COMPOSITE live-key identity through subscribeCollection. A
+// clustered epic's two same-epic `worktree_repo_status` sibling rows (distinct
+// repo_dir) must key `byId` / `order` / the per-row version cursor / direct-patch
+// merges by the composite (epic_id, repo_dir) live key, NOT the scalar epic_id pk
+// — else the second sibling's patch replaces the first, and a same-event sibling
+// patch is dropped on the shared per-epic version cursor.
+// ---------------------------------------------------------------------------
+
+function wrsResult(
+  id: string,
+  rows: Record<string, unknown>[],
+  rev = 1,
+): ServerFrame {
+  return {
+    type: "result",
+    id,
+    collection: "worktree_repo_status",
+    rev,
+    total: rows.length,
+    rows,
+  };
+}
+
+function wrsPatch(
+  id: string,
+  row: Record<string, unknown>,
+  rev = 2,
+): ServerFrame {
+  return { type: "patch", id, collection: "worktree_repo_status", rev, row };
+}
+
+function makeWrsSidecar(idPrefix: string): {
+  sock: MockSocket;
+  rowsLog: Record<string, unknown>[][];
+  handle: ReturnType<typeof subscribeCollection>;
+} {
+  const { factory, socketRef } = makeMockConnect();
+  const rowsLog: Record<string, unknown>[][] = [];
+  const handle = subscribeCollection({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix,
+    collection: "worktree_repo_status",
+    onRows: (rows) => rowsLog.push(rows),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  return { sock, rowsLog, handle };
+}
+
+test("subscribeCollection: a clustered epic's two same-epic worktree_repo_status siblings stay DISTINCT and BOTH update under sequential same-event patches; a second-only patch leaves the first untouched (fn-28 part 4d composite key)", () => {
+  const { sock, rowsLog, handle } = makeWrsSidecar("test-wrs");
+  const subId = "test-wrs-worktree_repo_status";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  // Seed two siblings of ONE epic (same epic_id, distinct repo_dir, same version).
+  sock.deliver([
+    wrsResult(subId, [
+      {
+        epic_id: "fn-1",
+        repo_dir: "/repo-a",
+        mode: "serial",
+        reason: "A1",
+        last_event_id: 5,
+      },
+      {
+        epic_id: "fn-1",
+        repo_dir: "/repo-b",
+        mode: "serial",
+        reason: "B1",
+        last_event_id: 5,
+      },
+    ]),
+  ]);
+  expect(rowsLog).toHaveLength(1);
+  expect(rowsLog[0]).toHaveLength(2);
+  sock.takeOutbound();
+
+  // Sequential SAME-EVENT patches (identical last_event_id) for BOTH siblings.
+  sock.deliver([
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: "/repo-a",
+      mode: "serial",
+      reason: "A2",
+      last_event_id: 8,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: "/repo-b",
+      mode: "serial",
+      reason: "B2",
+      last_event_id: 8,
+    }),
+  ]);
+  // No refetch round-trip.
+  expect(sock.takeOutbound()).toHaveLength(0);
+  const merged = rowsLog[rowsLog.length - 1] as Record<string, unknown>[];
+  // BOTH siblings survived AND both updated (the second same-event patch was NOT
+  // dropped on a shared per-epic version cursor, and neither replaced the other).
+  expect(merged).toHaveLength(2);
+  expect(merged.find((r) => r.repo_dir === "/repo-a")?.reason).toBe("A2");
+  expect(merged.find((r) => r.repo_dir === "/repo-b")?.reason).toBe("B2");
+  // Seed order preserved.
+  expect(merged.map((r) => r.repo_dir)).toEqual(["/repo-a", "/repo-b"]);
+
+  // A patch for the SECOND sibling only leaves the FIRST untouched.
+  sock.deliver([
+    wrsPatch(
+      subId,
+      {
+        epic_id: "fn-1",
+        repo_dir: "/repo-b",
+        mode: "serial",
+        reason: "B3",
+        last_event_id: 9,
+      },
+      3,
+    ),
+  ]);
+  const after = rowsLog[rowsLog.length - 1] as Record<string, unknown>[];
+  expect(after.find((r) => r.repo_dir === "/repo-a")?.reason).toBe("A2");
+  expect(after.find((r) => r.repo_dir === "/repo-b")?.reason).toBe("B3");
+
+  handle.dispose();
+});
+
 test("subscribeCollection: meta still triggers a refetch", () => {
   const { sock, rowsLog, handle } = makeJobsSidecar("test-meta");
   const subId = "test-meta-jobs";

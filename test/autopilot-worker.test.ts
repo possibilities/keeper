@@ -10670,6 +10670,86 @@ test("fn-28 part 4c clusterEpicRepos: an ALL-DONE absent GROUP gets NO fresh-epo
   expect(repoB?.freshEpoch).toBeUndefined();
 });
 
+test("fn-28 blocker2 classifyEpicRepo: a SINGLE-REPO no-manifest ALL-DONE absent epic with prior-lane PROOF does NOT re-cut (stays disabled — no freshEpoch, no empty base), and the true-reopen guard gates BEFORE the proof read", () => {
+  // The no-manifest re-cut arm must honor the SAME true-reopen predicate as the
+  // eligible arm — an all-done epic (no gained work) must never mint a fresh epoch
+  // that filters to zero active tasks yet retains the base/close sink (an empty base).
+  let priorLaneReads = 0;
+  const proofProbe = (): LaneProbeResult => ({
+    epoch: "absent",
+    get priorLane(): boolean {
+      priorLaneReads++;
+      return true;
+    },
+  });
+  const noManifest = () => ({
+    eligible: false,
+    reason: "worktree-disabled:no-manifest",
+  });
+  const epic = allDoneEpic(); // fn-1-alldone: single-repo /repo-a, both tasks done
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    noManifest,
+    proofProbe,
+    true,
+  );
+  // No re-cut: an all-done no-manifest epic stays disabled (serial), never freshEpoch.
+  expect(repoMap.get("fn-1-alldone")?.kind).toBe("disabled");
+  // The true-reopen guard gated BEFORE `.priorLane`, so the proof db read never fired.
+  expect(priorLaneReads).toBe(0);
+  // Disabled → tasks key the BARE toplevel (serial), never a fresh worktree base.
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  expect(prepared.laneKeyById.get("fn-1-alldone.1")).toBe("/repo-a");
+  expect(prepared.laneKeyById.get("fn-1-alldone.2")).toBe("/repo-a");
+});
+
+test("fn-28 blocker2 clusterEpicRepos: a no-manifest ALL-DONE group with proof re-cuts to a FULL worktree group (mode worktree, NO freshEpoch) — pinned so the clustered arm cannot silently drift from the single-repo guard", () => {
+  // The clustered arm re-cuts an all-done no-manifest group to a worktree group
+  // (the no-manifest grandfather is eligibility-independent) but sets NO freshEpoch
+  // (a true reopen needs a non-done task), so it derives the FULL graph — never an
+  // empty fresh base. Distinct from the single-repo arm (which stays disabled); both
+  // are pinned so they cannot diverge unnoticed.
+  const epic = makeEpic({
+    epic_id: "fn-1-cnm",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-cnm.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-cnm.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const noManifestB = (top: string) =>
+    top === "/repo-b"
+      ? { eligible: false, reason: "worktree-disabled:no-manifest" }
+      : { eligible: true, reason: "worktree-eligible" };
+  const laneProbe = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-b"
+      ? { epoch: "absent", priorLane: true }
+      : { epoch: "present", priorLane: false };
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    noManifestB,
+    laneProbe,
+    true,
+  ).get("fn-1-cnm");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  const repoB = res.groups.find((g) => g.repoDir === "/repo-b");
+  expect(repoB?.mode).toBe("worktree");
+  expect(repoB?.freshEpoch).toBeUndefined();
+});
+
 // ---------------------------------------------------------------------------
 // fn-28 part 4(b) + 4(d) — the epic-bound, bounded prior-lane PROOF query. Exercised
 // as the REAL query against a migrated DB (no injected priorLane), through the

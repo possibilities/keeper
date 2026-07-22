@@ -5360,11 +5360,14 @@ function classifyEpicRepo(
   // unconditionally — the grandfather decides its very mode.
   const hasDoneTask = epic.tasks.some((t) => t.worker_phase === "done");
   const hasNonDoneTask = epic.tasks.some((t) => t.worker_phase !== "done");
+  // The SINGLE true-reopen predicate BOTH single-repo fresh-epoch arms (eligible AND
+  // no-manifest re-cut) share, so they cannot drift: a fresh epoch is minted ONLY
+  // when a done task (the finalized epoch) AND a non-done task (the newly added work)
+  // coexist. It gates the eligible re-cut AND the no-manifest re-cut identically.
+  const trueReopen = hasDoneTask && hasNonDoneTask;
   if (eligibility.eligible) {
     const freshEpoch =
-      hasDoneTask &&
-      hasNonDoneTask &&
-      laneProbe(epic.epic_id, repoDir).epoch === "absent";
+      trueReopen && laneProbe(epic.epic_id, repoDir).epoch === "absent";
     return okOrForeignAnchor(freshEpoch);
   }
   const lane = laneProbe(epic.epic_id, repoDir);
@@ -5377,14 +5380,17 @@ function classifyEpicRepo(
     return okOrForeignAnchor(false);
   }
   // NO-MANIFEST RE-CUT: a torn-down (positively-absent) epoch with a restart-safe,
-  // repo-bound prior-lane proof bootstraps a FRESH worktree epoch — but ONLY for the
-  // EXACT `no-manifest` disable (equality, never a fragile `.includes` that a future
-  // reason substring could trip). A workspace-marker / submodule / probe-error repo
-  // STAYS serial: a fresh worktree checkout there would carry the wrong dependency
-  // tree. The reason check gates BEFORE `.priorLane` so the lazy proof db read fires
-  // only for a no-manifest absent epoch, never an unsafe one on the re-cut path.
+  // repo-bound prior-lane proof bootstraps a FRESH worktree epoch — but ONLY for a
+  // TRUE reopen (a done AND a non-done task) on the EXACT `no-manifest` disable
+  // (equality, never a fragile `.includes`). An ALL-DONE no-manifest epoch must NOT
+  // re-cut (that would filter to zero active tasks yet retain the base/close sink — an
+  // empty base re-provisioned only to finalize + tear down). A workspace-marker /
+  // submodule / probe-error repo STAYS serial regardless. `trueReopen` AND the reason
+  // check BOTH gate BEFORE `.priorLane`, so the lazy proof db read fires only for a
+  // no-manifest absent epoch that is genuinely re-openable — never an all-done one.
   if (
     lane.epoch === "absent" &&
+    trueReopen &&
     eligibility.reason === NO_MANIFEST_REASON &&
     lane.priorLane
   ) {
