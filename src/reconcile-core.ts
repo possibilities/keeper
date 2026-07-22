@@ -254,14 +254,25 @@ export type DetailPart = string | { readonly bounded: string };
 
 /**
  * Compose labeled facts into a detail that fits {@link WITHHOLD_DETAIL_MAX} with every
- * value surviving. A plain overall-string slice — withhold's final backstop — can only
- * SHORTEN the LAST value by position: with two long values it drops the second
- * entirely once the first fills the budget. This renderer instead splits the budget
- * left after the fixed labels across the bounded values, eliding an over-share value in
- * the MIDDLE (prefix + "…" + suffix) so a ref or path stays identifiable at BOTH ends,
- * where its distinguishing bytes live. A value already within its share renders
- * verbatim, so a detail whose values all fit equals a plain concatenation of the parts;
- * the result never exceeds the cap, so the backstop slice stays inert.
+ * bounded value surviving identifiably at BOTH ends. A plain overall-string slice —
+ * withhold's final backstop — can only SHORTEN the LAST value by position: with two long
+ * values it drops the second entirely once the first fills the budget. This renderer
+ * instead splits the budget left after the fixed labels across the bounded values,
+ * eliding an over-share value in the MIDDLE (prefix + "…" + suffix) so a ref or path
+ * stays identifiable at both ends, where its distinguishing bytes live. A value already
+ * within its share renders verbatim, so a detail whose values all fit equals a plain
+ * concatenation of the parts; the result NEVER exceeds the cap, so the backstop slice
+ * stays inert.
+ *
+ * Fixed labels are emitted verbatim and each bounded value needs at least a first+last
+ * (2-char) endpoint slot, so the smallest honorable layout needs `fixedLen + 2·(bounded
+ * count)` chars. When that floor exceeds the cap the layout could only overflow the cap
+ * or delete a field, so this FAILS CLOSED — a plain Error naming the helper and the
+ * overflow — rather than silently returning >cap or dropping a value. That is a
+ * programmer error surfaced at test time, not a runtime hazard: production layouts are
+ * compile-time constants with short labels that clear the floor comfortably. Clearing
+ * the floor guarantees every bounded value a cap of at least 2, so {@link elideMiddle}
+ * always has room to keep both endpoints and never has to drop one.
  */
 export function boundedFields(parts: readonly DetailPart[]): string {
   const fixedLen = parts.reduce(
@@ -271,10 +282,14 @@ export function boundedFields(parts: readonly DetailPart[]): string {
   const lengths = parts.flatMap((p) =>
     typeof p === "string" ? [] : [p.bounded.length],
   );
-  const caps = allocateBoundedCaps(
-    lengths,
-    Math.max(0, WITHHOLD_DETAIL_MAX - fixedLen),
-  );
+  const floor = fixedLen + 2 * lengths.length;
+  if (floor > WITHHOLD_DETAIL_MAX) {
+    throw new Error(
+      `boundedFields: layout overflows WITHHOLD_DETAIL_MAX (${WITHHOLD_DETAIL_MAX}) — ` +
+        `${fixedLen} fixed chars + ${lengths.length} bounded value(s) need >= ${floor}`,
+    );
+  }
+  const caps = allocateBoundedCaps(lengths, WITHHOLD_DETAIL_MAX - fixedLen);
   let i = 0;
   return parts
     .map((p) => (typeof p === "string" ? p : elideMiddle(p.bounded, caps[i++])))
@@ -313,18 +328,23 @@ function allocateBoundedCaps(
 }
 
 /**
- * Shorten `value` to `cap` chars, keeping a head and tail around a middle "…" so both
- * ends survive; a value already within `cap` is returned unchanged.
+ * Shorten `value` to at most `cap` chars, keeping both ends so a ref/path stays
+ * identifiable; a value already within `cap` is returned unchanged. The "…" marker costs
+ * a char, so it appears only when `cap >= 3` leaves room for a head AND a tail around it.
+ * At `cap === 2` the two slots render the first+last chars with NO ellipsis — the glyph
+ * must never consume an endpoint slot. The `cap <= 1` arms (first char, then empty)
+ * cannot keep both ends and are unreachable for a real elision: {@link boundedFields}'
+ * floor guarantees every elided value a cap of at least 2, so they stand only as defense.
  */
 function elideMiddle(value: string, cap: number): string {
   if (value.length <= cap) return value;
-  if (cap <= 1) return value.slice(0, Math.max(0, cap));
+  if (cap <= 0) return "";
+  if (cap === 1) return value.slice(0, 1);
+  if (cap === 2) return `${value.slice(0, 1)}${value.slice(value.length - 1)}`;
   const keep = cap - 1; // one char reserved for the "…" marker
   const head = Math.ceil(keep / 2);
   const tail = keep - head;
-  return tail === 0
-    ? `${value.slice(0, head)}…`
-    : `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+  return `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
 }
 
 export function withhold(

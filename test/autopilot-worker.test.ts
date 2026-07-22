@@ -3223,6 +3223,46 @@ test("ISSUE-09 boundedFields: a structural detail with a long fence AND a long r
   expect(detail).toContain("…");
 });
 
+test("ISSUE-09 boundedFields: fixed labels alone past the cap FAIL CLOSED (throw) — never a >512 verbatim return", () => {
+  // (a)(i) Reviewer repro #1: a layout whose FIXED parts alone exceed the cap has no
+  // bounded value to shorten, so it could only return >512 verbatim. It now throws
+  // naming the helper + the overflow rather than emitting an oversized detail.
+  expect(() =>
+    boundedFields(["x".repeat(WITHHOLD_DETAIL_MAX + 1)]),
+  ).toThrow(/boundedFields: layout overflows WITHHOLD_DETAIL_MAX/);
+});
+
+test("ISSUE-09 boundedFields: the two-endpoint budget (508 fixed + abcd + wxyz) renders first+last of each — no ellipsis eats an endpoint, total <= 512", () => {
+  // (b)(ii) Reviewer repro #2: budget = 4 across two 4-char values → cap 2 each. cap=2
+  // must render first+last (`ad`/`wz`), NOT first+ellipsis (`a…`) which deleted both
+  // suffixes although `ad`+`wz` fits exactly. 254 + 254 = 508 fixed chars clears the
+  // floor (508 + 2·2 = 512), so it renders rather than throws.
+  const fixedA = "L".repeat(254);
+  const fixedB = "R".repeat(254);
+  const detail = boundedFields([
+    fixedA,
+    { bounded: "abcd" },
+    fixedB,
+    { bounded: "wxyz" },
+  ]);
+  expect(detail).toBe(`${fixedA}ad${fixedB}wz`);
+  expect(detail.length).toBe(WITHHOLD_DETAIL_MAX);
+  expect(detail).not.toContain("…"); // the ellipsis never consumed an endpoint slot
+});
+
+test("ISSUE-09 boundedFields: one char past the floor (509 fixed + abcd + wxyz) FAILS CLOSED — no field silently disappears", () => {
+  // (a)(iii) Just past the endpoint floor (509 + 2·2 = 513 > 512): a budget below the
+  // minimum first+last allocation could only overflow or delete a field, so it throws.
+  expect(() =>
+    boundedFields([
+      "L".repeat(255),
+      { bounded: "abcd" },
+      "R".repeat(254),
+      { bounded: "wxyz" },
+    ]),
+  ).toThrow(/boundedFields: layout overflows WITHHOLD_DETAIL_MAX/);
+});
+
 test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
   // The worker boots from `workerData.paused`, which the daemon seeds from the
   // durable `autopilot_state.paused` column — so a normal boot resumes the last
@@ -13566,11 +13606,14 @@ test("fn-1034 runReconcileCycle: a clustered finalize provisions the non-primary
 });
 
 test("ISSUE-09 runReconcileCycle: a COMPLETED withhold frame publishes BEFORE the finalize tail — a throwing finalize step still leaves the new frame emitted AND propagates the throw", async () => {
-  // Two-sided placement pin: classification COMPLETES (a frame with content), then the
-  // finalize tail (the `finalizeEpic` step) throws. The publish sits BETWEEN — so the
-  // completed frame is already visible/emitted, yet the throw still reaches the caller.
-  // Moving the publish BELOW finalize would drop the emitted frame; keeping it above
-  // the launch pass would publish a partial map — this test fails either way.
+  // This fixture pins ONE side of the placement: publish sits BEFORE the finalize tail.
+  // Classification COMPLETES (a frame with content), then the finalize tail (the
+  // `finalizeEpic` step) throws — the completed frame is already visible/emitted, yet the
+  // throw still reaches the caller. Moving the publish BELOW finalize would drop the
+  // emitted frame, which this test catches. The OTHER side — publish sits AFTER
+  // classification, so a pre-classification throw preserves the prior frame — is pinned by
+  // the fn-09b abort/producer tests; the SUITE jointly bounds the publish point, not this
+  // fixture alone.
   const epic = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/repo-a",
