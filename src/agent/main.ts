@@ -357,11 +357,10 @@ export interface MainDeps {
    */
   loadPanelSelectionsFn: (catalog: PresetCatalog) => PanelSelections;
   /**
-   * Re-assert Claude's canonical `~/.claude/CLAUDE.md` global-instruction link
-   * onto the one shared source. HOME-coupled, so a seam; `realDeps()` binds it
-   * against `homedir()` + `defaultClaudeStowDir()` + `defaultSharedStowDir()`.
-   * Claude's `settings.json` is install-time-seeded only — this never compares,
-   * repairs, or blocks a launch on its live drift.
+   * Re-assert Claude's canonical `~/.claude/settings.json` and `CLAUDE.md`
+   * repository links before every launch, repairing equivalent clobbers and
+   * failing loudly on divergent files. HOME-coupled, so a seam; `realDeps()`
+   * binds it to the canonical Keeper sources.
    */
   ensureClaudeStateSharingFn: (actionLog: string[]) => void;
   /**

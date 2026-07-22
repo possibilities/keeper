@@ -5,10 +5,9 @@
  *
  * There is no Keeper-owned profile farm: claude-swap exclusively owns any
  * managed-account session directory, and Keeper neither discovers nor repairs
- * its private layout. Claude's `settings.json` is install-time-seeded ONLY —
- * created from the claude stow source the first time `~/.claude/settings.json`
- * is absent, never again after that: this module never compares, repairs,
- * rejects, or blocks a launch on its live drift.
+ * its private layout. Keeper still owns canonical Claude configuration:
+ * `~/.claude/settings.json` and `~/.claude/CLAUDE.md` are checked against their
+ * repository sources and re-asserted as symlinks before every Claude launch.
  */
 
 import {
@@ -120,6 +119,10 @@ function normalizeAbsolute(p: string): string {
   return resolve(p);
 }
 
+/** How a canonical leaf's regular-file clobber is compared to its source:
+ * `json` is whitespace/key-order-insensitive (settings.json); `bytes` is exact. */
+export type LeafCompare = "json" | "bytes";
+
 /**
  * What the guard does when a leaf's regular-file clobber diverges from its source:
  * `error` hard-throws (keeper-owned leaves); `warn` leaves the live file in place
@@ -128,68 +131,47 @@ function normalizeAbsolute(p: string): string {
 export type LeafDivergence = "error" | "warn";
 
 /**
- * One canonical global-instruction leaf the launch guard re-asserts: a symlink at
- * `linkPath` that must resolve to the real stow `source`. A per-harness row so
- * Claude's `CLAUDE.md` and Pi's canonical `AGENTS.md` all
- * re-link to keeper's one shared source on every launch. `onDivergence` picks the
- * hard-error vs warn-and-respect split (a wrong-TARGET symlink is always repaired
- * regardless — that repair reasserts Keeper's source).
+ * One canonical leaf the launch guard re-asserts: a symlink at `linkPath` that
+ * must resolve to the repository `source`. `compare` selects semantic JSON or
+ * exact-byte clobber equality; `onDivergence` selects fail-loud ownership or
+ * warn-and-respect handling.
  */
 export interface CanonicalStowLeaf {
   source: string;
   linkPath: string;
+  compare: LeafCompare;
   onDivergence: LeafDivergence;
 }
 
-/** The claude leaf: `CLAUDE.md` sourced from the ONE shared `AGENTS.md`
- *  (keeper-owned, so a divergent clobber is fail-loud). Claude's `settings.json`
- *  is install-time-seeded only (the `claude` stow package) — never re-asserted or
- *  compared here, so a live drift after install never repairs, rejects, or blocks
- *  a launch. */
+/** Keeper-owned Claude leaves. Null sources are test-only fail-open seams. */
 function claudeStowLeaves(
-  sharedStowDir: string,
+  claudeStowDir: string | null,
+  sharedStowDir: string | null,
   homeDir: string,
 ): CanonicalStowLeaf[] {
   const claudeDir = join(homeDir, ".claude");
   return [
-    {
-      source: join(sharedStowDir, "AGENTS.md"),
-      linkPath: join(claudeDir, "CLAUDE.md"),
-      onDivergence: "error",
-    },
+    ...(claudeStowDir === null
+      ? []
+      : [
+          {
+            source: join(claudeStowDir, "settings.json"),
+            linkPath: join(claudeDir, "settings.json"),
+            compare: "json" as const,
+            onDivergence: "error" as const,
+          },
+        ]),
+    ...(sharedStowDir === null
+      ? []
+      : [
+          {
+            source: join(sharedStowDir, "AGENTS.md"),
+            linkPath: join(claudeDir, "CLAUDE.md"),
+            compare: "bytes" as const,
+            onDivergence: "error" as const,
+          },
+        ]),
   ];
-}
-
-/**
- * Seed `~/.claude/settings.json` from the repo's canonical claude stow source
- * ONLY when the path is entirely absent — install-time seeding, never
- * repeated. Once anything sits at that path (a symlink, a regular file,
- * matching or diverging content), this is a permanent no-op: unlike a
- * {@link CanonicalStowLeaf}, a settings.json clobber is never compared,
- * repaired, rejected, or launch-blocking — the live file may evolve freely
- * after the first seed, and claude-swap shares it unmodified into every
- * managed session.
- */
-function ensureClaudeSettingsSeed(
-  homeDir: string,
-  claudeStowDir: string,
-  actionLog: string[] | null,
-): void {
-  const claudeDir = join(homeDir, ".claude");
-  const linkPath = join(claudeDir, "settings.json");
-  if (lexists(linkPath)) {
-    return;
-  }
-  const source = join(claudeStowDir, "settings.json");
-  if (!existsSync(source)) {
-    actionLog?.push(
-      `WARNING: claude settings stow source missing, cannot seed: ${source}`,
-    );
-    return;
-  }
-  mkdirSync(claudeDir, { recursive: true });
-  symlinkSync(relative(claudeDir, source), linkPath);
-  actionLog?.push(`Seeded Claude settings: ${linkPath} -> ${source}`);
 }
 
 /** The pi canonical leaf: `<canonicalDir>/AGENTS.md` sourced from the shared file,
@@ -202,9 +184,49 @@ function piCanonicalStowLeaves(
     {
       source: join(sharedStowDir, "AGENTS.md"),
       linkPath: join(canonicalDir, "AGENTS.md"),
+      compare: "bytes",
       onDivergence: "warn",
     },
   ];
+}
+
+/** Whitespace-insensitive, key-order-independent JSON equality. */
+function jsonSemanticEqual(a: string, b: string): boolean {
+  if (a === b) {
+    return true;
+  }
+  let parsedA: unknown;
+  let parsedB: unknown;
+  try {
+    parsedA = JSON.parse(a);
+    parsedB = JSON.parse(b);
+  } catch {
+    return false;
+  }
+  return canonicalJson(parsedA) === canonicalJson(parsedB);
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortKeysDeep);
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+/** Quote one argv value for copy-pasteable POSIX shell recovery commands. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function divergentClobberMessage(
@@ -212,26 +234,40 @@ function divergentClobberMessage(
   target: string,
   relTarget: string,
 ): string {
+  const quotedLink = shellQuote(linkPath);
+  const quotedTarget = shellQuote(target);
+  const quotedRelativeTarget = shellQuote(relTarget);
   return [
     `Canonical Claude config drift: ${linkPath} is a regular file whose`,
-    `contents differ from the stow source ${target}.`,
+    `contents differ from the repository source ${target}.`,
     "",
-    "A direct edit replaced the stow symlink and the live file has since",
-    "diverged from the repo. keeper agent will not pick a winner for you.",
-    "Resolve it one of these ways:",
+    "A direct edit or atomic write replaced the canonical symlink. Keeper will",
+    "not pick a winner or overwrite either version. Resolve it one of these ways:",
     "",
-    `  # 1. Inspect the difference`,
-    `  diff -u ${target} ${linkPath}`,
+    "  # 1. Inspect the difference",
+    `  diff -u -- ${quotedTarget} ${quotedLink}`,
     "",
-    `  # 2. Discard the live file and restore the repo's version`,
-    `  rm ${linkPath} && ( cd ${dirname(target)} && stow --restow -t ${join(linkPath, "..")} . ) \\`,
-    `    || ln -snf ${relTarget} ${linkPath}`,
+    "  # 2. Discard the live file and restore the repository link",
+    `  rm -- ${quotedLink} && ln -snf -- ${quotedRelativeTarget} ${quotedLink}`,
     "",
-    `  # 3. Keep the live file: copy it into the repo, commit, then restore the link`,
-    `  cp ${linkPath} ${target} && rm ${linkPath} && ln -snf ${relTarget} ${linkPath}`,
+    "  # 3. Keep the live file: copy it into the repository",
+    `  cp -- ${quotedLink} ${quotedTarget}`,
+    "  # Commit the repository change, then restore the link",
+    `  rm -- ${quotedLink} && ln -snf -- ${quotedRelativeTarget} ${quotedLink}`,
     "",
     "Rip-cord — bypass this guard entirely for one launch (last resort):",
     "  KEEPER_AGENT_SKIP_LINK_GUARD=1 <your keeper agent command>",
+  ].join("\n");
+}
+
+function unsupportedClobberMessage(linkPath: string, target: string): string {
+  return [
+    `Canonical Claude config path has an unsupported filesystem type: ${linkPath}`,
+    `Expected a symlink to ${target} or a regular file that can be compared.`,
+    "Keeper will not read, remove, or replace this path.",
+    "",
+    "Inspect it, move or remove it deliberately, then relaunch Keeper:",
+    `  ls -ld -- ${shellQuote(linkPath)}`,
   ].join("\n");
 }
 
@@ -251,15 +287,15 @@ function divergentRespectMessage(linkPath: string, target: string): string {
 }
 
 /**
- * Re-assert every canonical global-instruction symlink in `leaves` on each launch —
- * one keeper-owned `system/shared/AGENTS.md` behind claude's `~/.claude/CLAUDE.md`,
- * Pi's canonical `AGENTS.md`. A direct edit can replace a
- * relative symlink with a regular file; this guard force-restores the link.
+ * Re-assert every canonical symlink in `leaves` on each launch — Claude's
+ * repository-owned settings and global instructions plus Pi's shared global
+ * instructions. A direct edit or atomic replacement can turn a link into a file.
  *
  * Per leaf (via lstat, so a clobber is never silently dereferenced):
  *   - correct symlink (resolves to the leaf's source) → no-op
- *   - symlink to the wrong target → repair + loud log (the correction to Keeper's shared source, for EVERY leaf regardless of `onDivergence`)
- *   - regular-file clobber, contents identical to the source → repair + loud log
+ *   - symlink to the wrong target → repair + loud log
+ *   - regular-file clobber, equivalent to the source → repair + loud log
+ *     (`compare: "json"` ignores whitespace/key order; `"bytes"` is exact)
  *   - regular-file clobber, divergent contents → `onDivergence: "error"` throws
  *     StateError with recovery; `"warn"` leaves the live file + logs a WARNING
  *   - link absent but source present → create the relative link
@@ -277,8 +313,8 @@ export function ensureCanonicalStowLinks(
 ): void {
   if (env.KEEPER_AGENT_SKIP_LINK_GUARD) {
     actionLog?.push(
-      "WARNING: KEEPER_AGENT_SKIP_LINK_GUARD set — skipping the canonical stow " +
-        "link guard; harness global-instruction links are NOT re-asserted",
+      "WARNING: KEEPER_AGENT_SKIP_LINK_GUARD set — skipping canonical Claude " +
+        "settings and harness global-instruction link enforcement",
     );
     return;
   }
@@ -314,10 +350,23 @@ export function ensureCanonicalStowLinks(
       continue;
     }
 
-    // Regular-file clobber: a direct edit replaced the symlink with a real file.
+    // Refuse directories, devices, sockets, and FIFOs before any blocking read.
+    if (!lstatSync(linkPath).isFile()) {
+      const message = unsupportedClobberMessage(linkPath, target);
+      if (leaf.onDivergence === "error") {
+        throw new StateError(message);
+      }
+      actionLog?.push(`WARNING: ${message}`);
+      continue;
+    }
+
+    // Regular-file clobber: a direct edit or atomic write replaced the symlink.
     const live = readFileSync(linkPath, "utf8");
     const source = readFileSync(target, "utf8");
-    const identical = live === source;
+    const identical =
+      leaf.compare === "json"
+        ? jsonSemanticEqual(live, source)
+        : live === source;
     if (!identical) {
       if (leaf.onDivergence === "error") {
         throw new StateError(
@@ -353,15 +402,10 @@ function relinkCanonical(linkPath: string, relTarget: string): void {
 }
 
 /**
- * Prepare Claude's canonical `~/.claude/` root on every claude launch: seed
- * `settings.json` from the claude stow source ONLY when absent (install-time
- * seeding — see {@link ensureClaudeSettingsSeed}; never compared, repaired, or
- * launch-blocking once it exists), then re-assert the `CLAUDE.md`
- * global-instruction link against the one shared source (always enforced,
- * fail-loud on a genuine divergence — see {@link ensureCanonicalStowLinks}).
- * A null `claudeStowDir` / `sharedStowDir` independently disables its half of
- * the guard (test-only fail-open); production resolves real paths via
- * `defaultClaudeStowDir()` / `defaultSharedStowDir()`.
+ * Prepare Claude's canonical `~/.claude/` root before every Claude launch and
+ * enforce both repository-owned symlinks. Equivalent clobbers self-heal;
+ * divergent files remain untouched and fail loudly with recovery instructions.
+ * Null source directories independently disable their leaf (test-only seams).
  */
 export function ensureClaudeStateSharing(
   actionLog: string[] | null = null,
@@ -369,18 +413,10 @@ export function ensureClaudeStateSharing(
   claudeStowDir: string | null = null,
   sharedStowDir: string | null = null,
 ): void {
-  const canonicalDir = join(homeDir, ".claude");
-  mkdirSync(canonicalDir, { recursive: true });
-
-  if (claudeStowDir !== null) {
-    ensureClaudeSettingsSeed(homeDir, claudeStowDir, actionLog);
-  }
-
-  if (sharedStowDir !== null) {
-    ensureCanonicalStowLinks(
-      claudeStowLeaves(sharedStowDir, homeDir),
-      actionLog,
-    );
+  mkdirSync(join(homeDir, ".claude"), { recursive: true });
+  const leaves = claudeStowLeaves(claudeStowDir, sharedStowDir, homeDir);
+  if (leaves.length > 0) {
+    ensureCanonicalStowLinks(leaves, actionLog);
   }
 }
 

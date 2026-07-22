@@ -220,8 +220,12 @@ Account focuses affect only Keeper-launched Claude routing. Pi and Codex session
 Non-Codex Pi providers keep their native path, and the Pi Codex pool has its own visible native
 `openai-codex` fallback and proof-gated activation.
 
-Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
-absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.
+Keeper owns `~/.claude/settings.json` as a symlink to
+`system/claude/.claude/settings.json`. Every Keeper-launched Claude process checks that link before
+routing through claude-swap: absent and wrong-target paths are repaired, semantically equivalent JSON
+clobbers are relinked, and divergent regular files remain untouched while launch stops with inspection,
+discard, preserve, and one-launch bypass instructions. Claude-swap shares the canonical link into managed
+sessions.
 
 Private clean-break archive, outside keeper's runtime, with the archive root at mode `0700`:
 

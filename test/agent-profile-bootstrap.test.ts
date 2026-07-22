@@ -18,6 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
+import { StateError } from "../src/agent/state-sharing";
 import {
   expectExit,
   flagValues,
@@ -91,6 +92,22 @@ describe("main() passthrough commands", () => {
 // Pi carries no automatic profile selection replacement — it always runs
 // against its one canonical account.
 describe("main() has no profile farm — Claude always routes, Pi always native", () => {
+  test("a canonical-settings divergence prints recovery and blocks before spawn", async () => {
+    const h = makeHarness({ argv: ["--print"], env: {} });
+    h.deps.ensureClaudeStateSharingFn = () => {
+      throw new StateError(
+        "Canonical Claude config drift\nrepair instructions",
+      );
+    };
+
+    expect(await expectExit(main(h.deps))).toBe(1);
+    expect(h.spawned).toEqual([]);
+    expect(h.err.join("")).toContain(
+      "Error: Canonical Claude config drift\nrepair instructions",
+    );
+    expect(h.routerCalls()).toBe(0);
+  });
+
   test("an unpinned Claude launch routes via the account router", async () => {
     const h = makeHarness({ argv: ["--print"], env: {} });
     expect((await runAndCapture(h, main)).length).toBeGreaterThan(0);

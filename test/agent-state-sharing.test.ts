@@ -1,17 +1,3 @@
-/**
- * Global-instruction guard pins. `ensureCanonicalStowLinks` is generalized into
- * a per-harness leaf table: claude's CLAUDE.md, codex's AGENTS.md, and pi's
- * canonical AGENTS.md all re-link to the ONE keeper-owned system/shared/AGENTS.md,
- * with a per-leaf hard-error (claude, keeper-owned) vs warn-and-respect (codex/pi,
- * human-owned) split on a divergent regular-file clobber.
- *
- * Claude's `settings.json` is a SEPARATE, lesser mechanism: install-time seeding
- * only (create when absent), never the compare/repair/throw treatment above —
- * pinned in its own section below. There is no Keeper-owned profile farm: the
- * HOME-rooted orchestrators (`ensureClaudeStateSharing` / `ensurePiStateSharing`)
- * never create or scan `.claude-profiles` / `.pi-profiles`.
- */
-
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
@@ -72,6 +58,7 @@ describe("ensureCanonicalStowLinks — per-leaf behaviors", () => {
     const leaf = (): CanonicalStowLeaf => ({
       source: sharedSrc,
       linkPath: linkPathFor(),
+      compare: "bytes",
       onDivergence,
     });
 
@@ -137,7 +124,10 @@ describe("ensureCanonicalStowLinks — divergent-clobber split", () => {
     const linkPath = join(tmpDir, `leaf-${onDivergence}`, "DOC.md");
     mkdirSync(dirname(linkPath), { recursive: true });
     writeFileSync(linkPath, "# HUMAN EDIT — do not clobber\n");
-    return [{ source: sharedSrc, linkPath, onDivergence }, linkPath];
+    return [
+      { source: sharedSrc, linkPath, compare: "bytes", onDivergence },
+      linkPath,
+    ];
   };
 
   test("an error leaf (claude) throws StateError and leaves the file untouched", () => {
@@ -162,12 +152,24 @@ describe("ensureCanonicalStowLinks — divergent-clobber split", () => {
       log.some((l) => l.startsWith("WARNING") && l.includes(linkPath)),
     ).toBe(true);
   });
+
+  test("a warn leaf preserves a non-file clobber without reading it", () => {
+    const linkPath = join(tmpDir, "warn-directory");
+    mkdirSync(linkPath);
+    const leaf: CanonicalStowLeaf = {
+      source: sharedSrc,
+      linkPath,
+      compare: "bytes",
+      onDivergence: "warn",
+    };
+    const log: string[] = [];
+    expect(() => ensureCanonicalStowLinks([leaf], log, {})).not.toThrow();
+    expect(lstatSync(linkPath).isDirectory()).toBe(true);
+    expect(log).toEqual([expect.stringContaining("WARNING")]);
+  });
 });
 
-// Claude's settings.json is NOT a CanonicalStowLeaf: it is seeded ONCE (when
-// entirely absent) and then permanently hands-off — no compare, no repair, no
-// reject, no launch-blocking, regardless of what later sits at the path.
-describe("ensureClaudeStateSharing — settings.json install-time seed only", () => {
+describe("ensureClaudeStateSharing — canonical settings.json", () => {
   let homeDir: string;
   let claudeDir: string;
   let claudeStowDir: string;
@@ -185,45 +187,124 @@ describe("ensureClaudeStateSharing — settings.json install-time seed only", ()
     settingsLink = join(claudeDir, "settings.json");
   });
 
-  test("seeds settings.json as a symlink when absent", () => {
+  test("creates the relative settings symlink when absent", () => {
     const log: string[] = [];
     ensureClaudeStateSharing(log, homeDir, claudeStowDir, null);
     expect(lstatSync(settingsLink).isSymbolicLink()).toBe(true);
     expect(readlinkSync(settingsLink)).toBe(relative(claudeDir, settingsSrc));
-    expect(log.some((l) => l.includes("Seeded Claude settings"))).toBe(true);
+    expect(log.some((line) => line.includes("Created canonical"))).toBe(true);
   });
 
-  test("never touches an existing divergent regular file (no compare, no repair, no throw)", () => {
-    writeFileSync(settingsLink, '{"a": 999, "live": true}\n');
-    const log: string[] = [];
-    expect(() =>
-      ensureClaudeStateSharing(log, homeDir, claudeStowDir, null),
-    ).not.toThrow();
-    expect(lstatSync(settingsLink).isSymbolicLink()).toBe(false);
-    expect(readFileSync(settingsLink, "utf8")).toBe(
-      '{"a": 999, "live": true}\n',
-    );
-  });
-
-  test("never repairs an existing symlink to the wrong target", () => {
+  test("repairs a wrong-target settings symlink and logs", () => {
     const wrong = join(tmpDir, "wrong-settings.json");
     writeFileSync(wrong, "{}\n");
     symlinkSync(wrong, settingsLink);
-    ensureClaudeStateSharing([], homeDir, claudeStowDir, null);
-    expect(readlinkSync(settingsLink)).toBe(wrong);
+    const log: string[] = [];
+    ensureClaudeStateSharing(log, homeDir, claudeStowDir, null);
+    expect(readlinkSync(settingsLink)).toBe(relative(claudeDir, settingsSrc));
+    expect(log.some((line) => line.includes("wrong target"))).toBe(true);
   });
 
-  test("warns and skips when the stow source is missing, never throws", () => {
+  test("relinks semantically equal JSON despite formatting and key order", () => {
+    writeFileSync(settingsLink, '{"b":2,"a":1}');
+    const log: string[] = [];
+    ensureClaudeStateSharing(log, homeDir, claudeStowDir, null);
+    expect(lstatSync(settingsLink).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(settingsLink)).toBe(relative(claudeDir, settingsSrc));
+    expect(log.some((line) => line.includes("identical clobber"))).toBe(true);
+  });
+
+  test("treats __proto__ as data when comparing semantic JSON", () => {
+    writeFileSync(settingsLink, '{"a":1,"b":2,"__proto__":{"hook":true}}\n');
+    expect(() =>
+      ensureClaudeStateSharing([], homeDir, claudeStowDir, null),
+    ).toThrow(StateError);
+    expect(lstatSync(settingsLink).isSymbolicLink()).toBe(false);
+  });
+
+  test("blocks divergent JSON, preserves it, and prints recovery choices", () => {
+    const divergent = '{"a":999,"live":true}\n';
+    writeFileSync(settingsLink, divergent);
+    let thrown: unknown;
+    try {
+      ensureClaudeStateSharing([], homeDir, claudeStowDir, null);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StateError);
+    const message = (thrown as Error).message;
+    expect(message).toContain("diff -u");
+    expect(message).toContain("Discard the live file");
+    expect(message).toContain("Keep the live file");
+    expect(message).toContain("KEEPER_AGENT_SKIP_LINK_GUARD=1");
+    expect(lstatSync(settingsLink).isSymbolicLink()).toBe(false);
+    expect(readFileSync(settingsLink, "utf8")).toBe(divergent);
+  });
+
+  test("recovery commands shell-quote paths containing spaces and apostrophes", () => {
+    const unusualHome = join(tmpDir, "home with 'quote");
+    const unusualClaude = join(unusualHome, ".claude");
+    mkdirSync(unusualClaude, { recursive: true });
+    writeFileSync(join(unusualClaude, "settings.json"), '{"a":999}\n');
+    let message = "";
+    try {
+      ensureClaudeStateSharing([], unusualHome, claudeStowDir, null);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    const commands = message
+      .split("\n")
+      .filter((line) => /^( {2}diff | {2}rm | {2}cp )/.test(line));
+    expect(message).toContain("\\''");
+    expect(commands).toHaveLength(4);
+    for (const command of commands) {
+      expect(Bun.spawnSync(["bash", "-n", "-c", command]).exitCode).toBe(0);
+    }
+  });
+
+  test("refuses a non-file clobber without reading or removing it", () => {
+    mkdirSync(settingsLink);
+    let thrown: unknown;
+    try {
+      ensureClaudeStateSharing([], homeDir, claudeStowDir, null);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(StateError);
+    expect((thrown as Error).message).toContain("unsupported filesystem type");
+    expect(lstatSync(settingsLink).isDirectory()).toBe(true);
+  });
+
+  test("warns and skips when the repository settings source is missing", () => {
     rmSync(settingsSrc);
     const log: string[] = [];
-    expect(() =>
-      ensureClaudeStateSharing(log, homeDir, claudeStowDir, null),
-    ).not.toThrow();
+    ensureClaudeStateSharing(log, homeDir, claudeStowDir, null);
     expect(existsSync(settingsLink)).toBe(false);
-    expect(log.some((l) => l.includes("stow source missing"))).toBe(true);
+    expect(log.some((line) => line.includes("stow source missing"))).toBe(true);
   });
 
-  test("a null claudeStowDir disables seeding entirely (test-only fail-open)", () => {
+  test("the bypass leaves a divergent regular file untouched and logs loudly", () => {
+    const divergent = '{"a":999}\n';
+    writeFileSync(settingsLink, divergent);
+    const leaves: CanonicalStowLeaf[] = [
+      {
+        source: settingsSrc,
+        linkPath: settingsLink,
+        compare: "json",
+        onDivergence: "error",
+      },
+    ];
+    const log: string[] = [];
+    ensureCanonicalStowLinks(leaves, log, {
+      KEEPER_AGENT_SKIP_LINK_GUARD: "1",
+    });
+    expect(readFileSync(settingsLink, "utf8")).toBe(divergent);
+    expect(log).toEqual([
+      expect.stringContaining("settings and harness global-instruction"),
+    ]);
+  });
+
+  test("a null claudeStowDir disables the settings leaf", () => {
     ensureClaudeStateSharing([], homeDir, null, null);
     expect(existsSync(settingsLink)).toBe(false);
   });
@@ -249,12 +330,20 @@ describe("per-harness wiring resolves the leaf to the shared source", () => {
     writeFileSync(sharedSrc, "# shared canonical\n");
   });
 
-  test("claude: ~/.claude/CLAUDE.md → shared AGENTS.md", () => {
-    ensureClaudeStateSharing([], homeDir, null, sharedDir);
+  test("claude: settings.json → Claude source and CLAUDE.md → shared AGENTS.md", () => {
+    const claudeStow = join(tmpDir, "repo", "system", "claude", ".claude");
+    mkdirSync(claudeStow, { recursive: true });
+    const settingsSrc = join(claudeStow, "settings.json");
+    writeFileSync(settingsSrc, "{}\n");
+
+    ensureClaudeStateSharing([], homeDir, claudeStow, sharedDir);
 
     const claudeMd = join(homeDir, ".claude", "CLAUDE.md");
     expect(lstatSync(claudeMd).isSymbolicLink()).toBe(true);
     expect(readlinkSync(claudeMd)).toBe(relTo(claudeMd, sharedSrc));
+    const settingsLink = join(homeDir, ".claude", "settings.json");
+    expect(lstatSync(settingsLink).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(settingsLink)).toBe(relTo(settingsLink, settingsSrc));
   });
 
   test("pi: ~/.pi/agent/AGENTS.md → shared AGENTS.md, plus a sessions dir", () => {
@@ -294,7 +383,7 @@ describe("defaultClaudeStowDir", () => {
     expect(existsSync(join(dir, "CLAUDE.md"))).toBe(true);
   });
 
-  test("the real claude wiring seeds settings.json and links CLAUDE.md from absent", () => {
+  test("the real Claude wiring enforces settings.json and CLAUDE.md from absent", () => {
     const home = join(tmpDir, "guard-home");
     const claudeDir = join(home, ".claude");
     mkdirSync(claudeDir, { recursive: true });
