@@ -989,3 +989,57 @@ test("half-pidless wrapper witness: a same-attempt NULL-pid resume over a non-nu
     db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 65").get(),
   ).toEqual({ state: "bound" });
 });
+
+for (const shape of [
+  {
+    label: "numeric-string dispatch_attempt_id",
+    data: JSON.stringify({ dispatch_attempt_id: "80" }),
+    attempt: 80,
+  },
+  {
+    label: "boolean dispatch_attempt_id (SQLite would coerce true->1)",
+    data: JSON.stringify({ dispatch_attempt_id: true }),
+    attempt: 1,
+  },
+  {
+    label: "null-shadow dispatch_attempt_id over attempt_id",
+    data: JSON.stringify({ dispatch_attempt_id: null, attempt_id: 80 }),
+    attempt: 80,
+  },
+] as const) {
+  test(`malformed newest attempt (${shape.label}) yields ZERO provider cascade/signal/release`, async () => {
+    const wrapper = `wrapper-mal-${shape.attempt}`;
+    const leg = `leg-mal-${shape.attempt}`;
+    seedAttempt({
+      task: `fn-1385-malattempt-${shape.attempt}.1`,
+      attempt: shape.attempt,
+      wrapper,
+      wrapperState: "killed",
+      legs: [{ id: leg, session: `${leg}-session`, pid: 900 }],
+    });
+    // NEWEST generation: a MALFORMED attempt with a gone-looking pair, below the kill
+    // stamp so jobs stays killed carrying the newest pid/start.
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data,
+                           start_time, spawn_name, harness)
+         VALUES (500, ?, 7000, 'SessionStart', 'session_start', ?, 'linux:7000',
+                 ?, 'claude')`,
+      [wrapper, shape.data, `work::fn-1385-malattempt-${shape.attempt}.1`],
+    );
+    drainAll();
+    // The canonical witness parser rejects the malformed newest attempt → UNKNOWN →
+    // HOLD (a gone probe is short-circuited, never borrowing the newest generation).
+    const d = deps({ probeRecordedIdentity: () => "gone" });
+    await runProviderLegCascadeSweep(db, d);
+    await runProviderLegCascadeSweep(db, d);
+    d.advance(PROVIDER_LEG_TERM_GRACE_SEC + 1);
+    await runProviderLegCascadeSweep(db, d);
+    expect(cascade(leg)).toBeNull();
+    expect(d.signals).toEqual([]);
+    expect(
+      db
+        .query("SELECT state FROM dispatch_claims WHERE attempt_id = ?")
+        .get(shape.attempt),
+    ).toEqual({ state: "bound" });
+  });
+}

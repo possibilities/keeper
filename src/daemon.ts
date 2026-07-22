@@ -374,6 +374,7 @@ import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
   drain,
+  parseSessionDispatchAttempt,
   readFoldWorkMsAccum,
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
@@ -1497,12 +1498,7 @@ function latestSessionStartWitness(
 ): SessionStartWitness | null {
   const row = db
     .query(
-      `SELECT pid, start_time,
-              CASE WHEN json_valid(data) THEN COALESCE(
-                json_extract(data, '$.dispatch_attempt_id'),
-                json_extract(data, '$.attempt_id'),
-                json_extract(data, '$.dispatch.attempt_id')
-              ) END AS attempt
+      `SELECT pid, start_time, data
          FROM events
         WHERE session_id = ? AND hook_event = 'SessionStart'
           AND id <= (SELECT last_event_id FROM reducer_state WHERE id = 1)
@@ -1511,11 +1507,18 @@ function latestSessionStartWitness(
     .get(sessionId) as {
     pid: number | null;
     start_time: string | null;
-    attempt: number | string | null;
+    data: string | null;
   } | null;
   if (row == null) return null;
-  const attempt = row.attempt == null ? Number.NaN : Number(row.attempt);
-  if (!Number.isSafeInteger(attempt) || attempt !== expectedAttemptId) {
+  // Parse the attempt from the raw `data` blob with the reducer's OWN canonical
+  // semantics — never a SQL `json_extract`/`COALESCE`, which would accept a numeric
+  // STRING (`"80"`), coerce a JSON boolean to 1, and fall a present-but-null
+  // `dispatch_attempt_id` THROUGH to `attempt_id` (SQL COALESCE skips null; the
+  // reducer's first-owned-field precedence does not). A `number` verdict is a valid
+  // attempt; `null` (none recorded) and `undefined` (owned-but-invalid) are both
+  // non-numbers, so a malformed/mismatched newest generation is `"unknown"` → HOLD.
+  const attempt = parseSessionDispatchAttempt(row.data);
+  if (typeof attempt !== "number" || attempt !== expectedAttemptId) {
     return "unknown";
   }
   return { pid: row.pid, start_time: row.start_time };

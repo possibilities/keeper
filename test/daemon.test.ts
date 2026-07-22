@@ -328,8 +328,10 @@ import {
 import {
   __resetEpicIndexMemoForTest,
   drain,
+  extractSessionDispatchAttempt,
   extractSessionTelemetry,
   GIT_STATUS_DIRTY_FILES_WIRE_CAP,
+  parseSessionDispatchAttempt,
 } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import {
@@ -7046,6 +7048,126 @@ test("half-pidless witness (non-provider): a same-attempt NULL-pid resume over a
   ).toBe(false);
   db.close();
 });
+
+test("parseSessionDispatchAttempt parity pin: the witness parser matches the reducer's fold-time extraction byte-for-byte on every canonical shape", () => {
+  // The recycle-safe session witness and the reducer fold MUST read the dispatch
+  // attempt identically — a drift lets a malformed newest generation read as a valid
+  // attempt in one and not the other. This pins the exact canonical outcomes and
+  // asserts the fold's own extractor agrees (it delegates to the same helper, so a
+  // future split fails loudly). `number` = valid; `null` = none recorded; `undefined`
+  // = owned-but-invalid.
+  const cases: Array<[string | null, number | null | undefined]> = [
+    [JSON.stringify({ dispatch_attempt_id: 80 }), 80],
+    [JSON.stringify({ attempt_id: 80 }), 80],
+    [JSON.stringify({ dispatch: { attempt_id: 80 } }), 80],
+    // A numeric STRING is invalid — never coerced (the SQL json_extract trap).
+    [JSON.stringify({ dispatch_attempt_id: "80" }), undefined],
+    [JSON.stringify({ dispatch_attempt_id: " 80 " }), undefined],
+    [JSON.stringify({ dispatch_attempt_id: "8e1" }), undefined],
+    // A boolean is invalid — never coerced to 1 (the SQLite boolean→1 trap).
+    [JSON.stringify({ dispatch_attempt_id: true }), undefined],
+    // Present-but-null STOPS at the first owned field — no fall-through to attempt_id
+    // (the SQL COALESCE trap).
+    [JSON.stringify({ dispatch_attempt_id: null, attempt_id: 80 }), null],
+    // Non-positive / non-safe-integer numbers are invalid.
+    [JSON.stringify({ dispatch_attempt_id: 0 }), undefined],
+    [JSON.stringify({ dispatch_attempt_id: -3 }), undefined],
+    [JSON.stringify({ dispatch_attempt_id: 3.5 }), undefined],
+    [JSON.stringify({ dispatch_attempt_id: 2 ** 53 }), undefined],
+    // No owned field / empty / absent / malformed JSON.
+    [JSON.stringify({}), null],
+    ["", null],
+    [null, null],
+    ["not json", undefined],
+  ];
+  for (const [data, expected] of cases) {
+    expect(parseSessionDispatchAttempt(data)).toBe(expected);
+    // Byte-for-byte parity with the reducer's fold-time extractor.
+    expect(extractSessionDispatchAttempt({ data } as Event)).toBe(
+      parseSessionDispatchAttempt(data),
+    );
+  }
+});
+
+for (const shape of [
+  {
+    label: "numeric-string dispatch_attempt_id",
+    data: JSON.stringify({ dispatch_attempt_id: "80" }),
+    attempt: 80,
+  },
+  {
+    label: "boolean dispatch_attempt_id (SQLite would coerce true→1)",
+    data: JSON.stringify({ dispatch_attempt_id: true }),
+    attempt: 1,
+  },
+  {
+    label: "null-shadow dispatch_attempt_id over attempt_id",
+    data: JSON.stringify({ dispatch_attempt_id: null, attempt_id: 80 }),
+    attempt: 80,
+  },
+] as const) {
+  test(`malformed newest attempt (${shape.label}) never releases the older exact-matching claim (non-provider)`, () => {
+    const { db } = freshMemDb();
+    const sid = "sess-mal";
+    // Older, exact-matching generation on the claim's attempt.
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time, spawn_name, data)
+         VALUES (1000, ?, 1000, 'SessionStart', 'session_start', 'linux:1000', 'work::fn-mal.1', ?)`,
+      [sid, JSON.stringify({ dispatch_attempt_id: shape.attempt })],
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+         VALUES (2000, ?, NULL, 'Killed', 'killed', ?)`,
+      [
+        sid,
+        JSON.stringify({
+          pid: 1000,
+          start_time: "linux:1000",
+          close_kind: "pid_died",
+          reason: "exit_watched",
+        }),
+      ],
+    );
+    // NEWEST generation: a MALFORMED attempt with a gone-looking (present-start) pair,
+    // below the kill stamp so jobs stays terminal carrying the newest pid/start.
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time, data)
+         VALUES (500, ?, 7000, 'SessionStart', 'session_start', 'linux:7000', ?)`,
+      [sid, shape.data],
+    );
+    while (drain(db) > 0) {
+      // fold to head
+    }
+    db.run(
+      `INSERT INTO dispatch_claims (verb, id, attempt_id, state, session_id, dir,
+                                    legacy_unfenced, acquired_at, bound_at,
+                                    last_event_id, updated_at)
+         VALUES ('work', 'fn-mal.1', ?, 'bound', ?, '/repo', 0, 1, 1, 1, 2)`,
+      [shape.attempt, sid],
+    );
+    // A present-start probe reads gone, so borrowing the newest generation WOULD
+    // release. The canonical parser rejects the malformed attempt → UNKNOWN → HOLD,
+    // and never skips back to the older exact-matching row.
+    const goneOnPresentStart = (
+      _pid: number,
+      startTime: string | null,
+    ): RecordedProcessIdentityVerdict =>
+      startTime == null ? "inconclusive" : "gone";
+    expect(
+      terminalSessionClaimIsReleaseable(
+        db,
+        {
+          verb: "work",
+          id: "fn-mal.1",
+          attempt_id: shape.attempt,
+          session_id: sid,
+        },
+        goneOnPresentStart,
+      ),
+    ).toBe(false);
+    db.close();
+  });
+}
 
 test("buildRetryDispatchResultMessage: refused_live, refused_identity, and cleared replies are explicit", () => {
   expect(

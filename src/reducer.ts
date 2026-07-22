@@ -5068,14 +5068,25 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
   }
 }
 
-function extractSessionDispatchAttempt(
-  event: Event,
+/**
+ * Canonical dispatch-attempt parse for a SessionStart `data` blob — the SINGLE
+ * source of truth shared by the reducer fold ({@link extractSessionDispatchAttempt})
+ * and the daemon's recycle-safe session witness (`latestSessionStartWitness`), so a
+ * malformed newest generation can never read as a valid attempt in one and not the
+ * other. `null` = no attempt recorded (empty/absent data, or a first-owned field that
+ * is present-but-null — precedence STOPS at the first owned field, granting no
+ * top-level fall-through the reducer would not); `undefined` = an owned field carried
+ * an INVALID value (a numeric string, a boolean, a non-safe / non-positive number —
+ * `parseDispatchAttempt` accepts only a strict positive safe-integer `number`).
+ */
+export function parseSessionDispatchAttempt(
+  data: string | null,
 ): number | null | undefined {
-  if (event.data == null || event.data.length === 0) {
+  if (data == null || data.length === 0) {
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    const parsed = JSON.parse(data) as Record<string, unknown>;
     const direct = dispatchAttemptField(
       parsed,
       "dispatch_attempt_id",
@@ -5095,6 +5106,12 @@ function extractSessionDispatchAttempt(
   } catch {
     return undefined;
   }
+}
+
+export function extractSessionDispatchAttempt(
+  event: Event,
+): number | null | undefined {
+  return parseSessionDispatchAttempt(event.data);
 }
 
 function foldDispatchClaimSuperseded(db: Database, event: Event): void {
