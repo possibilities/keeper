@@ -5329,6 +5329,116 @@ function clusterEpicRepos(
 }
 
 /**
+ * PURE, testable: the clustered `serial` groups that dispatch PENDING work AFTER
+ * already running in that repo — `>=1` `done` task (the group ran + per-repo
+ * finalized here) AND `>=1` non-`done` task (a refine-apply addition made after the
+ * finalize tore the lane + `keeper/epic/<id>` branch down). With the lane gone the
+ * grandfather lapses and a `disabled` repo re-derives `serial`, so the next dispatch
+ * degrades to a worktree-less launch on the SHARED checkout — the wrong-tree-guard
+ * inert, the worker's dirt coupling with anything else landing there. A worktree-
+ * ELIGIBLE re-opened group instead re-cuts a fresh lane (eligibility is independent
+ * of the lapsed grandfather), so it is never `serial` and never listed. The producer
+ * NAMES each listed degrade so it is never a SILENT `worktree:None`; a genuine re-cut
+ * of a `disabled` repo is blocked by the eligibility contract (a worktree there would
+ * hand a fresh checkout the wrong dependency tree — for a monorepo/submodule — so
+ * serial is the unavoidable degrade the finalize's own missing-branch tolerance was
+ * already built to survive). A FRESH serial group (no `done` task) is the normal
+ * `disabled` contract, not a degrade, and is never listed; the task-less primary
+ * close-sink anchor never matches (it carries zero tasks). Ordered by
+ * `(epic_id, repoDir)` for a deterministic list.
+ */
+export function clusteredSerialReopenDegrades(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+): Array<{ epicId: string; repoDir: string }> {
+  const out: Array<{ epicId: string; repoDir: string }> = [];
+  for (const epic of epics) {
+    const res = worktreeRepoByEpicId.get(epic.epic_id);
+    if (res?.kind !== "clustered") {
+      continue;
+    }
+    const phaseById = new Map(
+      epic.tasks.map((t) => [t.task_id, t.worker_phase]),
+    );
+    for (const g of res.groups) {
+      if (g.mode !== "serial") {
+        continue;
+      }
+      let hasDone = false;
+      let hasPending = false;
+      for (const id of g.taskIds) {
+        if (phaseById.get(id) === "done") {
+          hasDone = true;
+        } else {
+          hasPending = true;
+        }
+      }
+      if (hasDone && hasPending) {
+        out.push({ epicId: epic.epic_id, repoDir: g.repoDir });
+      }
+    }
+  }
+  out.sort(
+    (a, b) =>
+      a.epicId.localeCompare(b.epicId) || a.repoDir.localeCompare(b.repoDir),
+  );
+  return out;
+}
+
+/**
+ * Per-(epic, repo) latch for the clustered serial-reopen degrade notice, so a
+ * persistent degrade — a level-triggered loop re-observes it every cycle — logs ONE
+ * line per EPISODE, re-arming only once the group re-cuts / the epic closes and the
+ * key is no longer observed. Live-only process state — never a fold read, never
+ * persisted.
+ */
+const serialReopenDegradeLatch = new Map<string, string>();
+
+/** Emit the bounded serial-reopen degrade notice once per (epic, repo) episode. */
+function logSerialReopenDegradeOnce(
+  epicId: string,
+  repoDir: string,
+  reason: string,
+  seen: Set<string>,
+): void {
+  const key = `${epicId}\0${repoDir}`;
+  seen.add(key);
+  if (serialReopenDegradeLatch.get(key) === reason) {
+    return;
+  }
+  serialReopenDegradeLatch.set(key, reason);
+  console.error(
+    `[autopilot-worker] worktree-serial-reopen-degrade: epic ${epicId} dispatches a task worktree-less on the shared checkout of ${repoDir} — the repo group finalized and its lane was torn down, so a post-finalize task addition degrades to serial (${reason}); the wrong-tree-guard is inert there`,
+  );
+}
+
+/**
+ * Log every clustered serial-reopen degrade for this cycle (bounded, one line per
+ * episode) and drop latch keys no longer observed so a later recurrence reports
+ * afresh. Names the repo's `disabled` reason via the memoized `assessRepo`.
+ */
+export function reportSerialReopenDegrades(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  assessRepo: (toplevel: string) => WorktreeEligibility,
+): void {
+  const seen = new Set<string>();
+  for (const d of clusteredSerialReopenDegrades(epics, worktreeRepoByEpicId)) {
+    logSerialReopenDegradeOnce(
+      d.epicId,
+      d.repoDir,
+      assessRepo(d.repoDir).reason,
+      seen,
+    );
+  }
+  for (const key of serialReopenDegradeLatch.keys()) {
+    if (!seen.has(key)) {
+      serialReopenDegradeLatch.delete(key);
+    }
+  }
+}
+
+/**
  * PRODUCER: the per-epic grandfather predicate threaded into
  * {@link classifyWorktreeRepos} — true IFF epic `epicId` ALREADY has a live
  * worktree lane on `repoDir`, so a `disabled` verdict must NOT flip it (see the
@@ -11503,6 +11613,11 @@ export async function loadReconcileSnapshot(
         worktreeMultiRepo,
       )
     : new Map<string, WorktreeRepoResolution>();
+  // SAY-SO: a clustered `serial` group that gained a task AFTER finalizing here
+  // dispatches worktree-less on the shared checkout — name each degrade once per
+  // episode (bounded latch) so it is never a SILENT worktree:None. A no-op when
+  // worktree mode is OFF (the resolution is empty → no clustered groups).
+  reportSerialReopenDegrades(epics, worktreeRepoByEpicId, assessResolver);
   // The recover sweep's KNOWN-ROOTS set — every git-tracked project dir
   // (from the git-status projection) RESOLVED to its toplevel, so a repo carrying
   // a done-but-unmerged base whose epic was already reaped from the projection is
