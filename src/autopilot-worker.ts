@@ -4127,10 +4127,20 @@ export interface OriginContainmentStuckTracker {
     /** This cycle's repos with POSITIVE containment evidence (pushed / already-contained /
      *  remote-ahead) — re-arms the grace latch and level-clears any open row. */
     healthy: ReadonlySet<string>;
+    /** This cycle's repos observed NEUTRAL-and-retryable (a `deferred` inconclusive probe,
+     *  NOT the owner-attempt guard). They start no episode and mint nothing, but they DO arm a
+     *  bounded retry so a FIRST-cycle unknown on a quiescent DB still gets a clock edge to
+     *  re-probe. Optional (absent ⇒ empty) for call-site back-compat. */
+    neutralRetry?: ReadonlySet<string>;
     /** `repoDir`s that currently have an OPEN origin-containment distress row. */
     openDistressDirs: ReadonlySet<string>;
     nowSec: number;
   }): OriginContainmentDecision;
+  /** Drop ALL in-memory episode accounting (the `firstStuck` latch). Called on a POSITIVE
+   *  worktree-mode disable alongside the durable row clears, so a re-enable starts every repo
+   *  on a FRESH full grace — never minting from stale disabled-time accounting, and never
+   *  leaving a minted-then-cleared episode permanently latched. */
+  reset(): void;
 }
 
 export function createOriginContainmentStuckTracker(
@@ -4141,7 +4151,10 @@ export function createOriginContainmentStuckTracker(
   // stuck episode. In-worker memory only; a restart re-seeds the clear off the open-row set.
   const firstStuck = new Map<string, { sinceSec: number; minted: boolean }>();
   return {
-    step({ unhealthy, healthy, openDistressDirs, nowSec }) {
+    reset() {
+      firstStuck.clear();
+    },
+    step({ unhealthy, healthy, neutralRetry, openDistressDirs, nowSec }) {
       const decision: OriginContainmentDecision = {
         mint: [],
         clear: [],
@@ -4193,7 +4206,10 @@ export function createOriginContainmentStuckTracker(
       for (const dir of openDistressDirs) {
         if (!cleared.has(dir)) hasOpenAfterClear = true;
       }
-      if (hasOpenAfterClear) {
+      // A NEUTRAL-retryable probe this cycle (a first-cycle unknown that started no episode and
+      // opened no row) still needs a clock edge — otherwise a quiescent DB never re-probes it.
+      const hasNeutralRetry = (neutralRetry?.size ?? 0) > 0;
+      if (hasOpenAfterClear || hasNeutralRetry) {
         candidates.push(nowSec + retryIntervalSec);
       }
       decision.nextWakeAt =
@@ -8749,13 +8765,18 @@ export type OriginContainmentResult =
   // the other) — keeper cannot reconcile without a human (no fetch/rebase/force). NO push;
   // sustained past the grace it pages the operator. `ahead` is the local lead for context.
   | { kind: "diverged"; ahead: number }
-  // ACTIONABLE: origin/<default> was NEVER pushed and no owner (finalize/recover) exists to
-  // make the first push, so it can never self-resolve — sustained past the grace it pages a
-  // FIRST-PUSH-NEEDED row. NEVER auto-pushed (no cached positive-lead evidence exists).
+  // ACTIONABLE: origin/<default> was NEVER pushed (the git ref-probe DEFINITIVELY absent, exit
+  // 1) and no owner (finalize/recover) exists to make the first push, so it can never
+  // self-resolve — sustained past the grace it pages a FIRST-PUSH-NEEDED row. NEVER auto-pushed
+  // (no cached positive-lead evidence exists).
   | { kind: "first-push-needed" }
-  // NEUTRAL: a genuinely INCONCLUSIVE probe (a 124/128 git read, an unparseable count) OR a
-  // push already attempted this cycle by an owner — DEFER, no push, no page (tri-state).
+  // NEUTRAL-RETRY: a genuinely INCONCLUSIVE probe (a 124/128 git read, an unparseable count, an
+  // UNKNOWN ref-probe error) — DEFER, no push, no page, but a bounded retry re-probes so a
+  // first-cycle unknown on a quiescent DB still gets a clock edge.
   | { kind: "deferred"; reason: string }
+  // NEUTRAL-GUARDED: a push already attempted this cycle by an OWNER (finalize/recover) — DEFER
+  // with NO retry wake: the owner already has an event/clock path, so re-probing here is waste.
+  | { kind: "owner-attempt" }
   // The push-side degrades. ALL are ACTIONABLE in the ownerless containment context (no
   // finalize owner exists to surface them): `push-timeout`/`push-failed` (local leads but
   // the push will not land — silent-lag), `off-branch` (checkout off default), `not-turn-key`
@@ -8794,10 +8815,7 @@ export async function reconcileOriginContainment(
   pushInFlight = false,
 ): Promise<OriginContainmentResult> {
   if (pushInFlight) {
-    return {
-      kind: "deferred",
-      reason: `a finalize/recover push already ran this cycle for ${repo}`,
-    };
+    return { kind: "owner-attempt" };
   }
   const remoteRef = originDefaultRef(defaultBranch);
   const localRef = `refs/heads/${defaultBranch}`;
@@ -8805,11 +8823,19 @@ export async function reconcileOriginContainment(
     cwd: repo,
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
-  if (exists.code !== 0) {
-    // origin/<default> was never pushed. In the ownerless containment context there is no
-    // finalize to make the first push, so this can never self-resolve — it is ACTIONABLE
-    // (a first-push-needed row past the grace), NOT auto-pushed (no cached lead to prove).
+  // FAIL-OPEN on the ref probe: exit 1 is git's DEFINITIVE "ref does not exist" — only that
+  // mints first-push-needed. A 124 timeout / 128 error / 127 spawn-fail is UNKNOWN, never a
+  // positive absence, so it DEFERS (a bounded retry re-probes) — never a false first-push page.
+  if (exists.code === 1) {
+    // origin/<default> was never pushed and no owner exists to make the first push, so it can
+    // never self-resolve — ACTIONABLE (a first-push-needed row past the grace), NOT auto-pushed.
     return { kind: "first-push-needed" };
+  }
+  if (exists.code !== 0) {
+    return {
+      kind: "deferred",
+      reason: `could not resolve origin/${defaultBranch} (rev-parse exit ${exists.code})`,
+    };
   }
   const contains = await run(
     ["merge-base", "--is-ancestor", remoteRef, localRef],
@@ -8864,9 +8890,11 @@ export async function reconcileOriginContainment(
  *    while local leads (silent-lag), a true `diverged`, an `off-branch` checkout, a
  *    `not-turn-key` push (auth/remote/target), a `non-ff` after the positive-lead probe, or
  *    a `first-push-needed` never-pushed origin. Advances the grace clock, carrying the reason.
- *  - `neutral` — a genuinely INCONCLUSIVE probe (`deferred`: a 124/128 git read, an
- *    unparseable count, OR the owner-attempt guard): neither clears nor advances (tri-state
- *    discipline — an unknown state is never a licence to page OR to dismiss a live row). Pure.
+ *  - `neutral` — neither clears nor advances (tri-state — an unknown state never pages OR
+ *    dismisses a live row): a `deferred` INCONCLUSIVE probe (a 124/128 read, an unparseable
+ *    count, an unknown ref-probe) OR the `owner-attempt` guard. The GLUE re-probes a `deferred`
+ *    dir on a bounded retry (a first-cycle unknown still gets a clock edge) but NOT an
+ *    `owner-attempt` (the owner already has an event path). Pure.
  */
 export function classifyOriginContainment(
   repo: string,
@@ -8917,6 +8945,7 @@ export function classifyOriginContainment(
         reason: `${prefix}origin/${defaultBranch} has never been pushed and no owner exists to make the first push past the ${graceMin}min grace — push ${defaultBranch} to origin once ${tail}`,
       };
     case "deferred":
+    case "owner-attempt":
       return { class: "neutral" };
     default:
       return assertNever(result);
@@ -14643,6 +14672,10 @@ function main(): void {
             );
             const unhealthy = new Map<string, string>();
             const healthy = new Set<string>();
+            // NEUTRAL-retryable dirs (a `deferred` inconclusive probe, NEVER the `owner-attempt`
+            // guard): they mint nothing but still need a bounded retry wake so a FIRST-cycle
+            // unknown on a quiescent DB re-probes rather than going dark.
+            const neutralRetry = new Set<string>();
             for (const {
               dir,
               defaultBranch,
@@ -14662,11 +14695,14 @@ function main(): void {
                 healthy.add(dir);
               } else if (health.class === "actionable") {
                 unhealthy.set(dir, health.reason);
+              } else if (result.kind === "deferred") {
+                neutralRetry.add(dir);
               }
             }
             const containmentDecision = originContainmentStuckTracker.step({
               unhealthy,
               healthy,
+              neutralRetry,
               openDistressDirs: openContainmentDirs,
               nowSec: deps.now(),
             });
@@ -14707,14 +14743,22 @@ function main(): void {
           // paging jam) — level-clear every OPEN row, keyed straight off the durable open set
           // (the in-memory latch is irrelevant). Empty on an unknown/degraded mode read or
           // while paused, so a live jam is never dismissed.
-          for (const { id, dir } of originContainmentModeOffClears(
+          const modeOffClears = originContainmentModeOffClears(
             snapshot.worktreeMode,
             state.paused,
             openContainmentDirs,
-          )) {
+          );
+          for (const { id, dir } of modeOffClears) {
             deps.clearSharedWedgeDistress?.(
               claimlessDistressClear(snapshot.dispatchFailureFences, id, dir),
             );
+          }
+          // A POSITIVE disable (mode explicitly false, not paused) must RESET the in-memory
+          // episode latch alongside the durable row clears — else a re-enable mints immediately
+          // from stale disabled-time accounting, or a minted-then-cleared episode never mints
+          // again. The helper already gates on exactly that condition, so reuse its verdict.
+          if (snapshot.worktreeMode === false && !state.paused) {
+            originContainmentStuckTracker.reset();
           }
           // A DISABLED sweep (mode-off / paused / no driver) is a positive no-candidate — disarm
           // the containment edge; `play` / a mode flip delivers the explicit re-kick.

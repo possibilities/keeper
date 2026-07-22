@@ -25611,6 +25611,9 @@ function makeContainmentGit(
   opts: {
     headBranch?: string;
     originResolves?: boolean;
+    // Explicit exit code for the origin-ref probe (overrides originResolves). exit 1 →
+    // definitely-absent; 124/128 → UNKNOWN error.
+    originResolveExit?: number;
     originContainedExit?: number;
     // The second divergence probe: is local <default> an ancestor of origin? exit 0 →
     // origin strictly ahead (remote-ahead, healthy); exit 1 → true divergence. Default 1.
@@ -25643,6 +25646,9 @@ function makeContainmentGit(
       return { code: 0, stdout: `${def}\n`, stderr: "" };
     }
     if (joined === `rev-parse --verify --quiet ${originDefaultRef(def)}`) {
+      if (opts.originResolveExit !== undefined) {
+        return { code: opts.originResolveExit, stdout: "", stderr: "" };
+      }
       return opts.originResolves === false
         ? { code: 1, stdout: "", stderr: "" }
         : { code: 0, stdout: "deadbeef\n", stderr: "" };
@@ -25851,7 +25857,10 @@ test("fn-13 reconcileOriginContainment DEFERS when the ahead-count is inconclusi
 test("fn-13 reconcileOriginContainment does NOT double-fire when a push is already in flight this cycle", async () => {
   const g = makeContainmentGit({ aheadCount: "4" });
   const res = await reconcileOriginContainment("/repo", "main", g.run, true);
-  expect(res.kind).toBe("deferred");
+  // owner-attempt (distinct from a probe-error deferred): the owner already has an event path,
+  // so the containment fallback neither pages NOR arms a bounded retry for it.
+  expect(res.kind).toBe("owner-attempt");
+  expect(classifyOriginContainment("/repo", "main", res).class).toBe("neutral");
   // A short-circuit BEFORE any git read — never re-probes or re-pushes.
   expect(g.calls.length).toBe(0);
 });
@@ -25885,11 +25894,7 @@ test("fn-13 driver.reconcileOrigin defers a repo already pushed this cycle — n
   if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
   const outcomes = await driver.reconcileOrigin([repo]);
   expect(outcomes).toEqual([
-    {
-      dir: repo,
-      defaultBranch: "main",
-      result: { kind: "deferred", reason: expect.any(String) },
-    },
+    { dir: repo, defaultBranch: "main", result: { kind: "owner-attempt" } },
   ]);
   // Exactly ONE push origin this cycle — the finalize leg's, never a containment re-push.
   expect(g.calls.filter((c) => c.args === "push origin main").length).toBe(1);
@@ -25958,7 +25963,7 @@ test("13b ordering: an owner push that TIMED OUT this cycle still blocks a conta
   const driver = createWorktreeDriver(g.run);
   if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
   const [outcome] = await driver.reconcileOrigin([repo]);
-  expect(outcome.result.kind).toBe("deferred"); // guard short-circuit — no second push
+  expect(outcome.result.kind).toBe("owner-attempt"); // guard short-circuit — no second push
   expect(g.calls.filter((c) => c.args === "push origin main").length).toBe(1);
 });
 
@@ -25967,11 +25972,11 @@ test("13b ordering: beginContainmentCycle re-arms the guard so the NEXT cycle re
   const g = makeContainmentGit({ aheadCount: "4" });
   const driver = createWorktreeDriver(g.run);
   if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
-  // Cycle 1: an owner push stamps the guard → containment defers.
+  // Cycle 1: an owner push stamps the guard → containment defers (owner-attempt).
   beginContainmentCycle();
   await pushDefaultToOrigin(repo, "main", g.run);
   expect((await driver.reconcileOrigin([repo]))[0].result.kind).toBe(
-    "deferred",
+    "owner-attempt",
   );
   // Cycle 2: the guard is cleared → no owner push → containment fires.
   beginContainmentCycle();
@@ -26205,4 +26210,142 @@ test("13c open-row union: a repo with an open row but no epic/root is still re-p
   const orphanRoot = "/repo-13c-orphan-open-row";
   const repos = reposForRecovery([], new Map(), [orphanRoot]);
   expect(repos).toContain(orphanRoot);
+});
+
+// --- 13d: ref-probe fail-open, first-cycle neutral clock edge, mode-off tracker reset ---
+
+test("13d reconcileOriginContainment ref-probe FAILS OPEN: exit 1 → first-push-needed, 124/128 → deferred", async () => {
+  // Only git's DEFINITIVE missing-ref exit (1) mints first-push-needed; an UNKNOWN read never
+  // becomes a false first-push page.
+  const absent = makeContainmentGit({ originResolveExit: 1 });
+  expect(
+    (await reconcileOriginContainment("/repo", "main", absent.run)).kind,
+  ).toBe("first-push-needed");
+
+  for (const exit of [GIT_SPAWN_TIMEOUT_CODE, 128]) {
+    const g = makeContainmentGit({ originResolveExit: exit });
+    const res = await reconcileOriginContainment("/repo", "main", g.run);
+    expect(res.kind).toBe("deferred");
+    // Deferred (neutral) — NOT first-push-needed, and no push.
+    expect(classifyOriginContainment("/repo", "main", res).class).toBe(
+      "neutral",
+    );
+    expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+  }
+});
+
+test("13d tracker: a FIRST-cycle neutral-retry probe (no episode, no open row) still arms a bounded retry", () => {
+  // BLOCKER-addition 2: without threading neutralRetry, the first ownerless probe-error for a
+  // repo would come back nextWakeAt=null and a quiescent DB would never re-probe it.
+  const tracker = createOriginContainmentStuckTracker(600, 60);
+  const dir = "/repo-13d-neutral";
+  const decision = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set<string>(),
+    neutralRetry: new Set([dir]),
+    openDistressDirs: new Set<string>(),
+    nowSec: 1000,
+  });
+  expect(decision).toEqual({ mint: [], clear: [], nextWakeAt: 1060 });
+  // With NO neutral-retry (and nothing else), the edge is null (disarm) — the guarded/quiescent case.
+  expect(
+    tracker.step({
+      unhealthy: new Map(),
+      healthy: new Set<string>(),
+      neutralRetry: new Set<string>(),
+      openDistressDirs: new Set<string>(),
+      nowSec: 1000,
+    }).nextWakeAt,
+  ).toBeNull();
+});
+
+test("13d tracker.reset(): a positive mode-off disable un-latches the episode so re-enable starts a FRESH grace", () => {
+  const grace = 600;
+  const tracker = createOriginContainmentStuckTracker(grace, 60);
+  const dir = "/repo-13d-reset";
+  const unhealthy = new Map([
+    [dir, `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: x`],
+  ]);
+  const empty = new Set<string>();
+  // An episode accrues most of its grace…
+  tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 0,
+  });
+  tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: grace - 10,
+  });
+  // …mode off → reset drops the in-memory accounting.
+  tracker.reset();
+  // Re-enabled, STILL actionable: a FRESH grace starts at the re-enable ts — NOT an immediate
+  // mint from stale disabled-time accounting.
+  const reenable = 10_000;
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: reenable,
+    }).mint,
+  ).toEqual([]);
+  // Only after the full fresh grace does it mint (exactly once — not permanently latched off).
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: reenable + grace,
+    }).mint,
+  ).toEqual([
+    {
+      id: originContainmentDistressId(dir),
+      dir,
+      reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: x`,
+    },
+  ]);
+});
+
+test("13d tracker.reset(): a MINTED episode whose row was cleared at mode-off can mint AGAIN after re-enable", () => {
+  const grace = 600;
+  const tracker = createOriginContainmentStuckTracker(grace, 60);
+  const dir = "/repo-13d-remint";
+  const unhealthy = new Map([
+    [dir, `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: x`],
+  ]);
+  const empty = new Set<string>();
+  tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 0,
+  });
+  const minted = tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: grace,
+  });
+  expect(minted.mint).toHaveLength(1); // minted:true latched
+  // Mode-off clears the durable row AND resets the tracker; without the reset, this minted:true
+  // episode would never mint again even though its row is gone.
+  tracker.reset();
+  tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 20_000,
+  });
+  expect(
+    tracker.step({
+      unhealthy,
+      healthy: empty,
+      openDistressDirs: empty,
+      nowSec: 20_000 + grace,
+    }).mint,
+  ).toHaveLength(1);
 });

@@ -879,11 +879,13 @@ export function buildRetryDispatchResultMessage(args: {
  * EXEMPTS the crash-loop and repeated-native-crash distress keys AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
- * isSharedDesyncDistressKey}) distress key: each is un-retryable by the wire validator
+ * isSharedDesyncDistressKey}) / per-repo origin-containment-stuck ({@link
+ * isOriginContainmentDistressKey}) distress key: each is un-retryable by the wire validator
  * BY DESIGN (an operator never clears them through the retry wire), and a level-trigger
  * (main's boot recovery / the recover pass observing the lane clean / the stale-base
  * probe observing the lane re-based or torn down / the desync content probe observing
- * the checkout carry the default tip) owns dropping them — so the orphan sweep must
+ * the checkout carry the default tip / the origin-containment sweep observing origin contain
+ * or lead local default) owns dropping them — so the orphan sweep must
  * never reap a self-managed row out from under its signal. The per-repo shared-base
  * repair latch (`repair::<repo-token>`) is exempt for a DIFFERENT reason: its verb IS
  * retryable via the wire (`keeper autopilot retry repair::<token>` re-arms a stranded
@@ -2447,10 +2449,11 @@ export function buildRepairHumanNotifyBody(args: {
 
 /**
  * Build the ONE structured operator page the shared-checkout page-once sweep sends over
- * agentbot when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
+ * agentbot when a `shared-checkout-{dirty,desync}:<repoHash>` / `origin-containment-stuck:
+ * <repoHash>` (and the bus/monitor-slot/zombie/lane siblings) distress row has stayed live
  * past its producer's grace watermark. Short by design — the sticky distress row carries
  * the full context on the board; this is the courtesy page that names the affected
- * subsystem, hazard, and clear evidence. The `id` picks bus/dirty/desync wording. Pure —
+ * subsystem, hazard, and clear evidence. The `id` picks bus/dirty/desync/origin wording. Pure —
  * no clock/fs/spawn. These rows clear EXCLUSIVELY via their producer level-trigger
  * (never `keeper autopilot retry`), so the page names no re-arm command.
  */
@@ -15541,8 +15544,9 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // OPEN, not-yet-paged shared-checkout hygiene rows. The live producer for each
-  // family owns its clear; this reader only feeds their page-once promotion.
+  // OPEN, not-yet-paged synthetic-`daemon` hygiene rows — the shared-checkout dirty/desync,
+  // lane teardown/backup, monitor-slot, zombie-session, and origin-containment-stuck families.
+  // The live producer for each owns its clear; this reader only feeds their page-once promotion.
   function selectUnpagedSharedCheckoutRows(
     excludeIds: ReadonlySet<string> = new Set(),
   ): SharedCheckoutPageRow[] {
