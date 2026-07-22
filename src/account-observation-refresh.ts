@@ -67,9 +67,33 @@ const realTryAcquireLock: TryAcquireRefreshLock = (path) =>
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-export async function refreshObservationIfStale(
+/**
+ * How one provider-safe refresh resolved, so a caller can distinguish a
+ * completed provider call from a withheld one without re-deriving state.
+ * `contended` means the refresh lock stayed held for the whole bounded wait,
+ * so this attempt withheld its own provider call rather than pile a second on.
+ */
+export type RefreshOutcome =
+  | "already-fresh"
+  | "peer-published"
+  | "refreshed"
+  | "contended";
+
+export interface RefreshResult {
+  outcome: RefreshOutcome;
+  /** Best available observation after the attempt, or null when none exists. */
+  observation: Observation | null;
+}
+
+/**
+ * The shared provider-safe refresh both the observer cadence and an on-demand
+ * launch refresh run through: at most one bounded `cswap` call under a
+ * nonblocking lock, with contention bounded to a re-read rather than a second
+ * provider call.
+ */
+export async function runProviderSafeRefresh(
   deps: RefreshObservationDeps,
-): Promise<Observation | null> {
+): Promise<RefreshResult> {
   const sidecar = observationSidecarPath(deps.stateDir);
   const freshSidecar = (): Observation | null => {
     const observation = readObservationSidecar(sidecar);
@@ -79,7 +103,7 @@ export async function refreshObservationIfStale(
       : null;
   };
   const before = freshSidecar();
-  if (before) return before;
+  if (before) return { outcome: "already-fresh", observation: before };
 
   mkdirSync(deps.stateDir, { recursive: true });
   const acquire = deps.tryAcquireLock ?? realTryAcquireLock;
@@ -99,20 +123,31 @@ export async function refreshObservationIfStale(
     await sleep(delay);
     remainingMs -= delay;
     const published = freshSidecar();
-    if (published) return published;
+    if (published) return { outcome: "peer-published", observation: published };
     lock = acquire(lockPath);
   }
-  if (lock === null) return readObservationSidecar(sidecar);
+  if (lock === null) {
+    return {
+      outcome: "contended",
+      observation: readObservationSidecar(sidecar),
+    };
+  }
 
   try {
     const underLock = freshSidecar();
-    if (underLock) return underLock;
+    if (underLock) return { outcome: "peer-published", observation: underLock };
     const observation = await observeOnce(deps);
     publishObservation(deps.stateDir, observation);
-    return observation;
+    return { outcome: "refreshed", observation };
   } finally {
     lock.release();
   }
+}
+
+export async function refreshObservationIfStale(
+  deps: RefreshObservationDeps,
+): Promise<Observation | null> {
+  return (await runProviderSafeRefresh(deps)).observation;
 }
 
 /** Preserve the caller environment; no retired provider-specific flags exist. */

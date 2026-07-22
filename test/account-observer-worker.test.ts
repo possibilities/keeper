@@ -104,6 +104,7 @@ describe("AccountObserver", () => {
         tryAcquireLock: () => null,
         contentionWaitMs: 7,
         contentionTimeoutMs: 7,
+        logLine: () => {},
       });
       await observer.runCycleNoThrow();
       expect(sleeps).toBe(1);
@@ -142,6 +143,69 @@ describe("AccountObserver", () => {
       await observer.run();
       expect(calls).toHaveLength(1);
       expect(sleepDurations).toEqual([210_000]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("at-risk cadence visibility", () => {
+  test("a keeping-up cycle never logs at-risk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
+    try {
+      const logs: string[] = [];
+      const observer = new AccountObserver({
+        stateDir: dir,
+        runner: runnerWithCalls().runner,
+        clock: { nowMs: () => NOW_MS, uniform: () => 0, sleep: async () => {} },
+        shutdownSignal: new AbortController().signal,
+        cswapArgv: CSWAP_ARGV,
+        tryAcquireLock: () => fakeLock(),
+        logLine: (line) => logs.push(line),
+      });
+      await observer.runCycleNoThrow();
+      expect(logs).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("at-risk fires once per episode and re-arms after a fresh success", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
+    try {
+      const logs: string[] = [];
+      let contended = true;
+      let now = NOW_MS;
+      const observer = new AccountObserver({
+        stateDir: dir,
+        runner: runnerWithCalls().runner,
+        clock: { nowMs: () => now, uniform: () => 0, sleep: async () => {} },
+        shutdownSignal: new AbortController().signal,
+        cswapArgv: CSWAP_ARGV,
+        tryAcquireLock: () => (contended ? null : fakeLock()),
+        contentionWaitMs: 1,
+        contentionTimeoutMs: 1,
+        logLine: (line) => logs.push(line),
+      });
+      const atRisk = (): string[] =>
+        logs.filter((line) => line.includes("refresh cadence at risk"));
+
+      // Episode one: repeated contention logs exactly once.
+      await observer.runCycleNoThrow();
+      await observer.runCycleNoThrow();
+      expect(atRisk()).toHaveLength(1);
+      expect(atRisk()[0]).toContain("refresh-lock contention");
+
+      // A fresh success clears the episode without logging.
+      contended = false;
+      await observer.runCycleNoThrow();
+      expect(atRisk()).toHaveLength(1);
+
+      // Drifting past the ceiling minus one interval re-arms and logs again.
+      contended = true;
+      now = NOW_MS + 200_000;
+      await observer.runCycleNoThrow();
+      expect(atRisk()).toHaveLength(2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

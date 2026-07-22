@@ -27,6 +27,7 @@ import {
   type Route,
   readObservationSidecar,
 } from "./account-observation";
+import type { RefreshResult } from "./account-observation-refresh";
 import {
   fableFocusPolicyPath,
   LEDGER_SCHEMA_VERSION,
@@ -79,6 +80,24 @@ export type RouteResolution =
 
 export type RequestedRouteResolution = RouteResolution;
 
+/**
+ * A bounded on-demand refresh attempt, resolved to how it should shape a launch
+ * decision. `refreshed` means a fresh, healthy observation is now published;
+ * the other arms each carry a PII-free detail the refusal names so the next
+ * stale incident is diagnosable without archaeology.
+ */
+export type OnDemandRefreshOutcome =
+  | { kind: "refreshed" }
+  | { kind: "still-stale" }
+  | { kind: "pacing-declined"; detail: string }
+  | { kind: "provider-failed"; detail: string };
+
+/** Provider-safe on-demand refresh seam; the launcher wires the real path. */
+export type OnDemandRefresh = (input: {
+  stateDir: string;
+  nowMs: number;
+}) => Promise<OnDemandRefreshOutcome>;
+
 export interface SelectRouteDeps {
   stateDir?: string;
   nowMs?: number;
@@ -90,6 +109,12 @@ export interface SelectRouteDeps {
   focusDelivery?: FableFocusDelivery;
   /** Independently injectable Non-Fable-focus delivery. */
   nonFableFocusDelivery?: NonFableFocusDelivery;
+  /**
+   * When set, a launch that finds a stale snapshot runs one bounded on-demand
+   * refresh through this seam before refusing. Absent (the pure selectors),
+   * staleness refuses immediately as before.
+   */
+  refreshObservation?: OnDemandRefresh;
 }
 
 function displayOrdinal(
@@ -146,6 +171,119 @@ export function selectRouteByAccountOrdinal(
   }
 }
 
+/**
+ * Automatic selection that, on a stale snapshot, runs one bounded on-demand
+ * refresh through `deps.refreshObservation` before refusing. A happy (fresh)
+ * path never invokes the refresh; a still-stale, pacing-declined, or failed
+ * refresh yields a typed refusal that names the cause and the manual fallback.
+ */
+export async function selectRouteWithRefresh(
+  deps: SelectRouteDeps = {},
+): Promise<RouteResolution> {
+  return withOnDemandRefresh(deps, () => selectRoute(deps));
+}
+
+/** Explicit-ordinal selection with the same on-demand refresh-before-refusal. */
+export async function selectRouteByAccountOrdinalWithRefresh(
+  ordinal: number,
+  deps: SelectRouteDeps = {},
+): Promise<RequestedRouteResolution> {
+  return withOnDemandRefresh(deps, () =>
+    selectRouteByAccountOrdinal(ordinal, deps),
+  );
+}
+
+/** Return the current snapshot only when it exists and is genuinely stale. */
+function staleObservation(stateDir: string, nowMs: number): Observation | null {
+  const observation = readObservationSidecar(observationSidecarPath(stateDir));
+  if (observation === null || isObservationFresh(observation, nowMs)) {
+    return null;
+  }
+  return observation;
+}
+
+async function withOnDemandRefresh(
+  deps: SelectRouteDeps,
+  select: () => RouteResolution,
+): Promise<RouteResolution> {
+  const refresh = deps.refreshObservation;
+  if (!refresh) return select();
+  const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
+  const nowMs = deps.nowMs ?? Date.now();
+  const stale = staleObservation(stateDir, nowMs);
+  if (stale === null) return select();
+  let outcome: OnDemandRefreshOutcome;
+  try {
+    outcome = await refresh({ stateDir, nowMs });
+  } catch {
+    outcome = { kind: "still-stale" };
+  }
+  if (outcome.kind === "refreshed") return select();
+  return {
+    ok: false,
+    error: onDemandRefusal(stale, nowMs, deps.model, outcome),
+  };
+}
+
+/**
+ * Map a completed {@link RefreshResult} to how a launch should treat it. A
+ * fresh, healthy observation proceeds; a fresh-but-unhealthy one is a provider
+ * failure; a withheld (contended) attempt is pacing; anything still stale asks
+ * for another cycle. Callers pass a post-fetch `nowMs`.
+ */
+export function classifyOnDemandRefresh(
+  result: RefreshResult,
+  nowMs: number,
+): OnDemandRefreshOutcome {
+  const observation = result.observation;
+  if (observation !== null && isObservationFresh(observation, nowMs)) {
+    return observation.health === "ok"
+      ? { kind: "refreshed" }
+      : { kind: "provider-failed", detail: observation.health };
+  }
+  if (result.outcome === "contended") {
+    return {
+      kind: "pacing-declined",
+      detail: "a refresh is already in progress",
+    };
+  }
+  return { kind: "still-stale" };
+}
+
+function onDemandRefusal(
+  observation: Observation,
+  nowMs: number,
+  model: string | null | undefined,
+  outcome: Exclude<OnDemandRefreshOutcome, { kind: "refreshed" }>,
+): string {
+  switch (outcome.kind) {
+    case "still-stale":
+      return staleInventoryError(
+        observation,
+        nowMs,
+        model,
+        " and an on-demand refresh returned no fresher inventory",
+        "wait for keeperd to refresh it or run `cswap list --json`",
+      );
+    case "pacing-declined":
+      return staleInventoryError(
+        observation,
+        nowMs,
+        model,
+        `; an on-demand refresh was withheld by provider pacing (${outcome.detail})`,
+        "retry shortly or run `cswap list --json`",
+      );
+    case "provider-failed":
+      return staleInventoryError(
+        observation,
+        nowMs,
+        model,
+        ` and an on-demand refresh failed (${outcome.detail})`,
+        "run `cswap list --json` to refresh status or repair the account",
+      );
+  }
+}
+
 function readFreshObservation(
   stateDir: string,
   nowMs: number,
@@ -163,16 +301,13 @@ function readFreshObservation(
     };
   }
   if (!isObservationFresh(observation, nowMs)) {
-    const ageSeconds = Math.max(
-      0,
-      Math.ceil((nowMs - observation.observed_at_ms) / 1000),
-    );
     return {
       ok: false,
-      error: inventoryWideError(
+      error: staleInventoryError(
         observation,
+        nowMs,
         model,
-        `inventory snapshot is stale (${ageSeconds}s old; maximum ${OBSERVATION_FRESHNESS_CEILING_MS / 1000}s)`,
+        "",
         "wait for keeperd to refresh it or run `cswap list --json`",
       ),
     };
@@ -321,6 +456,29 @@ function inventoryWideError(
   }
   lines.push(`Next: ${next}.`);
   return lines.join("\n");
+}
+
+/**
+ * Build the inventory-wide stale refusal, appending `detail` (an on-demand
+ * refresh verdict, or "" for the plain stale case) after the age clause.
+ */
+function staleInventoryError(
+  observation: Observation,
+  nowMs: number,
+  model: string | null | undefined,
+  detail: string,
+  next: string,
+): string {
+  const ageSeconds = Math.max(
+    0,
+    Math.ceil((nowMs - observation.observed_at_ms) / 1000),
+  );
+  return inventoryWideError(
+    observation,
+    model,
+    `inventory snapshot is stale (${ageSeconds}s old; maximum ${OBSERVATION_FRESHNESS_CEILING_MS / 1000}s)${detail}`,
+    next,
+  );
 }
 
 function quotaResetSuffix(

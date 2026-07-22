@@ -4,10 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Observation, Route } from "../src/account-observation";
 import { writeObservationSidecar } from "../src/account-observation";
+import type { RefreshResult } from "../src/account-observation-refresh";
 import {
+  classifyOnDemandRefresh,
   inspectRouting,
+  type OnDemandRefresh,
   selectRoute,
   selectRouteByAccountOrdinal,
+  selectRouteByAccountOrdinalWithRefresh,
+  selectRouteWithRefresh,
 } from "../src/account-router";
 import {
   ledgerPath,
@@ -824,5 +829,184 @@ describe("read-only inspection", () => {
       "claude-swap:5",
     ]);
     expect(() => readFileSync(ledgerPath(dir), "utf8")).toThrow();
+  });
+});
+
+describe("on-demand refresh before a stale refusal", () => {
+  const STALE = NOW - 300_001;
+
+  function refreshFn(
+    outcome: Awaited<ReturnType<OnDemandRefresh>>,
+    onCall?: (stateDir: string) => void,
+  ): { refreshObservation: OnDemandRefresh; calls: () => number } {
+    let count = 0;
+    return {
+      calls: () => count,
+      refreshObservation: async ({ stateDir }) => {
+        count += 1;
+        onCall?.(stateDir);
+        return outcome;
+      },
+    };
+  }
+
+  test("a successful on-demand refresh proceeds without refusing", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const refresh = refreshFn({ kind: "refreshed" }, (stateDir) =>
+      publish(stateDir, observation([route(2, 0.2)], { observedAtMs: NOW })),
+    );
+    const result = await selectRouteWithRefresh({
+      stateDir: dir,
+      nowMs: NOW,
+      refreshObservation: refresh.refreshObservation,
+    });
+    expect(refresh.calls()).toBe(1);
+    expect(result).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2" },
+    });
+  });
+
+  test("a fresh snapshot never invokes the on-demand refresh", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)]));
+    const refresh = refreshFn({ kind: "refreshed" });
+    const result = await selectRouteWithRefresh({
+      stateDir: dir,
+      nowMs: NOW,
+      refreshObservation: refresh.refreshObservation,
+    });
+    expect(refresh.calls()).toBe(0);
+    expect(result).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2" },
+    });
+  });
+
+  test("a pacing-declined refresh refuses and names pacing", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const refresh = refreshFn({
+      kind: "pacing-declined",
+      detail: "a refresh is already in progress",
+    });
+    const result = await selectRouteWithRefresh({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
+      refreshObservation: refresh.refreshObservation,
+    });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain("301s old; maximum 300s");
+    expect(!result.ok && result.error).toContain("withheld by provider pacing");
+    expect(!result.ok && result.error).toContain(
+      "a refresh is already in progress",
+    );
+    expect(!result.ok && result.error).toContain("cswap list --json");
+  });
+
+  test("a failed refresh refuses and names the provider failure", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const refresh = refreshFn({ kind: "provider-failed", detail: "error" });
+    const result = await selectRouteWithRefresh({
+      stateDir: dir,
+      nowMs: NOW,
+      refreshObservation: refresh.refreshObservation,
+    });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain(
+      "on-demand refresh failed (error)",
+    );
+    expect(!result.ok && result.error).toContain("cswap list --json");
+  });
+
+  test("a still-stale refresh refuses that no fresher inventory arrived", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const refresh = refreshFn({ kind: "still-stale" });
+    const result = await selectRouteByAccountOrdinalWithRefresh(0, {
+      stateDir: dir,
+      nowMs: NOW,
+      refreshObservation: refresh.refreshObservation,
+    });
+    expect(refresh.calls()).toBe(1);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain(
+      "returned no fresher inventory",
+    );
+  });
+
+  test("a thrown refresh degrades to the still-stale refusal", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const result = await selectRouteWithRefresh({
+      stateDir: dir,
+      nowMs: NOW,
+      refreshObservation: async () => {
+        throw new Error("boom");
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain(
+      "returned no fresher inventory",
+    );
+  });
+
+  test("without a refresh seam a stale snapshot refuses immediately", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: STALE }));
+    const result = await selectRouteWithRefresh({ stateDir: dir, nowMs: NOW });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain("301s old; maximum 300s");
+    expect(!result.ok && result.error).not.toContain("on-demand refresh");
+  });
+});
+
+describe("classifyOnDemandRefresh", () => {
+  function result(
+    outcome: RefreshResult["outcome"],
+    observedAtMs: number | null,
+    health: Observation["health"] = "ok",
+  ): RefreshResult {
+    return {
+      outcome,
+      observation:
+        observedAtMs === null
+          ? null
+          : observation(health === "ok" ? [route(2, 0.2)] : [], {
+              observedAtMs,
+              health,
+              count: health === "ok" ? undefined : 0,
+            }),
+    };
+  }
+
+  test("a fresh, healthy refresh is usable", () => {
+    expect(classifyOnDemandRefresh(result("refreshed", NOW), NOW)).toEqual({
+      kind: "refreshed",
+    });
+  });
+
+  test("a fresh, unhealthy refresh is a named provider failure", () => {
+    expect(
+      classifyOnDemandRefresh(result("refreshed", NOW, "error"), NOW),
+    ).toEqual({ kind: "provider-failed", detail: "error" });
+  });
+
+  test("a withheld contended attempt is pacing", () => {
+    expect(
+      classifyOnDemandRefresh(result("contended", NOW - 300_001), NOW),
+    ).toMatchObject({ kind: "pacing-declined" });
+    expect(
+      classifyOnDemandRefresh(result("contended", null), NOW),
+    ).toMatchObject({ kind: "pacing-declined" });
+  });
+
+  test("anything still stale asks for another cycle", () => {
+    expect(
+      classifyOnDemandRefresh(result("refreshed", NOW - 300_001), NOW),
+    ).toEqual({ kind: "still-stale" });
   });
 });

@@ -13,6 +13,7 @@ import {
   observeOnce,
   type RefreshLock,
   refreshObservationIfStale,
+  runProviderSafeRefresh,
 } from "../src/account-observation-refresh";
 import {
   cswapListArgv,
@@ -243,6 +244,76 @@ describe("refreshObservationIfStale", () => {
       });
       expect(sleeps).toEqual([7, 7, 1]);
       expect(result).toBeNull();
+      expect(calls).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runProviderSafeRefresh outcomes", () => {
+  test("a provider call reports refreshed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      writeObservationSidecar(
+        observationSidecarPath(dir),
+        observation(NOW - 101),
+      );
+      const { runner } = recordingRunner();
+      const result = await runProviderSafeRefresh({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        tryAcquireLock: () => held(),
+      });
+      expect(result.outcome).toBe("refreshed");
+      expect(result.observation?.observed_at_ms).toBe(NOW);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an in-flight refresh publishing during the wait reports peer-published", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      const path = observationSidecarPath(dir);
+      const { runner, calls } = recordingRunner();
+      const result = await runProviderSafeRefresh({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        contentionWaitMs: 7,
+        tryAcquireLock: () => null,
+        sleep: async () => {
+          writeObservationSidecar(path, observation(NOW));
+        },
+      });
+      expect(result.outcome).toBe("peer-published");
+      expect(result.observation?.observed_at_ms).toBe(NOW);
+      expect(calls).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a held lock through the deadline reports contended", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      const { runner, calls } = recordingRunner();
+      const result = await runProviderSafeRefresh({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        contentionWaitMs: 7,
+        contentionTimeoutMs: 7,
+        tryAcquireLock: () => null,
+        sleep: async () => {},
+      });
+      expect(result.outcome).toBe("contended");
+      expect(result.observation).toBeNull();
       expect(calls).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

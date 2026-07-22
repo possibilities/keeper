@@ -22,16 +22,22 @@ import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { queryCollection, roundTrip } from "../../cli/control-rpc";
 import {
+  makeBoundedRunner,
+  runProviderSafeRefresh,
+} from "../account-observation-refresh";
+import {
+  classifyOnDemandRefresh,
   constructObservedFableFocus,
   inspectRouting,
   modelHasFableIntent,
+  type OnDemandRefresh,
   type RequestedRouteResolution,
   type RouteResolution,
   type RouteSelection,
   type RoutingInspection,
   resolveObservedManagedRoute,
-  selectRoute,
-  selectRouteByAccountOrdinal,
+  selectRouteByAccountOrdinalWithRefresh,
+  selectRouteWithRefresh,
 } from "../account-router";
 import {
   CODEX_OBSERVATION_FRESHNESS_CEILING_MS,
@@ -40,6 +46,7 @@ import {
   KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
   MAX_OUTPUT_BYTES,
+  OBSERVATION_FRESHNESS_CEILING_MS,
   resolveCodexAccountRoutingRoot,
   resolveCswapCommand,
   SUBPROCESS_TIMEOUT_MS,
@@ -510,7 +517,7 @@ export interface MainDeps {
   selectAccountRouteFn: (
     model: string | null,
     fableIntent: boolean | null,
-  ) => RouteResolution;
+  ) => RouteResolution | Promise<RouteResolution>;
   /**
    * Resolve a human-requested zero-based Claude account index exactly. Unlike
    * automatic routing this is fail-loud and never substitutes another account.
@@ -519,7 +526,7 @@ export interface MainDeps {
     ordinal: number,
     model: string | null,
     fableIntent: boolean | null,
-  ) => RequestedRouteResolution;
+  ) => RequestedRouteResolution | Promise<RequestedRouteResolution>;
   /** Resolve stored process-lineage intent for an agent-native continuation. */
   resolveFableIntentFn: (target: string) => Promise<boolean | null>;
   setFableFocusFn: (
@@ -1034,9 +1041,17 @@ export function realDeps(): MainDeps {
     acquirePartnerCaptureLeaseFn: acquirePartnerCaptureLease,
     resolveBusArtifactRootFn: resolveBusArtifactRoot,
     selectAccountRouteFn: (model, fableIntent) =>
-      selectRoute({ model, fableIntent }),
+      selectRouteWithRefresh({
+        model,
+        fableIntent,
+        refreshObservation: onDemandAccountRefresh,
+      }),
     selectAccountRouteByOrdinalFn: (ordinal, model, fableIntent) =>
-      selectRouteByAccountOrdinal(ordinal, { model, fableIntent }),
+      selectRouteByAccountOrdinalWithRefresh(ordinal, {
+        model,
+        fableIntent,
+        refreshObservation: onDemandAccountRefresh,
+      }),
     resolveFableIntentFn: (target) =>
       resolveStoredFableIntent(resolveAgentSockPath(process.env), target),
     setFableFocusFn: (focus) =>
@@ -1061,6 +1076,25 @@ export function realDeps(): MainDeps {
     seedClaudeWorkspaceTrustFn: seedClaudeWorkspaceTrust,
   };
 }
+
+/**
+ * Production on-demand refresh: one bounded `cswap` inventory call through the
+ * SAME provider-safe machinery the observer cadence uses, mapped to a launch
+ * verdict. The refusal, never this adapter, decides whether the launch stands.
+ */
+const onDemandAccountRefresh: OnDemandRefresh = async ({ stateDir }) => {
+  try {
+    const result = await runProviderSafeRefresh({
+      stateDir,
+      runner: makeBoundedRunner(),
+      nowMs: () => Date.now(),
+      maxAgeMs: OBSERVATION_FRESHNESS_CEILING_MS,
+    });
+    return classifyOnDemandRefresh(result, Date.now());
+  } catch {
+    return { kind: "still-stale" };
+  }
+};
 
 function resolveAccountConfigDir(cswapBin: string, slot: number): string {
   const [command, ...args] = cswapListArgv(cswapBin);
@@ -4355,14 +4389,13 @@ export async function main(deps: MainDeps): Promise<never> {
     } else {
       deps.env.KEEPER_FABLE_INTENT = fableIntent ? "1" : "0";
     }
-    const resolution =
-      parsed.launcherAccountOrdinal !== null
-        ? deps.selectAccountRouteByOrdinalFn(
-            parsed.launcherAccountOrdinal,
-            routingModel,
-            fableIntent,
-          )
-        : deps.selectAccountRouteFn(routingModel, fableIntent);
+    const resolution = await (parsed.launcherAccountOrdinal !== null
+      ? deps.selectAccountRouteByOrdinalFn(
+          parsed.launcherAccountOrdinal,
+          routingModel,
+          fableIntent,
+        )
+      : deps.selectAccountRouteFn(routingModel, fableIntent));
     if (!resolution.ok) {
       const routingError = resolution.error.trimEnd();
       const punctuation = /[.!?]$/u.test(routingError) ? "" : ".";
