@@ -10290,6 +10290,122 @@ test("fn-16f createWorktreeDriver: assembleBase CONTINUES past clean conflict ab
   expect(cmds.filter((c) => c === `merge --no-edit ${RIB3}`)).toHaveLength(1);
 });
 
+/** A production-shaped runner where RIB1 conflicts ONLY while RIB2 is not yet in the
+ * base — RIB2's clean merge advances the base and makes RIB1 mergeable. `merge`/ancestry
+ * outcomes are BASE-STATE-DEPENDENT (they read `inBase`), so the fixed-point rescan is
+ * genuinely exercised. */
+function makeStaleConflictRun(): {
+  run: Parameters<typeof createWorktreeDriver>[0];
+  cmds: string[];
+} {
+  const cmds: string[] = [];
+  const inBase = new Set<string>();
+  let added = false;
+  let midMerge = false;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.includes("MERGE_HEAD")) {
+      return midMerge
+        ? { code: 0, stdout: "deadbeef\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.includes("^{commit}")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      const src = args[args.length - 2] ?? "";
+      return { code: inBase.has(src) ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (joined === "merge --abort") {
+      midMerge = false;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "merge") {
+      const src = args[args.length - 1] ?? "";
+      // RIB1 conflicts until the base has advanced past RIB2's clean merge.
+      if (src === RIB1 && !inBase.has(RIB2)) {
+        midMerge = true;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+        };
+      }
+      inBase.add(src);
+      return { code: 0, stdout: "Merge made\n", stderr: "" };
+    }
+    if (joined.startsWith("diff --name-only")) {
+      return { code: 0, stdout: "src/x.ts\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      const main = "worktree /repo\nHEAD main000\nbranch refs/heads/main\n\n";
+      return added
+        ? {
+            code: 0,
+            stdout:
+              main +
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: main, stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: `${RIB_BASE}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, cmds };
+}
+
+function makeStaleConflictSinkInfo(): WorktreeLaunchInfo {
+  return {
+    assignment: {
+      nodeId: "fn-1-foo.close",
+      isCloseSink: true,
+      branch: RIB_BASE,
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [RIB1, RIB2],
+      assertBranch: RIB_BASE,
+    },
+    baseBranch: RIB_BASE,
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [
+      { nodeId: "fn-1-foo.1", branch: RIB1, worktreePath: "/w1" },
+      { nodeId: "fn-1-foo.2", branch: RIB2, worktreePath: "/w2" },
+      { nodeId: "fn-1-foo.close", branch: RIB_BASE, worktreePath: "/wc" },
+    ],
+    parentBranch: RIB_BASE,
+  };
+}
+
+test("fn-16 createWorktreeDriver: a STALE conflict (RIB1 conflicts on base B, then RIB2's clean merge advances the base and makes RIB1 mergeable) RESCANS to a fixed point — RIB1 merges on the rescan and it returns ASSEMBLED, routing NO incident on stale evidence", async () => {
+  const { run, cmds } = makeStaleConflictRun();
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeStaleConflictSinkInfo(), null);
+  // NO incident routed on the now-stale conflict — the rescan resolved it.
+  expect(res).toEqual({ kind: "assembled" });
+  // RIB1 WAS re-attempted and merged after RIB2 advanced the base (a real rescan).
+  expect(cmds).toContain(`merge --no-edit ${RIB1}`);
+  expect(cmds).toContain(`merge --no-edit ${RIB2}`);
+});
+
 /** A close-ready primaryless epic whose close ROUTES an open merge-escalation incident. */
 function incidentOwnerCloseSnap(): ReconcileSnapshot {
   const epic = closeReadyPrimarylessEpic();

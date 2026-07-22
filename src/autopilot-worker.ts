@@ -7511,98 +7511,118 @@ export function createWorktreeDriver(
         // SAME pairwise, lock-guarded routine refreshBase/finalize reuse, never a
         // second merge path. A CLEAN content-conflict abort is RECORDED and the scan
         // CONTINUES, so a conflicting rib never strands the CLEAN ribs after it (their
-        // absence would wedge the close's ancestry gate and exhaust the incident's
-        // bounded attachment budget against an effectively-resolved conflict). The
-        // FIRST conflict is routed to the resolver afterward; the rest surface as the
-        // producer re-enters once each is resolved. A dirty base losslessly cleans only
-        // a provably-redundant rib leak (identical to provision); a not-ready base defers.
-        const conflicts: {
+        // absence would wedge the close's ancestry gate). But a later clean merge
+        // MONOTONICALLY advances the base, which can make an earlier-recorded conflict
+        // now mergeable — so the FULL source scan iterates to a FIXED POINT: while any
+        // clean merge happened AND conflicts remain, re-scan against the advanced base
+        // (already-merged sources skip, so each source merges at most once — termination
+        // is bounded by the source count). A `conflict` is returned ONLY from a
+        // NO-PROGRESS pass, so it is positively current on the final unchanged base and
+        // never burns a scarce incident attachment on stale evidence. A structural
+        // failure / defer short-circuits (precedence unchanged); a dirty base losslessly
+        // cleans only a provably-redundant rib leak; a not-ready base defers.
+        let conflicts: {
           source: string;
           conflictedFiles: string[];
           stderr: string;
         }[] = [];
-        for (const source of preMerges) {
-          const ready = await gitMergeReadiness(
-            worktreePath,
-            branch,
-            run,
-            source,
-            undefined,
-            repoDir,
-          );
-          if (ready.kind === "dirty") {
-            const cleaned = await gitLosslessPremergeClean(
+        // Bounded by the source count: at most one clean merge per source can make
+        // progress, so a no-progress pass (the loop's natural exit) always precedes this.
+        for (let scan = 0; scan <= preMerges.length; scan++) {
+          conflicts = [];
+          let progress = false;
+          for (const source of preMerges) {
+            const ready = await gitMergeReadiness(
               worktreePath,
               branch,
-              source,
-              liveAttributedDirty,
               run,
+              source,
+              undefined,
+              repoDir,
             );
-            if (cleaned.kind === "retry") {
+            if (ready.kind === "dirty") {
+              const cleaned = await gitLosslessPremergeClean(
+                worktreePath,
+                branch,
+                source,
+                liveAttributedDirty,
+                run,
+              );
+              if (cleaned.kind === "retry") {
+                return {
+                  kind: "defer",
+                  reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the pre-close fan-in of ${source} into ${branch} — ${cleaned.reason}`,
+                };
+              }
+            } else if (ready.kind !== "ready") {
               return {
                 kind: "defer",
-                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the pre-close fan-in of ${source} into ${branch} — ${cleaned.reason}`,
+                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the pre-close fan-in`,
               };
             }
-          } else if (ready.kind !== "ready") {
-            return {
-              kind: "defer",
-              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the pre-close fan-in`,
-            };
+            const merge = await gitMergeBranchInto(
+              worktreePath,
+              source,
+              run,
+              acquireLock,
+            );
+            switch (merge.kind) {
+              case "merged":
+                progress = true; // a monotonic ancestry advance — re-scan afterward
+                continue;
+              case "already-merged":
+              case "missing-source":
+                continue;
+              case "conflict":
+                // RECORD the (cleanly-aborted) conflict and CONTINUE the scan so the
+                // clean suffix is still assembled — do NOT return early.
+                conflicts.push({
+                  source,
+                  conflictedFiles: merge.conflictedFiles,
+                  stderr: merge.stderr,
+                });
+                continue;
+              case "abort-failed":
+                return {
+                  kind: "failed",
+                  reason: `worktree-preclose-abort-failed: the guarded git merge --abort left ${worktreePath} mid-merge while merging ${source} into ${branch} — ${merge.stderr}`,
+                };
+              case "merge-failed":
+                // A non-content STRUCTURAL merge failure — a visible failure, NOT the
+                // content-conflict resolver path.
+                return {
+                  kind: "failed",
+                  reason: `worktree-preclose-merge-failed: merging ${source} into ${branch} in ${worktreePath} is a non-content structural failure — ${merge.stderr}`,
+                };
+              case "merge-inconclusive":
+                // The merge's class could not be positively determined (an inconclusive
+                // merge-state probe or a signal disagreement) — retry next cycle; never a
+                // false structural sticky or a resolver route.
+                return {
+                  kind: "defer",
+                  reason: `worktree-preclose-merge-inconclusive: could not classify merging ${source} into ${branch} in ${worktreePath} — retrying — ${merge.stderr}`,
+                };
+              case "lock-timeout":
+              case "local-timeout":
+                return {
+                  kind: "defer",
+                  reason: `worktree-preclose-${merge.kind}: deferring the pre-close fan-in of ${source} into ${branch}`,
+                };
+              default:
+                assertNever(merge);
+            }
           }
-          const merge = await gitMergeBranchInto(
-            worktreePath,
-            source,
-            run,
-            acquireLock,
-          );
-          switch (merge.kind) {
-            case "merged":
-            case "already-merged":
-            case "missing-source":
-              continue;
-            case "conflict":
-              // RECORD the (cleanly-aborted) conflict and CONTINUE the scan so the
-              // clean suffix is still assembled — do NOT return early.
-              conflicts.push({
-                source,
-                conflictedFiles: merge.conflictedFiles,
-                stderr: merge.stderr,
-              });
-              continue;
-            case "abort-failed":
-              return {
-                kind: "failed",
-                reason: `worktree-preclose-abort-failed: the guarded git merge --abort left ${worktreePath} mid-merge while merging ${source} into ${branch} — ${merge.stderr}`,
-              };
-            case "merge-failed":
-              // A non-content STRUCTURAL merge failure — a visible failure, NOT the
-              // content-conflict resolver path.
-              return {
-                kind: "failed",
-                reason: `worktree-preclose-merge-failed: merging ${source} into ${branch} in ${worktreePath} is a non-content structural failure — ${merge.stderr}`,
-              };
-            case "merge-inconclusive":
-              // The merge's class could not be positively determined (an inconclusive
-              // merge-state probe or a signal disagreement) — retry next cycle; never a
-              // false structural sticky or a resolver route.
-              return {
-                kind: "defer",
-                reason: `worktree-preclose-merge-inconclusive: could not classify merging ${source} into ${branch} in ${worktreePath} — retrying — ${merge.stderr}`,
-              };
-            case "lock-timeout":
-            case "local-timeout":
-              return {
-                kind: "defer",
-                reason: `worktree-preclose-${merge.kind}: deferring the pre-close fan-in of ${source} into ${branch}`,
-              };
-            default:
-              assertNever(merge);
+          // Fixed point: no conflicts (done), or no clean merge this pass (the conflicts
+          // are stuck on the final base → positively current). Only a pass that made
+          // progress AND still has conflicts re-scans against the advanced base.
+          if (conflicts.length === 0 || !progress) {
+            break;
           }
         }
         if (conflicts.length > 0) {
-          // Route the FIRST conflict to the resolver incident; the clean suffix has
-          // been assembled, and later conflicts surface iteratively after this resolves.
+          // Route the FIRST conflict — from a NO-PROGRESS pass, so it is positively
+          // current on the final base; later conflicts surface as the producer re-enters
+          // once this one is resolved.
           const first = conflicts[0];
           if (first !== undefined) {
             return {
