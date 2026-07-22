@@ -213,6 +213,7 @@ code transitions and rate-limits each target/code pair.
 | `finalizer-guard` | The epic finalizer guard suppresses a duplicate close. |
 | `data-bug-missing-cwd` | The task or epic has no effective launch cwd. This is the only `error`-severity withhold; repair the Plan's repo coordinates. |
 | `budget-exhausted` | The current global dispatch budget has no remaining capacity. |
+| `lane-provision` | A ready launch survived the pure gates but its worktree lane could not be provisioned this cycle — a base refresh is blocked, a clustered close's fan-in base is not assembled, or a resource hold owns the lane. `detail` names the blocking claim/session or, on a degraded pane probe, says the liveness check was inconclusive. |
 
 These are live decision reasons, not sticky failure codes and not Parked launches.
 They mint no Event or Projection row.

@@ -228,6 +228,7 @@ export type WithholdReasonCode =
   | "finalizer-guard"
   | "data-bug-missing-cwd"
   | "budget-exhausted"
+  | "lane-provision"
   | "fatal-audit";
 
 /** One current, replace-merge withhold observation for a task or close target. */
@@ -241,7 +242,7 @@ export interface WithholdReason {
 
 const OCCUPANCY_PROBE_DEGRADED_DETAIL = "tmux pane probe unavailable";
 
-function withhold(
+export function withhold(
   code: WithholdReasonCode,
   detail: string | null = null,
 ): WithholdReason {

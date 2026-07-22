@@ -3073,6 +3073,51 @@ test("withhold frame emission is transition-gated, pair-rate-limited, and replac
   expect(state.lastEmittedAtByTarget.size).toBe(0);
 });
 
+test("fn-09b withhold rail: a persistent lane-provision degrade emits once (detail churn is not a transition) and clears when the hold lifts", () => {
+  const state = createWithholdFrameState();
+  const lines: string[] = [];
+  const emit = (line: string): void => {
+    lines.push(line);
+  };
+  const frame = (
+    code: WithholdReason["code"],
+    detail: string | null,
+  ): Map<string, WithholdReason> =>
+    new Map([["fn-1-foo.1", { code, severity: "normal", detail }]]);
+
+  // First observation of a degraded (probe-inconclusive) lane hold → one frame that
+  // states the pass was inconclusive rather than naming a proven blocker.
+  updateWithholdFrameState(
+    state,
+    frame("lane-provision", "liveness probe inconclusive for lane A"),
+    100,
+    emit,
+  );
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("reason=lane-provision");
+  expect(lines[0]).toContain("inconclusive");
+  // Same code, CHURNING detail (a different inconclusive lane the next cycle) → NO
+  // re-emit: the transition gate keys on the stable code, so a persistent degrade
+  // episode does not flap.
+  updateWithholdFrameState(
+    state,
+    frame("lane-provision", "liveness probe inconclusive for lane B"),
+    101,
+    emit,
+  );
+  expect(lines).toHaveLength(1);
+  // A genuine reason change → a fresh transition emits.
+  updateWithholdFrameState(state, frame("cooldown", null), 102, emit);
+  expect(lines).toHaveLength(2);
+  // The hold lifts entirely → the target is pruned to a clear, never left standing as
+  // if still current, and nothing re-emits afterward.
+  updateWithholdFrameState(state, new Map(), 103, emit);
+  expect(state.current.size).toBe(0);
+  expect(state.lastReasonByTarget.size).toBe(0);
+  updateWithholdFrameState(state, new Map(), 104, emit);
+  expect(lines).toHaveLength(2);
+});
+
 test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
   // The worker boots from `workerData.paused`, which the daemon seeds from the
   // durable `autopilot_state.paused` column — so a normal boot resumes the last
@@ -14472,6 +14517,100 @@ test("lane maintenance hold attributes every cycle pass and prevents provision/f
     "worktree-finalize-deferred: live claimed session work::fn-1-foo.1",
   );
   expect(lines.every((line) => line.length <= 531)).toBe(true);
+});
+
+test("fn-09b runReconcileCycle: a worktree-provision defer routes the ready WORK launch through the lane-provision withhold rail, naming the live holder", async () => {
+  const taskId = "fn-1-foo.1";
+  const baseLane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const liveWorker = makeJob({
+    job_id: "live-lane-worker",
+    plan_verb: "work",
+    plan_ref: taskId,
+    cwd: baseLane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[liveWorker.job_id, liveWorker]]),
+    new Map(),
+    new Set(),
+  );
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: taskId })],
+  });
+  const decision = reconcile(
+    makeSnapshot({ epics: [epic], worktreeMode: true }),
+    makeState(),
+    0,
+  );
+  // Precondition: the pure core cleared this task to launch — it carries NO core
+  // withhold, so any hold below is purely the producer's lane-provision defer.
+  expect(
+    decision.launches.some((l) => l.verb === "work" && l.id === taskId),
+  ).toBe(true);
+  expect(decision.withholds.has(taskId)).toBe(false);
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+    new Map(),
+    undefined,
+    probe,
+  );
+
+  // Nothing dispatched and no git mutation ran — the lane was held...
+  expect(depsLog.launches).toEqual([]);
+  expect(log.calls).toEqual([]);
+  // ...and the withheld target is now explainable on the ephemeral rail: the stable
+  // machine code plus a detail naming the POSITIVELY-observed live holder this cycle.
+  const wh = decision.withholds.get(taskId);
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.severity).toBe("normal");
+  expect(wh?.detail).toContain(`work::${taskId}`);
+});
+
+test("fn-09b runReconcileCycle: a pre-close assembly defer routes the ready CLOSE launch through the lane-provision withhold rail", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    assembleDefer: (info) =>
+      info.repoDir === "/repo-a"
+        ? "worktree-lane-premerge-not-ready: fan-in base not quiescent"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const decision = reconcile(
+    multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve),
+    makeState(),
+    0,
+  );
+  expect(
+    decision.launches.some((l) => l.verb === "close" && l.id === "fn-1-anchor"),
+  ).toBe(true);
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // The close never launched (its non-close-host fan-in was not ready)...
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeUndefined();
+  // ...and the withheld close is explainable on the rail, its detail naming the
+  // transient fan-in blocker observed this cycle.
+  const wh = decision.withholds.get("fn-1-anchor");
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.detail).toContain("worktree-lane-premerge-not-ready");
 });
 
 test("base refresh producer: conflict defers without a sticky and lets the owning fan-in proceed", async () => {
