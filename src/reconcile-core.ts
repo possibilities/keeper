@@ -1268,6 +1268,19 @@ export interface WorktreeRepoGroup {
    * (present / inconclusive epoch) derivation.
    */
   freshEpoch?: boolean;
+  /**
+   * Set on a `serial` group that is an INTENTIONAL reopened-serial degrade — a group
+   * whose base epoch is positively ABSENT with a restart-safe prior-lane PROOF (it ran
+   * a worktree lane here before) that GAINED a task, yet stays serial because the repo
+   * is an UNSAFE dep-tree hazard (workspace-marker / submodule / probe-error): a fresh
+   * worktree checkout there would carry the wrong dependency tree, so it dispatches
+   * worktree-less on the shared checkout. The string is the operator-facing reason
+   * surfaced on the LIVE-ONLY `worktree_repo_status` projection (never a console latch),
+   * and describes ACTUAL state (absent epoch + proof + gained task), never a done+pending
+   * heuristic. Undefined for every non-degrade group (a fresh/normal serial group, or a
+   * worktree group).
+   */
+  reopenDegrade?: string;
 }
 /**
  * The RESOLVED git toplevel a task's lane lives in — how the per-(epic, repoDir)

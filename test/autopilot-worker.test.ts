@@ -72,7 +72,6 @@ import {
   clearDeadZombieSessionMarker,
   clearPushTimeoutStreak,
   closerJobFinished,
-  clusteredSerialReopenDegrades,
   computeBaseDriftEntries,
   computeCloseRecoveryEligibleIds,
   computeDeferredEpicIds,
@@ -171,7 +170,6 @@ import {
   recoverFailuresToClear,
   recoverWorktrees,
   refreshSuppressionForOpenPending,
-  reportSerialReopenDegrades,
   reposForRecovery,
   resolveDriftThresholds,
   runDeadWriterCheckoutSweep,
@@ -8685,6 +8683,103 @@ test("fn-1013 buildWorktreeStatusEntries: an all-eligible board surfaces NO entr
   expect(buildWorktreeStatusEntries(map)).toEqual([]);
 });
 
+test("28b buildWorktreeStatusEntries: a CLUSTERED epic's reopened-serial DEGRADE surfaces on the projection — absent epoch + prior-lane proof + gained task on an UNSAFE (submodule) repo", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-deg",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-deg.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-deg.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      // The GAINED task on the unsafe repo (a refine-apply addition post-teardown).
+      makeTask({
+        task_id: "fn-1-deg.3",
+        task_number: 3,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const assess = (top: string) =>
+    top === "/repo-b"
+      ? { eligible: false, reason: "worktree-disabled:submodules" }
+      : { eligible: true, reason: "worktree-eligible" };
+  const laneProbe = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-b"
+      ? { epoch: "absent", priorLane: true } // ran a lane before, now torn down
+      : { epoch: "present", priorLane: false };
+  const map = classifyWorktreeRepos([epic], abResolve, assess, laneProbe, true);
+  const entries = buildWorktreeStatusEntries(map);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.epic_id).toBe("fn-1-deg");
+  expect(entries[0]?.repo_dir).toBe("/repo-b");
+  expect(entries[0]?.mode).toBe("serial");
+  expect(entries[0]?.reason).toContain("worktree-reopen-serial");
+});
+
+test("28b buildWorktreeStatusEntries: a no-manifest group WITH proof re-cuts to worktree (NO degrade row); an unsafe group with NO gained task / NO proof surfaces NOTHING", () => {
+  // (a) no-manifest + absent + proof → RE-CUTS to worktree → not a serial degrade.
+  const nm = makeEpic({
+    epic_id: "fn-1-nm",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-nm.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-nm.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-nm.3",
+        task_number: 3,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const noManifest = (top: string) =>
+    top === "/repo-b"
+      ? { eligible: false, reason: "worktree-disabled:no-manifest" }
+      : { eligible: true, reason: "worktree-eligible" };
+  const absentProof = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-b"
+      ? { epoch: "absent", priorLane: true }
+      : { epoch: "present", priorLane: false };
+  expect(
+    buildWorktreeStatusEntries(
+      classifyWorktreeRepos([nm], abResolve, noManifest, absentProof, true),
+    ),
+  ).toEqual([]);
+  // (b) unsafe repo, absent epoch, but NO prior-lane proof → serial WITHOUT a degrade
+  //     (never proven to run a worktree lane) → nothing surfaces.
+  const submodules = (top: string) =>
+    top === "/repo-b"
+      ? { eligible: false, reason: "worktree-disabled:submodules" }
+      : { eligible: true, reason: "worktree-eligible" };
+  const absentNoProof = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-b"
+      ? { epoch: "absent", priorLane: false }
+      : { epoch: "present", priorLane: false };
+  expect(
+    buildWorktreeStatusEntries(
+      classifyWorktreeRepos([nm], abResolve, submodules, absentNoProof, true),
+    ),
+  ).toEqual([]);
+});
+
 test("fn-978 classifyWorktreeRepos: an empty root → unresolved WITHOUT calling the resolver", () => {
   const epic = makeEpic({
     epic_id: "fn-1-foo",
@@ -10102,270 +10197,6 @@ test("fn-28b runReconcileCycle: the eligible re-opened group PROVISIONS the new 
       (p) => p.assignment.branch === "keeper/epic/fn-1-reopen",
     ),
   ).toBe(true);
-});
-
-// fn-28 — a repo group that per-finalized and had its lane/branch torn down, then
-// GAINED a todo task (refine-apply after finalize), must not SILENTLY dispatch
-// worktree:None onto the shared checkout. A worktree-ELIGIBLE re-opened group re-cuts
-// a fresh lane (the grandfather lapse is harmless — eligibility drives the mode); a
-// genuinely `disabled` (no-manifest / workspace-marker / submodule) re-opened group
-// cannot safely re-cut, so its serial degrade is NAMED (never silent). A FRESH serial
-// group and the task-less primary anchor are not degrades.
-const bDisabledNoManifest = (
-  top: string,
-): { eligible: boolean; reason: string } =>
-  top === "/repo-b"
-    ? { eligible: false, reason: "worktree-disabled:no-manifest" }
-    : { eligible: true, reason: "worktree-eligible" };
-
-test("fn-28 reconcile: a worktree-ELIGIBLE re-opened group (done + new todo task, grandfather lapsed) RE-CUTS a fresh lane — the new task dispatches into its lane, NOT worktree:None", () => {
-  const epic = makeEpic({
-    epic_id: "fn-1-reopen",
-    project_dir: "/repo-a",
-    tasks: [
-      makeTask({
-        task_id: "fn-1-reopen.1",
-        task_number: 1,
-        epic_id: "fn-1-reopen",
-        target_repo: "/repo-a",
-        worker_phase: "done",
-        runtime_status: "done",
-      }),
-      // NEW todo task added after the group per-finalized (lane torn down).
-      makeTask({
-        task_id: "fn-1-reopen.2",
-        task_number: 2,
-        epic_id: "fn-1-reopen",
-        target_repo: "/repo-a",
-      }),
-      makeTask({
-        task_id: "fn-1-reopen.3",
-        task_number: 3,
-        epic_id: "fn-1-reopen",
-        target_repo: "/repo-b",
-      }),
-    ],
-  });
-  // Default assessRepo = eligible everywhere; grandfather FALSE (lane torn down).
-  const repoMap = classifyWorktreeRepos(
-    [epic],
-    abcResolve,
-    undefined,
-    grandfatherLaneProbe(() => false),
-    true,
-  );
-  const snap = makeSnapshot({
-    epics: [epic],
-    worktreeMode: true,
-    worktreeRepoByEpicId: repoMap,
-  });
-  const decision = reconcile(snap, makeState(), 0);
-  const newTask = decision.launches.find((l) => l.id === "fn-1-reopen.2");
-  expect(newTask?.verb).toBe("work");
-  // A fresh lane in its OWN repo — never worktree:None on the shared checkout.
-  expect(newTask?.worktree?.repoDir).toBe("/repo-a");
-  // An eligible group is never `serial`, so it is never a serial-reopen degrade.
-  expect(clusteredSerialReopenDegrades([epic], repoMap)).toEqual([]);
-});
-
-test("fn-28 clusteredSerialReopenDegrades: a `disabled` (no-manifest) re-opened group (done + new todo task, no grandfather) is a NAMED serial degrade; its new task dispatches worktree:None", () => {
-  const epic = makeEpic({
-    epic_id: "fn-1-nm",
-    project_dir: "/repo-a", // eligible primary hosts a task
-    tasks: [
-      makeTask({
-        task_id: "fn-1-nm.1",
-        task_number: 1,
-        epic_id: "fn-1-nm",
-        target_repo: "/repo-a",
-      }),
-      // /repo-b ran + finalized here (done), then gained a new todo task.
-      makeTask({
-        task_id: "fn-1-nm.2",
-        task_number: 2,
-        epic_id: "fn-1-nm",
-        target_repo: "/repo-b",
-        worker_phase: "done",
-        runtime_status: "done",
-      }),
-      makeTask({
-        task_id: "fn-1-nm.3",
-        task_number: 3,
-        epic_id: "fn-1-nm",
-        target_repo: "/repo-b",
-      }),
-    ],
-  });
-  const repoMap = classifyWorktreeRepos(
-    [epic],
-    abcResolve,
-    bDisabledNoManifest,
-    grandfatherLaneProbe(() => false),
-    true,
-  );
-  // /repo-b: disabled + no grandfather + done(.2) + pending(.3) → a NAMED degrade.
-  expect(clusteredSerialReopenDegrades([epic], repoMap)).toEqual([
-    { epicId: "fn-1-nm", repoDir: "/repo-b" },
-  ]);
-  // Its pending task still dispatches worktree-less (the unavoidable serial degrade)
-  // — but the producer now names it rather than leaving it a silent worktree:None.
-  const snap = makeSnapshot({
-    epics: [epic],
-    worktreeMode: true,
-    worktreeRepoByEpicId: repoMap,
-  });
-  const decision = reconcile(snap, makeState(), 0);
-  const newTask = decision.launches.find((l) => l.id === "fn-1-nm.3");
-  expect(newTask?.verb).toBe("work");
-  expect(newTask?.worktree).toBeUndefined();
-});
-
-test("fn-28 reportSerialReopenDegrades: names the degrade with its disable reason ONCE per episode (bounded latch), re-arming after it clears", () => {
-  const epic = makeEpic({
-    epic_id: "fn-1-saylog",
-    project_dir: "/repo-a",
-    tasks: [
-      makeTask({
-        task_id: "fn-1-saylog.1",
-        task_number: 1,
-        epic_id: "fn-1-saylog",
-        target_repo: "/repo-a",
-      }),
-      makeTask({
-        task_id: "fn-1-saylog.2",
-        task_number: 2,
-        epic_id: "fn-1-saylog",
-        target_repo: "/repo-b",
-        worker_phase: "done",
-        runtime_status: "done",
-      }),
-      makeTask({
-        task_id: "fn-1-saylog.3",
-        task_number: 3,
-        epic_id: "fn-1-saylog",
-        target_repo: "/repo-b",
-      }),
-    ],
-  });
-  const repoMap = classifyWorktreeRepos(
-    [epic],
-    abcResolve,
-    bDisabledNoManifest,
-    grandfatherLaneProbe(() => false),
-    true,
-  );
-  const emptyMap = classifyWorktreeRepos(
-    [],
-    abcResolve,
-    bDisabledNoManifest,
-    grandfatherLaneProbe(() => false),
-    true,
-  );
-  const lines: string[] = [];
-  const orig = console.error;
-  console.error = (...args: unknown[]) => {
-    lines.push(args.join(" "));
-  };
-  try {
-    reportSerialReopenDegrades([epic], repoMap, bDisabledNoManifest);
-    reportSerialReopenDegrades([epic], repoMap, bDisabledNoManifest); // same episode
-    reportSerialReopenDegrades([], emptyMap, bDisabledNoManifest); // cleared → prune
-    reportSerialReopenDegrades([epic], repoMap, bDisabledNoManifest); // re-armed
-  } finally {
-    console.error = orig;
-  }
-  const named = lines.filter(
-    (l) =>
-      l.includes("worktree-serial-reopen-degrade") &&
-      l.includes("fn-1-saylog") &&
-      l.includes("/repo-b"),
-  );
-  // Once per EPISODE: the initial line + the re-armed line, NOT the latched repeat.
-  expect(named).toHaveLength(2);
-  // The bounded line NAMES the repo's disable reason.
-  expect(named[0]).toContain("no-manifest");
-});
-
-test("fn-28 clusteredSerialReopenDegrades: NOT a degrade — a grandfathered re-opened group (stays worktree), a FRESH serial group (no done task), and the task-less primary anchor (no tasks)", () => {
-  // (b1) /repo-b disabled BUT grandfathered → worktree, never serial → not a degrade.
-  const gf = makeEpic({
-    epic_id: "fn-1-gf",
-    project_dir: "/repo-a",
-    tasks: [
-      makeTask({
-        task_id: "fn-1-gf.1",
-        task_number: 1,
-        epic_id: "fn-1-gf",
-        target_repo: "/repo-a",
-      }),
-      makeTask({
-        task_id: "fn-1-gf.2",
-        task_number: 2,
-        epic_id: "fn-1-gf",
-        target_repo: "/repo-b",
-        worker_phase: "done",
-        runtime_status: "done",
-      }),
-      makeTask({
-        task_id: "fn-1-gf.3",
-        task_number: 3,
-        epic_id: "fn-1-gf",
-        target_repo: "/repo-b",
-      }),
-    ],
-  });
-  const gfMap = classifyWorktreeRepos(
-    [gf],
-    abcResolve,
-    bDisabledNoManifest,
-    grandfatherLaneProbe((_e, repo) => repo === "/repo-b"),
-    true,
-  );
-  expect(clusteredSerialReopenDegrades([gf], gfMap)).toEqual([]);
-  // (b2) FRESH serial /repo-b (all pending, no done task) → normal disabled contract.
-  const fresh = makeEpic({
-    epic_id: "fn-1-fresh",
-    project_dir: "/repo-a",
-    tasks: [
-      makeTask({
-        task_id: "fn-1-fresh.1",
-        task_number: 1,
-        epic_id: "fn-1-fresh",
-        target_repo: "/repo-a",
-      }),
-      makeTask({
-        task_id: "fn-1-fresh.2",
-        task_number: 2,
-        epic_id: "fn-1-fresh",
-        target_repo: "/repo-b",
-      }),
-      makeTask({
-        task_id: "fn-1-fresh.3",
-        task_number: 3,
-        epic_id: "fn-1-fresh",
-        target_repo: "/repo-b",
-      }),
-    ],
-  });
-  const freshMap = classifyWorktreeRepos(
-    [fresh],
-    abcResolve,
-    bDisabledNoManifest,
-    grandfatherLaneProbe(() => false),
-    true,
-  );
-  expect(clusteredSerialReopenDegrades([fresh], freshMap)).toEqual([]);
-  // (b3) the task-less primary serial anchor (0 tasks) is never a degrade.
-  const anchorMap = classifyWorktreeRepos(
-    [primarylessEpic()],
-    abcResolve,
-    undefined,
-    undefined,
-    true,
-  );
-  expect(clusteredSerialReopenDegrades([primarylessEpic()], anchorMap)).toEqual(
-    [],
-  );
 });
 
 test("fn-1034 classifyWorktreeRepos: a single-repo epic NEVER clusters (stays `ok`, byte-identical) even with the flag ON", () => {
