@@ -1,7 +1,10 @@
-// epics verb — the port of planctl/run_epics.py. Lists every epic sorted by
-// parse_id epic number (unparseable -> 999, so it sorts last), each with a
-// per-epic task summary merged through the runtime overlay. Owns the only
-// --format human surface in this epic: _render_human's table view, matched
+// epics verb — the port of planctl/run_epics.py. Orders epics through
+// orderEpicsForListing (list.ts): the default listing surfaces open epics
+// first, ascending by epic number, then done epics most-recent-first;
+// --status open/done restrict to that section, --status all is the flat
+// ascending-by-number order over every epic. Each epic carries a per-epic
+// task summary merged through the runtime overlay. Owns the only --format
+// human surface in this epic: _render_human's table view, matched
 // byte-for-byte (non-zero-status parenthetical, non-ASCII title preserved).
 
 import { existsSync, readdirSync } from "node:fs";

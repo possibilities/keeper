@@ -1,9 +1,13 @@
 // list verb — the port of planctl/run_list.py. Builds the epic→tasks tree
-// (epics sorted by number, tasks by ordinal, statuses merged through the runtime
-// overlay) and emits it. The --format human render is golden-pinned byte-for-
-// byte: a per-epic header line, one indented line per task, and a blank spacer
-// line between epics (never trailing). Returns the resolved project root for the
-// read-only trailer (no positional id -> target null).
+// (epics ordered via orderEpicsForListing — open epics first ascending by
+// number then done epics most-recent-first by default, restricted to one
+// section under --status open/done, flat ascending-by-number under --status
+// all; tasks within each epic sorted by ordinal with status merged through
+// the runtime overlay) and emits it. The --format human render is
+// golden-pinned byte-for-byte: a per-epic header line, one indented line per
+// task, and a blank spacer line between epics (never trailing). Returns the
+// resolved project root for the read-only trailer (no positional id -> target
+// null).
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -175,9 +179,10 @@ export function orderEpicsForListing(
   return [...open.sort(compareEpics), ...done.sort(compareDoneRecent)];
 }
 
-/** An epic counts as open only when its status is exactly "open"; every other
- * status (done, or any unexpected value) falls into the history section so no
- * epic is ever dropped from a listing. */
+/** An epic counts as open when its status is the string "open" or is
+ * absent/non-string (a malformed epic stays visible in the open section
+ * rather than being buried in history); any other string status falls into
+ * the history section. */
 function isOpenEpic(e: Record<string, unknown>): boolean {
   return (typeof e.status === "string" ? e.status : "open") === "open";
 }

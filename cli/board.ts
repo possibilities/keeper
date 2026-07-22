@@ -1453,8 +1453,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     }
     // Same rule as the task arm: a [blocked:<reason>] verdict drops to its
     // own line beneath the [id]; ready/completed/running stay inline.
-    // `closeVerdict` was resolved once at the top of the block (the pinned-closed
-    // WHY line reads it too).
+    // `closeVerdict` was resolved once at the top of the block.
     const closeIdLines =
       closeVerdict.tag === "blocked"
         ? [`    [${epicId}]`, `    ${iconizePills(formatPill(closeVerdict))}`]
