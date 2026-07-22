@@ -6251,12 +6251,15 @@ function extractBlockEscalationAttemptedPayload(
 }
 
 /**
- * Fold one synthetic `BlockEscalationAttempted` event with staged outcomes. The
- * terminal legacy-fallback outcome advances requested → attempted. Ordinary
- * non-terminal launch failures reset to pending. Owning-work outcomes also reset
- * to pending while incrementing the durable attachment count, whether the launch
- * succeeded or failed. Every branch reads only the payload, event id, and persisted
- * row, so replay is deterministic; a missing latch is a safe no-op.
+ * Fold one synthetic `BlockEscalationAttempted` event with staged outcomes. Terminal
+ * outcomes advance requested → attempted: the legacy `dispatched` fallback, the
+ * `owner_exhausted` lease-spent verdict (which the stage-3 human-notify sweep pages on),
+ * and the `skipped_*` surface-and-stop terminals. Ordinary non-terminal launch failures
+ * reset to pending. Owning-work re-attach outcomes (`owner_redispatched` /
+ * `owner_redispatch_failed`) also reset to pending while incrementing the durable
+ * attachment count, whether the launch succeeded or failed. Every branch reads only the
+ * payload, event id, and persisted row, so replay is deterministic; a missing latch is a
+ * safe no-op.
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);

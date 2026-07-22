@@ -1632,6 +1632,18 @@ export const BLOCK_ESCALATION_SKIP_CATEGORY = "TOOLING_FAILURE";
 export const SHARED_BASE_BROKEN_CATEGORY = "SHARED_BASE_BROKEN";
 
 /**
+ * The one escalatable category whose blocker is a TRANSIENT EXTERNAL condition (a
+ * provider quota / rate-limit window), not a question the owning session already
+ * failed to answer. It rides the ordinary owner-fenced ladder like every other
+ * escalatable category, but through a TIME-DRIVEN re-check gate instead of the
+ * owner-death gate: the external condition, not the owner session, is the thing to
+ * re-test, so the ladder re-dispatches the owning `work::<task>` verb on a generous
+ * cadence ({@link EXTERNAL_BLOCK_RECHECK_INTERVAL_MS}) regardless of owner liveness.
+ * Named as its own constant so the sweep can key the cadence branch on it.
+ */
+export const EXTERNAL_BLOCKED_CATEGORY = "EXTERNAL_BLOCKED";
+
+/**
  * A pending `block_escalations` latch row joined to its epic's `project_dir` and
  * the embedded task's live `runtime_status` / `target_repo`. The producer sweep's
  * current-state working set — bounded by the number of concurrently-blocked
@@ -1646,6 +1658,9 @@ export interface PendingBlockEscalation {
   outcome: string | null;
   /** Durable count of owning-work attachment attempts for this block instance. */
   owner_redispatch_attempts: number;
+  /** The latch's last-touch wall-clock (seconds) — set on block arrival, then bumped
+   *  by each attachment attempt. The EXTERNAL_BLOCKED re-check cadence clocks off it. */
+  updated_at: number;
   /** Owning epic's `project_dir` — the plan state-file root for the reason read. */
   project_dir: string | null;
   /** The embedded task's live `runtime_status` — the cancellation-guard signal. */
@@ -1678,7 +1693,7 @@ export function selectPendingBlockEscalations(
   const latches = db
     .query(
       `SELECT id AS task_id, block_status AS status, block_outcome AS outcome,
-              owner_redispatch_attempts
+              owner_redispatch_attempts, updated_at
          FROM dispatch_failures
         WHERE verb = 'block'
           AND (block_status = 'pending'
@@ -1689,6 +1704,7 @@ export function selectPendingBlockEscalations(
     status: string;
     outcome: string | null;
     owner_redispatch_attempts: number;
+    updated_at: number;
   }[];
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
@@ -1737,6 +1753,7 @@ export function selectPendingBlockEscalations(
       status: latch.status,
       outcome: latch.outcome,
       owner_redispatch_attempts: latch.owner_redispatch_attempts,
+      updated_at: latch.updated_at,
       project_dir: epicRow?.project_dir ?? null,
       runtime_status: runtimeStatus,
       target_repo: targetRepo,
@@ -1961,18 +1978,58 @@ export function blockOwnerEscalationDecision(
     : "surface_exhausted";
 }
 
+/**
+ * The cadence (ms) between EXTERNAL_BLOCKED owner re-checks. Provider quota /
+ * rate-limit windows are hours-scale, so a re-check every few seconds only burns the
+ * bounded attempt budget hammering the SAME closed window. At 45 minutes the two
+ * bounded attachment attempts ({@link BLOCK_OWNER_REDISPATCH_LIMIT}) span ~1.5h of
+ * wall-clock — long enough for at least one quota window to reset and the re-dispatched
+ * `work::<task>` session to land — before the ladder exhausts and pages a human. Much
+ * shorter wastes the budget inside one window; much longer needlessly delays the page.
+ * The block sweep already rides a steady 60s heartbeat
+ * ({@link BLOCK_ESCALATION_SWEEP_INTERVAL_MS}), independent of `data_version`, so this
+ * multiple-of-a-minute cadence is observed even on a fully quiescent board with no
+ * waker armed.
+ */
+export const EXTERNAL_BLOCK_RECHECK_INTERVAL_MS = 45 * 60_000;
+
+/**
+ * The EXTERNAL_BLOCKED re-check gate — the time-driven sibling of {@link
+ * blockOwnerEscalationDecision}. A transient external blocker (a provider quota window)
+ * clears on its own clock, not on the owner session's death, so this gate ignores owner
+ * liveness entirely: it re-dispatches the owning `work::<task>` verb once the re-check
+ * interval has elapsed since the last attempt (or the block's arrival), consuming one
+ * bounded attachment attempt each time. Once the bounded budget is spent it surfaces
+ * exhausted so stage-3 pages — the same convergence-then-page shape as the owner-death
+ * ladder, just clocked on the external window instead of an owner death. `lastAttemptMs`
+ * is the latch's last-touch wall-clock (block arrival, then each attempt), so the
+ * attempts space out by `intervalMs`. Pure.
+ */
+export function externalBlockRecheckDecision(
+  lastAttemptMs: number,
+  ownerRedispatchAttempts: number,
+  nowMs: number,
+  intervalMs: number = EXTERNAL_BLOCK_RECHECK_INTERVAL_MS,
+  attemptLimit: number = BLOCK_OWNER_REDISPATCH_LIMIT,
+): "defer" | "redispatch_owner" | "surface_exhausted" {
+  if (ownerRedispatchAttempts >= attemptLimit) return "surface_exhausted";
+  return nowMs - lastAttemptMs >= intervalMs ? "redispatch_owner" : "defer";
+}
+
 /** The outcome the producer records on the `block_escalations` latch (the
  *  `BlockEscalationAttempted.outcome` column). The TERMINAL `dispatched` (the
- *  legacy `unblock::<task>` fallback launched) and the two skip terminals advance
- *  the latch to `attempted`; a later parsed reason-class change can re-arm
- *  `skipped_category` through the producer. Ordinary `dispatch_failed` resets to
- *  `pending`; the two `owner_*` outcomes also reset to pending while consuming a
- *  durable attachment attempt. A cap/occupancy skip mints nothing. */
+ *  legacy `unblock::<task>` fallback launched), `owner_exhausted` (the bounded owner
+ *  re-attach lease is spent — the terminal outcome stage-3 pages on), and the two skip
+ *  terminals advance the latch to `attempted`; a later parsed reason-class change can
+ *  re-arm `skipped_category` through the producer. Ordinary `dispatch_failed` resets to
+ *  `pending`; the two `owner_redispatch*` outcomes also reset to pending while consuming
+ *  a durable attachment attempt. A cap/occupancy skip mints nothing. */
 export type BlockEscalationOutcome =
   | "dispatched"
   | "dispatch_failed"
   | "owner_redispatched"
   | "owner_redispatch_failed"
+  | "owner_exhausted"
   | "skipped_category"
   | "skipped_unblocked";
 
@@ -2067,9 +2124,11 @@ export type BlockCandidateDropClass =
  * Run one daemon block-escalation sweep (stage 2) — the producer half of the
  * blocked-task handling ladder. Walk pending latches, preserve the category routes,
  * defer ordinary escalatable blocks while their owning work orchestrator is live or
- * death-grace-held, and consume bounded `work::<task>` attempts before the legacy
- * `unblock::<task>` fallback for both dead AUDIT_READY owners and ordinary blocks.
- * Every launch rung is serialized per epic.
+ * death-grace-held, consume bounded `work::<task>` re-attach attempts for both dead
+ * AUDIT_READY owners and ordinary blocks, then PAGE once the lease is spent. An
+ * EXTERNAL_BLOCKED block re-attaches on a time cadence instead of an owner death, so a
+ * quota window that reopens is retried automatically. Every launch rung is serialized
+ * per epic.
  *
  * Each row resolves to one of:
  *  - `skipped_unblocked` (terminal) — the cancellation guard fired (task left
@@ -2081,6 +2140,9 @@ export type BlockCandidateDropClass =
  *    block handler: mints nothing, so the latch stays pending.
  *  - `owner_redispatched` / `owner_redispatch_failed` — consume one durable
  *    attachment attempt and stay pending.
+ *  - `owner_exhausted` (terminal) — the bounded re-attach lease is spent. Mints
+ *    Requested→Attempted so the row leaves `pending` and the stage-3 human-notify
+ *    sweep pages the operator ONCE. NEVER dispatches an agent.
  *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal) — the legacy
  *    fallback launch outcome. A cap/occupancy skip mints nothing.
  *
@@ -2229,20 +2291,40 @@ export async function runBlockEscalationSweep(
 
     // Every non-skip route rides the bounded owner-fenced work ladder: the owning
     // `work::<task>` session is re-attached (running the in-session unblocker), and
-    // once the attachment lease is exhausted the block surfaces and waits on the
-    // board. No escalation session is ever dispatched.
+    // once the attachment lease is exhausted the block PAGES a human (stage 3). No
+    // escalation session is ever dispatched. EXTERNAL_BLOCKED rides the SAME ladder
+    // but through the time-driven re-check gate — the external window, not an owner
+    // death, is what re-opens it — so its decision ignores owner liveness.
+    const decideLadder = (liveness: BlockOwnerLiveness) =>
+      category === EXTERNAL_BLOCKED_CATEGORY
+        ? externalBlockRecheckDecision(
+            row.updated_at * 1000,
+            row.owner_redispatch_attempts,
+            (deps.now ?? Date.now)(),
+          )
+        : blockOwnerEscalationDecision(
+            liveness,
+            row.owner_redispatch_attempts,
+            (deps.now ?? Date.now)(),
+          );
     {
       const liveness: BlockOwnerLiveness =
         route === "work"
           ? (auditLiveness ?? { state: "absent" })
           : (deps.ownerLiveness?.(row) ?? { state: "absent" });
-      const decision = blockOwnerEscalationDecision(
-        liveness,
-        row.owner_redispatch_attempts,
-        (deps.now ?? Date.now)(),
-      );
-      // `defer` (owner may recover) and `surface_exhausted` (lease spent — the
-      // block stays visible pending an operator) both skip without dispatching.
+      const decision = decideLadder(liveness);
+      // The exhausted lease is TERMINAL: mint `owner_exhausted` (Requested→Attempted)
+      // so the row leaves the block-sweep working set and enters the stage-3
+      // human-notify sweep, which pages the operator ONCE. Minted exactly once per
+      // instance — the `attempted/owner_exhausted` latch matches neither `pending` nor
+      // the `skipped_category` re-arm the block selector reads, so it never re-mints.
+      if (decision === "surface_exhausted") {
+        deps.mintRequested(row.epic_id, row.task_id);
+        deps.mintAttempted(row.epic_id, row.task_id, "owner_exhausted");
+        continue;
+      }
+      // `defer` (owner may recover, or the external re-check interval has not elapsed)
+      // skips without dispatching.
       if (decision !== "redispatch_owner") continue;
     }
 
@@ -2286,11 +2368,10 @@ export async function runBlockEscalationSweep(
         route === "work"
           ? (deps.auditOrchestratorLiveness?.(row) ?? { state: "absent" })
           : (deps.ownerLiveness?.(row) ?? { state: "absent" });
-      const refreshed = blockOwnerEscalationDecision(
-        liveness,
-        row.owner_redispatch_attempts,
-        (deps.now ?? Date.now)(),
-      );
+      // The attempt count is unchanged mid-sweep, so a re-probe can only flip
+      // redispatch→defer (the owner attached in the race), never →surface_exhausted;
+      // the exhaustion mint stays owned by the first decision above.
+      const refreshed = decideLadder(liveness);
       if (refreshed !== "redispatch_owner") continue;
     }
 
@@ -2336,48 +2417,57 @@ export async function runBlockEscalationSweep(
 // ---------------------------------------------------------------------------
 //
 // The TERMINAL stage of the block/unblock escalation path, sibling to the
-// deconflict human-notify sweep. Where stage 2 (`runBlockEscalationSweep`)
-// DISPATCHES an `unblock::<task>` session, this sweep fires the ONE human
-// notification — via agentbot — only once that session ALSO declines or dies. A
-// SUCCESSFUL unblock flips the task out of `blocked`, which DELETEs the latch via
-// the leave-blocked `TaskSnapshot` fold, so this sweep never sees a resolved block.
+// deconflict human-notify sweep. It fires the ONE human notification — via agentbot —
+// when the block-handling ladder gives up: an `owner_exhausted` row (the bounded
+// owner re-attach lease is spent) pages DIRECTLY, since exhaustion is already the
+// terminal verdict; a legacy `dispatched` `unblock::<task>` row pages only once that
+// session ALSO declines or dies. A SUCCESSFUL resolution flips the task out of
+// `blocked`, which DELETEs the latch via the leave-blocked `TaskSnapshot` fold, so
+// this sweep never sees a resolved block.
 
 /**
- * A dispatched-but-not-yet-notified block incident — the stage-3 working set.
- * Bounded by the number of concurrently dispatched-and-declined unblock
- * escalations, never a history scan.
+ * A terminal-but-not-yet-notified block incident — the stage-3 working set. Bounded by
+ * the number of concurrently exhausted/declined blocks, never a history scan. `outcome`
+ * is the terminal `block_outcome` that fed stage-3 — it decides how the row pages (see
+ * {@link runBlockHumanNotifySweep}).
  */
 export interface PendingBlockHumanNotify {
   epic_id: string;
   task_id: string;
+  /** The terminal `block_outcome`: `owner_exhausted` (pages directly) or the legacy
+   *  `dispatched` (sequences behind the `unblock::<task>` session's verdict). */
+  outcome: string;
 }
 
 /**
- * Select every block incident (the `dispatch_failures` `verb='block'` subset) whose
- * `unblock::<task>` session was DISPATCHED (`block_status='attempted'`,
- * `block_outcome='dispatched'`) but whose human has NOT yet been notified
- * (`human_notified_at IS NULL`). The SQL twin of the stage-3 gate:
- * `block_outcome='dispatched'` excludes the `skipped_*` terminals (no session ran for
- * them), and a stamped `human_notified_at` (the terminal `notified` fold) drops the
- * row — the notify-once guarantee. The leave-blocked DELETE re-arms the whole chain.
- * The `epic_id` is derived from the incident id (a `block` row carries only the task
- * id) for the `BlockHumanNotified` mint's payload.
+ * Select every block incident (the `dispatch_failures` `verb='block'` subset) that
+ * reached a TERMINAL page-eligible outcome (`block_status='attempted'` AND
+ * `block_outcome IN ('dispatched','owner_exhausted')`) but whose human has NOT yet been
+ * notified (`human_notified_at IS NULL`). `owner_exhausted` is the outcome the modern
+ * owner-fenced ladder mints when its bounded re-attach lease is spent; `dispatched` is
+ * the legacy `unblock::<task>` fallback, retained for back-compat. The filter excludes
+ * the `skipped_*` terminals (surface-and-stop, no page) and the non-terminal
+ * `owner_redispatch*` rungs (still converging). A stamped `human_notified_at` (the
+ * terminal `notified` fold) drops the row — the notify-once guarantee; the leave-blocked
+ * DELETE re-arms the whole chain. The `epic_id` is derived from the incident id (a
+ * `block` row carries only the task id) for the `BlockHumanNotified` mint's payload.
  */
 export function selectPendingBlockHumanNotifications(
   db: Database,
 ): PendingBlockHumanNotify[] {
   const rows = db
     .query(
-      `SELECT id FROM dispatch_failures
+      `SELECT id, block_outcome FROM dispatch_failures
          WHERE verb = 'block'
            AND block_status = 'attempted'
-           AND block_outcome = 'dispatched'
+           AND block_outcome IN ('dispatched', 'owner_exhausted')
            AND human_notified_at IS NULL`,
     )
-    .all() as { id: string }[];
+    .all() as { id: string; block_outcome: string }[];
   return rows.map((r) => ({
     task_id: r.id,
     epic_id: parsePlanRef(r.id)?.epic_id ?? "",
+    outcome: r.block_outcome,
   }));
 }
 
@@ -2388,17 +2478,36 @@ export function selectPendingBlockHumanNotifications(
 export type BlockHumanNotifiedOutcome = "notified" | "notify_failed";
 
 /**
- * Build the ONE structured operator notification the unblock human-notify sweep
- * sends over agentbot when an `unblock::<task>` session DECLINES (stamped BLOCKED) or
- * DIES. Short by design — the blocked task already carries the full context on the
- * board (`keeper status` / `keeper plan show`); this is the courtesy ping that names
- * the task, the verdict, and the unstick command. Pure.
+ * The stage-3 page verdict. `declined` / `died` come from a legacy `unblock::<task>`
+ * session's terminal classification; `exhausted` is the modern ladder's own verdict —
+ * the bounded owner re-attach lease is spent (an unrecoverable spec/design blocker, or
+ * an external window that never reopened within the budget).
+ */
+export type BlockNotifyVerdict = "declined" | "died" | "exhausted";
+
+/**
+ * Build the ONE structured operator notification the block human-notify sweep sends over
+ * agentbot when the block-handling ladder gives up: the owning work session's bounded
+ * re-attach lease is `exhausted`, or a legacy `unblock::<task>` session `declined` /
+ * `died`. Short by design — the blocked task already carries the full context on the
+ * board (`keeper status` / `keeper plan show`); this is the courtesy ping that names the
+ * task, the verdict, and the unstick command. Pure.
  */
 export function buildBlockHumanNotifyBody(args: {
   epicId: string;
   taskId: string;
-  verdict: "declined" | "died";
+  verdict: BlockNotifyVerdict;
 }): string {
+  if (args.verdict === "exhausted") {
+    return [
+      `🔴 keeper: ${args.taskId} needs you — the autonomous block-handling ladder`,
+      `re-attached its owning work session the maximum number of times and task`,
+      `${args.taskId} (epic ${args.epicId}) is STILL blocked; it will NOT auto-retry.`,
+      ``,
+      `Resolve the blocker by hand, then unstick the board:`,
+      `  keeper plan unblock ${args.taskId}`,
+    ].join("\n");
+  }
   const verdictLine =
     args.verdict === "died"
       ? `its job DIED before resolving`
@@ -2540,23 +2649,24 @@ export interface BlockHumanNotifySweepDeps {
   /** The current-state pending working set (DELEGATES to
    *  {@link selectPendingBlockHumanNotifications} in production). */
   readonly selectPending: () => PendingBlockHumanNotify[];
-  /** Re-read that the latch for `(epicId, taskId)` is STILL the dispatched-but-not-
+  /** Re-read that the latch for `(epicId, taskId)` is STILL a terminal-but-not-
    *  notified stage-3 row — checked immediately before the notify to narrow the
    *  clear-mid-sweep window (a leave-blocked DELETE between select and notify drops
    *  the row). Reads the live projection on the writable connection in production. */
   readonly stillPending: (epicId: string, taskId: string) => boolean;
-  /** Classify the dispatched `unblock::<task>` session's outcome for `taskId`
+  /** Classify the legacy `dispatched` `unblock::<task>` session's outcome for `taskId`
    *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
-   *  production). The human is notified ONLY on a terminal verdict; while the session
-   *  is live or its job has not folded yet it returns `{terminal:false}` and the
-   *  sweep skips the row (a successful unblock clears the latch before this runs). */
+   *  production). Read ONLY for a `dispatched` row; an `owner_exhausted` row is already
+   *  terminal by construction and pages directly. The human is notified ONLY on a
+   *  terminal verdict; while the session is live or its job has not folded yet it
+   *  returns `{terminal:false}` and the sweep skips the row. */
   readonly unblockOutcome: (taskId: string) => ResolverOutcome;
-  /** Send the ONE agentbot notification about the declined/dead unblock session.
+  /** Send the ONE agentbot notification about the exhausted/declined/dead block.
    *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
    *  (the block stays operator-visible meanwhile), never a wedge or a silent drop. */
   readonly notifyHuman: (
     row: PendingBlockHumanNotify,
-    verdict: "declined" | "died",
+    verdict: BlockNotifyVerdict,
   ) => Promise<BlockHumanNotifiedOutcome>;
   /** Mint a `BlockHumanNotified{outcome}` synthetic event. The fold stamps
    *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the latch —
@@ -2571,11 +2681,13 @@ export interface BlockHumanNotifySweepDeps {
 }
 
 /**
- * Run one daemon unblock human-notify sweep (stage 3) — the terminal "notify the
- * human ONCE" half of the block/unblock escalation path. Walk the dispatched-but-
- * not-notified latch rows, re-read that each is STILL pending, sequence behind the
- * `unblock::<task>` session's TERMINAL decline/death, send ONE agentbot notification,
- * then mint `BlockHumanNotified{outcome}`.
+ * Run one daemon block human-notify sweep (stage 3) — the terminal "notify the human
+ * ONCE" half of the block escalation path. Walk the terminal-but-not-notified latch
+ * rows, re-read that each is STILL pending, resolve its page verdict, send ONE agentbot
+ * notification, then mint `BlockHumanNotified{outcome}`. An `owner_exhausted` row is
+ * already terminal (the block sweep only mints it once the bounded re-attach lease is
+ * spent), so it pages DIRECTLY with the `exhausted` verdict; a legacy `dispatched` row
+ * sequences behind the `unblock::<task>` session's TERMINAL decline/death.
  *
  * NOTIFIES ONCE — the sweep NEVER clears the latch; only the leave-blocked DELETE
  * does. A TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next
@@ -2594,7 +2706,7 @@ export async function runBlockHumanNotifySweep(
     pending = deps.selectPending();
   } catch (err) {
     note(
-      `# warn: unblock human-notify sweep read threw (non-fatal): ${
+      `# warn: block human-notify sweep read threw (non-fatal): ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
@@ -2607,21 +2719,30 @@ export async function runBlockHumanNotifySweep(
     // unblocked) or the notified fold between select and notify means there is
     // nothing left to notify — skip without minting.
     if (!deps.stillPending(row.epic_id, row.task_id)) continue;
-    // Sequence behind the unblock session: notify the human only once that session
-    // reached a TERMINAL decline/death. While it is live — or its job has not folded
-    // yet — skip without minting, so the row re-sweeps next tick. A successful unblock
-    // takes the task out of `blocked`, deleting the latch before this sweep sees it.
-    const outcome = deps.unblockOutcome(row.task_id);
-    if (!outcome.terminal) continue;
+    // Resolve the page verdict. An exhausted lease is ALREADY terminal — the block
+    // sweep minted `owner_exhausted` only after the bounded re-attach budget was spent,
+    // so there is no session to sequence behind: page directly. A legacy `dispatched`
+    // row sequences behind the unblock session — notify only once it reached a TERMINAL
+    // decline/death; while it is live or its job has not folded yet, skip without
+    // minting so the row re-sweeps next tick (a successful resolution deletes the latch
+    // before this sweep sees it).
+    let verdict: BlockNotifyVerdict;
+    if (row.outcome === "owner_exhausted") {
+      verdict = "exhausted";
+    } else {
+      const outcome = deps.unblockOutcome(row.task_id);
+      if (!outcome.terminal) continue;
+      verdict = outcome.verdict;
+    }
 
     let result: BlockHumanNotifiedOutcome;
     try {
-      result = await deps.notifyHuman(row, outcome.verdict);
+      result = await deps.notifyHuman(row, verdict);
     } catch (err) {
       // The helper is fail-open by contract; this catch is defense-in-depth so a
       // surprise throw still records a non-terminal outcome and never aborts the sweep.
       note(
-        `# warn: unblock human-notify threw for ${row.task_id} (non-fatal): ${
+        `# warn: block human-notify threw for ${row.task_id} (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -15200,7 +15321,7 @@ function startDaemonWithExitAttribution(
     });
   }
 
-  // Send the ONE agentbot notification about a declined/dead `unblock::<task>` session
+  // Send the ONE agentbot notification about an exhausted lease / declined / dead block
   // (stage 3). ASYNC spawn, array form so the body
   // rides as a literal argv element (no shell interpolation). A non-zero exit OR a missing
   // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and the row
@@ -15208,7 +15329,7 @@ function startDaemonWithExitAttribution(
   // on the board throughout.
   async function notifyHumanOfBlock(
     row: PendingBlockHumanNotify,
-    verdict: "declined" | "died",
+    verdict: BlockNotifyVerdict,
   ): Promise<BlockHumanNotifiedOutcome> {
     const body = buildBlockHumanNotifyBody({
       epicId: row.epic_id,
@@ -15340,14 +15461,15 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // Producer-side unblock human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
-  // the block latches whose `unblock::<task>` session was dispatched but whose human is
-  // not yet notified, and sends ONE agentbot notification once that session reaches a
-  // TERMINAL decline/death — then mints `BlockHumanNotified{outcome}`. A terminal
-  // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE; a
-  // `notify_failed` re-sweeps. A successful unblock takes the task out of `blocked`,
-  // deleting the latch before this ever fires. Same pause + autopilot-role gating as the
-  // dispatch sweep.
+  // Producer-side block human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
+  // the terminal block latches whose human is not yet notified, and sends ONE agentbot
+  // notification: an `owner_exhausted` row (the bounded owner re-attach lease spent)
+  // pages directly, a legacy `dispatched` row pages once its `unblock::<task>` session
+  // reaches a TERMINAL decline/death — then mints `BlockHumanNotified{outcome}`. A
+  // terminal `notified` stamps the `human_notified_at` once-marker so the human is
+  // notified ONCE; a `notify_failed` re-sweeps. A successful resolution takes the task
+  // out of `blocked`, deleting the latch before this ever fires. Same pause +
+  // autopilot-role gating as the dispatch sweep.
   async function runBlockHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
@@ -15358,7 +15480,7 @@ function startDaemonWithExitAttribution(
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome = 'dispatched' AND human_notified_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome IN ('dispatched', 'owner_exhausted') AND human_notified_at IS NULL LIMIT 1",
               )
               .get(taskId) != null
           );

@@ -66,6 +66,7 @@ import {
   type BlockEscalationSweepDeps,
   type BlockHumanNotifiedOutcome,
   type BlockHumanNotifySweepDeps,
+  type BlockNotifyVerdict,
   type BlockOwnerLiveness,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
@@ -111,9 +112,11 @@ import {
   dispatchClearFencesAtAppend,
   drainToCompletion,
   type EscalationDispatchOutcome,
+  EXTERNAL_BLOCK_RECHECK_INTERVAL_MS,
   type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
   expireIncidentGrants,
+  externalBlockRecheckDecision,
   findOsMemoryKillEvidence,
   foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
@@ -8438,6 +8441,7 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
     status: "pending",
     outcome: null,
     owner_redispatch_attempts: 0,
+    updated_at: 1,
     project_dir: "/proj/foo",
     runtime_status: "blocked",
     target_repo: "/repo/x",
@@ -8469,6 +8473,7 @@ test("selectPendingBlockEscalations: attempted skipped_category remains eligible
       status: "attempted",
       outcome: "skipped_category",
       owner_redispatch_attempts: 0,
+      updated_at: 1,
       project_dir: "/proj/rearm",
       runtime_status: "blocked",
       target_repo: null,
@@ -8497,6 +8502,7 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
     status: "pending",
     outcome: null,
     owner_redispatch_attempts: 0,
+    updated_at: 1,
     project_dir: null,
     runtime_status: null,
     target_repo: null,
@@ -8510,6 +8516,7 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
     status: "pending",
     outcome: null,
     owner_redispatch_attempts: 0,
+    updated_at: 1,
     project_dir: "/proj/bar",
     runtime_status: null,
     target_repo: null,
@@ -8548,6 +8555,10 @@ function blockedRow(
     status: "pending",
     outcome: null,
     owner_redispatch_attempts: 0,
+    // Block-arrival anchor for the EXTERNAL_BLOCKED re-check cadence; ignored by every
+    // other category. Zero = "blocked at epoch", so an external fixture with the default
+    // `nowMs` reads the cadence as elapsed unless a test overrides one of the two.
+    updated_at: 0,
     project_dir: "/proj",
     runtime_status: "blocked",
     target_repo: null,
@@ -9019,8 +9030,10 @@ test("runBlockEscalationSweep: an already_live skip (occupancy guard) mints NOTH
 
 test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attempted{owner_redispatch_failed} (re-sweepable)", async () => {
   const { deps, mints } = fakeSweepDeps({
+    // A non-external category so the default (owner-dead-past-grace) fixture reaches the
+    // dispatch — EXTERNAL rides the time cadence and would defer here.
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
-    reasons: { "fn-1-foo.1": "EXTERNAL_BLOCKED: api down" },
+    reasons: { "fn-1-foo.1": "DEPENDENCY_BLOCKED: upstream down" },
     dispatchOwner: async () => "dispatch_failed",
   });
   await runBlockEscalationSweep(deps);
@@ -9063,12 +9076,15 @@ test("runBlockEscalationSweep: an empty pending set is a no-op (no mints, no dis
   expect(dispatches).toEqual([]);
 });
 
+// The owner-death-gated escalatable categories — every category whose owner ladder
+// keys on witnessed owner LIVENESS. EXTERNAL_BLOCKED is deliberately EXCLUDED: it rides
+// the same ladder but through the time-driven re-check gate (it ignores owner liveness),
+// so its behavior is pinned by the dedicated cadence tests below, not this liveness one.
 const IN_SESSION_BLOCK_CATEGORIES = [
   "SPEC_UNCLEAR",
   "DEPENDENCY_BLOCKED",
   "DESIGN_CONFLICT",
   "SCOPE_EXCEEDED",
-  "EXTERNAL_BLOCKED",
   "RESUME_EXHAUSTED",
 ] as const;
 
@@ -9104,7 +9120,7 @@ test("runBlockEscalationSweep: every ordinary escalatable category defers while 
   expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: witnessed owner deaths consume two durable attachment attempts, then the exhausted lease surfaces silently (no dispatch of any kind)", async () => {
+test("runBlockEscalationSweep: witnessed owner deaths consume two durable attachment attempts, then the exhausted lease mints owner_exhausted (which stage-3 pages on)", async () => {
   const taskId = "fn-30-lease.1";
   const row = blockedRow("fn-30-lease", taskId, {
     owner_redispatch_attempts: 0,
@@ -9141,15 +9157,33 @@ test("runBlockEscalationSweep: witnessed owner deaths consume two durable attach
   expect(dispatches).toEqual([]);
 
   // The lease is now exhausted: `blockOwnerEscalationDecision` returns
-  // `surface_exhausted`, NOT a fallback dispatch of any kind (the legacy
-  // `unblock::<task>` fallback no longer exists) — the sweep skips the row without
-  // minting, so it surfaces silently on the board pending an operator.
+  // `surface_exhausted`, and the sweep mints the TERMINAL `owner_exhausted`
+  // (Requested→Attempted) — NO dispatch of any kind — so the row leaves `pending`
+  // and feeds the stage-3 human-notify sweep, which pages the operator ONCE.
   const mintsBefore = mints.length;
   row.owner_redispatch_attempts = BLOCK_OWNER_REDISPATCH_LIMIT;
   await runBlockEscalationSweep(deps);
   expect(ownerDispatches).toHaveLength(2);
   expect(dispatches).toEqual([]);
-  expect(mints).toHaveLength(mintsBefore);
+  expect(mints.slice(mintsBefore)).toEqual([
+    { kind: "requested", epicId: "fn-30-lease", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-30-lease",
+      taskId,
+      outcome: "owner_exhausted",
+    },
+  ]);
+
+  // Once minted, the row is `attempted/owner_exhausted` — it leaves the block-sweep
+  // working set (the production selector admits only `pending` / `skipped_category`),
+  // so a synthetic re-sweep of the same row (were it still selected) never re-mints.
+  const afterExhaustMint = mints.length;
+  row.status = "attempted";
+  row.outcome = "owner_exhausted";
+  await runBlockEscalationSweep(deps);
+  expect(mints).toHaveLength(afterExhaustMint);
+  expect(ownerDispatches).toHaveLength(2);
 });
 
 test("runBlockEscalationSweep: an owner launch failure consumes a bounded attachment attempt", async () => {
@@ -9160,7 +9194,9 @@ test("runBlockEscalationSweep: an owner launch failure consumes a bounded attach
         owner_redispatch_attempts: 0,
       }),
     ],
-    reasons: { [taskId]: "EXTERNAL_BLOCKED: fixture" },
+    // A non-external category so this pins the owner-DEATH ladder's failed-launch
+    // accounting (EXTERNAL rides the time cadence — its own tests below).
+    reasons: { [taskId]: "DESIGN_CONFLICT: fixture" },
     owner: { [taskId]: { state: "dead", diedAtMs: 0 } },
     nowMs: BLOCK_OWNER_GRACE_MS,
     dispatchOwner: async () => "dispatch_failed",
@@ -9190,6 +9226,109 @@ test("runBlockEscalationSweep: an exhausted attachment lease still defers every 
   expect(ownerDispatches).toEqual([]);
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([]);
+});
+
+// ---- EXTERNAL_BLOCKED time-driven re-check cadence ---------------------------
+
+// A blocked-at anchor of 1000s → 1_000_000ms; the cadence gate compares against this.
+const EXTERNAL_BLOCKED_AT_S = 1_000;
+const EXTERNAL_BLOCKED_AT_MS = EXTERNAL_BLOCKED_AT_S * 1000;
+
+test("runBlockEscalationSweep: EXTERNAL_BLOCKED defers BEFORE its re-check interval elapses — even with a dead owner past grace (cadence, not liveness)", async () => {
+  const taskId = "fn-40-quota.1";
+  const { deps, mints, ownerDispatches } = fakeSweepDeps({
+    pending: [
+      blockedRow("fn-40-quota", taskId, {
+        owner_redispatch_attempts: 0,
+        updated_at: EXTERNAL_BLOCKED_AT_S,
+      }),
+    ],
+    reasons: { [taskId]: "EXTERNAL_BLOCKED: provider quota exhausted" },
+    // A dead-past-grace owner would fire the ORDINARY ladder immediately; EXTERNAL must
+    // still wait for its interval, so this proves the gate ignores owner liveness.
+    owner: { [taskId]: { state: "dead", diedAtMs: 0 } },
+    nowMs: EXTERNAL_BLOCKED_AT_MS + EXTERNAL_BLOCK_RECHECK_INTERVAL_MS - 1,
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(ownerDispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: EXTERNAL_BLOCKED re-dispatches the owning work verb once the interval elapses (quiescent DB: pure clock edge, owner liveness ignored)", async () => {
+  const taskId = "fn-41-quota.1";
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
+    pending: [
+      blockedRow("fn-41-quota", taskId, {
+        owner_redispatch_attempts: 0,
+        updated_at: EXTERNAL_BLOCKED_AT_S,
+      }),
+    ],
+    reasons: { [taskId]: "EXTERNAL_BLOCKED: provider quota exhausted" },
+    // A LIVE owner would make the ordinary ladder defer forever; EXTERNAL ignores it and
+    // re-dispatches on the clock (the production `already_live` guard handles the race).
+    owner: { [taskId]: { state: "live" } },
+    nowMs: EXTERNAL_BLOCKED_AT_MS + EXTERNAL_BLOCK_RECHECK_INTERVAL_MS,
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  // A re-dispatch of the OWNING work verb (never an escalation verb), and the durable
+  // attempt is consumed via owner_redispatched.
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([{ epicId: "fn-41-quota", taskId }]);
+  expect(mints).toEqual([
+    { kind: "requested", epicId: "fn-41-quota", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-41-quota",
+      taskId,
+      outcome: "owner_redispatched",
+    },
+  ]);
+});
+
+test("runBlockEscalationSweep: EXTERNAL_BLOCKED converges over the bounded budget then PAGES via owner_exhausted", async () => {
+  const taskId = "fn-42-quota.1";
+  const row = blockedRow("fn-42-quota", taskId, {
+    owner_redispatch_attempts: 0,
+    updated_at: EXTERNAL_BLOCKED_AT_S,
+  });
+  const options = {
+    pending: [row],
+    reasons: { [taskId]: "EXTERNAL_BLOCKED: provider quota exhausted" },
+    owner: { [taskId]: { state: "live" as const } },
+    nowMs: EXTERNAL_BLOCKED_AT_MS + EXTERNAL_BLOCK_RECHECK_INTERVAL_MS,
+  };
+  const { deps, mints, ownerDispatches } = fakeSweepDeps(options);
+
+  // Burn each bounded re-check attempt, one per elapsed interval (simulate the fold
+  // resetting to pending + bumping the attempt count and the updated_at anchor).
+  for (let attempt = 0; attempt < BLOCK_OWNER_REDISPATCH_LIMIT; attempt += 1) {
+    await runBlockEscalationSweep(deps);
+    expect(ownerDispatches).toHaveLength(attempt + 1);
+    row.owner_redispatch_attempts += 1;
+    row.outcome = "owner_redispatched";
+    // The attempt bumped updated_at; the next re-check waits another full interval.
+    row.updated_at = Math.floor(options.nowMs / 1000);
+    options.nowMs += EXTERNAL_BLOCK_RECHECK_INTERVAL_MS;
+  }
+
+  // Budget spent → the sweep mints the TERMINAL owner_exhausted (no more dispatch), which
+  // the stage-3 sweep pages on.
+  const mintsBefore = mints.length;
+  await runBlockEscalationSweep(deps);
+  expect(ownerDispatches).toHaveLength(BLOCK_OWNER_REDISPATCH_LIMIT);
+  expect(mints.slice(mintsBefore)).toEqual([
+    { kind: "requested", epicId: "fn-42-quota", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-42-quota",
+      taskId,
+      outcome: "owner_exhausted",
+    },
+  ]);
 });
 
 test("runBlockEscalationSweep: a newly-live owner closes the fallback dispatch race", async () => {
@@ -9313,7 +9452,7 @@ test("runBlockEscalationSweep: an AUDIT_READY work resume at cap stays pending",
   expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust the owner bound and surface silently; a synthetic page still fires on a declined/died unblock incident", async () => {
+test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust the owner bound, mint owner_exhausted, and the stage-3 sweep pages on it exactly once", async () => {
   const epicId = "fn-1-audit-loop";
   const taskId = `${epicId}.1`;
   const row = blockedRow(epicId, taskId, {
@@ -9352,35 +9491,50 @@ test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust t
     options.nowMs += 1;
   }
 
-  // The lease is now exhausted: `surface_exhausted` skips WITHOUT minting (no
-  // fallback dispatch of any kind — the legacy `unblock::<task>` fallback is gone).
+  // The lease is now exhausted: `surface_exhausted` mints the TERMINAL `owner_exhausted`
+  // (Requested→Attempted) — no dispatch of any kind — so the row leaves `pending` and
+  // becomes an `attempted/owner_exhausted` incident the stage-3 sweep pages on.
   const mintsBefore = mints.length;
   await runBlockEscalationSweep(deps);
   expect(ownerDispatches).toHaveLength(BLOCK_OWNER_REDISPATCH_LIMIT);
   expect(dispatches).toEqual([]);
-  expect(mints).toHaveLength(mintsBefore);
+  expect(mints.slice(mintsBefore)).toEqual([
+    { kind: "requested", epicId, taskId },
+    { kind: "attempted", epicId, taskId, outcome: "owner_exhausted" },
+  ]);
 
-  // The exhausted lease no longer feeds `runBlockHumanNotifySweep` in production
-  // (nothing ever mints a `dispatched` outcome for it to select), but the sweep's
-  // own paging mechanics stay independently correct given a synthetic pending row.
-  const pages: { taskId: string; verdict: "declined" | "died" }[] = [];
+  // The exhausted lease now feeds `runBlockHumanNotifySweep` in production: the
+  // production selector admits `owner_exhausted`, and an `owner_exhausted` row is
+  // ALREADY terminal (the block sweep only mints it once the lease is spent), so it
+  // pages DIRECTLY with the `exhausted` verdict — no `unblockOutcome` sequencing — and
+  // exactly once. A second sweep after the notify latch is stamped selects nothing.
+  const pages: { taskId: string; verdict: BlockNotifyVerdict }[] = [];
   const notifyMints: BlockHumanNotifyMintCall[] = [];
+  let notified = false;
   await runBlockHumanNotifySweep({
-    selectPending: () => [{ epic_id: epicId, task_id: taskId }],
+    selectPending: () =>
+      notified
+        ? []
+        : [{ epic_id: epicId, task_id: taskId, outcome: "owner_exhausted" }],
     stillPending: () => true,
-    unblockOutcome: () => ({ terminal: true, verdict: "died" }),
+    // An owner_exhausted row must NOT consult the unblock classifier at all.
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly, never sequence");
+    },
     notifyHuman: async (pending, verdict) => {
       pages.push({ taskId: pending.task_id, verdict });
       return "notified";
     },
-    mintAttempted: (notifiedEpicId, notifiedTaskId, outcome) =>
+    mintAttempted: (notifiedEpicId, notifiedTaskId, outcome) => {
       notifyMints.push({
         epicId: notifiedEpicId,
         taskId: notifiedTaskId,
         outcome,
-      }),
+      });
+      notified = true;
+    },
   });
-  expect(pages).toEqual([{ taskId, verdict: "died" }]);
+  expect(pages).toEqual([{ taskId, verdict: "exhausted" }]);
   expect(notifyMints).toEqual([{ epicId, taskId, outcome: "notified" }]);
 });
 
@@ -9634,6 +9788,42 @@ test("blockOwnerEscalationDecision: witnessed death advances attachment attempts
       10 * BLOCK_OWNER_GRACE_MS,
     ),
   ).toBe("defer");
+});
+
+test("externalBlockRecheckDecision: re-dispatches once the interval elapses, ignores owner liveness, then surfaces exhausted", () => {
+  const interval = EXTERNAL_BLOCK_RECHECK_INTERVAL_MS;
+  const blockedAt = 1_000_000;
+  // Before the interval elapses → defer (do not hammer a still-closed window).
+  expect(
+    externalBlockRecheckDecision(blockedAt, 0, blockedAt + interval - 1),
+  ).toBe("defer");
+  // Exactly at the interval → re-dispatch (>=).
+  expect(externalBlockRecheckDecision(blockedAt, 0, blockedAt + interval)).toBe(
+    "redispatch_owner",
+  );
+  expect(
+    externalBlockRecheckDecision(blockedAt, 1, blockedAt + 10 * interval),
+  ).toBe("redispatch_owner");
+  // Bounded budget spent → surface exhausted (pages), even far past an interval.
+  expect(
+    externalBlockRecheckDecision(
+      blockedAt,
+      BLOCK_OWNER_REDISPATCH_LIMIT,
+      blockedAt + 100 * interval,
+    ),
+  ).toBe("surface_exhausted");
+  // Exhaustion wins over the interval gate even if the interval has NOT elapsed.
+  expect(
+    externalBlockRecheckDecision(
+      blockedAt,
+      BLOCK_OWNER_REDISPATCH_LIMIT,
+      blockedAt,
+    ),
+  ).toBe("surface_exhausted");
+  // Clock skew (anchor in the future) never premature-dispatches.
+  expect(externalBlockRecheckDecision(blockedAt, 0, blockedAt - 1)).toBe(
+    "defer",
+  );
 });
 
 test("runBlockEscalationSweep: a SHARED_BASE_BROKEN block routes to REPAIR — never dispatches an unblock, never surface-and-stops", async () => {
@@ -11292,6 +11482,18 @@ test("buildBlockHumanNotifyBody: a died verdict names the death", () => {
   expect(body).toContain("keeper plan unblock fn-9-foo.2");
 });
 
+test("buildBlockHumanNotifyBody: an exhausted verdict names the spent re-attach lease and the unblock command", () => {
+  const body = buildBlockHumanNotifyBody({
+    epicId: "fn-9-foo",
+    taskId: "fn-9-foo.2",
+    verdict: "exhausted",
+  });
+  expect(body).toContain("fn-9-foo.2");
+  expect(body).toContain("fn-9-foo");
+  expect(body).toContain("NOT auto-retry");
+  expect(body).toContain("keeper plan unblock fn-9-foo.2");
+});
+
 // ---- selectPendingBlockHumanNotifications (the stage-3 working-set read) ------
 
 /** Seed one block incident (the `dispatch_failures` `verb='block'` subset) with the
@@ -11311,15 +11513,25 @@ function seedFullBlockLatch(
   );
 }
 
-test("selectPendingBlockHumanNotifications: picks only dispatched-but-not-notified latches", () => {
+test("selectPendingBlockHumanNotifications: picks only terminal (dispatched | owner_exhausted)-but-not-notified latches, carrying the outcome", () => {
   const { db } = freshMemDb();
-  // Dispatched, human not yet notified → SELECTED (the stage-3 working set).
+  // Legacy dispatched, human not yet notified → SELECTED (the stage-3 working set).
   seedFullBlockLatch(
     db,
     "fn-1-foo",
     "fn-1-foo.1",
     "attempted",
     "dispatched",
+    null,
+  );
+  // The modern exhausted-lease terminal, not yet notified → SELECTED: this is exactly
+  // the outcome the owner-fenced ladder mints when its bounded lease is spent.
+  seedFullBlockLatch(
+    db,
+    "fn-5-exh",
+    "fn-5-exh.1",
+    "attempted",
+    "owner_exhausted",
     null,
   );
   // Not-yet-dispatched (a skipped_category terminal — no session ran) → dropped.
@@ -11329,6 +11541,15 @@ test("selectPendingBlockHumanNotifications: picks only dispatched-but-not-notifi
     "fn-2-tool.1",
     "attempted",
     "skipped_category",
+    null,
+  );
+  // A non-terminal owner rung (still converging) → dropped.
+  seedFullBlockLatch(
+    db,
+    "fn-6-rung",
+    "fn-6-rung.1",
+    "pending",
+    "owner_redispatched",
     null,
   );
   // Still pending (stage 2 owns it) → dropped.
@@ -11344,7 +11565,10 @@ test("selectPendingBlockHumanNotifications: picks only dispatched-but-not-notifi
   );
 
   const rows = selectPendingBlockHumanNotifications(db);
-  expect(rows).toEqual([{ epic_id: "fn-1-foo", task_id: "fn-1-foo.1" }]);
+  expect(rows).toEqual([
+    { epic_id: "fn-1-foo", task_id: "fn-1-foo.1", outcome: "dispatched" },
+    { epic_id: "fn-5-exh", task_id: "fn-5-exh.1", outcome: "owner_exhausted" },
+  ]);
   db.close();
 });
 
@@ -11368,16 +11592,16 @@ function fakeBlockHumanNotifySweepDeps(opts: {
   unblockOutcome?: (taskId: string) => ResolverOutcome;
   notify?: (
     row: PendingBlockHumanNotify,
-    verdict: "declined" | "died",
+    verdict: BlockNotifyVerdict,
   ) => Promise<BlockHumanNotifiedOutcome>;
   selectThrows?: boolean;
 }): {
   deps: BlockHumanNotifySweepDeps;
   mints: BlockHumanNotifyMintCall[];
-  notifies: { taskId: string; verdict: "declined" | "died" }[];
+  notifies: { taskId: string; verdict: BlockNotifyVerdict }[];
 } {
   const mints: BlockHumanNotifyMintCall[] = [];
-  const notifies: { taskId: string; verdict: "declined" | "died" }[] = [];
+  const notifies: { taskId: string; verdict: BlockNotifyVerdict }[] = [];
   const deps: BlockHumanNotifySweepDeps = {
     selectPending: () => {
       if (opts.selectThrows) throw new Error("read boom");
@@ -11397,8 +11621,11 @@ function fakeBlockHumanNotifySweepDeps(opts: {
   return { deps, mints, notifies };
 }
 
+/** A legacy `dispatched` stage-3 row — sequences behind the unblock classifier. */
 function blockNotifyPending(): PendingBlockHumanNotify[] {
-  return [{ epic_id: "fn-1-foo", task_id: "fn-1-foo.1" }];
+  return [
+    { epic_id: "fn-1-foo", task_id: "fn-1-foo.1", outcome: "dispatched" },
+  ];
 }
 
 test("runBlockHumanNotifySweep: a declined unblock notifies the human ONCE and mints notified", async () => {
@@ -11485,6 +11712,67 @@ test("runBlockHumanNotifySweep: a throwing selectPending degrades to a no-op (fa
   await runBlockHumanNotifySweep(deps);
   expect(mints).toEqual([]);
   expect(notifies).toEqual([]);
+});
+
+test("runBlockHumanNotifySweep: an owner_exhausted row PAGES DIRECTLY with the exhausted verdict and NEVER consults the unblock classifier", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: [
+      {
+        epic_id: "fn-7-exh",
+        task_id: "fn-7-exh.1",
+        outcome: "owner_exhausted",
+      },
+    ],
+    // Exhaustion is already terminal — the sweep must not sequence behind any unblock
+    // session. A throw here proves the classifier is never touched for this row.
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly");
+    },
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([{ taskId: "fn-7-exh.1", verdict: "exhausted" }]);
+  expect(mints).toEqual([
+    { epicId: "fn-7-exh", taskId: "fn-7-exh.1", outcome: "notified" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: an owner_exhausted notify_failed leaves the marker unset (re-sweepable, never silent)", async () => {
+  const { deps, mints } = fakeBlockHumanNotifySweepDeps({
+    pending: [
+      {
+        epic_id: "fn-7-exh",
+        task_id: "fn-7-exh.1",
+        outcome: "owner_exhausted",
+      },
+    ],
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly");
+    },
+    notify: async () => "notify_failed",
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(mints).toEqual([
+    { epicId: "fn-7-exh", taskId: "fn-7-exh.1", outcome: "notify_failed" },
+  ]);
+});
+
+test("runBlockHumanNotifySweep: an owner_exhausted row cleared mid-sweep (stillPending false) is skipped — no page", async () => {
+  const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+    pending: [
+      {
+        epic_id: "fn-7-exh",
+        task_id: "fn-7-exh.1",
+        outcome: "owner_exhausted",
+      },
+    ],
+    stillPending: () => false,
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly");
+    },
+  });
+  await runBlockHumanNotifySweep(deps);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
