@@ -988,6 +988,12 @@ export interface ReconcileSnapshot {
    *  (UNKNOWN — a transient receipt read failure or a still-standing verdict never
    *  fail-open clears). The reconciler clears exactly `openFatalAuditIds ∩ this set`. */
   fatalAuditResolvedEpicIds?: ReadonlySet<string>;
+  /** The epic ids whose one-shot fatal-audit lift is CONSUMED — the single operator-retry
+   *  close already LAUNCHED (its side effect fired). A close WITHHOLD arm ({@link
+   *  isFatalAuditHeld}) so reconcile can never plan a SECOND close on the terminal cycle;
+   *  released only when a fresh valid receipt / positive resolution reclassifies the epic
+   *  (the memo re-observes a new row or GCs on resolution). Producer-tracked in-memory. */
+  fatalAuditConsumedEpicIds?: ReadonlySet<string>;
   /** The epic ids whose fatal-audit fence the operator LIFTED via `retry_dispatch` (the
    *  row was cleared while the verdict is still current), so the withhold releases for ONE
    *  closer re-run. Producer-tracked in-memory across cycles ({@link
@@ -2337,20 +2343,19 @@ export function fatalHaltReceiptIsCurrent(
 }
 
 /**
- * Whether the close of `epicId` is HELD by the fatal-audit fence this cycle. The hold is
- * the UNION of two conditions, minus the operator lift:
- *   (a) a KNOWN-CURRENT fatal receipt stands ({@link ReconcileSnapshot.currentFatalAuditEpicIds}),
- *       OR
- *   (b) an OPEN `close::fatal-audit:<epic>` synthetic row exists WITHOUT positive resolution
- *       ({@link ReconcileSnapshot.openFatalAuditIds} minus
- *       {@link ReconcileSnapshot.fatalAuditResolvedEpicIds}).
- * Arm (b) is load-bearing: a stable-MALFORMED or unreadable LATEST receipt is a trusted
- * known-absence for the retry clock, yet it is NOT positive nonfatal evidence — so the
- * epic drops out of `currentFatalAuditEpicIds` while the durable open row remains
- * unresolved, and the closer must NOT relaunch over the standing fence. The exact operator
- * lift ({@link ReconcileSnapshot.fatalAuditFenceLifted}, the observed-open→gone memo)
- * releases the hold for exactly one re-run; `fatalAuditResolvedEpicIds` stays the SOLE
- * automatic clear authority (a positive nonfatal receipt / task-done drift / done / absent).
+ * Whether the close of `epicId` is HELD by the fatal-audit fence this cycle. Precedence:
+ *   1. the exact operator LIFT ({@link ReconcileSnapshot.fatalAuditFenceLifted}, the armed
+ *      observed-open→gone token) → released for exactly one re-run (wins over every hold);
+ *   2. positive RESOLUTION ({@link ReconcileSnapshot.fatalAuditResolvedEpicIds} — a positive
+ *      nonfatal receipt / task-done drift / done / absent) → cleared (the SOLE automatic
+ *      clear authority; also wins over the holds so a drifted verdict re-audits);
+ *   3. HOLD on ANY of: a KNOWN-CURRENT fatal receipt
+ *      ({@link ReconcileSnapshot.currentFatalAuditEpicIds} — durable: a malformed LATEST
+ *      receipt falls back to the most-recent READABLE fatal, never erasing it), an OPEN
+ *      synthetic row ({@link ReconcileSnapshot.openFatalAuditIds}), or a CONSUMED lift
+ *      ({@link ReconcileSnapshot.fatalAuditConsumedEpicIds} — the one retry-launch already
+ *      fired; the fence re-holds until a fresh valid receipt / positive resolution
+ *      reclassifies, so reconcile can NEVER plan a SECOND close on the terminal cycle).
  * Pure; NEVER throws.
  */
 export function isFatalAuditHeld(
@@ -2359,12 +2364,14 @@ export function isFatalAuditHeld(
   openFatalAuditIds: ReadonlySet<string> | undefined,
   fatalAuditResolvedEpicIds: ReadonlySet<string> | undefined,
   fatalAuditFenceLifted: ReadonlySet<string> | undefined,
+  fatalAuditConsumedEpicIds: ReadonlySet<string> | undefined,
 ): boolean {
   if (fatalAuditFenceLifted?.has(epicId) === true) return false;
-  if (currentFatalAuditEpicIds?.has(epicId) === true) return true;
+  if (fatalAuditResolvedEpicIds?.has(epicId) === true) return false;
   return (
-    openFatalAuditIds?.has(epicId) === true &&
-    fatalAuditResolvedEpicIds?.has(epicId) !== true
+    currentFatalAuditEpicIds?.has(epicId) === true ||
+    openFatalAuditIds?.has(epicId) === true ||
+    fatalAuditConsumedEpicIds?.has(epicId) === true
   );
 }
 
@@ -3170,6 +3177,7 @@ export function reconcile(
           snapshot.openFatalAuditIds,
           snapshot.fatalAuditResolvedEpicIds,
           snapshot.fatalAuditFenceLifted,
+          snapshot.fatalAuditConsumedEpicIds,
         ) &&
         !routesCloseIncident
       ) {

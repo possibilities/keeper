@@ -68,6 +68,7 @@ import {
   CLOSE_RECOVERY_MARKER,
   type ClaimAcquireObservation,
   type CloseRecoveryStampResult,
+  type ConfirmOutcome,
   type ConfirmRunningDeps,
   classifyCloseRecoveryStampExit,
   classifyOriginContainment,
@@ -125,6 +126,7 @@ import {
   FINALIZE_PUSH_PER_COMMIT_MS,
   FINALIZER_GUARD_S,
   type FoundJob,
+  fatalAuditLiftConsumedByOutcome,
   fatalHaltReceiptIsCurrent,
   finalizePushDeadlineMs,
   findShadowingWorkManifest,
@@ -7742,6 +7744,58 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
   });
 });
 
+test("latest close receipts are DURABLE: an UNREADABLE latest falls back to the prior fatal (never erased)", async () => {
+  await withSeededDb((db) => {
+    const jobs = new Map([
+      [
+        "cj",
+        makeJob({
+          job_id: "cj",
+          state: "stopped",
+          plan_verb: "close",
+          plan_ref: "fn-9-dur",
+        }),
+      ],
+    ]);
+    // A readable fatal_halt receipt, then a NEWER UNREADABLE close-finalize (a parse error /
+    // relocated blob). The durable scan skips the unreadable latest and falls back to the
+    // fatal — the standing fatal verdict is never erased for fence purposes (blocker 3).
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (30, 'cj', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', 'fn-9-dur')`,
+      [
+        JSON.stringify({
+          tool_response: { stdout: JSON.stringify({ outcome: "fatal_halt" }) },
+        }),
+      ],
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (31, 'cj', 'PostToolUse', 'post_tool_use', '{ not valid json', 'close-finalize', 'fn-9-dur')`,
+    );
+    const receipt = loadLatestCloseReceipts(db, jobs).receipts.get("fn-9-dur");
+    // The durable scan fell back PAST the unreadable latest to the prior readable fatal.
+    expect(receipt?.outcome).toBe("fatal_halt");
+    expect(receipt?.ts).toBe(30); // the fatal event (ts 30), not the unreadable one (ts 31)
+
+    // A readable NON-fatal latest, by contrast, DEFINITIVELY supersedes the fatal.
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (32, 'cj', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', 'fn-9-dur')`,
+      [
+        JSON.stringify({
+          tool_response: {
+            stdout: JSON.stringify({ outcome: "closed_clean" }),
+          },
+        }),
+      ],
+    );
+    expect(
+      loadLatestCloseReceipts(db, jobs).receipts.get("fn-9-dur")?.outcome,
+    ).toBe("closed_clean");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Fatal close-audit fence — the loop-stop for a re-halting closer.
 // ---------------------------------------------------------------------------
@@ -7844,19 +7898,36 @@ type FenceMemo = Map<
   string,
   { observedInstance: number | null; lift: "none" | "armed" | "consumed" }
 >;
+// One real producer cycle: step the memo → gate.forget(toForget) → derive the consumed set →
+// isFatalAuditHeld → (reconcile plans a launch iff not held) → CONSUME only at the launch
+// SIDE-EFFECT (an `ok` outcome), never on the pre-launch plan. `launchOutcome` models
+// confirmRunning: "ok" fired the closer (consumes); "aborted-prelaunch" is a runtime skip.
 function glueCycle(
   memo: FenceMemo,
   gate: ReturnType<typeof createDispatchFailedGate>,
   openInstance: ReadonlyMap<string, number>,
   current: ReadonlyMap<string, string>,
   resolved: ReadonlySet<string>,
+  launchOutcome: ConfirmOutcome = "ok",
 ): { held: boolean; launched: boolean } {
   const step = stepFatalAuditFenceMemo(openInstance, memo);
   for (const e of step.toForget) gate.forget("close", fatalAuditDispatchId(e));
+  const consumed = new Set(
+    [...memo].filter(([, v]) => v.lift === "consumed").map(([k]) => k),
+  );
   const open = new Set(openInstance.keys());
-  const held = isFatalAuditHeld("e", current, open, resolved, step.lifted);
-  const launched = !held; // the close is otherwise ready → launches iff not held
-  if (launched) consumeFatalAuditLift(memo, ["e"]);
+  const held = isFatalAuditHeld(
+    "e",
+    current,
+    open,
+    resolved,
+    step.lifted,
+    consumed,
+  );
+  const launched = !held; // reconcile plans a close iff not held
+  if (launched && fatalAuditLiftConsumedByOutcome("close", launchOutcome)) {
+    consumeFatalAuditLift(memo, ["e"]);
+  }
   return { held, launched };
 }
 
@@ -7909,17 +7980,30 @@ test("LOCKED (b): valid receipt + retry → first launch consumes → closer ter
   });
 });
 
-test("LOCKED (c): a cap/occupancy withhold before launch does NOT consume the token (single retry survives)", () => {
+test("LOCKED (c): a pre-launch runtime skip (abort / no-claim / preclose defer) does NOT consume the token", () => {
+  // The consume trigger is ONLY a positive launch side effect.
+  expect(fatalAuditLiftConsumedByOutcome("close", "ok")).toBe(true);
+  expect(fatalAuditLiftConsumedByOutcome("close", "aborted-postlaunch")).toBe(
+    true,
+  );
+  for (const skip of [
+    "failed",
+    "aborted-prelaunch",
+    "suppressed-dup",
+    "no-claim",
+    "indoubt",
+  ] as const) {
+    expect(fatalAuditLiftConsumedByOutcome("close", skip)).toBe(false);
+  }
+  // Driven through the glue: an armed epic whose launch is a pre-launch abort keeps the token
+  // armed (the single retry survives) — a cap/occupancy withhold is likewise never a launch.
   const memo: FenceMemo = new Map();
-  stepFatalAuditFenceMemo(new Map([["e", 10]]), memo); // observe open
-  let step = stepFatalAuditFenceMemo(new Map(), memo); // retry → armed
-  expect([...step.lifted]).toEqual(["e"]);
-  // A cap/occupancy withhold means NO close launched this cycle → the launched set is EMPTY.
-  consumeFatalAuditLift(memo, []);
-  expect(memo.get("e")?.lift).toBe("armed"); // token survives the withhold
-  // Next cycle — still armed, still lifted (the one operator retry is still pending a launch).
-  step = stepFatalAuditFenceMemo(new Map(), memo);
-  expect([...step.lifted]).toEqual(["e"]);
+  const gate = createDispatchFailedGate();
+  glueCycle(memo, gate, new Map([["e", 10]]), new Map(), new Set()); // observe
+  glueCycle(memo, gate, new Map(), new Map(), new Set(), "aborted-prelaunch"); // retry → armed, launch aborts
+  expect(memo.get("e")?.lift).toBe("armed"); // NOT consumed
+  // Next cycle the same single retry is still pending a real launch.
+  expect(stepFatalAuditFenceMemo(new Map(), memo).lifted.has("e")).toBe(true);
 });
 
 test("LOCKED (d): the lift + gate reset fire ONCE, not every cycle (multi-cycle)", () => {
@@ -8080,29 +8164,28 @@ test("fatal-audit: no open row and no current verdict does NOT withhold or mint"
   expect(decision.fatalAuditClears).toEqual([]);
 });
 
-test("isFatalAuditHeld: current-fatal OR open-unresolved holds; resolved / no-row / lift release", () => {
+test("isFatalAuditHeld: current / open / CONSUMED hold; resolved / lift release", () => {
   const cur = new Map([["e", "boom"]]);
   const open = new Set(["e"]);
+  const consumed = new Set(["e"]);
   const resolved = new Set(["e"]);
   const lifted = new Set(["e"]);
-  // (a) known-current fatal → held.
-  expect(isFatalAuditHeld("e", cur, undefined, undefined, undefined)).toBe(
-    true,
-  );
-  // (b) open row + NOT resolved (UNKNOWN receipt) → held.
-  expect(isFatalAuditHeld("e", undefined, open, new Set(), undefined)).toBe(
-    true,
-  );
-  // open row + resolved → released (positive evidence clears).
-  expect(isFatalAuditHeld("e", undefined, open, resolved, undefined)).toBe(
+  const none = undefined;
+  // Any of current / open / consumed → HELD.
+  expect(isFatalAuditHeld("e", cur, none, none, none, none)).toBe(true);
+  expect(isFatalAuditHeld("e", none, open, none, none, none)).toBe(true);
+  // (blocker 2a) a CONSUMED lift is a hold arm — no second launch on the terminal cycle.
+  expect(isFatalAuditHeld("e", none, none, none, none, consumed)).toBe(true);
+  // Positive resolution RELEASES (clears) even over a hold — a drifted verdict re-audits.
+  expect(isFatalAuditHeld("e", cur, open, resolved, none, consumed)).toBe(
     false,
   );
-  // no current, no open row → released.
+  // The exact operator LIFT releases (one re-run) — wins over every hold.
+  expect(isFatalAuditHeld("e", cur, open, none, lifted, consumed)).toBe(false);
+  // Nothing set → released.
   expect(
-    isFatalAuditHeld("e", new Map(), new Set(), new Set(), undefined),
+    isFatalAuditHeld("e", new Map(), new Set(), new Set(), none, none),
   ).toBe(false);
-  // the exact operator lift releases even a current-fatal open-unresolved epic.
-  expect(isFatalAuditHeld("e", cur, open, new Set(), lifted)).toBe(false);
 });
 
 test("loadEpicTaskDoneWatermarks: max TASK-DONE fact id per epic, ignoring non-done ops", async () => {
@@ -8332,6 +8415,55 @@ test("fatal-audit read-trust COMPOSITION: task-done edge + first read throws →
     expect(reconcile(snap2, makeState(), 0).fatalAuditClears).toEqual([
       { id: epicId },
     ]);
+  });
+});
+
+test("fatal-audit restart-safe: an empty memo + operator-cleared row + malformed latest RE-HOLDS via the durable fence", async () => {
+  await withSeededDb(async (db) => {
+    // A fresh daemon (EMPTY memo, no lift/consumed state), the row already operator-cleared
+    // (no open synthetic row), and the LATEST close-finalize is UNREADABLE — but a prior
+    // fatal_halt stands. The durable receipt scan holds the fence via currentFatalAudit.
+    const epicId = "fn-60-restart";
+    seedEpicRow(db, epicId, {
+      epic_number: 60,
+      status: "open",
+      tasks: [
+        makeTask({
+          task_id: `${epicId}.1`,
+          epic_id: epicId,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (100, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt", fatal_reason: "boom" }), epicId],
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (101, 'sess', 'PostToolUse', 'post_tool_use', '{ unreadable', 'close-finalize', ?)`,
+      [epicId],
+    );
+    const snap = await loadReconcileSnapshot(db);
+    // The malformed latest fell back to the durable fatal → the epic is current-fatal.
+    expect(snap.currentFatalAuditEpicIds?.has(epicId)).toBe(true);
+    // No open row, empty memo (fresh boot) → the fence HOLDS on the durable receipt alone,
+    // and the close is withheld (no natural relaunch). The operator re-retries.
+    expect(
+      isFatalAuditHeld(
+        epicId,
+        snap.currentFatalAuditEpicIds,
+        snap.openFatalAuditIds,
+        snap.fatalAuditResolvedEpicIds,
+        undefined, // empty memo → no lift
+        undefined, // empty memo → no consumed
+      ),
+    ).toBe(true);
+    const decision = reconcile(snap, makeState(), 0);
+    expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
+    expect(decision.withholds.get(epicId)?.code).toBe("fatal-audit");
   });
 });
 

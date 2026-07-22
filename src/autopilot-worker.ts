@@ -7373,6 +7373,15 @@ export async function runReconcileCycle(
           controller: new AbortController(),
         });
       }
+      // CONSUME the fatal-audit one-shot lift at the EXACT launch side-effect seam — only
+      // `ok` (SessionStart bound) or `aborted-postlaunch` (launch fired, then shutdown)
+      // POSITIVELY prove `launch()` ran the closer. Every other outcome (failed /
+      // aborted-prelaunch / suppressed-dup / no-claim, and the CONFLATED `indoubt` —
+      // pre-launch claim-fold timeout OR transient launch fail OR post-launch ceiling) did
+      // NOT run a closer, so it leaves the token armed for the operator's single retry.
+      if (fatalAuditLiftConsumedByOutcome(plan.verb, outcome)) {
+        consumeFatalAuditLift(state.fatalAuditFenceMemo, [plan.id]);
+      }
       // Other outcomes (failed / indoubt / aborted-*) record no live entry; see
       // the ConfirmOutcome doc and the stamp handling above. `inFlight` is
       // released for all in the `finally`.
@@ -12160,12 +12169,34 @@ export interface CloseReceiptRead {
   trusted: boolean;
 }
 
+/** Whether a close-finalize event's OUTER `data` is READABLE (parses to a non-null object) —
+ *  a DEFINITIVE close-finalize result even when it carries no fatal outcome (e.g. a
+ *  `{success:false}` typed error supersedes an older fatal). An UNREADABLE event — null/empty
+ *  data (a relocated blob) or a JSON parse error — is UNKNOWN, so the durable receipt scan
+ *  falls back PAST it to the most-recent readable close-finalize, never erasing a prior
+ *  standing fatal verdict for fence purposes. Pure; NEVER throws. */
+function closeFinalizeOuterReadable(data: string | null): boolean {
+  if (data == null || data.length === 0) return false;
+  try {
+    const outer = JSON.parse(data) as unknown;
+    return outer != null && typeof outer === "object";
+  } catch {
+    return false;
+  }
+}
+
+/** How far back the durable receipt scan looks past UNREADABLE close-finalize events for the
+ *  most-recent DEFINITIVE one — generous, since consecutive unreadable receipts are rare. */
+const DURABLE_RECEIPT_SCAN_DEPTH = 8;
+
 /**
- * Join each live close target to its newest durable close-finalize receipt. The
- * events projection is indexed by `plan_target`; one bounded point lookup runs per
- * distinct live close epic. A malformed newest receipt yields no terminal fact (a stable
- * known-absence, `trusted`) — an older fatal outcome may not leak across a later failed
- * attempt; a QUERY THROW marks the read UNTRUSTED so the caller arms a retry.
+ * Join each close target to its most-recent DEFINITIVE close-finalize receipt — DURABLE: the
+ * scan skips UNREADABLE latest events (a relocated blob / a parse error — UNKNOWN) and uses
+ * the most-recent READABLE one, so a malformed LATEST receipt never erases a prior standing
+ * fatal verdict (the fence survives a restart from durable receipt history). A readable
+ * NON-fatal result (`closed_clean`, a `{success:false}` error, …) still SUPERSEDES an older
+ * fatal (it is definitive, so the scan stops there with no fatal receipt). A QUERY THROW
+ * marks the read UNTRUSTED so the caller arms a retry; a bounded per-epic scan.
  */
 export function loadLatestCloseReceipts(
   db: Parameters<typeof runQuery>[0],
@@ -12194,21 +12225,26 @@ export function loadLatestCloseReceipts(
   let trusted = true;
   for (const epicId of [...epicIds].sort()) {
     try {
-      const row = db
+      const rows = db
         .query(
           `SELECT id, ts, data
              FROM events
             WHERE plan_target = ? AND plan_op = 'close-finalize'
-            ORDER BY id DESC LIMIT 1`,
+            ORDER BY id DESC LIMIT ?`,
         )
-        .get(epicId) as {
+        .all(epicId, DURABLE_RECEIPT_SCAN_DEPTH) as {
         id: number;
         ts: number;
         data: string | null;
-      } | null;
-      if (row == null) continue;
-      const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
-      if (receipt != null) receipts.set(epicId, receipt);
+      }[];
+      for (const row of rows) {
+        if (!closeFinalizeOuterReadable(row.data)) continue; // UNKNOWN → fall back
+        // The most-recent READABLE close-finalize is DEFINITIVE: a fatal outcome yields a
+        // receipt; a readable non-fatal yields none (superseding any older fatal). Stop here.
+        const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
+        if (receipt != null) receipts.set(epicId, receipt);
+        break;
+      }
     } catch {
       // A transient read error is UNTRUSTED (not a known-absence) → arm a retry.
       trusted = false;
@@ -12322,6 +12358,24 @@ export function consumeFatalAuditLift(
       entry.lift = "consumed";
     }
   }
+}
+
+/**
+ * Whether a `confirmRunning` {@link ConfirmOutcome} for a CLOSE launch is a POSITIVE
+ * launch-side-effect — `launch()` actually ran the closer — and so consumes the one-shot
+ * fatal-audit lift. ONLY `ok` (SessionStart bound) and `aborted-postlaunch` (launch fired,
+ * then shutdown) qualify. Every runtime skip (`failed`, `aborted-prelaunch`, `suppressed-dup`,
+ * `no-claim`, and the CONFLATED `indoubt` — a pre-launch claim-fold timeout / transient launch
+ * fail / post-launch ceiling) ran NO closer, so it leaves the token armed for the single
+ * operator retry. Pure; NEVER throws.
+ */
+export function fatalAuditLiftConsumedByOutcome(
+  verb: Verb,
+  outcome: ConfirmOutcome,
+): boolean {
+  return (
+    verb === "close" && (outcome === "ok" || outcome === "aborted-postlaunch")
+  );
 }
 
 /**
@@ -12730,7 +12784,13 @@ export async function loadReconcileSnapshot(
           openFatalAuditIds.add(fatalEpic);
           const inst = (row as { instance_event_id?: unknown })
             .instance_event_id;
-          if (typeof inst === "number" && Number.isSafeInteger(inst)) {
+          // Positive-safe-token contract (mirrors the reducer's validInstanceToken): a
+          // zero/negative/non-safe instance is never a valid lift-observation anchor.
+          if (
+            typeof inst === "number" &&
+            Number.isSafeInteger(inst) &&
+            inst > 0
+          ) {
             openFatalAuditInstanceByEpic.set(fatalEpic, inst);
           }
         }
@@ -14752,6 +14812,15 @@ function main(): void {
           state.fatalAuditFenceMemo,
         );
         snapshot.fatalAuditFenceLifted = fatalAuditStep.lifted;
+        // The CONSUMED set (the one retry-launch already fired) is a close WITHHOLD arm — so
+        // reconcile withholds a consumed epic instead of planning a SECOND close, even when
+        // the durable receipt momentarily reads UNKNOWN. Derived from the memo state at cycle
+        // start (a prior cycle's launch-seam consume).
+        const fatalAuditConsumed = new Set<string>();
+        for (const [epicId, entry] of state.fatalAuditFenceMemo) {
+          if (entry.lift === "consumed") fatalAuditConsumed.add(epicId);
+        }
+        snapshot.fatalAuditConsumedEpicIds = fatalAuditConsumed;
         // An operator `retry_dispatch` clears the row through the reducer, NOT
         // `emitDispatchCleared` → the change-gate never saw the clear and would suppress an
         // identical same-finding re-mint to the watermark (~15m). Reset the gate ONCE, on the
@@ -14760,49 +14829,15 @@ function main(): void {
           dispatchFailedGate.forget("close", fatalAuditDispatchId(epicId));
         }
         const decision = reconcile(snapshot, state, deps.now());
-        // CONSUME the one-shot lift for each epic whose close was actually LAUNCHED this
-        // cycle (a cap/occupancy withhold before launch leaves it armed). Then GC the memo
-        // for epics with positive resolution (the fatal episode is over).
-        consumeFatalAuditLift(
-          state.fatalAuditFenceMemo,
-          decision.launches.filter((l) => l.verb === "close").map((l) => l.id),
-        );
+        // The one-shot lift is CONSUMED at the exact launch side-effect seam inside
+        // `runReconcileCycle` (`ok` / `aborted-postlaunch` only) — NEVER here on the
+        // pre-launch `decision.launches`, which every runtime skip (preclose/provision defer,
+        // abort, in-flight, cwd/cell reject, no-claim, …) would falsely consume. GC the memo
+        // for positively-resolved epics (the fatal episode is over). Visible fatal state after
+        // a lift is restored by the ordinary `currentFatalAuditEpicIds` mint path (durable
+        // receipt fence), not a pre-launch "attempt ended" fabrication.
         for (const epicId of snapshot.fatalAuditResolvedEpicIds ?? []) {
           state.fatalAuditFenceMemo.delete(epicId);
-        }
-        // RE-HOLD (fix point 4): after the one lift-launch is CONSUMED, if the attempt ENDED
-        // without reclassifying the epic — no fresh valid receipt (not current), no positive
-        // resolution, no re-minted open row — and the close is no longer in-flight, RE-MINT
-        // visible fatal state so the fence holds again. Prevents a silent relaunch loop when a
-        // retried closer keeps dying WITHOUT writing a receipt (a malformed/unreadable latest
-        // receipt case). Rides the change-gate (forgotten on the lift), so it emits once until
-        // the row folds; UPSERT-idempotent with any later fresh-receipt re-mint on the same key.
-        const liveCloseEpics = new Set<string>();
-        for (const job of snapshot.jobs.values()) {
-          if (
-            job.plan_verb === "close" &&
-            (job.state === "working" || job.state === "stopped") &&
-            job.plan_ref != null &&
-            job.plan_ref !== ""
-          ) {
-            liveCloseEpics.add(job.plan_ref);
-          }
-        }
-        for (const [epicId, entry] of state.fatalAuditFenceMemo) {
-          if (entry.lift !== "consumed") continue;
-          if (snapshot.openFatalAuditInstanceByEpic?.has(epicId)) continue;
-          if (snapshot.currentFatalAuditEpicIds?.has(epicId)) continue;
-          if (snapshot.fatalAuditResolvedEpicIds?.has(epicId)) continue;
-          if (state.inFlight.has(dispatchKey("close", epicId))) continue;
-          if (liveCloseEpics.has(epicId)) continue;
-          deps.emitDispatchFailed({
-            verb: "close",
-            id: fatalAuditDispatchId(epicId),
-            reason: `${FATAL_AUDIT_REASON_TOKEN}: the retry attempt ended without a fresh close-audit receipt`,
-            dir: null,
-            conflictedFiles: null,
-            ts: deps.now(),
-          });
         }
         // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;
         // a trusted no-candidate (or paused) disarms; a DEGRADED PANE probe (untrusted null,
