@@ -134,6 +134,7 @@ import {
   isBareShellCommand,
   isEpicDoneById,
   isEpicInFlight,
+  isFatalAuditHeld,
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
@@ -7881,7 +7882,7 @@ test("fatal-audit: a standing row is not re-minted (fold-safe) and the RECEIPT w
   expect(decision.fatalAuditClears).toEqual([]);
 });
 
-test("fatal-audit: POSITIVE resolution evidence level-CLEARS an open row", () => {
+test("fatal-audit: POSITIVE resolution evidence CLEARS the open row AND releases the hold", () => {
   const decision = reconcile(
     fatalAuditSnapshot({
       // The verdict resolved (drift / non-fatal receipt / done): the producer graded the
@@ -7895,14 +7896,16 @@ test("fatal-audit: POSITIVE resolution evidence level-CLEARS an open row", () =>
   );
   expect(decision.fatalAuditClears).toEqual([{ id: "fn-2-close" }]);
   expect(decision.fatalAuditMints).toEqual([]);
+  // Resolved → NOT held → the closer relaunches to re-audit the fresh tree.
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
 });
 
-test("fatal-audit: an open row with NO resolution evidence (UNKNOWN) is RETAINED, never fail-open cleared", () => {
+test("fatal-audit: an OPEN row with a malformed/UNKNOWN latest receipt HOLDS the close and is RETAINED", () => {
   const decision = reconcile(
     fatalAuditSnapshot({
-      // Absent from BOTH current and resolved (e.g. a transient receipt read failure — the
-      // producer marks the cycle degraded so dispatch bails; here we assert the row is not
-      // fail-open cleared).
+      // The latest receipt is stable-malformed / unreadable → the epic is NOT known-current
+      // AND NOT resolved (UNKNOWN is not positive nonfatal evidence). The durable open row
+      // must keep FENCING — the closer must not relaunch over a standing fatal verdict.
       currentFatalAuditEpicIds: new Map(),
       openFatalAuditIds: new Set(["fn-2-close"]),
       fatalAuditResolvedEpicIds: new Set(),
@@ -7910,20 +7913,64 @@ test("fatal-audit: an open row with NO resolution evidence (UNKNOWN) is RETAINED
     makeState(),
     0,
   );
-  expect(decision.fatalAuditClears).toEqual([]);
+  expect(decision.fatalAuditClears).toEqual([]); // no positive evidence → retained
+  expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined(); // HELD (the fix)
+  expect(decision.withholds.get("fn-2-close")?.code).toBe("fatal-audit");
 });
 
-test("fatal-audit: a non-current / non-fatal receipt does NOT withhold or mint", () => {
+test("fatal-audit: an operator lift releases the hold even with an open unresolved row (exactly one re-run)", () => {
+  const decision = reconcile(
+    fatalAuditSnapshot({
+      currentFatalAuditEpicIds: new Map(),
+      openFatalAuditIds: new Set(["fn-2-close"]),
+      fatalAuditResolvedEpicIds: new Set(),
+      fatalAuditFenceLifted: new Set(["fn-2-close"]),
+    }),
+    makeState(),
+    0,
+  );
+  // The exact operator lift releases the hold for one re-run; no automatic clear.
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
+  expect(decision.fatalAuditClears).toEqual([]);
+  expect(decision.fatalAuditMints).toEqual([]);
+});
+
+test("fatal-audit: no open row and no current verdict does NOT withhold or mint", () => {
   const decision = reconcile(
     fatalAuditSnapshot({ currentFatalAuditEpicIds: new Map() }),
     makeState(),
     0,
   );
-  // No current fatal verdict → the close proceeds normally, no fence, no row.
+  // Nothing fences (no current fatal receipt, no open row) → the close proceeds normally.
   expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
   expect(decision.withholds.get("fn-2-close")?.code).not.toBe("fatal-audit");
   expect(decision.fatalAuditMints).toEqual([]);
   expect(decision.fatalAuditClears).toEqual([]);
+});
+
+test("isFatalAuditHeld: current-fatal OR open-unresolved holds; resolved / no-row / lift release", () => {
+  const cur = new Map([["e", "boom"]]);
+  const open = new Set(["e"]);
+  const resolved = new Set(["e"]);
+  const lifted = new Set(["e"]);
+  // (a) known-current fatal → held.
+  expect(isFatalAuditHeld("e", cur, undefined, undefined, undefined)).toBe(
+    true,
+  );
+  // (b) open row + NOT resolved (UNKNOWN receipt) → held.
+  expect(isFatalAuditHeld("e", undefined, open, new Set(), undefined)).toBe(
+    true,
+  );
+  // open row + resolved → released (positive evidence clears).
+  expect(isFatalAuditHeld("e", undefined, open, resolved, undefined)).toBe(
+    false,
+  );
+  // no current, no open row → released.
+  expect(
+    isFatalAuditHeld("e", new Map(), new Set(), new Set(), undefined),
+  ).toBe(false);
+  // the exact operator lift releases even a current-fatal open-unresolved epic.
+  expect(isFatalAuditHeld("e", cur, open, new Set(), lifted)).toBe(false);
 });
 
 test("loadEpicTaskDoneWatermarks: max TASK-DONE fact id per epic, ignoring non-done ops", async () => {
@@ -8072,6 +8119,87 @@ test("loadReconcileSnapshot fatal-audit: an open row RETAINS on an unreadable re
     expect(snap.openFatalAuditIds?.has(unknown)).toBe(true);
     expect(snap.fatalAuditResolvedEpicIds?.has(unknown)).toBe(false); // UNKNOWN → retain
     expect(snap.fatalAuditResolvedEpicIds?.has(resolvedDone)).toBe(true); // done → clear
+  });
+});
+
+test("fatal-audit read-trust COMPOSITION: task-done edge + first read throws → degraded arms a bounded wake → second read positively clears", async () => {
+  await withSeededDb(async (db) => {
+    // An OPEN epic with a fatal_halt receipt + an OPEN fatal-audit synthetic row, plus a
+    // TASK-DONE fact newer than the receipt (the follow-up drift edge that should clear).
+    const epicId = "fn-50-comp";
+    seedEpicRow(db, epicId, {
+      epic_number: 50,
+      status: "open",
+      tasks: [
+        makeTask({
+          task_id: `${epicId}.1`,
+          epic_id: epicId,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (100, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt", fatal_reason: "boom" }), epicId],
+    );
+    db.run(
+      `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at)
+       VALUES ('close', ?, 'fatal-audit: boom', 1, 1, 1, 1)`,
+      [`fatal-audit:${epicId}`],
+    );
+    db.run(
+      `INSERT INTO commit_trailer_facts
+         (event_id, committer_session_id, plan_op, plan_target, plan_epic_id, committed_at_ms)
+       VALUES (300, 'sess', 'done', ?, ?, 5000)`,
+      [`${epicId}.2`, epicId],
+    );
+
+    // Wrap the DB so the FIRST task-done watermark query THROWS (a transient read error
+    // coinciding with the one data_version edge), then passes through untouched.
+    let watermarkThrown = false;
+    const flakyDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "query") {
+          return (sql: string) => {
+            if (
+              !watermarkThrown &&
+              sql.includes("commit_trailer_facts") &&
+              sql.includes("plan_op = 'done'")
+            ) {
+              watermarkThrown = true;
+              const boom = () => {
+                throw new Error("transient watermark read error");
+              };
+              return { get: boom, all: boom };
+            }
+            return target.query(sql);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as unknown as typeof db;
+
+    // 1) The first read's watermark throw marks the cycle degraded/UNKNOWN (never a
+    //    fail-open clear) — dispatch bails this cycle.
+    const snap1 = await loadReconcileSnapshot(flakyDb);
+    expect(snap1.readinessDegraded).toBe(true);
+
+    // 2) The degraded-UNKNOWN path arms a BOUNDED WAKE (not a disarm), so the reconciler
+    //    re-reads even on a now-quiescent DB.
+    expect(readinessDegradedWakeArms(false).slot).toBe("unknown");
+    expect(readinessDegradedWakeArms(false).containment).toBe("unknown");
+
+    // 3) The second, COMPLETE read positively clears: the task-done drift grades the epic
+    //    into the resolved set, and reconcile emits the clear.
+    const snap2 = await loadReconcileSnapshot(db);
+    expect(snap2.readinessDegraded).toBe(false);
+    expect(snap2.fatalAuditResolvedEpicIds?.has(epicId)).toBe(true);
+    expect(reconcile(snap2, makeState(), 0).fatalAuditClears).toEqual([
+      { id: epicId },
+    ]);
   });
 });
 

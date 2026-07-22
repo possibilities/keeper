@@ -2323,6 +2323,38 @@ export function fatalHaltReceiptIsCurrent(
   return taskDoneWatermark <= receipt.eventId;
 }
 
+/**
+ * Whether the close of `epicId` is HELD by the fatal-audit fence this cycle. The hold is
+ * the UNION of two conditions, minus the operator lift:
+ *   (a) a KNOWN-CURRENT fatal receipt stands ({@link ReconcileSnapshot.currentFatalAuditEpicIds}),
+ *       OR
+ *   (b) an OPEN `close::fatal-audit:<epic>` synthetic row exists WITHOUT positive resolution
+ *       ({@link ReconcileSnapshot.openFatalAuditIds} minus
+ *       {@link ReconcileSnapshot.fatalAuditResolvedEpicIds}).
+ * Arm (b) is load-bearing: a stable-MALFORMED or unreadable LATEST receipt is a trusted
+ * known-absence for the retry clock, yet it is NOT positive nonfatal evidence — so the
+ * epic drops out of `currentFatalAuditEpicIds` while the durable open row remains
+ * unresolved, and the closer must NOT relaunch over the standing fence. The exact operator
+ * lift ({@link ReconcileSnapshot.fatalAuditFenceLifted}, the observed-open→gone memo)
+ * releases the hold for exactly one re-run; `fatalAuditResolvedEpicIds` stays the SOLE
+ * automatic clear authority (a positive nonfatal receipt / task-done drift / done / absent).
+ * Pure; NEVER throws.
+ */
+export function isFatalAuditHeld(
+  epicId: string,
+  currentFatalAuditEpicIds: ReadonlyMap<string, string> | undefined,
+  openFatalAuditIds: ReadonlySet<string> | undefined,
+  fatalAuditResolvedEpicIds: ReadonlySet<string> | undefined,
+  fatalAuditFenceLifted: ReadonlySet<string> | undefined,
+): boolean {
+  if (fatalAuditFenceLifted?.has(epicId) === true) return false;
+  if (currentFatalAuditEpicIds?.has(epicId) === true) return true;
+  return (
+    openFatalAuditIds?.has(epicId) === true &&
+    fatalAuditResolvedEpicIds?.has(epicId) !== true
+  );
+}
+
 /** The pure inputs the slot-occupancy pass reads — all liveness enters via the
  *  snapshot fields, so the decision stays a total function (re-fold safe). */
 export interface SlotOccupancyInput {
@@ -3119,17 +3151,23 @@ export function reconcile(
       } else if (snapshot.failedKeys.has(closeKey) && !routesCloseIncident) {
         closeWithhold = withhold("failed-key");
       } else if (
-        snapshot.currentFatalAuditEpicIds?.has(epicId) === true &&
-        snapshot.fatalAuditFenceLifted?.has(epicId) !== true &&
+        isFatalAuditHeld(
+          epicId,
+          snapshot.currentFatalAuditEpicIds,
+          snapshot.openFatalAuditIds,
+          snapshot.fatalAuditResolvedEpicIds,
+          snapshot.fatalAuditFenceLifted,
+        ) &&
         !routesCloseIncident
       ) {
-        // A still-current fatal close-audit verdict stands: re-dispatching only re-halts
-        // (~21s) and reaps a slot. WITHHOLD on the receipt itself (this fires the FIRST
-        // cycle, before the durable row folds — the mint rides the same decision), and
-        // keep withholding once the row is in `failedKeys` above. `retry_dispatch` clears
-        // the row + sets `fatalAuditFenceLifted` so this arm releases for exactly one
-        // re-run; a commit-set drift drops the epic from `currentFatalAuditEpicIds` so
-        // the arm and the mint both stop.
+        // HELD by the fatal-audit fence ({@link isFatalAuditHeld}): a known-current fatal
+        // verdict OR a standing OPEN `close::fatal-audit:<epic>` row without positive
+        // resolution. Re-dispatching only re-halts (~21s) and reaps a slot. Critically, the
+        // OPEN-row arm keeps withholding even when the LATEST receipt is UNKNOWN (a stable-
+        // malformed / unreadable receipt is NOT positive nonfatal evidence), so the closer
+        // never relaunches over a durable fatal fence. `retry_dispatch` clears the row +
+        // sets `fatalAuditFenceLifted` → released for exactly one re-run; only
+        // `fatalAuditResolvedEpicIds` (positive evidence) automatically drops the hold.
         closeWithhold = withhold("fatal-audit");
       } else {
         const ownershipCode = dispatchTargetWithholdCode(

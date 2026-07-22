@@ -405,6 +405,7 @@ export {
   fatalHaltReceiptIsCurrent,
   isBareShellCommand,
   isEpicInFlight,
+  isFatalAuditHeld,
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
