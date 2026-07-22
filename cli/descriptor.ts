@@ -947,6 +947,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       "4": "watched target was deleted",
       "5": "stuck verdict (only under --fail-on-stuck)",
       "9": "--probe: evaluated cleanly, condition does not hold",
+      "10": "external SIGTERM/SIGINT (e.g. Monitor's kill timeout), distinct from the own-deadline timeout",
     },
     flags: [
       FLAG_HELP,

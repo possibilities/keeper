@@ -183,7 +183,9 @@ Defaults and overrides:
   `timeout_ms` on the Monitor invocation — NOT `keeper await --timeout`. Let
   Monitor own the deadline as the single source of truth. On timeout Monitor
   SIGTERMs the process and `keeper await` emits `[keeper-await] failed
-  reason=timeout` exit 3 through the same flush path.
+  reason=signal signal=SIGTERM` exit 10 through the same flush path — an
+  external kill, DISTINCT from your own `--timeout` deadline (reason=timeout
+  exit 3), so a mass-reap reads as reaps, not self-deadlines.
 - **Stuck verdicts** (job-rejected, dep-on-epic-dangling) keep waiting
   by default. Add `--fail-on-stuck` only if the user explicitly wants
   the wait to surrender on those.
@@ -242,12 +244,15 @@ aggregate:
 
 For an AND aggregate, a plan sub-condition that fails names which
 condition fired via a `from=<condition-label>` field on the `failed`
-line. A `timeout`/`unreachable` failure additionally carries the LAST
+line. A `timeout`/`signal`/`unreachable` failure additionally carries the LAST
 waiting detail it observed (`detail=` — the condition's own last-known
-state, e.g. `2 running jobs`) and `retryable=true` (re-arming the same
-`keeper await` invocation is the right next move once the caller's
-deadline or the daemon link recovers). A `stuck` failure carries
-`retryable=false` instead — an operator jam needs a human, not a re-arm.
+state, e.g. `2 running jobs`). `timeout`/`unreachable` carry `retryable=true`
+(re-arming the same `keeper await` invocation is the right next move once the
+caller's deadline or the daemon link recovers). A `signal` failure (external
+SIGTERM/SIGINT) additionally names the killing signal (`signal=SIGTERM`) and
+carries `retryable=false` — an external kill is not the caller's own budget.
+A `stuck` failure carries `retryable=false` too — an operator jam needs a
+human, not a re-arm.
 
 **Heartbeats (stderr, not the terminal contract).** While the wait is
 still open, `keeper await` emits a periodic STDERR-only progress line —
@@ -285,7 +290,8 @@ Reasons + exit codes:
 | `failed reason=connect …` | 1 | A terminal query-SHAPE error keeperd rejected — a malformed/unrecoverable query (e.g. `bad_frame` / `unknown_collection`). NOT a capacity condition: a `max_connections` cap reject is transient and rides the reconnect loop (it never surfaces here). | Tell the user the query was rejected; the wait can't proceed. |
 | `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`** (or implicitly under `--probe`, which always carries a bounded deadline). keeperd stayed unreachable past that deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=` and `retryable=true`. **Reconnect-forever is the default for every condition** — a plain await with no `--connect-timeout` NEVER emits this, it just keeps reconnecting; `server-up` is the one condition permanently barred from opting out (see the `server-up` row above). | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
-| `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit (or your own `--timeout`). Carries `retryable=true` — the caller's budget ran out, not a verdict on the condition. | Tell the user it timed out; ask whether to extend or re-arm. |
+| `failed reason=timeout …` | 3 | Your own `--timeout` deadline hit. Carries `retryable=true` — the caller's budget ran out, not a verdict on the condition. | Tell the user it timed out; ask whether to extend or re-arm. |
+| `failed reason=signal signal=<SIGTERM\|SIGINT> …` | 10 | An external signal killed the wait — Monitor's `timeout_ms` kill, or an operator kill. Names the signal and carries `retryable=false` — not the caller's own budget, so a mass-reap is never mistaken for self-deadlines. | Tell the user the wait was killed externally (e.g. Monitor's deadline); ask whether to re-arm or extend the deadline. |
 | `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. Carries `retryable=false` — an operator jam, not self-clearing. | Tell the user the target is stuck; surface the verdict. |
 | `probe result=does-not-hold …` | 9 | **`--probe` only.** Evaluated cleanly against the first snapshot; the condition just doesn't hold right now. Never 124 (that's GNU `timeout(1)`'s collision code). | Tell the user it doesn't hold yet; surface the `states=`/`holders=` detail. Do NOT run the follow-up. |
 

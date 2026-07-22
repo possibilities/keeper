@@ -9,7 +9,8 @@
  * Coverage tracks the task spec's Test notes:
  *   - armed-then-met across task-complete / task-unblocked / epic-unblocked.
  *   - not-found at first paint → no armed line, exit 1.
- *   - SIGTERM → failed reason=timeout exit 3 (exactly one terminal line).
+ *   - SIGTERM/SIGINT → failed reason=signal exit 10 (external kill, distinct
+ *     from the own-`--timeout` reason=timeout exit 3; exactly one terminal line).
  *   - stuck default keeps waiting; --fail-on-stuck → exit 5.
  *   - epic-complete via drop + present re-query → met; drop + miss → deleted.
  *   - reconnect blip first-paint absence does NOT fire deleted.
@@ -491,7 +492,7 @@ interface AwaitHarness {
   stderr: string[];
   exitCode: number | null;
   flushed: boolean;
-  fireSignal: () => void;
+  fireSignal: (signal?: string) => void;
   fireDeadline: () => void;
   signalUnregistered: boolean;
   deadlineCleared: boolean;
@@ -502,7 +503,7 @@ function makeHarness(connect: ConnectFactory): AwaitHarness {
   const stdout: string[] = [];
   const stderr: string[] = [];
   const handlers: {
-    signal: (() => void) | null;
+    signal: ((signal: string) => void) | null;
     deadline: (() => void) | null;
   } = { signal: null, deadline: null };
   const h: AwaitHarness = {
@@ -510,7 +511,7 @@ function makeHarness(connect: ConnectFactory): AwaitHarness {
     stderr,
     exitCode: null,
     flushed: false,
-    fireSignal: () => handlers.signal?.(),
+    fireSignal: (signal = "SIGTERM") => handlers.signal?.(signal),
     fireDeadline: () => handlers.deadline?.(),
     signalUnregistered: false,
     deadlineCleared: false,
@@ -1677,10 +1678,10 @@ test("not-found at first paint: no armed line, failed reason=not-found exit 1", 
 });
 
 // ---------------------------------------------------------------------------
-// SIGTERM → failed reason=timeout exit 3 (single terminal line)
+// SIGTERM → failed reason=signal signal=SIGTERM exit 10 (single terminal line)
 // ---------------------------------------------------------------------------
 
-test("SIGTERM → failed reason=timeout exit 3, exactly one terminal line", async () => {
+test("SIGTERM → failed reason=signal signal=SIGTERM exit 10, exactly one terminal line", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
@@ -1700,17 +1701,63 @@ test("SIGTERM → failed reason=timeout exit 3, exactly one terminal line", asyn
   expect(h.exitCode).toBeNull();
 
   // Fire SIGTERM-equivalent.
-  h.fireSignal();
+  h.fireSignal("SIGTERM");
 
   expect(h.stdout).toHaveLength(2);
-  expect(h.stdout[1]).toContain("[keeper-await] failed");
-  expect(h.stdout[1]).toContain("reason=timeout");
-  expect(h.exitCode).toBe(3);
+  const line = h.stdout[1];
+  expect(line).toContain("[keeper-await] failed");
+  // Its OWN terminal — an external kill, NOT the deadline's reason=timeout.
+  expect(line).toContain("reason=signal");
+  expect(line).toContain("signal=SIGTERM");
+  expect(line).not.toContain("reason=timeout");
+  // An external kill is not the caller's own budget: it must NOT carry the
+  // deadline's `retryable=true` claim; the honest field is `retryable=false`.
+  expect(line).not.toContain("retryable=true");
+  expect(line).toContain("retryable=false");
+  // Shared identity fields stay common with the timeout path.
+  expect(line).toContain("target=fn-1-foo.1");
+  expect(line).toContain("kind=task");
+  expect(line).toContain("condition=complete");
+  expect(h.exitCode).toBe(10);
 
   // Re-firing the signal must NOT emit a second terminal line —
   // `terminating` latches.
-  h.fireSignal();
+  h.fireSignal("SIGTERM");
   expect(h.stdout).toHaveLength(2);
+});
+
+// SIGINT → failed reason=signal signal=SIGINT exit 10 (same shape, its name)
+// ---------------------------------------------------------------------------
+
+test("SIGINT → failed reason=signal signal=SIGINT exit 10", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ tasks: [makeTaskRow({ worker_phase: "open" })] }),
+  );
+  expect(h.stdout[0]).toContain("armed");
+
+  h.fireSignal("SIGINT");
+
+  expect(h.stdout).toHaveLength(2);
+  const line = h.stdout[1];
+  expect(line).toContain("reason=signal");
+  expect(line).toContain("signal=SIGINT");
+  expect(line).toContain("retryable=false");
+  expect(line).not.toContain("reason=timeout");
+  expect(h.exitCode).toBe(10);
 });
 
 // ---------------------------------------------------------------------------
@@ -1741,12 +1788,87 @@ test("--timeout deadline → failed reason=timeout exit 3", async () => {
 
   // Fire the deadline timer.
   h.fireDeadline();
-  expect(h.stdout[1]).toContain("reason=timeout");
+  const line = h.stdout[1];
+  expect(line).toContain("reason=timeout");
   expect(h.exitCode).toBe(3);
   // Task 2: timeout is the caller's own budget, not a verdict on the
   // condition — retryable, and it names what was still held at the deadline.
-  expect(h.stdout[1]).toContain("retryable=true");
-  expect(h.stdout[1]).toContain("detail=");
+  expect(line).toContain("retryable=true");
+  expect(line).toContain("detail=");
+  // Byte-identity lock: the own-deadline path is DISTINCT from the external
+  // signal path — it never borrows reason=signal / a signal= field / exit 10.
+  expect(line).not.toContain("reason=signal");
+  expect(line).not.toContain("signal=");
+});
+
+// ---------------------------------------------------------------------------
+// Both armed (deadline + signal): whichever fires FIRST wins its own shape,
+// and the `terminating` latch dedups the loser.
+// ---------------------------------------------------------------------------
+
+test("both armed, deadline fires first → timeout shape; the later signal is a no-op", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { timeoutMs: 1000 }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ tasks: [makeTaskRow({ worker_phase: "open" })] }),
+  );
+  expect(h.stdout[0]).toContain("armed");
+
+  h.fireDeadline();
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("reason=timeout");
+  expect(h.exitCode).toBe(3);
+
+  // Signal arriving after the deadline already terminalized: no second line.
+  h.fireSignal("SIGTERM");
+  expect(h.stdout).toHaveLength(2);
+  expect(h.exitCode).toBe(3);
+});
+
+test("both armed, signal fires first → signal shape; the later deadline is a no-op", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { timeoutMs: 1000 }),
+    h.deps,
+  );
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ tasks: [makeTaskRow({ worker_phase: "open" })] }),
+  );
+  expect(h.stdout[0]).toContain("armed");
+
+  h.fireSignal("SIGTERM");
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("reason=signal");
+  expect(h.stdout[1]).toContain("signal=SIGTERM");
+  expect(h.exitCode).toBe(10);
+
+  // Deadline arriving after the signal already terminalized: no second line.
+  h.fireDeadline();
+  expect(h.stdout).toHaveLength(2);
+  expect(h.exitCode).toBe(10);
 });
 
 // ---------------------------------------------------------------------------
@@ -3173,10 +3295,11 @@ test("AND complete + git-clean: plan not-found short-circuits aggregate (exit 1)
 });
 
 // ---------------------------------------------------------------------------
-// Aggregate timeout: SIGTERM on a multi-condition wait → exit 3, one line.
+// Aggregate signal: SIGTERM on a multi-condition wait → reason=signal exit
+// 10, one line, with the aggregate `conditions=` shared field.
 // ---------------------------------------------------------------------------
 
-test("AND aggregate: SIGTERM → failed reason=timeout exit 3, one terminal line", async () => {
+test("AND aggregate: SIGTERM → failed reason=signal exit 10, one terminal line", async () => {
   const { factory, socketsAll } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
@@ -3205,11 +3328,16 @@ test("AND aggregate: SIGTERM → failed reason=timeout exit 3, one terminal line
   ]);
   expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
 
-  h.fireSignal();
+  h.fireSignal("SIGTERM");
   const failed = h.stdout.filter((l) => l.includes("[keeper-await] failed"));
   expect(failed).toHaveLength(1);
-  expect(failed[0]).toContain("reason=timeout");
-  expect(h.exitCode).toBe(3);
+  expect(failed[0]).toContain("reason=signal");
+  expect(failed[0]).toContain("signal=SIGTERM");
+  expect(failed[0]).toContain("retryable=false");
+  // Aggregate shares the generalized `conditions=` field with the timeout path.
+  expect(failed[0]).toContain("conditions=");
+  expect(failed[0]).not.toContain("reason=timeout");
+  expect(h.exitCode).toBe(10);
 });
 
 // ---------------------------------------------------------------------------

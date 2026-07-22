@@ -16,10 +16,11 @@
  * Exit codes:
  *   0  met (or, under --probe, the condition holds now)
  *   1  not-found / usage / connection fatal / unreachable
- *   3  timeout (SIGTERM or our own --timeout deadline)
+ *   3  timeout (our own --timeout deadline)
  *   4  deleted (was on board, vanished, re-query miss)
  *   5  stuck under --fail-on-stuck (default: keep waiting)
  *   9  --probe only: evaluated cleanly, condition does not hold
+ *  10  signal (external SIGTERM/SIGINT — Monitor's kill timeout / operator kill)
  *
  * `reason=unreachable` (exit 1) is distinct from `reason=connect`: connect
  * is a terminal query-shape error keeperd rejected; unreachable is the
@@ -53,7 +54,9 @@
  * All flushes go through `process.stdout.write(line, () => process.exit(code))`
  * so a piped fd actually drains before exit. A single `terminating`
  * latch guards every terminal path so SIGTERM racing a met can't double
- * -emit. SIGTERM/SIGINT both route to `failed reason=timeout` exit 3.
+ * -emit. SIGTERM/SIGINT route to `failed reason=signal` exit 10 — an
+ * external kill, DISTINCT from our own `--timeout` deadline (reason=timeout
+ * exit 3) so forensics never confuses a mass-reap for self-deadlines.
  *
  * Reconnect blip is NOT a drop: subscribeReadiness re-gates first-paint
  * on reconnect, and a target absent in the post-reconnect first
@@ -196,6 +199,7 @@ Exit codes:
   1 not-found / no-match / no-git-root / usage / connect / unreachable
   3 timeout    4 deleted    5 stuck (only under --fail-on-stuck)
   9 --probe only: evaluated cleanly, condition does not hold
+  10 signal (external SIGTERM/SIGINT — e.g. Monitor's kill timeout)
 
 Examples:
   keeper await complete fn-12-add-oauth.3
@@ -258,7 +262,7 @@ surfaces as its own exit 5, not folded into the generic does-not-hold.
 
 Exit codes: 0 met (or --probe holds) · 1 not-found/usage/connect/unreachable · 3 timeout
 · 4 target deleted · 5 stuck (only under --fail-on-stuck) · 9 --probe only: evaluated
-cleanly, does not hold. Footguns: server-up can't be ANDed or take an explicit
+cleanly, does not hold · 10 signal (external SIGTERM/SIGINT). Footguns: server-up can't be ANDed or take an explicit
 --connect-timeout (no id) — under bare --probe it still gets a bounded deadline (the
 probe default), only the explicit flag combo is rejected; epic-added/epic-removed/changed
 are edge-triggered (never fire on first paint, and are a usage error under --probe);
@@ -519,6 +523,16 @@ const DEFAULT_HEARTBEAT_MS = 60_000;
  * `timeout(1)`'s "still running" collision).
  */
 const EXIT_PROBE_DOES_NOT_HOLD = 9;
+
+/**
+ * External-signal terminal code: a SIGTERM/SIGINT killed the await from
+ * OUTSIDE (Monitor's kill timeout, an operator kill), a DISTINCT verdict
+ * from the caller's own `--timeout` deadline (exit 3) so a mass-reap is
+ * never mistaken for a wave of self-deadlines. Registered in
+ * `cli/keeper.ts`'s `EXIT_CODES` and mirrored in `cli/descriptor.ts`'s await
+ * `exit_codes`; not 124 (GNU `timeout(1)` collision), not the frozen 3/4/5/6/9.
+ */
+const EXIT_SIGNAL = 10;
 
 /**
  * `--probe`'s implied connect deadline (task 3) when `--connect-timeout` is
@@ -979,11 +993,12 @@ export interface RunDeps {
   /** Process exit shim; must never return. */
   exit: (code: number) => never;
   /**
-   * Register a one-shot SIGTERM/SIGINT handler. Returns an unregister
-   * function so the runner can detach on terminate. Tests inject a
-   * controllable handler.
+   * Register a one-shot SIGTERM/SIGINT handler; the handler receives the
+   * killing signal's NAME (`"SIGTERM"` / `"SIGINT"`) so the terminal line
+   * can report WHICH signal. Returns an unregister function so the runner
+   * can detach on terminate. Tests inject a controllable handler.
    */
-  installSignals: (handler: () => void) => () => void;
+  installSignals: (handler: (signal: string) => void) => () => void;
   /**
    * Optional `connect` factory passed straight through to
    * `subscribeReadiness` / `subscribeCollection`. Production code
@@ -2880,38 +2895,58 @@ export async function runAwait(
     });
   };
 
-  // Aggregate timeout fields. Single-plan is byte-identical; otherwise
-  // a generalized shape.
-  const timeoutFields = (): Record<string, string> => {
-    const detail = lastWaitingDetail();
-    // Task 2: a `--timeout`/SIGTERM deadline is the CALLER's own budget
-    // running out, not a terminal verdict on the condition — re-arming the
-    // same await is exactly what a caller does next.
-    const extra: Record<string, string> = {
-      retryable: "true",
-      ...(detail !== undefined ? { detail } : {}),
-    };
+  // Shared slot-identity skeleton for the two caller-terminated deadline
+  // paths (own-`--timeout` and external signal). Single-plan is the
+  // byte-identical external contract; otherwise a generalized shape. Each
+  // caller appends its own `retryable`/`signal` tail + trailing `detail`
+  // AFTER this skeleton, so the frozen timeout wire order
+  // (reason,target,kind,condition,retryable,detail) is preserved exactly.
+  const deadlineIdentityFields = (
+    reason: "timeout" | "signal",
+  ): Record<string, string> => {
     if (single && slots[0]?.kind === "plan") {
       const t = slots[0].target;
-      return {
-        reason: "timeout",
-        target: t.id,
-        kind: t.kind,
-        condition: t.condition,
-        ...extra,
-      };
+      return { reason, target: t.id, kind: t.kind, condition: t.condition };
     }
     return {
-      reason: "timeout",
+      reason,
       conditions: slots.map(slotLabel).join(" and "),
-      ...extra,
     };
   };
 
-  // SIGTERM/SIGINT → failed reason=timeout exit 3 through the same
-  // `terminating` guard. Monitor sends SIGTERM at its kill timeout.
-  unregisterSignals = deps.installSignals(() => {
-    emitTerminal("failed", 3, timeoutFields());
+  const timeoutFields = (): Record<string, string> => {
+    const detail = lastWaitingDetail();
+    // Task 2: a `--timeout` deadline is the CALLER's own budget running out,
+    // not a terminal verdict on the condition — re-arming the same await is
+    // exactly what a caller does next, hence `retryable: "true"`.
+    return {
+      ...deadlineIdentityFields("timeout"),
+      retryable: "true",
+      ...(detail !== undefined ? { detail } : {}),
+    };
+  };
+
+  // An external SIGTERM/SIGINT (e.g. Monitor's kill timeout, an operator
+  // kill) is NOT the caller's own budget expiring — it is a foreign
+  // interruption. It gets its OWN `reason`, the killing signal's name, and a
+  // distinct exit code, and is `retryable: "false"` (per `emitPlanFailure`'s
+  // vocabulary: re-arming the same await does not undo an external kill) — so
+  // forensics never confuses a mass-reap for a wave of self-deadlines.
+  const signalFields = (signal: string): Record<string, string> => {
+    const detail = lastWaitingDetail();
+    return {
+      ...deadlineIdentityFields("signal"),
+      signal,
+      retryable: "false",
+      ...(detail !== undefined ? { detail } : {}),
+    };
+  };
+
+  // SIGTERM/SIGINT → failed reason=signal exit 10 through the same
+  // `terminating` guard — distinct from our own `--timeout` (reason=timeout
+  // exit 3). Monitor sends SIGTERM at its kill timeout.
+  unregisterSignals = deps.installSignals((signal) => {
+    emitTerminal("failed", EXIT_SIGNAL, signalFields(signal));
   });
 
   // Our own --timeout deadline. If both Monitor's kill timeout AND
@@ -3316,12 +3351,13 @@ export async function main(argv: string[]): Promise<void> {
     writeStderr: (line) => process.stderr.write(line),
     exit: (code) => process.exit(code),
     installSignals: (handler) => {
-      const wrap = (): void => handler();
-      process.on("SIGTERM", wrap);
-      process.on("SIGINT", wrap);
+      const onTerm = (): void => handler("SIGTERM");
+      const onInt = (): void => handler("SIGINT");
+      process.on("SIGTERM", onTerm);
+      process.on("SIGINT", onInt);
       return () => {
-        process.off("SIGTERM", wrap);
-        process.off("SIGINT", wrap);
+        process.off("SIGTERM", onTerm);
+        process.off("SIGINT", onInt);
       };
     },
     setTimer: (cb, ms) => setTimeout(cb, ms),
