@@ -37,9 +37,11 @@ import {
   classifyPremergeRedundancy,
   commitWorkLockPath,
   currentBranch,
+  currentBranchResult,
   DEFAULT_BRANCH_FALLBACKS,
   ensureWorktree,
   ensureWorktreeDepLink,
+  ensureWorktreeResult,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
   isBaselineScratchPath,
@@ -51,6 +53,7 @@ import {
   LANE_DIRT_INDEX_MAX_BYTES,
   type LockAcquirer,
   listEpicLaneBranches,
+  listWorktreesResult,
   losslessPremergeClean,
   measureBaseDrift,
   mergeBranchInto,
@@ -1293,6 +1296,244 @@ test("mergeBranchInto: a non-content merge failure (exit 128, NO MERGE_HEAD) →
   expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
     false,
   );
+});
+
+test("mergeBranchInto: a pre-merge-commit hook rejection (exit 1, MERGE_HEAD PRESENT, ZERO U-paths) → structural merge-failed AFTER aborting the clean merge state, never a resolver conflict", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+        a.some((t) => t.endsWith("^{commit}")),
+      result: { exitCode: 0 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+      result: { exitCode: 1 },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+      result: { stdout: "/wt/.git\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: 1, stderr: "error: pre-merge-commit hook declined" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "diff", "--name-only", "--diff-filter=U"),
+      result: { stdout: "" }, // ZERO unmerged paths — NOT a content conflict
+    },
+    {
+      when: (a) => argvHas(a, "MERGE_HEAD"),
+      result: { exitCode: 0, stdout: "mergehead\n" }, // git DID create a merge state
+    },
+  ]);
+  const res = await mergeBranchInto("/wt", "src", run, recordingLock().acquire);
+  expect(res.kind).toBe("merge-failed");
+  // The clean (U-less) merge state was ABORTED before returning — never left mid-merge.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    true,
+  );
+});
+
+test("mergeBranchInto: an INCONCLUSIVE merge-state probe (124) with positive U-paths → merge-inconclusive (never merge-failed), leaving residue for the next cycle (no premature abort)", async () => {
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+        a.some((t) => t.endsWith("^{commit}")),
+      result: { exitCode: 0 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+      result: { exitCode: 1 },
+    },
+    {
+      when: (a) =>
+        argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+      result: { stdout: "/wt/.git\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+      result: { exitCode: 1, stdout: "CONFLICT (content): foo.ts" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "diff", "--name-only", "--diff-filter=U"),
+      result: { stdout: "src/foo.ts\n" }, // POSITIVE unmerged paths
+    },
+    {
+      when: (a) => argvHas(a, "MERGE_HEAD"),
+      result: { exitCode: 124 }, // SIGKILLed probe → the merge state is UNKNOWN
+    },
+  ]);
+  const res = await mergeBranchInto("/wt", "src", run, recordingLock().acquire);
+  expect(res.kind).toBe("merge-inconclusive");
+  // NO abort on an UNKNOWN state — a possibly-wrong abort is worse than a retry.
+  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+    false,
+  );
+});
+
+// BLOCKER 3 — the four-state reads keep a TRANSIENT wedge, an UNKNOWN read, and a
+// POSITIVELY-OBSERVED structural fact apart (never a permanent sticky for UNKNOWN).
+
+test("listWorktreesResult: an EMPTY (code-0) output is inconclusive — git always lists at least the main worktree", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: { stdout: "" },
+    },
+  ]);
+  expect((await listWorktreesResult("/repo", run)).kind).toBe("inconclusive");
+});
+
+test("listWorktreesResult: a MALFORMED (unparseable, non-empty) output is inconclusive", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: { stdout: "garbage-not-porcelain\n" },
+    },
+  ]);
+  expect((await listWorktreesResult("/repo", run)).kind).toBe("inconclusive");
+});
+
+test("listWorktreesResult: a non-124 nonzero exit is inconclusive, a 124 SIGKILL is timeout", async () => {
+  const err = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: { exitCode: 128 },
+    },
+  ]);
+  expect((await listWorktreesResult("/repo", err.run)).kind).toBe(
+    "inconclusive",
+  );
+  const to = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: { exitCode: 124 },
+    },
+  ]);
+  expect((await listWorktreesResult("/repo", to.run)).kind).toBe("timeout");
+});
+
+test("currentBranchResult: an EMPTY (code-0) HEAD read is inconclusive, a valid one is ok", async () => {
+  const empty = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+      result: { stdout: "" },
+    },
+  ]);
+  expect((await currentBranchResult("/wt", empty.run)).kind).toBe(
+    "inconclusive",
+  );
+  const ok = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+      result: { stdout: "keeper/epic/x\n" },
+    },
+  ]);
+  expect(await currentBranchResult("/wt", ok.run)).toEqual({
+    kind: "ok",
+    value: "keeper/epic/x",
+  });
+});
+
+test("ensureWorktreeResult: a path registered on the WRONG branch is a positively-observed error", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: { stdout: "worktree /wt\nHEAD abc\nbranch refs/heads/other\n\n" },
+    },
+  ]);
+  const res = await ensureWorktreeResult(
+    "/repo",
+    "/wt",
+    "keeper/epic/x",
+    "main",
+    run,
+  );
+  expect(res.kind).toBe("error");
+  expect(res.kind === "error" && res.detail).toContain("refs/heads/other");
+});
+
+test("ensureWorktreeResult: a branch-exists probe 128 and a nonzero prune are UNKNOWN → inconclusive (never treated as absent / ignored)", async () => {
+  const probe128 = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: {
+        stdout: "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+      },
+    },
+    {
+      when: (a) => argvStartsWith(a, "worktree", "prune"),
+      result: { exitCode: 0 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 128 }, // UNKNOWN — never "absent"
+    },
+  ]);
+  expect(
+    (
+      await ensureWorktreeResult(
+        "/repo",
+        "/wt",
+        "keeper/epic/x",
+        "main",
+        probe128.run,
+      )
+    ).kind,
+  ).toBe("inconclusive");
+  const pruneFail = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: {
+        stdout: "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+      },
+    },
+    {
+      when: (a) => argvStartsWith(a, "worktree", "prune"),
+      result: { exitCode: 1 },
+    },
+  ]);
+  expect(
+    (
+      await ensureWorktreeResult(
+        "/repo",
+        "/wt",
+        "keeper/epic/x",
+        "main",
+        pruneFail.run,
+      )
+    ).kind,
+  ).toBe("inconclusive");
+});
+
+test("ensureWorktreeResult: a failed `worktree add` is a positively-observed error", async () => {
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "worktree", "list"),
+      result: {
+        stdout: "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+      },
+    },
+    {
+      when: (a) => argvStartsWith(a, "worktree", "prune"),
+      result: { exitCode: 0 },
+    },
+    {
+      when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
+      result: { exitCode: 1 }, // base branch positively absent → add -b
+    },
+    {
+      when: (a) => argvStartsWith(a, "worktree", "add"),
+      result: { exitCode: 128, stderr: "fatal: invalid reference" },
+    },
+  ]);
+  expect(
+    (await ensureWorktreeResult("/repo", "/wt", "keeper/epic/x", "main", run))
+      .kind,
+  ).toBe("error");
 });
 
 test("mergeBranchInto: phantom/unresolvable source → missing-source, no merge, no abort, no lock", async () => {

@@ -113,14 +113,25 @@ export type MergeResult =
    */
   | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   /**
-   * `git merge --no-edit` returned non-zero but left NO merge in flight (no
-   * `MERGE_HEAD`) — the merge NEVER STARTED. This is a STRUCTURAL, non-content
-   * failure (a pre-merge hook rejection, a bad/dubious config, an identity or index
-   * failure, an "untracked working tree files would be overwritten" abort), NOT a
-   * content conflict, so the caller mints a VISIBLE structural failure rather than
-   * routing it into the content-conflict resolver path. `stderr` carries git's output.
+   * `git merge --no-edit` returned non-zero as a STRUCTURAL, non-content failure —
+   * classified from BOTH the merge-state (`MERGE_HEAD`) AND the unmerged-path (U)
+   * signals: a merge that never started (no state, no U — a bad config / identity /
+   * index / would-clobber refusal), OR a state WITH ZERO U-paths (a pre-merge-commit
+   * hook that rejects AFTER git creates `MERGE_HEAD`; the clean merge state is ABORTED
+   * before returning). NOT a content conflict, so the caller mints a VISIBLE structural
+   * failure rather than routing it into the resolver. `stderr` carries git's output.
    */
   | { kind: "merge-failed"; stderr: string }
+  /**
+   * The merge failed but its true class cannot be POSITIVELY determined: the
+   * `MERGE_HEAD` probe was inconclusive (a 124 SIGKILL or a git error — UNKNOWN, never
+   * collapsed to absent), OR the two signals DISAGREE (positive U-paths with no merge
+   * state). A visible WEDGE/DEFER that never claims a clean structural failure and
+   * never routes a normal resolver — the checkout may still be mid-merge, so it is left
+   * for the next cycle's readiness/recover pass rather than a possibly-wrong abort.
+   * `stderr` carries git's output.
+   */
+  | { kind: "merge-inconclusive"; stderr: string }
   /**
    * The bounded {@link LockAcquirer} could not take the per-worktree commit-work
    * flock within its deadline — another holder (a concurrent commit-work or a
@@ -620,6 +631,30 @@ async function verifyPseudoRef(
   }
   const sha = r.stdout.trim();
   return sha.length > 0 ? sha : null;
+}
+
+/**
+ * TRI-STATE `MERGE_HEAD` presence — the merge-classification probe that (unlike
+ * {@link verifyPseudoRef}) NEVER collapses a 124 SIGKILL or a git error into "absent".
+ * `present` (a merge in flight) and `absent` (exit 1, no ref) are POSITIVE
+ * observations; a timeout (124) or any other error is `inconclusive` (UNKNOWN — the
+ * caller must not classify a clean structural failure nor route a resolver on it).
+ */
+async function probeMergeStateTri(
+  cwd: string,
+  run: GitRunner,
+): Promise<"present" | "absent" | "inconclusive"> {
+  const r = await run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (r.code === 0) {
+    return r.stdout.trim().length > 0 ? "present" : "inconclusive";
+  }
+  if (r.code === 1) {
+    return "absent";
+  }
+  return "inconclusive"; // 124 SIGKILL or a git error (e.g. 128) — never "absent"
 }
 
 /**
@@ -1850,21 +1885,30 @@ export async function ensureWorktree(
 }
 
 /**
- * A TRI-STATE git read for a structural preflight (the pre-close assembly's ensure /
- * registration / HEAD checks): a clean value, a TRANSIENT timeout (a 124 SIGKILL —
- * the caller DEFERS with no row), or a genuine structural error (the caller mints a
- * VISIBLE failure). The plain {@link listWorktrees} / {@link currentBranch} collapse
- * BOTH failure classes into `[]` / `""`, so a transient git wedge would mint a
- * PERMANENT sticky; these variants keep the two apart. Bounded by
- * {@link GIT_LOCAL_TIMEOUT_MS}.
+ * A FOUR-STATE git read for a structural preflight (the pre-close assembly's ensure /
+ * HEAD checks). The plain {@link listWorktrees} / {@link currentBranch} collapse EVERY
+ * failure — a transient wedge, an UNKNOWN read, AND a genuine mismatch — into `[]` /
+ * `""`, so a transient or ambiguous read would mint a PERMANENT structural sticky.
+ * These variants keep the four apart:
+ *  - `ok`           — a clean value.
+ *  - `timeout`      — a 124 SIGKILL; the caller DEFERS (no row).
+ *  - `inconclusive` — UNKNOWN: a non-124 nonzero exit, an EMPTY or MALFORMED read, or a
+ *    branch-probe / prune that could not resolve. NOT positive structure, so the caller
+ *    DEFERS (no row), never a sticky.
+ *  - `error`        — a POSITIVELY-OBSERVED structural fact (a path registered on the
+ *    WRONG branch, a failed `worktree add`); the caller mints a VISIBLE failure.
+ * Bounded by {@link GIT_LOCAL_TIMEOUT_MS}.
  */
 export type GitReadOutcome<T> =
   | { kind: "ok"; value: T }
   | { kind: "timeout" }
+  | { kind: "inconclusive"; detail: string }
   | { kind: "error"; detail: string };
 
-/** {@link listWorktrees}, tri-stated — a 124 SIGKILL is `timeout`, any other
- * non-zero is a structural `error`, else the parsed entries. */
+/** {@link listWorktrees}, four-stated — a 124 SIGKILL is `timeout`; any other non-zero,
+ * an EMPTY output, or an unparseable (malformed) output is `inconclusive` (UNKNOWN, git
+ * always lists at least the main worktree); else the parsed entries. Never `error` — a
+ * plain list observes no structure to fail on. */
 export async function listWorktreesResult(
   cwd: string,
   run: GitRunner = gitExec,
@@ -1876,16 +1920,30 @@ export async function listWorktreesResult(
   if (r.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
   if (r.code !== 0) {
     return {
-      kind: "error",
+      kind: "inconclusive",
       detail:
         (r.stdout + r.stderr).trim() || `git worktree list exited ${r.code}`,
     };
   }
-  return { kind: "ok", value: parseWorktreeList(r.stdout) };
+  if (r.stdout.trim() === "") {
+    return {
+      kind: "inconclusive",
+      detail: "git worktree list returned no worktrees",
+    };
+  }
+  const entries = parseWorktreeList(r.stdout);
+  if (entries.length === 0) {
+    return {
+      kind: "inconclusive",
+      detail: "git worktree list output could not be parsed",
+    };
+  }
+  return { kind: "ok", value: entries };
 }
 
-/** {@link currentBranch}, tri-stated — a 124 SIGKILL is `timeout`, any other
- * non-zero is a structural `error`, else the abbreviated HEAD branch. */
+/** {@link currentBranch}, four-stated — a 124 SIGKILL is `timeout`; any other non-zero
+ * or an EMPTY read is `inconclusive` (UNKNOWN); else the abbreviated HEAD branch. Never
+ * `error` — an on-wrong-branch verdict is the CALLER's positive comparison. */
 export async function currentBranchResult(
   cwd: string,
   run: GitRunner = gitExec,
@@ -1897,16 +1955,25 @@ export async function currentBranchResult(
   if (r.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
   if (r.code !== 0) {
     return {
-      kind: "error",
+      kind: "inconclusive",
       detail: (r.stdout + r.stderr).trim() || `git rev-parse exited ${r.code}`,
     };
   }
-  return { kind: "ok", value: r.stdout.trim() };
+  const head = r.stdout.trim();
+  if (head === "") {
+    return {
+      kind: "inconclusive",
+      detail: "git rev-parse returned an empty HEAD",
+    };
+  }
+  return { kind: "ok", value: head };
 }
 
-/** {@link ensureWorktree}, tri-stated — every git op is bounded, and a 124 SIGKILL
- * in ANY of them is a `timeout` (the caller defers, never a false structural sticky);
- * a genuine failure (a foreign-branch collision, a failed `worktree add`) is `error`. */
+/** {@link ensureWorktree}, four-stated — every git op is bounded. A 124 SIGKILL is
+ * `timeout`; an UNKNOWN read (an inconclusive list, a nonzero prune, a branch-probe that
+ * neither resolves nor positively-absents — e.g. a 128) is `inconclusive`; only a
+ * POSITIVELY-OBSERVED fact (a path registered on the WRONG branch, a failed `worktree
+ * add`) is `error`. */
 export async function ensureWorktreeResult(
   cwd: string,
   path: string,
@@ -1915,7 +1982,7 @@ export async function ensureWorktreeResult(
   run: GitRunner = gitExec,
 ): Promise<GitReadOutcome<void>> {
   const existing = await listWorktreesResult(cwd, run);
-  if (existing.kind !== "ok") return existing;
+  if (existing.kind !== "ok") return existing; // timeout / inconclusive propagate
   const atPath = existing.value.find((e) => samePath(e.path, path));
   if (atPath !== undefined) {
     if (atPath.branch === `refs/heads/${branch}`) {
@@ -1931,6 +1998,12 @@ export async function ensureWorktreeResult(
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
   if (prune.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+  if (prune.code !== 0) {
+    return {
+      kind: "inconclusive",
+      detail: `git worktree prune exited ${prune.code}`,
+    };
+  }
   let hasBranch = existing.value.some(
     (e) => e.branch === `refs/heads/${branch}`,
   );
@@ -1940,7 +2013,16 @@ export async function ensureWorktreeResult(
       { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
     );
     if (probe.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
-    hasBranch = probe.code === 0;
+    if (probe.code === 0) {
+      hasBranch = true;
+    } else if (probe.code === 1) {
+      hasBranch = false; // positively absent → create it
+    } else {
+      return {
+        kind: "inconclusive",
+        detail: `branch-exists probe for ${branch} exited ${probe.code}`,
+      };
+    }
   }
   const args = hasBranch
     ? ["worktree", "add", path, branch]
@@ -2135,28 +2217,48 @@ export async function mergeBranchInto(
             .map((path) => path.trim())
             .filter((path) => path.length > 0)
         : [];
-    // The MERGE STATE is the authoritative content-conflict signal — a real content
-    // conflict leaves a `MERGE_HEAD` (and unmerged paths). Abort iff one exists, so a
-    // merge that NEVER STARTED is not spuriously "aborted":
+    // Classify from BOTH signals — the MERGE STATE (`MERGE_HEAD`) AND the unmerged-path
+    // (U) evidence — never from state alone:
+    //  - state INCONCLUSIVE (probe timed out / errored) OR positive-U with NO state (the
+    //    two signals disagree) → `merge-inconclusive`: never claim a clean structural
+    //    failure nor route a resolver, and leave any residue for the next cycle (a
+    //    possibly-wrong abort on an unknown state is worse than a retry).
+    //  - state PRESENT → a merge IS in flight: abort it DIRECTLY (a re-probe could
+    //    collapse a timed-out MERGE_HEAD to "absent" and skip the abort, stranding
+    //    residue). Then present+U = a genuine content `conflict`; present+no-U = a
+    //    STRUCTURAL `merge-failed` (a pre-merge-commit hook that rejected AFTER git made
+    //    `MERGE_HEAD`) — the clean state is already aborted.
+    //  - state ABSENT + no U → the merge never started → STRUCTURAL `merge-failed`.
     //  - abort itself failed → the checkout is left mid-merge → `abort-failed` wedge.
-    //  - a merge WAS in flight and aborted cleanly → a genuine content `conflict`.
-    //  - NO merge was in flight (`no-merge`) → the non-zero exit is a STRUCTURAL,
-    //    non-content failure (a hook/config/identity/index/would-clobber refusal that
-    //    stopped before creating any merge state) → the visible `merge-failed`, NEVER
-    //    the content-conflict resolver path.
     const merged = (merge.stdout + merge.stderr).trim();
-    const aborted = await abortMergeIfInProgress(worktreePath, run);
-    if (aborted.kind === "abort-failed") {
-      return { kind: "abort-failed", stderr: aborted.stderr };
+    const hasU = conflictedFiles.length > 0;
+    const mergeState = await probeMergeStateTri(worktreePath, run);
+    if (mergeState === "inconclusive" || (mergeState === "absent" && hasU)) {
+      return { kind: "merge-inconclusive", stderr: merged };
     }
-    if (aborted.kind === "no-merge") {
-      return { kind: "merge-failed", stderr: merged };
+    if (mergeState === "present") {
+      const abort = await run(["merge", "--abort"], {
+        cwd: worktreePath,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
+      if (abort.code !== 0) {
+        const out = (abort.stdout + abort.stderr).trim();
+        return {
+          kind: "abort-failed",
+          stderr:
+            abort.code === GIT_SPAWN_TIMEOUT_CODE
+              ? `git merge --abort timed out${out.length > 0 ? `: ${out}` : ""}`
+              : out.length > 0
+                ? out
+                : `git merge --abort failed (exit ${abort.code})`,
+        };
+      }
+      return hasU
+        ? { kind: "conflict", stderr: merged, conflictedFiles }
+        : { kind: "merge-failed", stderr: merged };
     }
-    return {
-      kind: "conflict",
-      stderr: merged,
-      conflictedFiles,
-    };
+    // state ABSENT, no U — the merge never entered a merge state.
+    return { kind: "merge-failed", stderr: merged };
   } finally {
     lock.release();
   }
