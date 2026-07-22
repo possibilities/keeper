@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  __resetConfigWarnMemoForTest,
   DEFAULT_MAX_CONCURRENT_JOBS,
   resolveAutocloseEnabled,
   resolveAutocloseGraceSeconds,
@@ -25,6 +26,9 @@ let prevEnv: string | undefined;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "keeper-config-"));
   prevEnv = process.env.KEEPER_CONFIG;
+  // The config-warning memo is process-lifetime state; reset it per test so the
+  // warn-once assertions below start cold regardless of test order.
+  __resetConfigWarnMemoForTest();
 });
 
 afterEach(() => {
@@ -40,6 +44,21 @@ function writeConfig(yaml: string): void {
   const path = join(dir, "config.yaml");
   writeFileSync(path, yaml);
   process.env.KEEPER_CONFIG = path;
+}
+
+/** Run `fn` with `console.error` captured, returning the joined-arg lines. */
+function captureConsoleError(fn: () => void): string[] {
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  };
+  try {
+    fn();
+  } finally {
+    console.error = original;
+  }
+  return errors;
 }
 
 test("a stale exec_backend: key boots clean (silently ignored, no field)", () => {
@@ -185,6 +204,65 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
   const cfg = resolveConfig();
   expect(cfg.handoffPromptPrefix).toBe("/hack");
   expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// handoff_prompt_prefix — trim-before-match + warn-once-per-offending-value.
+// A stray-whitespace typo (`"/hack "`) must resolve to a working `/hack` with
+// ZERO warnings; a genuinely bad value must warn EXACTLY ONCE per process
+// however many times resolveConfig re-reads it (the reconciler reads it every
+// cycle), and a changed bad value must surface once more.
+// ---------------------------------------------------------------------------
+
+for (const form of ["/hack ", " /hack", "  /hack  ", "\t/hack\n"]) {
+  test(`handoff_prompt_prefix: whitespace-padded ${JSON.stringify(form)} is trimmed, accepted, warns zero times`, () => {
+    writeConfig(`handoff_prompt_prefix: ${JSON.stringify(form)}\n`);
+    const errors = captureConsoleError(() => {
+      expect(resolveConfig().handoffPromptPrefix).toBe("/hack");
+    });
+    expect(errors).toHaveLength(0);
+  });
+}
+
+test("a standing bad handoff_prompt_prefix warns exactly once across many reads", () => {
+  writeConfig("handoff_prompt_prefix: /plan:hack\n");
+  const errors = captureConsoleError(() => {
+    for (let i = 0; i < 5; i++) {
+      expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
+    }
+  });
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toContain("unsupported handoff_prompt_prefix");
+});
+
+test("swapping one bad handoff value for another surfaces one warning each", () => {
+  const errors = captureConsoleError(() => {
+    writeConfig("handoff_prompt_prefix: /plan:hack\n");
+    resolveConfig();
+    resolveConfig(); // repeat of value A → silent
+    writeConfig("handoff_prompt_prefix: /other\n");
+    resolveConfig();
+    resolveConfig(); // repeat of value B → silent
+  });
+  expect(errors).toHaveLength(2);
+  expect(errors[0]).toContain("/plan:hack");
+  expect(errors[1]).toContain("/other");
+});
+
+test("the config-warning memo caps growth and emits a single suppression line", () => {
+  // Drive well past the 64-entry cap with distinct bad values: the first 64
+  // warn and grow the memo, then it stops growing and emits exactly one
+  // suppression line, so 70 distinct bad values yield 64 + 1 = 65 lines total.
+  const errors = captureConsoleError(() => {
+    for (let i = 0; i < 70; i++) {
+      writeConfig(`handoff_prompt_prefix: /bad-${i}\n`);
+      resolveConfig();
+    }
+  });
+  expect(errors).toHaveLength(65);
+  expect(
+    errors.filter((e) => e.includes("further config warnings suppressed")),
+  ).toHaveLength(1);
 });
 
 // ---------------------------------------------------------------------------

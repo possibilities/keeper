@@ -4987,6 +4987,60 @@ export function resolveConfigPath(): string {
   return join(homedir(), ".config", "keeper", "config.yaml");
 }
 
+// Config-validation warnings are MEMOIZED. `resolveConfig` runs on many paths
+// several times per reconciler cycle, so a single standing bad value would
+// otherwise emit one warning PER READ — unbounded. `warnConfigOnce` warns once
+// per process per `(key, offending value)`: a repeat read of the SAME bad value
+// is silent, a CHANGED bad value (a config edit swapping one typo for another)
+// surfaces once more. Process-lifetime is the intended "once per boot" scope;
+// each worker has its own process + memo.
+
+/** Cap on distinct `(key, value)` pairs the config-warning memo records. The
+ *  config key set is finite, so this only bites a pathological value that
+ *  churns every read — past the cap the Set stops growing and one suppression
+ *  line is emitted, keeping the memo bounded by construction. */
+const CONFIG_WARN_MEMO_CAP = 64;
+const configWarnMemo = new Set<string>();
+let configWarnCapNoted = false;
+
+/**
+ * Emit `message` at most once per process for a given `(key, offendingValue)`
+ * pair, so a standing bad config value can never flood stderr across
+ * `resolveConfig`'s many per-cycle callers. A changed value re-warns; the memo
+ * is capped so a churning value degrades to a single suppression line rather
+ * than unbounded growth.
+ */
+function warnConfigOnce(
+  key: string,
+  offendingValue: unknown,
+  message: string,
+): void {
+  const serialized = JSON.stringify(offendingValue);
+  const memoKey = `${key} ${serialized === undefined ? "undefined" : serialized}`;
+  if (configWarnMemo.has(memoKey)) {
+    return;
+  }
+  if (configWarnMemo.size >= CONFIG_WARN_MEMO_CAP) {
+    if (!configWarnCapNoted) {
+      configWarnCapNoted = true;
+      console.error(
+        "[keeper] further config warnings suppressed (memo cap reached)",
+      );
+    }
+    return;
+  }
+  configWarnMemo.add(memoKey);
+  console.error(message);
+}
+
+/** Test-only: drop the process-lifetime config-warning memo so the NEXT bad
+ *  value warns cold. Production never calls this — the memo is intended
+ *  once-per-boot state that a fresh process starts empty. */
+export function __resetConfigWarnMemoForTest(): void {
+  configWarnMemo.clear();
+  configWarnCapNoted = false;
+}
+
 /**
  * Read + parse the keeper config YAML. Best-effort — must never throw past this
  * resolver; every key falls back to its default independently.
@@ -5059,10 +5113,17 @@ export function resolveConfig(): KeeperConfig {
       }
       const hpp = (raw as { handoff_prompt_prefix?: unknown })
         .handoff_prompt_prefix;
-      if (hpp === "/hack") {
-        handoffPromptPrefix = hpp;
+      // Exact-match key: TRIM a string before the compat check and use the
+      // trimmed value, so a stray-whitespace typo (`"/hack "`) resolves to a
+      // working `/hack` with no warning. A non-string or a trimmed-non-`/hack`
+      // value still warns — once per process per offending value.
+      const hppTrimmed = typeof hpp === "string" ? hpp.trim() : hpp;
+      if (hppTrimmed === "/hack") {
+        handoffPromptPrefix = "/hack";
       } else if (hpp !== undefined) {
-        console.error(
+        warnConfigOnce(
+          "handoff_prompt_prefix",
+          hpp,
           `[keeper] unsupported handoff_prompt_prefix ${JSON.stringify(hpp)}; Handoff prompts always use /hack — set handoff_prompt_prefix: /hack or remove the key`,
         );
       }
@@ -5085,9 +5146,14 @@ export function resolveConfig(): KeeperConfig {
       );
     }
   } catch (err) {
-    console.error(
-      `[keeper] config parse failed (${path}); using defaults:`,
-      err,
+    // Per-read like the value warnings above: a persistently malformed file
+    // would warn on EVERY resolveConfig call, so route it through the same memo
+    // (keyed on the error text — a different malformation re-warns).
+    const detail = err instanceof Error ? err.message : String(err);
+    warnConfigOnce(
+      "config-parse",
+      detail,
+      `[keeper] config parse failed (${path}); using defaults: ${detail}`,
     );
     return {
       roots: [...DEFAULT_PLAN_ROOTS],
