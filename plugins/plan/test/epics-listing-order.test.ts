@@ -109,7 +109,8 @@ describe("epics listing is open-first by default", () => {
     seedEpic(root, "fn-11-open", "open", MID);
     seedEpic(root, "fn-1-done", "done", NEW); // newest done
     seedEpic(root, "fn-2-done", "done", MID);
-    // Composite order: [fn-10-open, fn-11-open, fn-1-done, fn-2-done].
+    // Composite order is every open epic first, then the done epics — the page
+    // window below slices that ordering.
     const env = parseCliOutput(
       runCli(["epics", "--limit", "2", "--offset", "1"], { cwd: root }).output,
     ) as unknown as {

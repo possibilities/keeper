@@ -40,10 +40,12 @@ import {
   epicNumFromIdOrBare,
   formatBoardHeader,
   homedBlockedWorkRows,
+  isPlanClosedEpic,
   needsHumanLines,
   orphanedFailureRows,
   renderDeadLetterPill,
   renderEpicDepPills,
+  renderEpicHeaderLines,
   renderHandoffLinkLines,
   renderJobLinkLines,
   serializeSubagentIndex,
@@ -2218,8 +2220,11 @@ test("computeBoardSummary: counts open/running tasks and epics, including closin
     epic_id: "fn-1-a",
     tasks: [taskRunning, taskCompleted],
   });
+  // Plan-closed (`status: "done"`) — the authority for the open/closed split,
+  // independent of its close verdict.
   const epicCompleted = makeEpic({
     epic_id: "fn-2-b",
+    status: "done",
     tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
   });
   const epicFromClose = makeEpic({
@@ -2248,8 +2253,8 @@ test("computeBoardSummary: counts open/running tasks and epics, including closin
     epicsOpen: 2,
     epicsRunning: 2,
     epicsClosing: 1,
-    // The completed-close epic left `epicsOpen` yet still renders a block, so
-    // it counts here — the summary must name it, never drop it silently.
+    // The status-done epic left `epicsOpen` yet still renders a block, so it
+    // counts here — the summary must name it, never drop it silently.
     epicsClosed: 1,
     tasksOpen: 1,
     tasksRunning: 1,
@@ -2264,30 +2269,54 @@ test("computeBoardSummary: counts open/running tasks and epics, including closin
 // The counts-match-rows invariant: `renderEpicsBody` renders one block per
 // `snap.epics` entry, so the summary's open + closed epic counts must sum to
 // exactly the rendered block count — every epic lands in one bucket or the
-// other, never both, never neither.
-test("computeBoardSummary: epicsOpen + epicsClosed equals the rendered epic-block count", () => {
+// other, never both, never neither. The split keys on plan status, so the
+// partition is meaningful, not tautological with the verdict maps.
+test("computeBoardSummary: epicsOpen + epicsClosed equals the rendered epic-block count, split by plan status", () => {
   const epics = [
-    makeEpic({ epic_id: "fn-1-a", tasks: [] }),
-    makeEpic({ epic_id: "fn-2-b", tasks: [] }),
-    makeEpic({ epic_id: "fn-3-c", tasks: [] }),
-    // A verdict-less epic (no perCloseRow entry) still renders a block;
-    // `isOpenVerdict(undefined)` puts it in the open bucket, never uncounted.
-    makeEpic({ epic_id: "fn-4-d", tasks: [] }),
+    makeEpic({ epic_id: "fn-1-a", status: "open", tasks: [] }),
+    makeEpic({ epic_id: "fn-2-b", status: "done", tasks: [] }),
+    makeEpic({ epic_id: "fn-3-c", status: "open", tasks: [] }),
+    makeEpic({ epic_id: "fn-4-d", status: "done", tasks: [] }),
   ];
   const counts = computeBoardSummary({
     epics,
     readiness: {
       perTask: new Map<string, Verdict>(),
+      // Verdicts deliberately DISAGREE with plan status: the two done epics
+      // read `running`/`unknown`, an open epic reads `completed`. Status must
+      // win the split, or a winding-down close would leak into `epicsOpen`.
       perCloseRow: new Map<string, Verdict>([
-        ["fn-1-a", EPIC_NOT_VALIDATED],
-        ["fn-2-b", COMPLETED],
-        ["fn-3-c", JOB_RUNNING],
+        ["fn-1-a", COMPLETED],
+        ["fn-2-b", JOB_RUNNING],
+        ["fn-3-c", EPIC_NOT_VALIDATED],
       ]),
     },
   });
-  expect(counts.epicsOpen).toBe(3);
-  expect(counts.epicsClosed).toBe(1);
+  expect(counts.epicsOpen).toBe(2);
+  expect(counts.epicsClosed).toBe(2);
   expect(counts.epicsOpen + counts.epicsClosed).toBe(epics.length);
+});
+
+// Locked regression (a), counts half: a REAL plan-closed epic (`status: "done"`)
+// whose closer is still winding down reads a `running` close verdict. It must
+// count as closed / not open, while `closing` + `running` independently reflect
+// the live close job — the exact skew the verdict-based classifier got wrong.
+test("computeBoardSummary: a status-done epic with a running close verdict counts closed, not open", () => {
+  const counts = computeBoardSummary({
+    epics: [makeEpic({ epic_id: "fn-9-x", status: "done", tasks: [] })],
+    readiness: {
+      perTask: new Map<string, Verdict>(),
+      perCloseRow: new Map<string, Verdict>([["fn-9-x", JOB_RUNNING]]),
+    },
+  });
+  expect(counts).toEqual({
+    epicsOpen: 0,
+    epicsRunning: 1,
+    epicsClosing: 1,
+    epicsClosed: 1,
+    tasksOpen: 0,
+    tasksRunning: 0,
+  });
 });
 
 test("boardSummaryLines: no `closed` suffix when nothing is pinned-closed (byte-identical steady state)", () => {
@@ -2339,12 +2368,78 @@ test("closedEpicWhyLine: keeps only the reason's first line, capped with an elli
   );
 });
 
-// ADR 0018 (fn-1175.2): a pinned epic rides `snap.epics` with a REAL
-// `completeReadiness` verdict (plan-closed → its close row reads `completed`),
-// so `computeBoardSummary` — which derives every count from the readiness
-// verdict maps, never epic membership — must not inflate `epicsOpen` just
-// because the pinned epic is now present in the epics array.
-test("computeBoardSummary: a pinned plan-closed epic (completed close verdict) never inflates epicsOpen", () => {
+test("isPlanClosedEpic: keys on status === 'done', ignoring the close verdict", () => {
+  expect(isPlanClosedEpic({ status: "done" })).toBe(true);
+  expect(isPlanClosedEpic({ status: "open" })).toBe(false);
+  expect(isPlanClosedEpic({ status: null })).toBe(false);
+  expect(isPlanClosedEpic({})).toBe(false);
+  expect(isPlanClosedEpic(null)).toBe(false);
+});
+
+// The real render seam `renderEpicBlock` uses to build its header — the
+// conditional (plan-closed → why-line) lives inside it, so this drives the
+// actual decision, not just the string helper.
+//
+// Regressions (a) + (c): a status-done epic (close verdict irrelevant here —
+// the block already resolved the standing reason) gets the inline why-line
+// beneath a header line that is BYTE-IDENTICAL to the open epic's, which itself
+// carries no why-line.
+test("renderEpicHeaderLines: closed epic gets the why-line under an unchanged header; open epic is byte-identical", () => {
+  const header = "3. Ship it";
+  const openLines = renderEpicHeaderLines({
+    header,
+    epicVerdict: COMPLETED,
+    row: { status: "open" },
+    standingReason: undefined,
+  });
+  const closedLines = renderEpicHeaderLines({
+    header,
+    epicVerdict: COMPLETED,
+    row: { status: "done" },
+    standingReason: "worktree-finalize-non-fast-forward: origin moved ahead",
+  });
+  expect(openLines).toHaveLength(1);
+  expect(closedLines).toEqual([
+    openLines[0],
+    "  closed · still shown for standing post-close plumbing: worktree-finalize-non-fast-forward: origin moved ahead",
+  ]);
+});
+
+// Regression (b): a renderer/readiness skew that leaves the reason unresolvable
+// must NOT resurrect the bare-closed-row defect — the why-line still renders.
+test("renderEpicHeaderLines: a status-done epic with no resolvable reason still renders a why-line", () => {
+  const lines = renderEpicHeaderLines({
+    header: "4. Winding down",
+    epicVerdict: COMPLETED,
+    row: { status: "done" },
+    standingReason: undefined,
+  });
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toBe(
+    "  closed · still shown for standing post-close plumbing",
+  );
+});
+
+test("renderEpicHeaderLines: a blocked epic verdict keeps its continuation line, then appends the closed why-line", () => {
+  const lines = renderEpicHeaderLines({
+    header: "5. Blocked",
+    epicVerdict: EPIC_NOT_VALIDATED,
+    row: { status: "done" },
+    standingReason: "worktree-recover-dirty-checkout: dirty",
+  });
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toBe("5. Blocked");
+  expect(lines[2]).toBe(
+    "  closed · still shown for standing post-close plumbing: worktree-recover-dirty-checkout: dirty",
+  );
+});
+
+// ADR 0018: a pinned plan-closed epic (`status: "done"`) rides `snap.epics`
+// even though it left the open board, so `computeBoardSummary` must not inflate
+// `epicsOpen` just because it is present in the epics array. Here its close row
+// has already reached `completed` — the settled case, distinct from the
+// winding-down `running` case covered above.
+test("computeBoardSummary: a pinned plan-closed epic (settled close verdict) never inflates epicsOpen", () => {
   const pinnedEpic = makeEpic({
     epic_id: "fn-9-x",
     status: "done",

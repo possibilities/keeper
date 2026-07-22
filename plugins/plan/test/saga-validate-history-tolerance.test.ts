@@ -1,9 +1,9 @@
-// Whole-board `validate` tolerates the debris a DONE epic accretes as history —
-// retired repo paths (primary_repo / touched_repos) and dangling cross-epic
-// deps — degrading them to WARNINGS so the board stays green on things no
-// epic-file rewrite could repair. A LIVE (open) epic with the identical debris
-// stays RED with byte-identical error strings. Driven through the real CLI
-// `validate` verb seam (no --epic → no marker arm, no commit).
+// Whole-board `validate` tolerates the debris a DONE epic carries — missing
+// repo paths (primary_repo / touched_repos) and dangling cross-epic deps —
+// degrading them to WARNINGS so the board stays green on things no epic-file
+// rewrite could repair. A LIVE (open) epic with the identical debris stays RED
+// with byte-identical error strings. Driven through the real CLI `validate`
+// verb seam (no --epic → no marker arm, no commit).
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
@@ -17,7 +17,7 @@ interface ValidateEnvelope {
   warnings: string[];
 }
 
-/** Seed a task-free epic, then stamp it with a retired repo path + a dangling
+/** Seed a task-free epic, then stamp it with a missing repo path + a dangling
  * cross-epic dep at the requested status. Task-free keeps the epic-done
  * coherence check silent so only the debris is under test. */
 function seedDebrisEpic(root: string, epicId: string, status: string): void {

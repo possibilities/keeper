@@ -107,11 +107,11 @@ export interface CheckEpicTreeOptions {
   allEpicDeps?: Record<string, string[]> | null;
   allGlobalEpicIds?: Record<string, string> | null;
   epicSpecContent?: string | null;
-  // When true AND the epic's status is "done", retired-repo path failures and
-  // dangling cross-epic deps degrade from errors to warnings — a done epic is
-  // frozen history whose references can no longer be repaired. Only the validate
-  // verb opts in; every live epic and every gate/in-memory caller keeps hard
-  // errors byte-identically.
+  // When true AND the epic's status is "done", missing-repo path failures and
+  // dangling cross-epic deps degrade from errors to warnings — a done epic's
+  // references are immutable, so an unrepairable one cannot hard-fail. Only the
+  // validate verb opts in; every live epic and every gate/in-memory caller keeps
+  // hard errors byte-identically.
   tolerateDoneEpicDebris?: boolean;
 }
 
@@ -139,9 +139,9 @@ export function checkEpicTree(
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  // Retired-repo path failures and dangling cross-epic deps on a DONE epic are
-  // unfixable history; route them here so the validate verb's tolerance demotes
-  // them to warnings while every live epic keeps them as hard errors.
+  // Missing-repo path failures and dangling cross-epic deps on a DONE epic are
+  // unfixable; route them here so the validate verb's tolerance demotes them to
+  // warnings while every live epic keeps them as hard errors.
   const demoteDebris = tolerateDoneEpicDebris && epicData.status === "done";
   const debrisSink = (msg: string): void => {
     (demoteDebris ? warnings : errors).push(msg);

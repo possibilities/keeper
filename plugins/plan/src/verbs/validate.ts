@@ -176,7 +176,7 @@ export function runValidate(
   const epicIdsToCheck = epicId !== null ? [epicId] : [...allEpicIds].sort();
 
   for (const eid of epicIdsToCheck) {
-    // A DONE epic is frozen history: its retired-repo paths and dangling
+    // A DONE epic's references are immutable: its missing-repo paths and dangling
     // cross-epic deps degrade to warnings so a whole-board run stays green on
     // debris no epic-file rewrite could fix. Live epics keep hard errors.
     const [epErrors, epWarnings] = validateEpicIntegrityWithWarnings(

@@ -294,12 +294,12 @@ export interface BoardSummaryCounts {
   readonly epicsOpen: number;
   readonly epicsRunning: number;
   readonly epicsClosing: number;
-  // Rendered-but-not-open epics: a plan-closed epic whose close verdict reads
-  // `completed` yet is still pinned onto the grid by a standing post-close
-  // `dispatch_failures` row (ADR 0018). It leaves `epicsOpen`, so the summary
-  // must name it separately or the grid renders more epic blocks than the line
-  // counts. `epicsOpen + epicsClosed` is exactly the number of epic blocks
-  // rendered.
+  // Rendered-but-not-open epics: a plan-closed epic (`status === "done"`) still
+  // pinned onto the grid by a standing post-close `dispatch_failures` row (ADR
+  // 0018), independent of its close verdict — a winding-down closer keeps that
+  // verdict at `running:*`. It leaves `epicsOpen`, so the summary must name it
+  // separately or the grid renders more epic blocks than the line counts.
+  // `epicsOpen + epicsClosed` is exactly the number of epic blocks rendered.
   readonly epicsClosed: number;
   readonly tasksOpen: number;
   readonly tasksRunning: number;
@@ -337,6 +337,19 @@ function isRunningVerdict(verdict: Verdict | undefined): boolean {
   return verdict?.tag === "running";
 }
 
+/**
+ * Plan-closure authority: an epic is plan-closed IFF its OWN `status` is
+ * `done`. Deliberately NOT the close-row verdict — `closeReadiness` holds a
+ * status-done epic at `running:*` while its closer, subagents, and monitors
+ * wind down, and ADR 0018 pins an epic onto the board regardless of status or
+ * verdict. The board's open/closed split AND the per-block closed why-line both
+ * key on THIS single predicate, so a real plan-closed epic with a live
+ * winding-down closer can never render as a bare open epic or count as open.
+ */
+export function isPlanClosedEpic(row: unknown): boolean {
+  return boardSummaryId(row, "status") === "done";
+}
+
 export function computeBoardSummary(
   input: BoardSummaryInput,
 ): BoardSummaryCounts {
@@ -351,13 +364,16 @@ export function computeBoardSummary(
     const epicId = boardSummaryId(epic, "epic_id");
     const closeVerdict =
       epicId === "" ? undefined : input.readiness.perCloseRow.get(epicId);
-    if (isOpenVerdict(closeVerdict)) {
-      epicsOpen += 1;
-    } else {
-      // A `completed` close verdict — a pinned plan-closed epic. It still
-      // renders as an epic block (ADR 0018), so count it here to keep the
-      // summary reconcilable with the rendered row count.
+    // Open vs closed keys on plan status (`isPlanClosedEpic`), NOT the close
+    // verdict — a plan-closed epic whose closer is still winding down reads
+    // `running:*`, yet it renders a closed block (ADR 0018), so it must count
+    // as closed to stay reconcilable with the rendered rows. The `running` /
+    // `closing` counters below stay verdict-driven, free to independently
+    // reflect that winding-down close job.
+    if (isPlanClosedEpic(epic)) {
       epicsClosed += 1;
+    } else {
+      epicsOpen += 1;
     }
 
     let epicRunning = isRunningVerdict(closeVerdict);
@@ -805,8 +821,8 @@ export function homedBlockedWorkRows(args: {
  * defect this fixes. Names the standing post-close reason keeping it pinned (the
  * failure's first line, capped to keep the block scannable); a pin whose reason
  * can't be resolved still states the shown-because fact. Indented one level to
- * sit beneath the header like the blocked-verdict line. Returns "" for an epic
- * that is not pinned-closed (no line emitted).
+ * sit beneath the header like the blocked-verdict line. The gate on whether to
+ * emit at all lives in {@link renderEpicHeaderLines}.
  */
 export function closedEpicWhyLine(reason: string | undefined): string {
   const base = "  closed · still shown for standing post-close plumbing";
@@ -816,6 +832,33 @@ export function closedEpicWhyLine(reason: string | undefined): string {
   }
   const capped = first.length > 120 ? `${first.slice(0, 119)}…` : first;
   return `${base}: ${capped}`;
+}
+
+/**
+ * The epic header line(s) rendered at the top of an epic block, plus — for a
+ * plan-closed epic — the closed why-line beneath them. The plan-closed decision
+ * keys on {@link isPlanClosedEpic} (status `done`), NOT the close verdict, so a
+ * status-done epic whose closer is still winding down (verdict `running:*`) is
+ * ALWAYS annotated; a renderer/readiness skew can never resurrect a bare closed
+ * row. `standingReason` is the resolved post-close failure text (or `undefined`
+ * → the bare shown-because fact). For an open epic this returns the header
+ * line(s) unchanged — byte-identical to the pre-why-line render — so extracting
+ * this seam leaves ordinary epics untouched.
+ */
+export function renderEpicHeaderLines(args: {
+  header: string;
+  epicVerdict: Verdict;
+  row: unknown;
+  standingReason: string | undefined;
+}): string[] {
+  const lines =
+    args.epicVerdict.tag === "blocked"
+      ? [args.header, `  ${iconizePills(formatPill(args.epicVerdict))}`]
+      : [`${args.header} ${iconizePills(formatPill(args.epicVerdict))}`];
+  if (isPlanClosedEpic(args.row)) {
+    lines.push(closedEpicWhyLine(args.standingReason));
+  }
+  return lines;
 }
 
 function taskNumFromId(id: string): number | null {
@@ -1340,19 +1383,16 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     // boundary as the seam's `snap.epics as Epic[]`) can't throw the renderer.
     const startedSeg = startedPill(isEpicStarted(row as unknown as Epic));
     const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${armedSeg}${startedSeg}`;
-    const epicHeaderLines =
-      epicVerdict.tag === "blocked"
-        ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
-        : [`${epicHeader} ${iconizePills(formatPill(epicVerdict))}`];
-    lines.push(...epicHeaderLines);
-    // A pinned plan-closed epic (completed close verdict) still renders a full
-    // block (ADR 0018); annotate WHY directly under the header — the standing
-    // post-close dispatch-failure that keeps it pinned — so a closed epic never
-    // sits on the board with no reason. Prefer the close-row reason; fall back
-    // to a task's work-failure reason (a `work::` pin homes on a task, not the
-    // close row).
-    if (closeVerdict.tag === "completed") {
-      let standingReason = closeFailureReasonFor(epicId, [...epicIds]);
+    // A plan-closed epic (status `done`) still renders a full block when pinned
+    // by a standing post-close `dispatch_failures` row (ADR 0018); resolve the
+    // reason keeping it pinned — the close-row failure, else a task's work
+    // failure (a `work::` pin homes on a task, not the close row) — so
+    // `renderEpicHeaderLines` can annotate WHY it is still shown. The keying is
+    // status, NOT the close verdict: a winding-down closer reads `running:*`
+    // yet the epic is closed. `undefined` reason → the bare shown-because fact.
+    let standingReason: string | undefined;
+    if (isPlanClosedEpic(row)) {
+      standingReason = closeFailureReasonFor(epicId, [...epicIds]);
       if (standingReason === undefined) {
         for (const task of tasks) {
           const wf = workFailures.get(
@@ -1364,9 +1404,16 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
           }
         }
       }
-      lines.push(closedEpicWhyLine(standingReason));
     }
-    lines.push(...renderJobLinkLines(row.job_links));
+    lines.push(
+      ...renderEpicHeaderLines({
+        header: epicHeader,
+        epicVerdict,
+        row,
+        standingReason,
+      }),
+      ...renderJobLinkLines(row.job_links),
+    );
     // fn-941: the coarse "escalation in flight" set for this snapshot — task ids
     // carrying a `block_escalations` latch row. An escalated `runtime-blocked`
     // task renders `[blocked·escalated]` (planner notified) vs plain `[blocked:…]`.
