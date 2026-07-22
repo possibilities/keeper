@@ -228,26 +228,32 @@ export function runDone(args: DoneArgs): void {
       // audit-gate seam, target+lane-aware) and union them into the evidence commit
       // set — constrained to the task's resolved target repo so a flat evidence
       // list never mixes repos close then validates against a single base. A normal
-      // worker close-out (a landed source commit + a bare `done --summary`) thus
-      // records its sha automatically, needing neither --evidence nor a receipt.
-      // Best-effort: an unexpected git-read failure leaves the inline/carried set
-      // intact (the auto-commit below surfaces a real git fault).
-      let derivedCommits: string[] = [];
+      // worker close-out (a landed source commit + a bare `done --summary`) records
+      // its sha automatically, needing neither --evidence nor a receipt.
+      //
+      // scanFailed tracks a git-read failure: the scan could NOT prove the target
+      // has no commits, so its emptiness is UNKNOWN, not proven-empty. A no-op
+      // receipt substitutes only for a PROVEN-empty set; an UNKNOWN one fails closed
+      // below. An inline --evidence with commits still stands (the worker positively
+      // asserts them and close re-validates each sha — the backstop), so the
+      // evidenced path best-effort-skips a derivation fault; only the receipt /
+      // no-commit path fails closed on unknown.
+      let scanFailed = false;
       try {
-        derivedCommits = deriveTaskTargetRepoCommits(
+        for (const sha of deriveTaskTargetRepoCommits(
           taskId,
           dataDir,
           ctx.projectPath,
-        );
+        )) {
+          if (!evidence.commits.includes(sha)) {
+            evidence.commits.push(sha);
+          }
+        }
       } catch (exc) {
         if (!(exc instanceof GitError)) {
           throw exc;
         }
-      }
-      for (const sha of derivedCommits) {
-        if (!evidence.commits.includes(sha)) {
-          evidence.commits.push(sha);
-        }
+        scanFailed = true;
       }
 
       // Empty-evidence integrity gate + receipt precedence. Objective evidence
@@ -273,13 +279,32 @@ export function runDone(args: DoneArgs): void {
             : healUncommittedDone
               ? carriedReason
               : "";
-      if (evidence.commits.length === 0 && noOpReasonText === "") {
-        emitError(
-          `Task ${taskId} has no evidence commits — supply --evidence with the ` +
-            'landing commits, or --no-op-reason "<why no code landed>" to record ' +
-            "an explicit no-op receipt. Empty evidence never silently closes.",
-          format,
-        );
+      if (evidence.commits.length === 0) {
+        if (scanFailed) {
+          // UNKNOWN attributable state — the derivation could not read the target
+          // repo, so nothing proved the task landed no code. Fail CLOSED regardless
+          // of a receipt (a receipt attests a PROVEN-empty set, never an unknown
+          // one). Typed + distinct from the plain no-evidence refusal below.
+          emitFailureEnvelope(
+            "scan_unverifiable",
+            `Task ${taskId}: could not scan its target repo for landing commits ` +
+              "(git unreadable), so an empty evidence set is unverified — a " +
+              "--no-op-reason receipt cannot substitute for a scan that never " +
+              "proved the task landed no code",
+            [`target-repo commit scan failed for ${taskId}`],
+            "Resolve the git fault (unreadable target repo / missing git binary), " +
+              "then re-run `keeper plan done`.",
+          );
+          process.exit(1);
+        }
+        if (noOpReasonText === "") {
+          emitError(
+            `Task ${taskId} has no evidence commits — supply --evidence with the ` +
+              'landing commits, or --no-op-reason "<why no code landed>" to record ' +
+              "an explicit no-op receipt. Empty evidence never silently closes.",
+            format,
+          );
+        }
       }
 
       // Patch the spec — `## Done summary` then `## Evidence`, validating before

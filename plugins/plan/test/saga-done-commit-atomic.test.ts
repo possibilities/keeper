@@ -20,7 +20,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { failNextCommit } from "./fake-vcs.ts";
+import { failNextCommit, setGitBinaryPresent } from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
   fakeSourceCommit,
@@ -462,6 +462,52 @@ describe("done — server-derived evidence", () => {
     const rt = runtime(root, taskId) as Record<string, unknown>;
     expect((rt.evidence as Record<string, unknown>).commits).toContain(sha);
     // The receipt is dropped — a task with real commits closes on the commit.
+    expect(rt.no_op_reason).toBeNull();
+  });
+
+  test("git-failure + --no-op-reason fails CLOSED (unknown, not proven-empty)", () => {
+    const taskId = seedInProgress("fn-14-atomic");
+    // The target-repo scan cannot run — its emptiness is UNKNOWN, so a receipt
+    // must not substitute for a set that was never proven empty.
+    setGitBinaryPresent(false);
+
+    const r = runCli(
+      ["done", taskId, "--summary", "x", "--no-op-reason", "claims no code"],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).not.toBe(0);
+    const err = firstJsonPayload(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("scan_unverifiable");
+    // No durable done — the overlay stays in_progress, no commit landed.
+    expect((runtime(root, taskId) as Record<string, unknown>).status).toBe(
+      "in_progress",
+    );
+    expect(gitLogCount(root)).toBe(0);
+  });
+
+  test("git-failure + inline --evidence commits still lands (evidenced path, close is backstop)", () => {
+    const taskId = seedInProgress("fn-15-atomic");
+    // The derivation faults, but the worker positively asserts a commit inline;
+    // close re-validates it, so done best-effort-skips the derivation fault.
+    setGitBinaryPresent(false);
+
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "shipped",
+        "--evidence",
+        JSON.stringify({ commits: ["abc1234"] }),
+      ],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).toBe(0);
+    const rt = runtime(root, taskId) as Record<string, unknown>;
+    expect(rt.status).toBe("done");
+    expect((rt.evidence as Record<string, unknown>).commits).toEqual([
+      "abc1234",
+    ]);
     expect(rt.no_op_reason).toBeNull();
   });
 });

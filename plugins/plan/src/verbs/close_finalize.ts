@@ -1682,9 +1682,15 @@ export function integrateEpicBases(
  * base it is about to publish — the bounded receipt the abort names. */
 interface UnreachableTask {
   task_id: string;
-  reason: "unreachable-branch" | "unreachable-commits" | "no-evidence";
+  reason:
+    | "unreachable-branch"
+    | "unreachable-commits"
+    | "no-evidence"
+    | "unverifiable-target";
   /** The un-fanned-in `keeper/epic/<epic>--<task>` rib (unreachable-branch). */
   branch?: string;
+  /** The unreadable target repo (unverifiable-target). */
+  repo?: string;
   /** A bounded, de-duplicated slice of the unreachable evidence commits. */
   commits?: string[];
   /** Total distinct unreachable commits for this task (>= commits.length). */
@@ -1744,11 +1750,13 @@ function evidenceCommitsOf(task: Record<string, unknown>): string[] {
  * — a generic no-op receipt never masks a dangling rib or an unreachable commit
  * (abandon by RETIRING the rib, not by prose). A task with any objectively
  * reachable attributable commit (recorded evidence ∪ `Task:`-trailer scan ∪ rib
- * tip) passes. ONLY a truly EMPTY attributable set may fall back to an explicit
- * typed no-op receipt (`no_op_reason`); empty + no receipt is the
+ * tip) passes. ONLY a truly EMPTY-but-PROVEN attributable set may fall back to an
+ * explicit typed no-op receipt (`no_op_reason`); empty + no receipt is the
  * silent-empty-success this gate refuses to publish. Fail-closed throughout:
  * `isAncestor` treats anything it cannot prove reachable as unreachable, and an
- * unreadable target repo passes only under a receipt. */
+ * UNREADABLE target repo (an UNKNOWN, not proven-empty, set) fails closed with a
+ * distinct `unverifiable-target` reason regardless of any receipt — a receipt
+ * substitutes only for a set the scan proved empty, never one it never read. */
 function assertDoneTaskAncestry(
   epicId: string,
   stateCtx: ProjectContext,
@@ -1772,20 +1780,20 @@ function assertDoneTaskAncestry(
       (task.target_repo as string | null | undefined) || primaryRepo,
     );
     if (!vcs.isGitRepo(repo)) {
-      // A repo the scan cannot read cannot prove reachability. A declared no-op
-      // (no code to place) still passes; otherwise fail-closed. The fresh-hash /
-      // AllReposBroken guards already fail a wholly-broken scan set.
-      if (hasReceipt) {
-        continue;
-      }
-      offenders.push({ task_id: taskId, reason: "no-evidence" });
+      // UNKNOWN, not proven-empty: an unreadable target repo cannot be scanned, so
+      // the task's attributable set is unknown. A receipt substitutes for a PROVEN-
+      // empty set, never an unknown one — fail closed regardless of a receipt, with
+      // a reason distinct from no-evidence.
+      offenders.push({ task_id: taskId, reason: "unverifiable-target", repo });
       continue;
     }
     const laneResolves = vcs.resolveRef(laneRef, repo) !== null;
     const base = laneResolves ? laneRef : "HEAD";
     const scanRef = laneResolves ? laneRef : undefined;
     const trailerCommits = vcs.trailerCommitShas(taskId, repo, scanRef);
-    const evidenceCommits = evidenceCommitsOf(task);
+    // De-dupe BEFORE the isAncestor loop: a repeated bad sha must not fan out one
+    // git subprocess per repetition (the emitted slice is bounded separately).
+    const evidenceCommits = [...new Set(evidenceCommitsOf(task))];
     const ribBranch = `${laneRef}--${taskId}`;
     const ribTip = vcs.resolveRef(ribBranch, repo);
 
@@ -1840,6 +1848,9 @@ function assertDoneTaskAncestry(
         const extra =
           (o.commits_omitted ?? 0) > 0 ? ` +${o.commits_omitted} more` : "";
         return `${o.task_id} (commits ${shown}${extra} unreachable)`;
+      }
+      if (o.reason === "unverifiable-target") {
+        return `${o.task_id} (target repo ${o.repo} unreadable — cannot verify)`;
       }
       return `${o.task_id} (no landing evidence and no typed no-op receipt)`;
     })

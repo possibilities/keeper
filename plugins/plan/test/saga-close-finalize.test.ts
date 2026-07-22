@@ -2034,6 +2034,80 @@ describe("close-finalize per-task ancestry gate", () => {
     expect(off.commits_total).toBe(8);
     expect(off.commits_omitted).toBe(3);
   });
+
+  test("an unreadable target repo fails closed even with a receipt (unverifiable-target)", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Unreadable target", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    // Point the task at a dir with no .git — the scan cannot read it, so its
+    // attributable set is UNKNOWN, not proven-empty.
+    const bogus = join(proj.root, "no-git-target");
+    mkdirSync(bogus, { recursive: true });
+    const taskPath = join(proj.root, ".keeper", "tasks", `${taskId}.json`);
+    const def = JSON.parse(readFileSync(taskPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    def.target_repo = bogus;
+    writeFileSync(taskPath, `${JSON.stringify(def, null, 2)}\n`, "utf-8");
+    // A receipt claiming no code — must NOT rescue an unreadable (unknown) target.
+    markDone(proj.root, taskId, { no_op_reason: "claims no code" });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("TASK_ANCESTRY_UNVERIFIED");
+    const offenders = (err.details as Record<string, unknown>)
+      .offending_tasks as Array<Record<string, unknown>>;
+    expect(offenders[0]).toMatchObject({
+      task_id: taskId,
+      reason: "unverifiable-target",
+    });
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("a repeated unreachable evidence sha is de-duplicated before the ancestry scan", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Deduped shas", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    const orphan = fakeSourceCommit(proj.root, "orphan\n", {
+      refs: ["refs/heads/orphan"],
+    });
+    // The same unreachable sha recorded four times — deduped to one before the
+    // per-sha isAncestor probe (no subprocess fan-out on the repetition).
+    markDone(proj.root, taskId, {
+      evidence: {
+        commits: [orphan, orphan, orphan, orphan],
+        tests: [],
+        prs: [],
+      },
+    });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const off = (
+      (env.error as Record<string, unknown>).details as Record<string, unknown>
+    ).offending_tasks as Array<Record<string, unknown>>;
+    expect(off[0].reason).toBe("unreachable-commits");
+    expect(off[0].commits).toEqual([orphan]);
+    expect(off[0].commits_total).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
