@@ -21,7 +21,10 @@
 //
 // Denied for a marked subagent: Edit / MultiEdit / NotebookEdit outright; Write
 // whose target is not a fresh inert handoff leaf in an owner-private system-temp
-// directory (the guard descriptor-writes it, then denies the host Write); and every Bash command
+// directory (the guard descriptor-writes it, then denies the host Write); every
+// SendMessage outright (a dumb-courier wrapper reads no inbound messages, so a
+// message escalation is never processed and silently hangs the worker — the
+// subagent returns a typed BLOCKED to the parent instead); and every Bash command
 // off the delegation + close-out allowlist. The Bash decision is a POSITIVE
 // allowlist, never a blocklist (Claude Code's own regex blocklist fell to
 // CVE-2025-66032): the whole shell-operator / expansion / redirect / heredoc /
@@ -1255,6 +1258,21 @@ function unknownToolReason(tool: string): string {
   );
 }
 
+// Constant, bounded, payload-free: a wrapped subagent's SendMessage is denied for
+// EVERY target, and the reason interpolates nothing from the (attacker-influenced)
+// payload. It states the whole contract — do not retry, do not message again, and
+// hand the blocker up by RETURNING the fitting typed BLOCKED category to the
+// parent — using the wrapped partial's existing category vocabulary verbatim.
+const SEND_MESSAGE_REASON =
+  "Wrapped-cell worker BLOCKED: the SendMessage tool is denied for a wrapped " +
+  "(delegated) worker. You run under a dumb-courier wrapper that reads no inbound " +
+  "messages, so a message escalation — to a team-lead or ANY target — is never " +
+  "processed and silently hangs the worker. Do not retry, and do not send another " +
+  "message: park BLOCKED by RETURNING the fitting typed category to the parent — " +
+  "`BLOCKED: EXTERNAL_BLOCKED` for a hand-up only a human/parent can resolve (or " +
+  "`TOOLING_FAILURE` / `DEPENDENCY_BLOCKED` / `SHARED_BASE_BROKEN` as the case " +
+  "fits) — so the parent maps it through the standard blocked path.";
+
 // ---------------------------------------------------------------------------
 // Pure decision core.
 // ---------------------------------------------------------------------------
@@ -1366,6 +1384,14 @@ export function decideWrappedGuard(
   if (!p.agent_id && !p.agent_type) return null;
 
   const tool = p.tool_name;
+
+  // A wrapped subagent runs under a dumb-courier wrapper that processes no inbound
+  // messages, so a SendMessage escalation (to a team-lead or ANY target) is never
+  // read and silently hangs the worker. Deny it TOTALLY — target-agnostic, with a
+  // constant reason and NO grant/override path to lift it — before any probe or
+  // grant consultation below, steering the subagent to return a typed BLOCKED.
+  if (tool === "SendMessage") return denyEnvelope(SEND_MESSAGE_REASON);
+
   const resolvedProbe = probe ?? fsProbe();
 
   if (tool === "Edit" || tool === "MultiEdit" || tool === "NotebookEdit") {

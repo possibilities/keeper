@@ -972,6 +972,49 @@ describe("generated work plugins in the plan plugin", () => {
   }
 });
 
+describe("SendMessage rails in rendered worker cells (outbound prohibition vs inbound directive)", () => {
+  // A wrapped cell carries the OUTBOUND prohibition/return rail — never
+  // SendMessage-escalate, return a typed BLOCKED to the parent — while the INBOUND
+  // resume-directive contract (the parent may OPEN a turn with a SendMessage
+  // directive) stays intact in EVERY cell. The prohibition is outbound-only.
+  const OUTBOUND_RAIL = "Never escalate by message";
+  const OUTBOUND_RETURN = "return a typed `BLOCKED:` to the parent";
+  const INBOUND_DIRECTIVE =
+    "may open with a `SendMessage` directive from the parent";
+  const railMatrix = effectiveMatrix();
+  const railHost = loadHostMatrixV2();
+  for (const model of railMatrix.models) {
+    for (const effort of railMatrix.effortsFor(model)) {
+      test.skipIf(!WORKERS_RENDERED)(
+        `workers/${model}-${effort} carries the SendMessage rails right for its driver`,
+        () => {
+          const agentPath = join(
+            REPO,
+            "workers",
+            `${model}-${effort}`,
+            "agents",
+            "worker.md",
+          );
+          expect(existsSync(agentPath)).toBe(true);
+          const body = readFileSync(agentPath, "utf-8");
+          const native = railHost.driverByModel.get(model) === "native";
+          // INBOUND resume-directive contract stays intact in every cell (shared spine).
+          expect(body).toContain(INBOUND_DIRECTIVE);
+          if (native) {
+            // a native cell never carries the wrapped outbound prohibition.
+            expect(body).not.toContain(OUTBOUND_RAIL);
+          } else {
+            // a wrapped cell carries the outbound prohibition AND the typed-return steer.
+            expect(body).toContain(OUTBOUND_RAIL);
+            expect(body).toContain(OUTBOUND_RETURN);
+            expect(body).toContain("BLOCKED: EXTERNAL_BLOCKED");
+          }
+        },
+      );
+    }
+  }
+});
+
 describe("work.md.tmpl spawn shape", () => {
   test("constant work:worker spawn, no composed literal, no model=", () => {
     const tmpl = readFileSync(WORK_TMPL, "utf-8");

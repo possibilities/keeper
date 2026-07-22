@@ -1520,3 +1520,160 @@ describe("decideWrappedGuard — grant leaf override (synthetic leafs)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// SendMessage total denial — a wrapped subagent's message escalation is never
+// read under the dumb-courier wrapper and silently hangs the worker, so it is
+// denied for EVERY target with a constant, payload-free envelope that no grant
+// lifts. Unmarked sessions and identity-less marked calls (the /plan:work
+// orchestrator's own warm-resume SendMessage) stay byte-inert.
+// ---------------------------------------------------------------------------
+
+function sendMessagePayload(
+  extra: Record<string, unknown> = {},
+  input: Record<string, unknown> = { to: "team-lead", message: "please help" },
+): WrappedGuardPayload {
+  return {
+    tool_name: "SendMessage",
+    agent_id: "agent-7",
+    cwd: REPO,
+    tool_input: input,
+    ...extra,
+  } as WrappedGuardPayload;
+}
+
+describe("decideWrappedGuard — SendMessage total denial", () => {
+  test("a marked subagent's SendMessage is denied with the park-BLOCKED envelope", () => {
+    const d = decide(sendMessagePayload());
+    expect(d).not.toBeNull();
+    expect(d?.hookSpecificOutput.hookEventName).toBe("PreToolUse");
+    expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
+    const reason = d?.hookSpecificOutput.permissionDecisionReason ?? "";
+    // states the whole contract: do not retry, do not message again, hand up typed
+    expect(reason).toContain("SendMessage tool is denied");
+    expect(reason).toContain("Do not retry");
+    expect(reason).toContain("do not send another message");
+    expect(reason).toContain(
+      "RETURNING the fitting typed category to the parent",
+    );
+    // uses the wrapped partial's existing typed-status vocabulary verbatim
+    expect(reason).toContain("BLOCKED: EXTERNAL_BLOCKED");
+    expect(reason).toContain("TOOLING_FAILURE");
+    expect(reason).toContain("DEPENDENCY_BLOCKED");
+    expect(reason).toContain("SHARED_BASE_BROKEN");
+  });
+
+  test("the denial reason is CONSTANT and bounded — zero payload interpolation", () => {
+    const a = decide(
+      sendMessagePayload({}, { to: "team-lead", message: "help A" }),
+    );
+    const b = decide(
+      sendMessagePayload(
+        { agent_id: "other-agent" },
+        { to: "someone-else", message: '"quoted" & injected ${x}' },
+      ),
+    );
+    const ra = a?.hookSpecificOutput.permissionDecisionReason ?? "";
+    const rb = b?.hookSpecificOutput.permissionDecisionReason ?? "";
+    // identical across different targets/messages/identities → no interpolation
+    expect(ra).toBe(rb);
+    // and none of the (attacker-influenced) payload bytes leak into the reason
+    expect(ra).not.toContain("injected");
+    expect(ra).not.toContain("someone-else");
+    // bounded, not payload-scaled
+    expect(ra.length).toBeLessThan(800);
+  });
+
+  test("either identity anchor fires: agent_id-only AND agent_type-only both deny when marked", () => {
+    // agent_id present, agent_type absent
+    expect(
+      decide({
+        tool_name: "SendMessage",
+        agent_id: "agent-7",
+        cwd: REPO,
+        tool_input: { to: "lead", message: "x" },
+      })?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+    // agent_type present, agent_id absent
+    expect(
+      decide({
+        tool_name: "SendMessage",
+        agent_type: "work:worker",
+        cwd: REPO,
+        tool_input: { to: "lead", message: "x" },
+      })?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+  });
+
+  test("unmarked session + SendMessage stays inert (no output)", () => {
+    expect(decide(sendMessagePayload(), {})).toBeNull();
+    // a whitespace-only marker counts as absent → inert
+    expect(
+      decide(sendMessagePayload(), { KEEPER_WRAPPED_CELL: "   " }),
+    ).toBeNull();
+  });
+
+  test("marked but identity-less top-level SendMessage stays inert (the /plan:work orchestrator's warm-resume)", () => {
+    // work.md.tmpl Phase 2b sends SendMessage from the marked-env top-level context
+    // with NO subagent identity — that warm-resume path must survive byte-inert.
+    const orchestrator = {
+      tool_name: "SendMessage",
+      cwd: REPO,
+      tool_input: { to: "worker-agent-id", message: "finish implementation" },
+    };
+    expect(decide(orchestrator)).toBeNull();
+  });
+
+  test("no grant lifts the SendMessage denial (the arm returns before any grant/override path)", () => {
+    const grantAll: (t: string) => boolean = () => true;
+    expect(
+      decideWrappedGuard(
+        sendMessagePayload({ agent_type: "repairer" }),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+  });
+});
+
+describe("wrapped-guard hooks.json matcher routes SendMessage", () => {
+  // Production-shaped: the pure decision denies (above) AND the sole hooks.json
+  // actually routes a SendMessage PreToolUse to this shim — a pure test whose
+  // matcher never routed would be a silent no-op in production.
+  test("the sole hooks.json registers wrapped-guard on a PreToolUse matcher that routes SendMessage", () => {
+    const hooksPath = join(
+      import.meta.dir,
+      "..",
+      "plugins",
+      "keeper",
+      "hooks",
+      "hooks.json",
+    );
+    const data = JSON.parse(readFileSync(hooksPath, "utf-8")) as {
+      hooks: {
+        PreToolUse?: Array<{
+          matcher?: string;
+          hooks: Array<{ command?: string }>;
+        }>;
+      };
+    };
+    const wrappedMatchers = (data.hooks.PreToolUse ?? [])
+      .filter((e) =>
+        e.hooks.some((h) => (h.command ?? "").includes("wrapped-guard.ts")),
+      )
+      .map((e) => e.matcher ?? "");
+    expect(wrappedMatchers.length).toBeGreaterThan(0);
+    // at least one wrapped-guard matcher, treated as a regex, routes SendMessage
+    expect(wrappedMatchers.some((m) => new RegExp(m).test("SendMessage"))).toBe(
+      true,
+    );
+    // and SendMessage is a real alternation member, not a substring accident
+    expect(
+      wrappedMatchers.some((m) => m.split("|").includes("SendMessage")),
+    ).toBe(true);
+    // the Bash matcher must NOT accidentally route SendMessage
+    expect(new RegExp("Bash").test("SendMessage")).toBe(false);
+  });
+});
