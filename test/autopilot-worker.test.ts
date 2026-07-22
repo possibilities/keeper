@@ -85,6 +85,7 @@ import {
   computeSlotOccupancy,
   computeStaleBaseLaneEntries,
   confirmRunning,
+  consumeFatalAuditLift,
   createDispatchFailedGate,
   createDupEpicNumberTracker,
   createLaneMaintenanceProbe,
@@ -295,7 +296,10 @@ import {
   isRetryableDispatchKey,
   parseDispatchKey,
 } from "../src/dispatch-command";
-import { parseMergeConflictReason } from "../src/dispatch-failure-key";
+import {
+  fatalAuditDispatchId,
+  parseMergeConflictReason,
+} from "../src/dispatch-failure-key";
 import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
 import {
   buildProviderEquivalenceMap,
@@ -7782,29 +7786,157 @@ test("fatalHaltReceiptIsCurrent: positive-evidence-only staleness grade", () => 
   expect(fatalHaltReceiptIsCurrent(undefined, 1)).toBe(false);
 });
 
-test("stepFatalAuditFenceMemo: startup holds, fold-lag holds, operator retry lifts, re-arm", () => {
-  const memo = new Map<string, { eventId: number; observedOpen: boolean }>();
-  const cur = new Map([["fn-1", 100]]);
-  // Cycle 1 — minted this cycle, row not folded yet (openIds empty): NOT lifted (fold-lag,
-  // not a retry). The memo records the mint pending the fold.
-  memo.set("fn-1", { eventId: 100, observedOpen: false });
-  expect([...stepFatalAuditFenceMemo(cur, new Set(), memo)]).toEqual([]);
-  // Cycle 2 — row folded (open): observed, never lifted.
-  expect([...stepFatalAuditFenceMemo(cur, new Set(["fn-1"]), memo)]).toEqual(
-    [],
-  );
-  expect(memo.get("fn-1")).toEqual({ eventId: 100, observedOpen: true });
-  // Cycle 3 — operator retry_dispatch cleared the row (observed-then-gone) → LIFTED.
-  expect([...stepFatalAuditFenceMemo(cur, new Set(), memo)]).toEqual(["fn-1"]);
-  // Cycle 4 — the re-dispatched closer re-halted with a FRESH receipt id → re-arm (drop
-  // the stale entry) so the next cycle re-mints + re-withholds.
-  const cur2 = new Map([["fn-1", 200]]);
-  expect([...stepFatalAuditFenceMemo(cur2, new Set(), memo)]).toEqual([]);
-  expect(memo.has("fn-1")).toBe(false);
-  // A drift-cleared (no-longer-current) epic is GC'd from the memo.
-  memo.set("fn-2", { eventId: 5, observedOpen: true });
-  stepFatalAuditFenceMemo(new Map(), new Set(), memo);
-  expect(memo.has("fn-2")).toBe(false);
+test("stepFatalAuditFenceMemo: one-shot instance-keyed lift (observe → arm once → consume → re-observe)", () => {
+  const memo = new Map<
+    string,
+    { observedInstance: number | null; lift: "none" | "armed" | "consumed" }
+  >();
+  // Cycle 1 — the open row (instance 10) is observed; fence holds, never lifted.
+  let step = stepFatalAuditFenceMemo(new Map([["e", 10]]), memo);
+  expect([...step.lifted]).toEqual([]);
+  expect([...step.toForget]).toEqual([]);
+  expect(memo.get("e")).toEqual({ observedInstance: 10, lift: "none" });
+
+  // Cycle 2 — the row is GONE (operator retry cleared instance 10): observed open→gone →
+  // ARM one token + toForget (reset the gate ONCE). LIFTED.
+  step = stepFatalAuditFenceMemo(new Map(), memo);
+  expect([...step.lifted]).toEqual(["e"]);
+  expect([...step.toForget]).toEqual(["e"]);
+
+  // Cycle 3 — still gone, token still armed (no launch consumed it yet): LIFTED, but NOT a
+  // second gate reset (toForget empty) — the reset fires ONCE, not every cycle.
+  step = stepFatalAuditFenceMemo(new Map(), memo);
+  expect([...step.lifted]).toEqual(["e"]);
+  expect([...step.toForget]).toEqual([]);
+
+  // A close launches → CONSUME the token.
+  consumeFatalAuditLift(memo, ["e"]);
+  expect(memo.get("e")?.lift).toBe("consumed");
+
+  // Cycle 4 — still gone, token consumed: NOT lifted (the one launch was used).
+  step = stepFatalAuditFenceMemo(new Map(), memo);
+  expect([...step.lifted]).toEqual([]);
+
+  // Cycle 5 — a FRESH row (a new instance 20 — re-hold / re-halt re-mint) re-establishes the
+  // hold: back to observing, lift cleared.
+  step = stepFatalAuditFenceMemo(new Map([["e", 20]]), memo);
+  expect([...step.lifted]).toEqual([]);
+  expect(memo.get("e")).toEqual({ observedInstance: 20, lift: "none" });
+});
+
+test("consumeFatalAuditLift: only an armed token is consumed by a launch; a withheld (never-armed) epic is untouched", () => {
+  const memo = new Map<
+    string,
+    { observedInstance: number | null; lift: "none" | "armed" | "consumed" }
+  >();
+  memo.set("armed", { observedInstance: 1, lift: "armed" });
+  memo.set("held", { observedInstance: 2, lift: "none" });
+  // A cap/occupancy withhold means the epic is NOT in the launched set → not consumed.
+  consumeFatalAuditLift(memo, ["armed"]);
+  expect(memo.get("armed")?.lift).toBe("consumed");
+  expect(memo.get("held")?.lift).toBe("none"); // never launched → untouched
+});
+
+// The lift lifecycle driven through the REAL producer-glue functions (stepFatalAuditFenceMemo
+// → gate reset on toForget → isFatalAuditHeld → consumeFatalAuditLift), NEVER an injected
+// fatalAuditFenceLifted flag. `open`/`current`/`resolved` are the snapshot sets.
+type FenceMemo = Map<
+  string,
+  { observedInstance: number | null; lift: "none" | "armed" | "consumed" }
+>;
+function glueCycle(
+  memo: FenceMemo,
+  gate: ReturnType<typeof createDispatchFailedGate>,
+  openInstance: ReadonlyMap<string, number>,
+  current: ReadonlyMap<string, string>,
+  resolved: ReadonlySet<string>,
+): { held: boolean; launched: boolean } {
+  const step = stepFatalAuditFenceMemo(openInstance, memo);
+  for (const e of step.toForget) gate.forget("close", fatalAuditDispatchId(e));
+  const open = new Set(openInstance.keys());
+  const held = isFatalAuditHeld("e", current, open, resolved, step.lifted);
+  const launched = !held; // the close is otherwise ready → launches iff not held
+  if (launched) consumeFatalAuditLift(memo, ["e"]);
+  return { held, launched };
+}
+
+test("LOCKED (a): malformed receipt + open row → retry → ONE launch + same-finding re-halt <15m → fresh row/page ELIGIBLE (gate reset)", () => {
+  const memo: FenceMemo = new Map();
+  const gate = createDispatchFailedGate();
+  const mint = {
+    verb: "close" as const,
+    id: fatalAuditDispatchId("e"),
+    reason: "fatal-audit: boom",
+    dir: null,
+    conflictedFiles: null,
+    ts: 0,
+  };
+  expect(gate.shouldEmit(mint)).toBe(true); // the original mint records the gate memory
+  // Cycle 1 — malformed latest receipt (current EMPTY), but the OPEN ROW is observed. HELD via
+  // arm (b), NOT launched.
+  expect(
+    glueCycle(memo, gate, new Map([["e", 10]]), new Map(), new Set()),
+  ).toEqual({
+    held: true,
+    launched: false,
+  });
+  // Cycle 2 — operator retry cleared the row (gone): observed open→gone → armed + gate reset →
+  // NOT held → ONE launch (consumes the token).
+  expect(glueCycle(memo, gate, new Map(), new Map(), new Set())).toEqual({
+    held: false,
+    launched: true,
+  });
+  // The re-halt writes a fresh SAME-FINDING receipt; the reconciler re-mints the same row. The
+  // gate was reset on the lift, so the re-mint is emitted IMMEDIATELY (<15m) — page eligible.
+  expect(gate.shouldEmit({ ...mint, ts: 5 })).toBe(true);
+});
+
+test("LOCKED (b): valid receipt + retry → first launch consumes → closer terminal NO new receipt → NO second launch, fence restored", () => {
+  const memo: FenceMemo = new Map();
+  const gate = createDispatchFailedGate();
+  const cur = new Map([["e", "boom"]]);
+  // Cycle 1 — valid current receipt + open row: HELD (arm a), not launched.
+  expect(
+    glueCycle(memo, gate, new Map([["e", 10]]), cur, new Set()).launched,
+  ).toBe(false);
+  // Cycle 2 — retry cleared the row: armed → NOT held → ONE launch (consumes token).
+  expect(glueCycle(memo, gate, new Map(), cur, new Set()).launched).toBe(true);
+  // Cycle 3 — the closer terminated with NO new receipt: the VALID receipt is still current →
+  // token consumed (not lifted) → arm (a) RESTORES the fence → NO second launch.
+  expect(glueCycle(memo, gate, new Map(), cur, new Set())).toEqual({
+    held: true,
+    launched: false,
+  });
+});
+
+test("LOCKED (c): a cap/occupancy withhold before launch does NOT consume the token (single retry survives)", () => {
+  const memo: FenceMemo = new Map();
+  stepFatalAuditFenceMemo(new Map([["e", 10]]), memo); // observe open
+  let step = stepFatalAuditFenceMemo(new Map(), memo); // retry → armed
+  expect([...step.lifted]).toEqual(["e"]);
+  // A cap/occupancy withhold means NO close launched this cycle → the launched set is EMPTY.
+  consumeFatalAuditLift(memo, []);
+  expect(memo.get("e")?.lift).toBe("armed"); // token survives the withhold
+  // Next cycle — still armed, still lifted (the one operator retry is still pending a launch).
+  step = stepFatalAuditFenceMemo(new Map(), memo);
+  expect([...step.lifted]).toEqual(["e"]);
+});
+
+test("LOCKED (d): the lift + gate reset fire ONCE, not every cycle (multi-cycle)", () => {
+  const memo: FenceMemo = new Map();
+  const gate = createDispatchFailedGate();
+  const forgets: string[] = [];
+  const forgetAll = (s: Set<string>) => {
+    for (const e of s) {
+      gate.forget("close", fatalAuditDispatchId(e));
+      forgets.push(e);
+    }
+  };
+  stepFatalAuditFenceMemo(new Map([["e", 10]]), memo); // observe
+  forgetAll(stepFatalAuditFenceMemo(new Map(), memo).toForget); // retry → arm + 1 reset
+  forgetAll(stepFatalAuditFenceMemo(new Map(), memo).toForget); // still armed → NO reset
+  forgetAll(stepFatalAuditFenceMemo(new Map(), memo).toForget); // still armed → NO reset
+  expect(forgets).toEqual(["e"]); // the reset fired exactly once
 });
 
 // A close-ready epic whose latest close receipt is a still-current fatal_halt verdict.

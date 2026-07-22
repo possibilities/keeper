@@ -12260,44 +12260,68 @@ export function loadEpicTaskDoneWatermarks(
 }
 
 /**
- * Fold the producer's fatal-audit fence memo forward one cycle and return the epics whose
- * fence is LIFTED (an operator cleared the row while the verdict stands current — the
- * withhold releases for exactly one closer re-run). Pure over its inputs + the mutated
- * memo:
- *   - a CURRENT epic with an OPEN row → remember `(eventId, observedOpen:true)`; never lifted.
- *   - a CURRENT epic, row ABSENT, memo pinned to THIS receipt AND already observed-open →
- *     LIFTED (the row was cleared post-fold — an operator retry). Absent-but-never-observed
- *     is mint→fold lag, NOT a lift.
- *   - a receipt whose id advanced past the memo (the re-dispatched closer re-halted) →
- *     re-arm: drop the stale entry so the next cycle re-mints + re-withholds.
- *   - a NON-current epic → GC its entry (drift-cleared / receipt gone).
- * NEVER throws.
+ * Step the fatal-audit lift STATE MACHINE forward one cycle, keyed to the SYNTHETIC ROW
+ * INSTANCE (not receipt parseability), and return `{ lifted, toForget }`:
+ *   - `lifted` — epics whose lift token is ARMED (the close withhold releases for one re-run).
+ *   - `toForget` — epics that armed THIS cycle (the observed open→gone transition); the
+ *     producer resets the change-gate for exactly these, ONCE, so a same-finding fresh re-halt
+ *     is not watermark-suppressed.
+ * Transitions per epic over `openInstanceByEpic` (epic → its OPEN synthetic row instance):
+ *   - Row OPEN with a NEW instance → observe it (`lift:"none"`), ending any prior lift episode
+ *     (a fresh mint / re-mint re-establishes the hold); SAME instance still open keeps state.
+ *   - Row GONE while last observed OPEN and `lift:"none"` → ARM one token + `toForget` (an
+ *     operator `retry_dispatch` cleared it — observable even under a malformed latest receipt).
+ *   - Row GONE, `lift:"armed"` → stay armed (a cap/occupancy withhold consumed no launch yet).
+ *   - Row GONE, `lift:"consumed"` → NOT lifted (the one launch was used; awaits re-hold).
+ * The consume ({@link consumeFatalAuditLift}) and resolution GC run in the producer glue.
+ * Pure over its inputs + the mutated memo; NEVER throws.
  */
 export function stepFatalAuditFenceMemo(
-  currentReceiptEventIdByEpic: ReadonlyMap<string, number>,
-  openFatalAuditIds: ReadonlySet<string>,
+  openInstanceByEpic: ReadonlyMap<string, number>,
   memo: Map<string, FatalAuditFenceMemoEntry>,
-): Set<string> {
+): { lifted: Set<string>; toForget: Set<string> } {
   const lifted = new Set<string>();
-  for (const epicId of [...memo.keys()]) {
-    if (!currentReceiptEventIdByEpic.has(epicId)) memo.delete(epicId); // GC
-  }
-  for (const [epicId, eventId] of currentReceiptEventIdByEpic) {
+  const toForget = new Set<string>();
+  const epics = new Set<string>([...memo.keys(), ...openInstanceByEpic.keys()]);
+  for (const epicId of epics) {
+    const openInstance = openInstanceByEpic.get(epicId);
     const entry = memo.get(epicId);
-    if (entry !== undefined && entry.eventId !== eventId) {
-      memo.delete(epicId); // closer re-halted with a fresh receipt → re-arm
-    }
-    const open = openFatalAuditIds.has(epicId);
-    if (open) {
-      memo.set(epicId, { eventId, observedOpen: true });
+    if (openInstance !== undefined) {
+      if (entry === undefined || entry.observedInstance !== openInstance) {
+        memo.set(epicId, { observedInstance: openInstance, lift: "none" });
+      }
       continue;
     }
-    const cur = memo.get(epicId);
-    if (cur !== undefined && cur.eventId === eventId && cur.observedOpen) {
-      lifted.add(epicId); // observed-then-gone = operator retry
+    if (entry === undefined || entry.observedInstance === null) {
+      continue; // never observed a row → mint→fold lag / already GC'd, not a lift
+    }
+    if (entry.lift === "none") {
+      entry.lift = "armed";
+      lifted.add(epicId);
+      toForget.add(epicId);
+    } else if (entry.lift === "armed") {
+      lifted.add(epicId);
     }
   }
-  return lifted;
+  return { lifted, toForget };
+}
+
+/**
+ * CONSUME the one-shot lift token for each epic whose close was actually LAUNCHED this cycle:
+ * `armed → consumed`. A launch is the only consume trigger — a cap/occupancy/in-flight
+ * withhold before launch leaves the token armed, so the operator's single retry is honored
+ * exactly once. Producer glue; mutates the memo. NEVER throws.
+ */
+export function consumeFatalAuditLift(
+  memo: Map<string, FatalAuditFenceMemoEntry>,
+  launchedCloseEpicIds: Iterable<string>,
+): void {
+  for (const epicId of launchedCloseEpicIds) {
+    const entry = memo.get(epicId);
+    if (entry !== undefined && entry.lift === "armed") {
+      entry.lift = "consumed";
+    }
+  }
 }
 
 /**
@@ -12438,9 +12462,12 @@ export async function loadReconcileSnapshot(
   const openRecoverRows: NonNullable<ReconcileSnapshot["openRecoverRows"]> = [];
   const finalizeFailureIds = new Set<string>();
   const preCloseFenceFailureIds = new Set<string>();
-  // The epic ids with an OPEN `fatal-audit` `close::<epic>` row (reason leading token
-  // FATAL_AUDIT_REASON_TOKEN) — the mint-idempotency + positive-drift-clear set.
+  // The epic ids with an OPEN `fatal-audit` `close::fatal-audit:<epic>` row — the
+  // mint-idempotency + positive-drift-clear set. Paired with the per-epic OPEN-row
+  // `instance_event_id` the lift state machine observes (an operator retry clearing this
+  // exact instance is the observable open→gone transition, even under a malformed receipt).
   const openFatalAuditIds = new Set<string>();
+  const openFatalAuditInstanceByEpic = new Map<string, number>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
   // The `repoDir`s with an OPEN shared-checkout-wedge distress row — the level-clear
   // set the recover pass's grace tracker clears against (a row whose checkout is
@@ -12701,6 +12728,11 @@ export async function loadReconcileSnapshot(
         const fatalEpic = epicIdFromFatalAuditId(id);
         if (fatalEpic !== null && fatalEpic !== "") {
           openFatalAuditIds.add(fatalEpic);
+          const inst = (row as { instance_event_id?: unknown })
+            .instance_event_id;
+          if (typeof inst === "number" && Number.isSafeInteger(inst)) {
+            openFatalAuditInstanceByEpic.set(fatalEpic, inst);
+          }
         }
       }
       switch (route.kind) {
@@ -13316,6 +13348,7 @@ export async function loadReconcileSnapshot(
     latestCloseReceiptByEpicId,
     currentFatalAuditEpicIds,
     openFatalAuditIds,
+    openFatalAuditInstanceByEpic,
     fatalAuditResolvedEpicIds,
     pendingDispatches,
     providerLegActivityByWrapperJobId,
@@ -14710,31 +14743,67 @@ function main(): void {
             err,
           );
         }
-        // Step the fatal-audit fence memo (persistent producer state) so the pure
-        // `reconcile` sees which epics an operator `retry_dispatch` lifted (row
-        // observed-then-gone) vs a mint→fold lag. Keyed on each CURRENT fatal-audit
-        // receipt's own event id.
-        const fatalAuditReceiptEventIdByEpic = new Map<string, number>();
-        for (const epicId of snapshot.currentFatalAuditEpicIds?.keys() ?? []) {
-          const ev = snapshot.latestCloseReceiptByEpicId?.get(epicId)?.eventId;
-          if (typeof ev === "number") {
-            fatalAuditReceiptEventIdByEpic.set(epicId, ev);
-          }
-        }
-        snapshot.fatalAuditFenceLifted = stepFatalAuditFenceMemo(
-          fatalAuditReceiptEventIdByEpic,
-          snapshot.openFatalAuditIds ?? new Set<string>(),
+        // Step the fatal-audit lift STATE MACHINE (persistent producer state), keyed to the
+        // OPEN synthetic-row instance — so an operator `retry_dispatch` (open→gone) is
+        // realized even when the LATEST receipt is malformed/unreadable, and the lift is a
+        // ONE-SHOT (armed → consumed on launch), never a per-cycle level-trigger.
+        const fatalAuditStep = stepFatalAuditFenceMemo(
+          snapshot.openFatalAuditInstanceByEpic ?? new Map<string, number>(),
           state.fatalAuditFenceMemo,
         );
-        // An operator `retry_dispatch` clears the fatal-audit row through the reducer,
-        // NOT `emitDispatchCleared` → the change-gate never saw the clear and would
-        // suppress an identical same-finding re-mint to the watermark (~15m). Reset the
-        // gate on the positive observed-then-gone lift so the re-mint after the re-run's
-        // re-halt is emitted immediately.
-        for (const epicId of snapshot.fatalAuditFenceLifted) {
+        snapshot.fatalAuditFenceLifted = fatalAuditStep.lifted;
+        // An operator `retry_dispatch` clears the row through the reducer, NOT
+        // `emitDispatchCleared` → the change-gate never saw the clear and would suppress an
+        // identical same-finding re-mint to the watermark (~15m). Reset the gate ONCE, on the
+        // observed open→gone transition, so the fresh re-halt re-mint is emitted immediately.
+        for (const epicId of fatalAuditStep.toForget) {
           dispatchFailedGate.forget("close", fatalAuditDispatchId(epicId));
         }
         const decision = reconcile(snapshot, state, deps.now());
+        // CONSUME the one-shot lift for each epic whose close was actually LAUNCHED this
+        // cycle (a cap/occupancy withhold before launch leaves it armed). Then GC the memo
+        // for epics with positive resolution (the fatal episode is over).
+        consumeFatalAuditLift(
+          state.fatalAuditFenceMemo,
+          decision.launches.filter((l) => l.verb === "close").map((l) => l.id),
+        );
+        for (const epicId of snapshot.fatalAuditResolvedEpicIds ?? []) {
+          state.fatalAuditFenceMemo.delete(epicId);
+        }
+        // RE-HOLD (fix point 4): after the one lift-launch is CONSUMED, if the attempt ENDED
+        // without reclassifying the epic — no fresh valid receipt (not current), no positive
+        // resolution, no re-minted open row — and the close is no longer in-flight, RE-MINT
+        // visible fatal state so the fence holds again. Prevents a silent relaunch loop when a
+        // retried closer keeps dying WITHOUT writing a receipt (a malformed/unreadable latest
+        // receipt case). Rides the change-gate (forgotten on the lift), so it emits once until
+        // the row folds; UPSERT-idempotent with any later fresh-receipt re-mint on the same key.
+        const liveCloseEpics = new Set<string>();
+        for (const job of snapshot.jobs.values()) {
+          if (
+            job.plan_verb === "close" &&
+            (job.state === "working" || job.state === "stopped") &&
+            job.plan_ref != null &&
+            job.plan_ref !== ""
+          ) {
+            liveCloseEpics.add(job.plan_ref);
+          }
+        }
+        for (const [epicId, entry] of state.fatalAuditFenceMemo) {
+          if (entry.lift !== "consumed") continue;
+          if (snapshot.openFatalAuditInstanceByEpic?.has(epicId)) continue;
+          if (snapshot.currentFatalAuditEpicIds?.has(epicId)) continue;
+          if (snapshot.fatalAuditResolvedEpicIds?.has(epicId)) continue;
+          if (state.inFlight.has(dispatchKey("close", epicId))) continue;
+          if (liveCloseEpics.has(epicId)) continue;
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: fatalAuditDispatchId(epicId),
+            reason: `${FATAL_AUDIT_REASON_TOKEN}: the retry attempt ended without a fresh close-audit receipt`,
+            dir: null,
+            conflictedFiles: null,
+            ts: deps.now(),
+          });
+        }
         // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;
         // a trusted no-candidate (or paused) disarms; a DEGRADED PANE probe (untrusted null,
         // distinct from readinessDegraded's DB path above) preserves the wake / bounded retry

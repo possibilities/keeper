@@ -977,6 +977,11 @@ export interface ReconcileSnapshot {
    *  the mint-idempotency + clear set. Collected off the reason in
    *  {@link loadReconcileSnapshot}. */
   openFatalAuditIds?: ReadonlySet<string>;
+  /** Epic id → the OPEN fatal-audit row's `instance_event_id`. The lift state machine
+   *  ({@link stepFatalAuditFenceMemo}) observes this exact instance so an operator retry
+   *  (open→gone) is realized even under a malformed latest receipt. Producer-only (read in
+   *  the cycle glue, never in pure `reconcile`). */
+  openFatalAuditInstanceByEpic?: ReadonlyMap<string, number>;
   /** The epic ids with POSITIVE evidence their fatal-audit row should CLEAR — a known
    *  non-fatal latest close receipt, a follow-up task-done drift, or a positively
    *  done/absent epic. Assembled producer-side; an open row NOT in this set is RETAINED
@@ -1403,21 +1408,29 @@ export interface ReconcileState {
    */
   maxConcurrentPerRoot: number;
   /**
-   * The in-process fatal-audit fence memo (EPIC ID → `{eventId, observedOpen}`) — the
-   * producer state that distinguishes a mint→fold lag from an operator `retry_dispatch`
-   * (the row observed-then-gone). Read/mutated ONLY in the cycle glue
-   * (`stepFatalAuditFenceMemo`), never in the pure `reconcile`; the derived
-   * `fatalAuditFenceLifted` set rides the snapshot. IN-MEMORY ONLY; boots EMPTY (a fresh
-   * boot re-withholds a mid-retry epic once, an operator re-retries — matching the
-   * shared-checkout grace-tracker restart contract).
+   * The in-process fatal-audit lift STATE MACHINE (EPIC ID → `{observedInstance, lift}`) —
+   * the producer state that realizes a ONE-SHOT operator-retry lift, keyed to the SYNTHETIC
+   * ROW INSTANCE (`dispatch_failures.instance_event_id`), NOT receipt parseability. Observing
+   * the open row lets a MALFORMED-latest-receipt retry become observable; the observed
+   * open→gone transition arms ONE lift token (`"armed"`, released for one close) and resets
+   * the change-gate once; the token is CONSUMED (`"consumed"`) only when a close is actually
+   * launched (a cap/occupancy withhold before launch does NOT consume). Thereafter the fence
+   * re-holds — a fresh valid receipt / positive resolution reclassifies the epic, else the
+   * producer re-mints visible fatal state. Read/mutated ONLY in the cycle glue
+   * (`stepFatalAuditFenceMemo` + the consume/re-hold passes), never in the pure `reconcile`;
+   * the derived `fatalAuditFenceLifted` set rides the snapshot. IN-MEMORY ONLY; boots EMPTY —
+   * a fresh boot conservatively RE-HOLDS a mid-lift epic (no in-flight token survives), an
+   * operator re-retries, matching the shared-checkout grace-tracker restart contract.
    */
   fatalAuditFenceMemo: Map<string, FatalAuditFenceMemoEntry>;
 }
 
-/** One fatal-audit fence memo entry — see {@link ReconcileState.fatalAuditFenceMemo}. */
+/** One fatal-audit lift-state entry — see {@link ReconcileState.fatalAuditFenceMemo}.
+ *  `observedInstance` is the synthetic row's `instance_event_id` last seen OPEN (the episode
+ *  anchor for the open→gone transition); `lift` is the one-shot token lifecycle. */
 export interface FatalAuditFenceMemoEntry {
-  eventId: number;
-  observedOpen: boolean;
+  observedInstance: number | null;
+  lift: "none" | "armed" | "consumed";
 }
 
 /**
