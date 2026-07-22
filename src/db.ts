@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
+import { serialize as v8Serialize } from "node:v8";
 import {
   extractBackgroundTaskId,
   extractBashMutation,
@@ -4994,6 +4995,54 @@ export function resolveConfigPath(): string {
 // is silent, a CHANGED bad value (a config edit swapping one typo for another)
 // surfaces once more. Process-lifetime is the intended "once per boot" scope;
 // each worker has its own process + memo.
+//
+// The memo identity is a hash of `v8.serialize(value)`, NOT `JSON.stringify`:
+// JSON collapses `NaN`, `Infinity`, and `-Infinity` all to `null` (and nested
+// variants likewise), so a YAML `.nan` swapped for `null` would share one memo
+// key and silently swallow the changed bad value. The structured-clone encoding
+// distinguishes those; hashing keeps each stored entry constant-bounded.
+
+/** Cap on the rendered length of an offending value in a warning message; a
+ *  longer value is truncated with an honest note so a pathological giant value
+ *  can neither flood stderr nor be silently clipped. */
+const CONFIG_VALUE_RENDER_CAP = 200;
+
+/** Render an offending config value TRUTHFULLY and bounded for a warning
+ *  message. `JSON.stringify` renders `NaN`/`Infinity`/`-Infinity` as `null`, so
+ *  a `.nan` typo would be misnamed; name those (top-level and nested) as
+ *  themselves. Length is capped with an honest truncation note. */
+function renderConfigValue(value: unknown): string {
+  const nonFinite = (n: number): string =>
+    Number.isNaN(n) ? "NaN" : n > 0 ? "Infinity" : "-Infinity";
+  let rendered: string;
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    rendered = nonFinite(value);
+  } else if (value === undefined) {
+    rendered = "undefined";
+  } else {
+    rendered =
+      JSON.stringify(value, (_k, v) =>
+        typeof v === "number" && !Number.isFinite(v) ? nonFinite(v) : v,
+      ) ?? String(value);
+  }
+  return rendered.length > CONFIG_VALUE_RENDER_CAP
+    ? `${rendered.slice(0, CONFIG_VALUE_RENDER_CAP)}… (truncated, ${rendered.length} chars)`
+    : rendered;
+}
+
+/** Bounded, type-preserving identity for the config-warning memo. A hash of
+ *  `v8.serialize(value)` distinguishes `.nan`/`.inf`/`null` and nested variants
+ *  that `JSON.stringify` would collapse, while storing only a fixed-width
+ *  digest. `v8.serialize` handles every YAML-parsed scalar/object reachable
+ *  here; the try/guard falls back to a primitive-distinguishing tag on the
+ *  off chance an exotic value (a symbol keyed via a future path) can't encode. */
+function configValueIdentity(value: unknown): string {
+  try {
+    return createHash("sha256").update(v8Serialize(value)).digest("hex");
+  } catch {
+    return `${typeof value}:${renderConfigValue(value)}`;
+  }
+}
 
 /** Cap on distinct `(key, value)` pairs the config-warning memo records. The
  *  config key set is finite, so this only bites a pathological value that
@@ -5015,8 +5064,7 @@ function warnConfigOnce(
   offendingValue: unknown,
   message: string,
 ): void {
-  const serialized = JSON.stringify(offendingValue);
-  const memoKey = `${key} ${serialized === undefined ? "undefined" : serialized}`;
+  const memoKey = `${key} ${configValueIdentity(offendingValue)}`;
   if (configWarnMemo.has(memoKey)) {
     return;
   }
@@ -5124,7 +5172,7 @@ export function resolveConfig(): KeeperConfig {
         warnConfigOnce(
           "handoff_prompt_prefix",
           hpp,
-          `[keeper] unsupported handoff_prompt_prefix ${JSON.stringify(hpp)}; Handoff prompts always use /hack — set handoff_prompt_prefix: /hack or remove the key`,
+          `[keeper] unsupported handoff_prompt_prefix ${renderConfigValue(hpp)}; Handoff prompts always use /hack — set handoff_prompt_prefix: /hack or remove the key`,
         );
       }
       // Independent best-effort key — non-empty string only; garbage/absent
@@ -5153,7 +5201,7 @@ export function resolveConfig(): KeeperConfig {
     warnConfigOnce(
       "config-parse",
       detail,
-      `[keeper] config parse failed (${path}); using defaults: ${detail}`,
+      `[keeper] config parse failed (${path}); using defaults: ${renderConfigValue(detail)}`,
     );
     return {
       roots: [...DEFAULT_PLAN_ROOTS],

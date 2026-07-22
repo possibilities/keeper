@@ -266,6 +266,54 @@ test("the config-warning memo caps growth and emits a single suppression line", 
 });
 
 // ---------------------------------------------------------------------------
+// handoff_prompt_prefix — the warn-once memo keys on a TYPE-PRESERVING value
+// identity. `JSON.stringify` renders `NaN`, `Infinity`, and `null` all as the
+// string `null`, so a JSON-keyed memo would treat a swapped `.nan` → `null` as
+// the same value (swallowing the changed bad value) and misname it in the
+// message. YAML expresses these directly (`.nan`/`.inf`/`null`), so a real
+// fixture drives the exact production path — Bun parses them to runtime
+// `NaN` / `Infinity` / `null`.
+// ---------------------------------------------------------------------------
+
+test("a standing .nan handoff_prompt_prefix (runtime NaN) warns exactly once", () => {
+  writeConfig("handoff_prompt_prefix: .nan\n");
+  const errors = captureConsoleError(() => {
+    for (let i = 0; i < 5; i++) {
+      expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
+    }
+  });
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toContain("unsupported handoff_prompt_prefix");
+  // Truthful: NaN is named NaN, never JSON's collapsed `null`.
+  expect(errors[0]).toContain("NaN");
+  expect(errors[0]).not.toContain("null");
+});
+
+test("NaN → null → Infinity are three DISTINCT bad values, each warned truthfully", () => {
+  // The JSON-keyed memo bug: all three stringify to `null`, so only the first
+  // would warn and every message would misname the value. With a type-preserving
+  // identity each is distinct (re-warns) and each message names its value.
+  const errors = captureConsoleError(() => {
+    writeConfig("handoff_prompt_prefix: .nan\n");
+    resolveConfig();
+    resolveConfig(); // repeat of NaN → silent
+    writeConfig("handoff_prompt_prefix: null\n");
+    resolveConfig();
+    resolveConfig(); // repeat of null → silent
+    writeConfig("handoff_prompt_prefix: .inf\n");
+    resolveConfig();
+    resolveConfig(); // repeat of Infinity → silent
+  });
+  expect(errors).toHaveLength(3);
+  // Each message names its OWN value truthfully; the NaN warning must not read
+  // `null` (the pre-fix JSON.stringify bug).
+  expect(errors[0]).toContain("NaN");
+  expect(errors[0]).not.toContain("null");
+  expect(errors[1]).toContain("null");
+  expect(errors[2]).toContain("Infinity");
+});
+
+// ---------------------------------------------------------------------------
 // Unknown tmux icon keys are ignored
 // ---------------------------------------------------------------------------
 
