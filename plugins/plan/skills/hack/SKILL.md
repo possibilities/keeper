@@ -43,7 +43,7 @@ If two modes feel equally plausible and the choice would meaningfully change the
 
 ## How to investigate
 
-**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `agentscrape`, `agent-browser`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
+**Local helper CLIs degrade, never block.** Every helper named below (`knowctl`, `searchctl`, `agentscrape`, `agent-browser`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
 
 - `searchctl` (web search) → the harness `WebSearch` tool.
 - `agentscrape fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
