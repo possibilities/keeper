@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-22T14:56:14.197000Z",
+  "depends_on": [
+    "fn-1404-harden-shared-flock-outcomes.1"
+  ],
+  "epic": "fn-1404-harden-shared-flock-outcomes",
+  "id": "fn-1404-harden-shared-flock-outcomes.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Harden integrity lock callers",
+  "updated_at": "2026-07-22T14:56:14.197000Z"
+}
