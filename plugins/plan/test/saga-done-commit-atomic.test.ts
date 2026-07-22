@@ -17,7 +17,7 @@
 // assertions are on envelopes, .keeper/ files, and the fake git log.
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { failNextCommit, setGitBinaryPresent } from "./fake-vcs.ts";
@@ -509,5 +509,54 @@ describe("done — server-derived evidence", () => {
       "abc1234",
     ]);
     expect(rt.no_op_reason).toBeNull();
+  });
+
+  function setTaskTargetRepo(taskId: string, repo: string): void {
+    const p = join(root, ".keeper", "tasks", `${taskId}.json`);
+    const def = JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+    def.target_repo = repo;
+    writeFileSync(p, `${JSON.stringify(def, null, 2)}\n`, "utf-8");
+  }
+
+  test("a NON-GIT target repo + --no-op-reason fails CLOSED (unknown, not proven-empty)", () => {
+    const taskId = seedInProgress("fn-16-atomic");
+    // An existing dir with no .git: findSourceCommits would fail-open to [], but
+    // the derivation demands positive git-repo proof before [] means proven-empty.
+    const bogus = join(root, "no-git-target");
+    mkdirSync(bogus, { recursive: true });
+    setTaskTargetRepo(taskId, bogus);
+
+    const r = runCli(
+      ["done", taskId, "--summary", "x", "--no-op-reason", "claims no code"],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).not.toBe(0);
+    expect(
+      (firstJsonPayload(r.output).error as Record<string, unknown>).code,
+    ).toBe("scan_unverifiable");
+    // No durable done — the overlay stays in_progress, no commit landed.
+    expect((runtime(root, taskId) as Record<string, unknown>).status).toBe(
+      "in_progress",
+    );
+    expect(gitLogCount(root)).toBe(0);
+  });
+
+  test("a MISSING target repo + --no-op-reason fails CLOSED (unknown, not proven-empty)", () => {
+    const taskId = seedInProgress("fn-17-atomic");
+    // A path that does not exist at all — same unknown, never proven-empty.
+    setTaskTargetRepo(taskId, join(root, "does-not-exist"));
+
+    const r = runCli(
+      ["done", taskId, "--summary", "x", "--no-op-reason", "gone"],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).not.toBe(0);
+    expect(
+      (firstJsonPayload(r.output).error as Record<string, unknown>).code,
+    ).toBe("scan_unverifiable");
+    expect((runtime(root, taskId) as Record<string, unknown>).status).toBe(
+      "in_progress",
+    );
+    expect(gitLogCount(root)).toBe(0);
   });
 });

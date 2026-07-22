@@ -23,9 +23,10 @@ import { epicIdFromTask } from "./ids.ts";
 import { normalizeTask } from "./models.ts";
 import { resolveWorkerRepos } from "./runtime_status.ts";
 import { loadJson, loadJsonSafe } from "./store.ts";
-import { findSourceCommits } from "./verbs/reconcile.ts";
+import { getVcs } from "./vcs.ts";
+import { findSourceCommits, GitError } from "./verbs/reconcile.ts";
 
-export { GitError } from "./verbs/reconcile.ts";
+export { GitError };
 
 /** realpath(p), falling back to the absolute path when it can't be resolved —
  * byte-identical to reconcile's private helper of the same contract. */
@@ -119,9 +120,11 @@ export function deriveTaskCommitGroups(
  * validates every recorded sha against THAT repo's composed base, so a flat
  * evidence list can never carry a commit close would then test against the wrong
  * repo (a task committing outside its own target repo is a one-task/one-repo
- * contract violation, intentionally not recorded here). Fail-closed like
- * deriveTaskCommitGroups: propagates GitError (absent binary / unexpected git
- * failure) — the caller decides whether to surface or best-effort skip it. */
+ * contract violation, intentionally not recorded here). Fail-closed: an absent
+ * git binary, an UNEXPECTED git failure, AND a target that is not a readable git
+ * worktree all raise GitError — so a [] result means PROVEN-empty (a readable
+ * worktree with no Task commits), never an UNKNOWN one. The caller decides whether
+ * to surface or best-effort skip the GitError. */
 export function deriveTaskTargetRepoCommits(
   taskId: string,
   dataDir: string,
@@ -134,5 +137,17 @@ export function deriveTaskTargetRepoCommits(
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   const epicDef = existsSync(epicPath) ? (loadJsonSafe(epicPath) ?? {}) : {};
   const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, primaryRepo);
+  // Positive git-repo proof BEFORE trusting an empty scan: findSourceCommits
+  // returns [] for a non-git / missing repo (its fail-open contract for the
+  // multi-repo audit callers), which would read PROVEN-empty when the target is
+  // actually UNKNOWN. The done empty-evidence gate requires a proven-empty set, so
+  // demand the single target be a readable git worktree here — else a typed
+  // GitError the caller maps to scan_unverifiable. A born-or-unborn readable
+  // worktree with no Task commits stays a legitimate proven-empty [].
+  if (!getVcs().isGitRepo(targetRepo)) {
+    throw new GitError(
+      `target repo is not a readable git worktree: ${targetRepo}`,
+    );
+  }
   return findSourceCommits(taskId, targetRepo);
 }
