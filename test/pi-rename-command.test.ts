@@ -214,7 +214,7 @@ describe("/rename explicit slug", () => {
         turnReads += 1;
         return { stdout: "", stderr: "" };
       },
-      resolveModel: () => undefined,
+      resolveProvider: () => undefined,
       getAuth: async () => ({ ok: false, error: "unused" }),
       runCompletion: async () => {
         throw new Error("unused");
@@ -227,8 +227,9 @@ describe("/rename explicit slug", () => {
         getLeafId: () => "leaf-1",
         getSessionName: () => undefined,
       },
+      model: undefined,
       modelRegistry: {
-        find: () => undefined,
+        getProvider: () => undefined,
         getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
       },
       ui: {
@@ -255,7 +256,7 @@ describe("/rename explicit slug", () => {
     const notices: Array<{ message: string; level?: string }> = [];
     const deps: RenameCommandDeps = {
       runTurnCli: async () => ({ stdout: "", stderr: "" }),
-      resolveModel: () => undefined,
+      resolveProvider: () => undefined,
       getAuth: async () => ({ ok: false, error: "unused" }),
       runCompletion: async () => {
         throw new Error("unused");
@@ -268,8 +269,9 @@ describe("/rename explicit slug", () => {
         getLeafId: () => "leaf-1",
         getSessionName: () => undefined,
       },
+      model: undefined,
       modelRegistry: {
-        find: () => undefined,
+        getProvider: () => undefined,
         getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
       },
       ui: {
@@ -298,7 +300,7 @@ describe("/rename explicit slug", () => {
         stdout: JSON.stringify({ ok: true, data: { turn: null } }),
         stderr: "",
       }),
-      resolveModel: () => undefined,
+      resolveProvider: () => undefined,
       getAuth: async () => ({ ok: false, error: "unused" }),
       runCompletion: async () => {
         throw new Error("unused");
@@ -311,8 +313,9 @@ describe("/rename explicit slug", () => {
         getLeafId: () => "leaf-1",
         getSessionName: () => undefined,
       },
+      model: undefined,
       modelRegistry: {
-        find: () => undefined,
+        getProvider: () => undefined,
         getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
       },
       ui: { notify() {} },
@@ -351,8 +354,13 @@ describe("/rename conversation orchestration", () => {
           ],
         }),
       },
+      model: { provider: "anthropic", id: "claude-test" },
       modelRegistry: {
-        find: () => ({ provider: "openai-codex" }),
+        getProvider: () => ({
+          streamSimple: () => {
+            throw new Error("fake completion provider is not called directly");
+          },
+        }),
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test" }),
       },
       ui: { notify() {} },
@@ -363,8 +371,8 @@ describe("/rename conversation orchestration", () => {
         turnReads += 1;
         return { stdout: "", stderr: "" };
       },
-      resolveModel: (registry, provider, modelId) =>
-        registry.find(provider, modelId),
+      resolveProvider: (registry, model) =>
+        registry.getProvider(model.provider),
       getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
       runCompletion: async (_model, context) => {
         completionInput = context.messages[0]?.content[0]?.text ?? "";
@@ -404,8 +412,13 @@ describe("/rename conversation orchestration", () => {
         getSessionName: () => undefined,
         buildSessionContext: () => ({ messages: [] }),
       },
+      model: { provider: "google", id: "gemini-test" },
       modelRegistry: {
-        find: () => ({ provider: "openai-codex" }),
+        getProvider: () => ({
+          streamSimple: () => {
+            throw new Error("fake completion provider is not called directly");
+          },
+        }),
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test" }),
       },
       ui: { notify: (message) => notices.push(message) },
@@ -415,8 +428,8 @@ describe("/rename conversation orchestration", () => {
       runTurnCli: async () => {
         throw new Error("live context must not use the fallback");
       },
-      resolveModel: (registry, provider, modelId) =>
-        registry.find(provider, modelId),
+      resolveProvider: (registry, model) =>
+        registry.getProvider(model.provider),
       getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
       runCompletion: async () => {
         completionCalls += 1;

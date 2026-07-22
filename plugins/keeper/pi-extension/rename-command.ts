@@ -6,12 +6,11 @@
  *
  * SELF-CONTAINED ISLAND, same discipline as `keeper-events.ts`: this file
  * ships no static import of any `@earendil-works/*` package (that package is
- * not on keeper's own module path — see `docs/adr/0041`), so every Pi-shaped
- * type here is a hand-kept structural subset. The ONE exception is the host
- * completion boundary (`hostComplete`), which loads Pi's inference package
- * via a runtime `import()` INVOCATION-LOCALLY, inside the command handler,
- * never at module load — an import/API-shape failure there fails only that
- * one `/rename` invocation, never the Pi session.
+ * not on keeper's own module path — see `docs/adr/0106`), so every Pi-shaped
+ * type here is a hand-kept structural subset. The host completion boundary
+ * uses the effective provider already exposed by Pi's model registry. A
+ * provider/API-shape failure there fails only that one `/rename` invocation,
+ * never the Pi session.
  *
  * MUTATION DISCIPLINE: `runRenameInvocation` only ever COMPUTES an outcome;
  * `createRenameCommandHandler` is the sole call site of `pi.setSessionName()`,
@@ -37,10 +36,6 @@ import { fileURLToPath } from "node:url";
 // constants
 // ---------------------------------------------------------------------------
 
-/** The one fixed model this command ever resolves — no fallback (ADR 0041). */
-export const RENAME_MODEL_PROVIDER = "openai-codex";
-export const RENAME_MODEL_ID = "gpt-5.3-codex-spark";
-
 /** Bounded model input: at most this many UTF-8 bytes of transcript text. */
 export const RENAME_MAX_TRANSCRIPT_BYTES = 16 * 1024;
 export const RENAME_MAX_REFERENCES = 8;
@@ -49,7 +44,7 @@ export const RENAME_MAX_AGGREGATE_FILE_BYTES = 12 * 1024;
 /** Bounded model output: a short title needs very few tokens. */
 export const RENAME_MAX_RESPONSE_TOKENS = 64;
 /** Minimal/disabled reasoning — this is a metadata completion, not a turn. */
-export const RENAME_REASONING_EFFORT = "minimal";
+export const RENAME_REASONING_LEVEL = "minimal";
 /** Hard wall-clock budget for the whole completion call. */
 export const RENAME_TIMEOUT_MS = 20_000;
 
@@ -821,13 +816,30 @@ function runTurnCliViaKeeperBinary(argv: string[]): Promise<TurnCliExit> {
 }
 
 // ---------------------------------------------------------------------------
-// host inference boundary (ADR 0041)
+// host inference boundary (ADR 0106)
 // ---------------------------------------------------------------------------
 
 /** Structural subset of Pi's resolved `Model<Api>` this command needs. */
 export interface RenamePiModel {
   provider: string;
   [key: string]: unknown;
+}
+
+/** Structural subset of Pi's effective provider. Calling this surface keeps
+ *  extension-installed routing (including Keeper's Codex pool) in the path. */
+export interface RenamePiProvider {
+  streamSimple(
+    model: RenamePiModel,
+    context: {
+      systemPrompt: string;
+      messages: Array<{
+        role: "user";
+        content: Array<{ type: "text"; text: string }>;
+        timestamp: number;
+      }>;
+    },
+    options: RenameProviderCompletionOptions,
+  ): { result(): Promise<RenameCompletionResult> };
 }
 
 /** Mirrors Pi's `ResolvedRequestAuth` discriminated union exactly, so a real
@@ -838,12 +850,16 @@ export type RenameAuthResult =
       apiKey?: string;
       headers?: Record<string, string>;
       env?: Record<string, string>;
+      baseUrl?: string;
     }
   | { ok: false; error: string };
 
 export interface RenameModelRegistry {
-  find(provider: string, modelId: string): RenamePiModel | undefined;
+  getProvider(provider: string): RenamePiProvider | undefined;
   getApiKeyAndHeaders(model: RenamePiModel): Promise<RenameAuthResult>;
+  getProviderAuth?(
+    provider: string,
+  ): Promise<{ auth: { baseUrl?: string } } | undefined>;
 }
 
 export interface RenameCompletionContent {
@@ -870,8 +886,15 @@ export interface RenameCompletionOptions {
   env?: Record<string, string>;
   signal: AbortSignal;
   maxTokens: number;
-  reasoningEffort: string;
+  reasoning: string;
+  sessionId: string;
+  provider: RenamePiProvider;
 }
+
+export type RenameProviderCompletionOptions = Omit<
+  RenameCompletionOptions,
+  "provider"
+>;
 
 export type RenameCompletionFn = (
   model: RenamePiModel,
@@ -907,11 +930,9 @@ export function extractCompletionText(
 }
 
 /**
- * Invocation-local host completion. Dynamically imports Pi's own inference
- * package ONLY when a `/rename` invocation actually reaches this call —
- * never at extension load. An import failure or an API-shape surprise
- * rejects, which the caller folds into a normal failure outcome; it never
- * propagates past the command (docs/adr/0041).
+ * Invocation-local host completion through Pi's effective provider. A
+ * provider/API-shape surprise rejects, which the caller folds into a normal
+ * failure outcome; it never propagates past the command (docs/adr/0106).
  */
 async function hostComplete(
   model: RenamePiModel,
@@ -925,29 +946,10 @@ async function hostComplete(
   },
   options: RenameCompletionOptions,
 ): Promise<RenameCompletionResult> {
-  // @ts-expect-error — Pi's package is on PI's module path, not keeper's own
-  // (the self-contained-island rule forbids a static/typed dependency here);
-  // resolved only at runtime, inside Pi's process, never during keeper's own
-  // `tsc --noEmit`.
-  const hostModule = (await import("@earendil-works/pi-ai/compat")) as {
-    complete: (
-      model: unknown,
-      context: unknown,
-      options: unknown,
-    ) => Promise<{
-      stopReason: string;
-      content: Array<{ type: string; text?: string }>;
-      errorMessage?: string;
-    }>;
-  };
-  const response = await hostModule.complete(model, context, {
-    apiKey: options.apiKey,
-    headers: options.headers,
-    env: options.env,
-    signal: options.signal,
-    maxTokens: options.maxTokens,
-    reasoningEffort: options.reasoningEffort,
-  });
+  const { provider, ...requestOptions } = options;
+  const response = await provider
+    .streamSimple(model, context, requestOptions)
+    .result();
   return {
     stopReason: response.stopReason as RenameStopReason,
     content: response.content,
@@ -961,11 +963,10 @@ async function hostComplete(
 
 export interface RenameCommandDeps {
   runTurnCli: RunTurnCliFn;
-  resolveModel: (
+  resolveProvider: (
     registry: RenameModelRegistry,
-    provider: string,
-    modelId: string,
-  ) => RenamePiModel | undefined;
+    model: RenamePiModel,
+  ) => RenamePiProvider | undefined;
   getAuth: (
     registry: RenameModelRegistry,
     model: RenamePiModel,
@@ -982,9 +983,26 @@ export interface RenameCommandDeps {
 export function defaultRenameCommandDeps(): RenameCommandDeps {
   return {
     runTurnCli: runTurnCliViaKeeperBinary,
-    resolveModel: (registry, provider, modelId) =>
-      registry.find(provider, modelId),
-    getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
+    resolveProvider: (registry, model) =>
+      registry.getProvider(model.provider),
+    getAuth: async (registry, model) => {
+      const requestAuth = await registry.getApiKeyAndHeaders(model);
+      if (requestAuth.ok !== true || registry.getProviderAuth === undefined) {
+        return requestAuth;
+      }
+      try {
+        const providerAuth = await registry.getProviderAuth(model.provider);
+        const baseUrl = providerAuth?.auth.baseUrl;
+        return baseUrl === undefined
+          ? requestAuth
+          : { ...requestAuth, baseUrl };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
     runCompletion: hostComplete,
   };
 }
@@ -1006,6 +1024,9 @@ export interface RenameCommandContext {
   cwd: string;
   sessionManager: RenameSessionManager;
   modelRegistry: RenameModelRegistry;
+  /** The active model at the command/event boundary. `/rename` snapshots it
+   *  when explicitly invoked and never changes Pi's durable model selection. */
+  model: RenamePiModel | undefined;
   ui: RenameUi;
   /** Current Pi hosts provide this on command and event contexts. Absent on an
    *  older host degrades to the original immediate-attempt behavior. */
@@ -1015,6 +1036,7 @@ export interface RenameCommandContext {
 interface PendingRenameRequest {
   generation: number;
   sessionId: string;
+  model: RenamePiModel | undefined;
   initialTitle: string | undefined;
   readFailures: number;
   completionAttempts: number;
@@ -1066,6 +1088,7 @@ function beginRenameRequest(
   const request: PendingRenameRequest = {
     generation: ++state.generation,
     sessionId: ctx.sessionManager.getSessionId(),
+    model: ctx.model,
     initialTitle: ctx.sessionManager.getSessionName(),
     readFailures: 0,
     completionAttempts: 0,
@@ -1152,12 +1175,12 @@ async function runRenameAttempt(
     );
   }
 
-  const model = deps.resolveModel(
-    ctx.modelRegistry,
-    RENAME_MODEL_PROVIDER,
-    RENAME_MODEL_ID,
-  );
+  const model = request.model;
   if (model === undefined) {
+    return { outcome: "model_unavailable" };
+  }
+  const provider = deps.resolveProvider(ctx.modelRegistry, model);
+  if (provider === undefined) {
     return { outcome: "model_unavailable" };
   }
 
@@ -1176,6 +1199,8 @@ async function runRenameAttempt(
     return { outcome: "stale", staleReason: "retryable" };
   }
 
+  const requestModel =
+    auth.baseUrl === undefined ? model : { ...model, baseUrl: auth.baseUrl };
   request.completionAttempts += 1;
   const controller = new AbortController();
   state.activeAbort = controller;
@@ -1187,7 +1212,7 @@ async function runRenameAttempt(
   let completion: RenameCompletionResult;
   try {
     completion = await deps.runCompletion(
-      model,
+      requestModel,
       {
         systemPrompt: RENAME_SYSTEM_PROMPT,
         messages: [
@@ -1204,7 +1229,9 @@ async function runRenameAttempt(
         env: auth.env,
         signal: controller.signal,
         maxTokens: RENAME_MAX_RESPONSE_TOKENS,
-        reasoningEffort: RENAME_REASONING_EFFORT,
+        reasoning: RENAME_REASONING_LEVEL,
+        sessionId: request.sessionId,
+        provider,
       },
     );
   } catch {
@@ -1279,7 +1306,7 @@ export function renameFeedback(
       };
     case "model_unavailable":
       return {
-        message: `/rename: ${RENAME_MODEL_PROVIDER}/${RENAME_MODEL_ID} is unavailable`,
+        message: "/rename: selected model is unavailable",
         level: "error",
       };
     case "auth_failed":

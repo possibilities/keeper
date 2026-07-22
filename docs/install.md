@@ -516,8 +516,8 @@ title from bounded, compaction-aware conversation context, gives extra weight to
 and safely expands eligible project-file references. A canonical lowercase slug sets the title
 directly (`/rename project-search-ranking`); any other argument, including an `@path`, leaves the
 existing title unchanged. Empty context, cancellation, stale Session state, unavailable auth or
-model, timeout, or malformed output likewise fails open with content-free feedback. Pi performs its
-fixed cheap inference through its OAuth-aware host API and commits with `setSessionName()`.
+model, timeout, or malformed output likewise fails open with content-free feedback. Pi snapshots the
+active model, resolves its effective OAuth-aware provider, and commits with `setSessionName()`.
 
 Claude's native `custom-title` records and Pi's `session_info_changed` title bridge feed Keeper's
 `TranscriptTitle` events, title projection, and Tmux renamer asynchronously, never a direct database

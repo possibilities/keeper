@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Supersedes ADR 0093.
+Superseded by ADR 0106. Supersedes ADR 0093.
 
 ## Context
 

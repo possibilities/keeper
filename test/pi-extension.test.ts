@@ -56,11 +56,10 @@ import {
   buildRenameInputText,
   createRenameCommandHandler,
   createRenameInvocationState,
+  defaultRenameCommandDeps,
   extractCompletionText,
   type PiRenameApi,
   parseTurnCliOutput,
-  RENAME_MODEL_ID,
-  RENAME_MODEL_PROVIDER,
   type RenameCommandContext,
   type RenameCommandDeps,
   registerRenameCommand,
@@ -1545,10 +1544,98 @@ describe("titleEventBindings", () => {
   });
 });
 
-describe("/rename — fixed model", () => {
-  test("resolves only the one fixed cheap model, never a fallback", () => {
-    expect(RENAME_MODEL_PROVIDER).toBe("openai-codex");
-    expect(RENAME_MODEL_ID).toBe("gpt-5.3-codex-spark");
+describe("/rename — active model provider", () => {
+  test("host completion uses Pi's effective provider stream", async () => {
+    const calls: Array<{
+      provider: string;
+      sessionId: string;
+      maxTokens: number;
+      reasoning: string;
+      carriesProvider: boolean;
+    }> = [];
+    const provider = {
+      streamSimple(
+        model: { provider: string },
+        _context: unknown,
+        options: {
+          sessionId: string;
+          maxTokens: number;
+          reasoning: string;
+          provider?: unknown;
+        },
+      ) {
+        calls.push({
+          provider: model.provider,
+          sessionId: options.sessionId,
+          maxTokens: options.maxTokens,
+          reasoning: options.reasoning,
+          carriesProvider: "provider" in options,
+        });
+        return {
+          result: async () => ({
+            stopReason: "stop" as const,
+            content: [{ type: "text", text: "Provider Routed Title" }],
+          }),
+        };
+      },
+    };
+    const model = { provider: "anthropic", id: "claude-test" };
+    const result = await defaultRenameCommandDeps().runCompletion(
+      model,
+      {
+        systemPrompt: "name it",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "context" }],
+            timestamp: 1,
+          },
+        ],
+      },
+      {
+        signal: new AbortController().signal,
+        maxTokens: 64,
+        reasoning: "minimal",
+        sessionId: "session-1",
+        provider,
+      },
+    );
+
+    expect(result.stopReason).toBe("stop");
+    expect(calls).toEqual([
+      {
+        provider: "anthropic",
+        sessionId: "session-1",
+        maxTokens: 64,
+        reasoning: "minimal",
+        carriesProvider: false,
+      },
+    ]);
+  });
+
+  test("host auth preserves a credential-specific base URL", async () => {
+    const deps = defaultRenameCommandDeps();
+    const auth = await deps.getAuth(
+      {
+        getProvider: () => undefined,
+        getApiKeyAndHeaders: async () => ({
+          ok: true,
+          apiKey: "token",
+          headers: { authorization: "Bearer token" },
+        }),
+        getProviderAuth: async () => ({
+          auth: { baseUrl: "https://enterprise.example.test" },
+        }),
+      },
+      { provider: "github-copilot", id: "copilot-test" },
+    );
+
+    expect(auth).toEqual({
+      ok: true,
+      apiKey: "token",
+      headers: { authorization: "Bearer token" },
+      baseUrl: "https://enterprise.example.test",
+    });
   });
 });
 
@@ -1845,6 +1932,7 @@ function fakeUi(): {
 function fakeRenameCtx(overrides?: {
   sessionManager?: FakeSessionManager;
   cwd?: string;
+  model?: { provider: string; id: string } | null;
   ui?: ReturnType<typeof fakeUi>;
   isIdle?: () => boolean;
 }): RenameCommandContext {
@@ -1854,8 +1942,16 @@ function fakeRenameCtx(overrides?: {
   return {
     cwd: overrides?.cwd ?? "/work/repo",
     sessionManager,
+    model:
+      overrides?.model === null
+        ? undefined
+        : (overrides?.model ?? { provider: "anthropic", id: "claude-test" }),
     modelRegistry: {
-      find: () => ({ provider: RENAME_MODEL_PROVIDER, id: RENAME_MODEL_ID }),
+      getProvider: () => ({
+        streamSimple: () => {
+          throw new Error("fake completion provider is not called directly");
+        },
+      }),
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key-123" }),
     },
     ui: overrides?.ui ?? fakeUi(),
@@ -1876,8 +1972,7 @@ function fakeRenameDeps(
       }),
       stderr: "",
     }),
-    resolveModel: (registry, provider, modelId) =>
-      registry.find(provider, modelId),
+    resolveProvider: (registry, model) => registry.getProvider(model.provider),
     getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
     runCompletion: async () => ({
       stopReason: "stop",
@@ -1889,16 +1984,16 @@ function fakeRenameDeps(
 }
 
 describe("runRenameInvocation", () => {
-  test("a valid empty turn returns before model lookup", async () => {
-    let resolveModelCalled = false;
+  test("a valid empty turn returns before provider lookup", async () => {
+    let resolveProviderCalled = false;
     const ctx = fakeRenameCtx();
     const deps = fakeRenameDeps({
       runTurnCli: async () => ({
         stdout: turnEnvelopeStdout(null),
         stderr: "",
       }),
-      resolveModel: () => {
-        resolveModelCalled = true;
+      resolveProvider: () => {
+        resolveProviderCalled = true;
         return undefined;
       },
     });
@@ -1908,7 +2003,7 @@ describe("runRenameInvocation", () => {
       createRenameInvocationState(),
     );
     expect(result.outcome).toBe("empty");
-    expect(resolveModelCalled).toBe(false);
+    expect(resolveProviderCalled).toBe(false);
   });
 
   test("a turn CLI read failure is read_failed, distinct from empty", async () => {
@@ -1924,15 +2019,82 @@ describe("runRenameInvocation", () => {
     expect(result.outcome).toBe("read_failed");
   });
 
-  test("a missing model is model_unavailable", async () => {
-    const ctx = fakeRenameCtx();
-    const deps = fakeRenameDeps({ resolveModel: () => undefined });
+  test("a missing active model is model_unavailable", async () => {
+    const ctx = fakeRenameCtx({ model: null });
+    const deps = fakeRenameDeps();
     const result = await runRenameInvocation(
       ctx,
       deps,
       createRenameInvocationState(),
     );
     expect(result.outcome).toBe("model_unavailable");
+  });
+
+  test("a missing effective provider is model_unavailable", async () => {
+    const ctx = fakeRenameCtx();
+    const deps = fakeRenameDeps({ resolveProvider: () => undefined });
+    const result = await runRenameInvocation(
+      ctx,
+      deps,
+      createRenameInvocationState(),
+    );
+    expect(result.outcome).toBe("model_unavailable");
+  });
+
+  test("passes the invocation's active model to completion", async () => {
+    const model = { provider: "google", id: "gemini-test" };
+    let completedWith: unknown;
+    const ctx = fakeRenameCtx({ model });
+    const deps = fakeRenameDeps({
+      runCompletion: async (received) => {
+        completedWith = received;
+        return {
+          stopReason: "stop",
+          content: [{ type: "text", text: "Active Model Title" }],
+        };
+      },
+    });
+    const result = await runRenameInvocation(
+      ctx,
+      deps,
+      createRenameInvocationState(),
+    );
+
+    expect(result).toEqual({ outcome: "success", title: "active-model-title" });
+    expect(completedWith).toBe(model);
+  });
+
+  test("applies a credential-specific base URL to the request model", async () => {
+    let completedWith: unknown;
+    const ctx = fakeRenameCtx({
+      model: { provider: "github-copilot", id: "copilot-test" },
+    });
+    const deps = fakeRenameDeps({
+      getAuth: async () => ({
+        ok: true,
+        apiKey: "token",
+        baseUrl: "https://enterprise.example.test",
+      }),
+      runCompletion: async (received) => {
+        completedWith = received;
+        return {
+          stopReason: "stop",
+          content: [{ type: "text", text: "Enterprise Model Title" }],
+        };
+      },
+    });
+    const result = await runRenameInvocation(
+      ctx,
+      deps,
+      createRenameInvocationState(),
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(completedWith).toEqual({
+      provider: "github-copilot",
+      id: "copilot-test",
+      baseUrl: "https://enterprise.example.test",
+    });
   });
 
   test("a failed auth resolution is auth_failed", async () => {
