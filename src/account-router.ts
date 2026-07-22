@@ -180,7 +180,7 @@ export function selectRouteByAccountOrdinal(
 export async function selectRouteWithRefresh(
   deps: SelectRouteDeps = {},
 ): Promise<RouteResolution> {
-  return withOnDemandRefresh(deps, () => selectRoute(deps));
+  return withOnDemandRefresh(deps, (pinned) => selectRoute(pinned));
 }
 
 /** Explicit-ordinal selection with the same on-demand refresh-before-refusal. */
@@ -188,8 +188,8 @@ export async function selectRouteByAccountOrdinalWithRefresh(
   ordinal: number,
   deps: SelectRouteDeps = {},
 ): Promise<RequestedRouteResolution> {
-  return withOnDemandRefresh(deps, () =>
-    selectRouteByAccountOrdinal(ordinal, deps),
+  return withOnDemandRefresh(deps, (pinned) =>
+    selectRouteByAccountOrdinal(ordinal, pinned),
   );
 }
 
@@ -204,21 +204,28 @@ function staleObservation(stateDir: string, nowMs: number): Observation | null {
 
 async function withOnDemandRefresh(
   deps: SelectRouteDeps,
-  select: () => RouteResolution,
+  select: (deps: SelectRouteDeps) => RouteResolution,
 ): Promise<RouteResolution> {
   const refresh = deps.refreshObservation;
-  if (!refresh) return select();
+  if (!refresh) return select(deps);
   const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
+  // Pin ONE authority time so the staleness precheck and the same-cycle
+  // selector judge the snapshot at the identical instant — no TTL-edge race
+  // where a just-fresh precheck flips to a stale refusal on a re-sampled clock.
   const nowMs = deps.nowMs ?? Date.now();
   const stale = staleObservation(stateDir, nowMs);
-  if (stale === null) return select();
+  if (stale === null) return select({ ...deps, nowMs });
   let outcome: OnDemandRefreshOutcome;
   try {
     outcome = await refresh({ stateDir, nowMs });
   } catch {
     outcome = { kind: "still-stale" };
   }
-  if (outcome.kind === "refreshed") return select();
+  if (outcome.kind === "refreshed") {
+    // Judge the refreshed snapshot at its own post-refresh instant, not the
+    // stale precheck time, which now trails the just-published observation.
+    return select({ ...deps, nowMs: deps.nowMs ?? Date.now() });
+  }
   return {
     ok: false,
     error: onDemandRefusal(stale, nowMs, deps.model, outcome),

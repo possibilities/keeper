@@ -962,6 +962,63 @@ describe("on-demand refresh before a stale refusal", () => {
     expect(!result.ok && result.error).toContain("301s old; maximum 300s");
     expect(!result.ok && result.error).not.toContain("on-demand refresh");
   });
+
+  test("a just-fresh precheck ignores a selector clock that would cross the ceiling", async () => {
+    const dir = root();
+    // Snapshot is 299,999ms old at the pinned instant: fresh by 1ms.
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: NOW - 299_999 }));
+    const realNow = Date.now;
+    let calls = 0;
+    // Pin reads NOW; any later re-sample steps 2ms past the ceiling.
+    Date.now = () => (calls++ === 0 ? NOW : NOW + 2);
+    try {
+      const result = await selectRouteWithRefresh({
+        stateDir: dir,
+        refreshObservation: async () => {
+          throw new Error("must not refresh a just-fresh snapshot");
+        },
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        selection: { id: "claude-swap:2" },
+      });
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("a positively-stale decision refreshes once and reselects at a new pinned time", async () => {
+    const dir = root();
+    publish(dir, observation([route(2, 0.2)], { observedAtMs: NOW - 300_001 }));
+    const afterRefresh = NOW + 5_000;
+    const realNow = Date.now;
+    let calls = 0;
+    // Pin reads NOW (stale); every later read is the post-refresh instant.
+    Date.now = () => (calls++ === 0 ? NOW : afterRefresh);
+    let refreshCalls = 0;
+    try {
+      const result = await selectRouteWithRefresh({
+        stateDir: dir,
+        refreshObservation: async ({ stateDir: refreshDir }) => {
+          refreshCalls += 1;
+          publish(
+            refreshDir,
+            observation([route(2, 0.2)], { observedAtMs: afterRefresh }),
+          );
+          return { kind: "refreshed" };
+        },
+      });
+      expect(refreshCalls).toBe(1);
+      // A reselect at the STALE pinned time would read the fresh snapshot as
+      // future-dated and refuse; success proves the new post-refresh instant.
+      expect(result).toMatchObject({
+        ok: true,
+        selection: { id: "claude-swap:2" },
+      });
+    } finally {
+      Date.now = realNow;
+    }
+  });
 });
 
 describe("classifyOnDemandRefresh", () => {
