@@ -1021,6 +1021,7 @@ function logLaneMaintenanceDeferralOnce(
 const CYCLE_LANE_DEFERRAL_PASSES = [
   "worktree-base-refresh-deferred",
   "worktree-provision-deferred",
+  "worktree-preclose-provision-deferred",
   "worktree-sink-provision-deferred",
   "worktree-finalize-deferred",
 ] as const;
@@ -5204,30 +5205,50 @@ function classifyEpicRepo(
     };
   }
   // A would-be-`ok` (worktree-LANE) epic whose ONE task toplevel is NOT the resolved
-  // primary anchors its close to that FOREIGN task repo's base lane — where the
+  // primary would anchor its close to that FOREIGN task repo's base lane — where the
   // epic's plan state does not exist — dying EPIC_NOT_FOUND at preflight (the
-  // single-repo sibling of the clustered close-anchor bug). Reroute through the
-  // clustered path so the primary becomes a task-less serial close-sink anchor (the
-  // close runs on the primary shared checkout) while the foreign task repo keeps its
-  // worktree lane + finalize. Gated on the multi-repo flag (producing a `clustered`
-  // resolution is that rollout's surface) and a resolving primary; a null-resolving
-  // primary keeps the degraded `ok` fallback below. This only fires for a would-be
-  // `ok` — a `disabled` foreign repo already runs its close on `project_dir`
-  // (primary) worktree-less, so its return below is untouched.
+  // single-repo sibling of the clustered close-anchor bug). Resolve the primary FIRST
+  // and fail CLOSED on both anchor hazards before any `ok` return:
+  //  - primary_repo does not resolve to a git toplevel → typed `unresolved` reject;
+  //    NEVER anchor the close to the task repo on a guess. (`primaryResolved` is null
+  //    here only when EVERY task carries a foreign `target_repo`, so a genuinely
+  //    single-repo epic — a task root == primary — already resolved it in the loop.)
+  //  - primary_repo resolves to a DIFFERENT toplevel (foreign primary): with the
+  //    multi-repo flag ON, reroute through the clustered path so the primary becomes
+  //    a task-less serial close-sink anchor (the close runs on the primary shared
+  //    checkout) while the foreign task repo keeps its worktree lane + finalize;
+  //    with the flag OFF, REJECT with the enable-flag sticky (the same class the
+  //    >1-toplevel flag-OFF path mints) — never knowingly dispatch a closer into
+  //    EPIC_NOT_FOUND. A `disabled` foreign repo already runs its close on
+  //    `project_dir` (primary) worktree-less, so its `disabled` return below is
+  //    untouched; only a would-be-`ok` repo reroutes/rejects.
   const primaryResolved = resolve(projectDir);
-  const anchorsForeignPrimary =
-    multiRepoEnabled && primaryResolved !== null && primaryResolved !== repoDir;
-  const okOrForeignAnchor = (): WorktreeRepoResolution =>
-    anchorsForeignPrimary
-      ? clusterEpicRepos(
-          epic,
-          resolve,
-          assessRepo,
-          isGrandfathered,
-          projectDir,
-          topByTask,
-        )
-      : { kind: "ok", repoDir };
+  if (primaryResolved === null) {
+    return {
+      kind: "unresolved",
+      reason: `worktree-repo-unresolved: epic ${epic.epic_id} primary_repo ${projectDir} is not inside a git worktree — refusing to anchor the close on a guess`,
+    };
+  }
+  const foreignPrimary = primaryResolved !== repoDir;
+  const okOrForeignAnchor = (): WorktreeRepoResolution => {
+    if (!foreignPrimary) {
+      return { kind: "ok", repoDir };
+    }
+    if (multiRepoEnabled) {
+      return clusterEpicRepos(
+        epic,
+        resolve,
+        assessRepo,
+        isGrandfathered,
+        projectDir,
+        topByTask,
+      );
+    }
+    return {
+      kind: "multi-repo",
+      reason: `worktree-multi-repo: epic ${epic.epic_id} tasks resolve to ${repoDir} but its primary_repo resolves to ${primaryResolved} — a foreign-primary epic needs per-repo lane groups so the single close anchors to primary_repo. Enable with \`keeper autopilot config worktree_multi_repo on\``,
+    };
+  };
   // A would-be-`ok` epic resolving to ONE primary-backed toplevel: the LAST gate
   // is repo eligibility. A not-worktree-friendly toplevel (workspace marker /
   // submodule / no manifest / probe error) downgrades to `disabled` — a NORMAL,
@@ -5266,9 +5287,10 @@ function classifyEpicRepo(
  * anchor for the single plan-close. When the primary hosts no tasks it is absent
  * from the task groups, so it is appended as a TASK-LESS `serial` close-sink group
  * (the close then runs on the primary shared checkout, where the plan state lives,
- * never in a task-group lane). The first-group fallback survives ONLY for a primary
- * that fails to resolve. Pure: no fs/git beyond the injected `resolve` /
- * `assessRepo` / grandfather probes (all memoized producer-side).
+ * never in a task-group lane). A primary_repo that fails to resolve FAILS CLOSED with
+ * a typed `unresolved` reject — never an arbitrary `groups[0]` guess. Pure: no fs/git
+ * beyond the injected `resolve` / `assessRepo` / grandfather probes (all memoized
+ * producer-side).
  */
 function clusterEpicRepos(
   epic: Epic,
@@ -5314,18 +5336,20 @@ function clusterEpicRepos(
   // work, so a lane there would be an empty branch to provision + tear down for
   // nothing; the shared-checkout close is the existing serial-primary contract.
   const primaryResolved = resolve(projectDir);
-  if (
-    primaryResolved !== null &&
-    !groups.some((g) => g.repoDir === primaryResolved)
-  ) {
+  // FAIL CLOSED when primary_repo does not resolve to a git toplevel: the close must
+  // anchor to primary_repo, so an unresolvable primary has no real repo to anchor to.
+  // Reject typed `unresolved` — NEVER guess `groups[0]` (an arbitrary task repo where
+  // the epic's plan state does not exist → a closer dying EPIC_NOT_FOUND).
+  if (primaryResolved === null) {
+    return {
+      kind: "unresolved",
+      reason: `worktree-repo-unresolved: epic ${epic.epic_id} primary_repo ${projectDir} is not inside a git worktree — refusing to anchor the close on a guess`,
+    };
+  }
+  if (!groups.some((g) => g.repoDir === primaryResolved)) {
     groups.push({ repoDir: primaryResolved, taskIds: [], mode: "serial" });
   }
-  // Anchor on the resolved primary; fall back to the first group ONLY when the
-  // primary fails to resolve to a git toplevel (no real repo to anchor to — a
-  // degraded operator data bug, kept from prior behavior rather than widened).
-  const primaryRepoDir =
-    primaryResolved !== null ? primaryResolved : (groups[0]?.repoDir ?? "");
-  return { kind: "clustered", groups, primaryRepoDir };
+  return { kind: "clustered", groups, primaryRepoDir: primaryResolved };
 }
 
 /**
@@ -6154,6 +6178,65 @@ export async function runReconcileCycle(
       });
   }
 
+  // Pre-close fan-in. Assemble EVERY non-close-host worktree group's base BEFORE its
+  // close launches, so the close's per-repo done-ancestry gate sees each foreign rib
+  // already merged into keeper/epic/<id>. A serial-primary close otherwise launches
+  // AHEAD of the fan-in it depends on — the ancestry gate aborts on the unmerged rib
+  // and the typed-error closer keeps occupying its slot: the close blocks the fan-in
+  // it needs (an autonomous wedge). A failed / deferred / pending provision SUPPRESSES
+  // that cycle's close (retry next cycle) — NO sticky, NO incident row: the fan-in is
+  // simply not ready yet (the finalize pass owns the genuine-conflict sticky, once the
+  // closer runs and reaches it). Gated not-paused like refreshBase/finalize.
+  const preCloseProvisionBlocked = new Set<string>();
+  if (deps.worktree !== undefined && !state.paused) {
+    for (const sink of decision.worktreePreCloseProvision) {
+      if (signal.aborted) {
+        return;
+      }
+      const epicId = closeKeyEpicId(sink);
+      if (preCloseProvisionBlocked.has(epicId)) {
+        continue; // this epic's close is already suppressed — skip its siblings
+      }
+      const hold = probeLaneMaintenance(laneMaintenanceProbe, {
+        path: sink.assignment.worktreePath,
+        epicId,
+        taskId: null,
+      });
+      if (hold.kind === "defer") {
+        preCloseProvisionBlocked.add(epicId);
+        logLaneMaintenanceDeferralOnce(
+          "worktree-preclose-provision-deferred",
+          sink.assignment.worktreePath,
+          hold.reason,
+          laneDeferralsSeen,
+        );
+        continue;
+      }
+      const provisioned = await deps.worktree.provision(
+        sink,
+        liveAttrFor(sink),
+      );
+      if (!provisioned.ok) {
+        preCloseProvisionBlocked.add(epicId);
+        logLaneMaintenanceDeferralOnce(
+          "worktree-preclose-provision-deferred",
+          sink.assignment.worktreePath,
+          provisioned.reason,
+          laneDeferralsSeen,
+        );
+      } else if (provisioned.pendingIntegration !== undefined) {
+        // Base provisioned but a fan-in is not yet an ancestor — NOT assembled.
+        preCloseProvisionBlocked.add(epicId);
+        logLaneMaintenanceDeferralOnce(
+          "worktree-preclose-provision-deferred",
+          sink.assignment.worktreePath,
+          pendingIntegrationReason(provisioned.pendingIntegration),
+          laneDeferralsSeen,
+        );
+      }
+    }
+  }
+
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
@@ -6161,6 +6244,11 @@ export async function runReconcileCycle(
       plan.worktree !== undefined &&
       refreshBlockedEpics.has(closeKeyEpicId(plan.worktree))
     ) {
+      continue;
+    }
+    // Suppress a close whose non-close-host worktree groups are not yet fanned in —
+    // the pre-close provision above blocked it; retry next cycle (no sticky).
+    if (plan.verb === "close" && preCloseProvisionBlocked.has(plan.id)) {
       continue;
     }
     if (signal.aborted) {
@@ -6480,6 +6568,10 @@ export async function runReconcileCycle(
       // native launch, overwriting any stale session-env marker).
       plan.wrappedCell ?? null,
       plan.wrappedEnvelope ?? null,
+      // Serial-primary clustered-close owner-integration marker — rides the spec as
+      // KEEPER_PLAN_OWNER_INTEGRATE so the close integrates its plan-state touched
+      // bases without a lane cwd (empty on every other launch).
+      plan.ownerIntegrate,
     );
     // The dispatched-cell forensics recorded on the `Dispatched` event (ADR
     // 0047) — {assigned, effective, constraint} for a cell-bearing `work` launch,

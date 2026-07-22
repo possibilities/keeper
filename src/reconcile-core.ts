@@ -646,12 +646,18 @@ export function buildPlannedLaunchSpec(
   dispatchConstraint?: WorkerProvider | null,
   wrappedCell?: string | null,
   wrappedEnvelope?: string | null,
+  ownerIntegrate?: boolean,
 ): LaunchSpec {
   return {
     prompt: defaultPlanPrompt(verb, id),
     claudeName: dispatchKey(verb, id),
     model,
     effort,
+    // The serial-primary clustered-close owner-integration marker — set ONLY for a
+    // lane-less close that must still integrate every plan-state touched base. A
+    // lane-hosted / OFF-mode / task launch leaves it off (the exec builder emits it
+    // empty), so those launches stay byte-identical.
+    ...(ownerIntegrate === true ? { ownerIntegrate: true } : {}),
     ...(pluginDir != null && pluginDir !== "" ? { pluginDir } : {}),
     ...(worktreePath !== undefined && worktreePath !== ""
       ? { worktreePath }
@@ -1486,6 +1492,15 @@ export interface PlannedLaunch {
    * exclusive with {@link worktree}.
    */
   worktreeReject?: WorktreeReject;
+  /**
+   * Set IFF this is a CLUSTERED epic's serial-primary close — a close that runs
+   * worktree-less on the primary shared checkout (no {@link worktree} lane). The
+   * producer emits a `KEEPER_PLAN_OWNER_INTEGRATE` marker so the plan-side
+   * `integrateEpicBases` owner-integrates every plan-state touched base (primary ∪
+   * `touched_repos`) into its local default, instead of no-opping on the empty
+   * `KEEPER_PLAN_WORKTREE` lane gate. NEVER set on a lane-hosted or OFF-mode close.
+   */
+  ownerIntegrate?: boolean;
 }
 
 /**
@@ -1593,6 +1608,20 @@ export interface ReconcileDecision {
    * as {@link worktreeFinalize}, so a group is fanned-in only when the epic is done.
    */
   worktreeSinkProvision: WorktreeLaunchInfo[];
+  /**
+   * The NON-close-host worktree-group close sinks a CLUSTERED epic must fan-in
+   * (rib→base) via the producer's `provision` path BEFORE the CLOSE LAUNCH — so the
+   * close's per-repo done-ancestry gate sees each foreign rib already merged into
+   * `keeper/epic/<id>`, never a still-unmerged leaf. Populated whenever a clustered
+   * epic has a close launch this cycle (distinct from {@link worktreeSinkProvision},
+   * which is the `needsFinalize` pass AFTER the closer is done). The "close-host"
+   * group (the primary group a worktree-primary close dispatches into, assembling its
+   * own base) is excluded; a serial-primary close hosts NONE, so every worktree group
+   * is fanned in here. A failed/deferred provision SUPPRESSES that cycle's close
+   * (retry next cycle) — no sticky, no incident. EMPTY for single-repo (`ok`) epics
+   * and whenever worktree mode is OFF.
+   */
+  worktreePreCloseProvision: WorktreeLaunchInfo[];
   /**
    * The OPEN per-repo worktree-finalize dispatch-failure ids (mirrored straight off
    * `snapshot.finalizeFailureIds`). The finalize driver clears any whose repo
@@ -2345,6 +2374,7 @@ export function reconcile(
       baseDriftEntries: [],
       worktreeFinalize: [],
       worktreeSinkProvision: [],
+      worktreePreCloseProvision: [],
       finalizeFailureIds: new Set(),
       slotOccupancy: [],
       slotOccupancyClears: [],
@@ -2886,6 +2916,7 @@ export function reconcile(
   // untouched and the worktree logic is isolated.
   const worktreeFinalize: WorktreeLaunchInfo[] = [];
   const worktreeSinkProvision: WorktreeLaunchInfo[] = [];
+  const worktreePreCloseProvision: WorktreeLaunchInfo[] = [];
   // Gate ALL worktree producer work on not-paused, matching recover() (`:3126`):
   // finalize merges the epic base into the default branch and pushes, which a
   // paused autopilot must not do. Launches are already suppressed while paused, so
@@ -2944,6 +2975,7 @@ export function reconcile(
       finalizeEpicIds,
       worktreeFinalize,
       worktreeSinkProvision,
+      worktreePreCloseProvision,
       worktreeGeometry.byEpicId,
     );
     const epicById = new Map(
@@ -3026,6 +3058,7 @@ export function reconcile(
     baseDriftEntries,
     worktreeFinalize,
     worktreeSinkProvision,
+    worktreePreCloseProvision,
     finalizeFailureIds: snapshot.finalizeFailureIds,
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
@@ -3281,6 +3314,7 @@ function attachWorktreeGeometry(
   finalizeEpicIds: Set<string>,
   worktreeFinalize: WorktreeLaunchInfo[],
   worktreeSinkProvision: WorktreeLaunchInfo[],
+  worktreePreCloseProvision: WorktreeLaunchInfo[],
   byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
 ): void {
   // Index launches by epic. A task launch belongs to the epic owning the task; a
@@ -3380,10 +3414,30 @@ function attachWorktreeGeometry(
       for (const l of epicLaunches) {
         if (l.verb === "close") {
           // The single close maps to the PRIMARY group's sink; a serial primary
-          // (no plan) leaves it worktree-less (runs on the shared checkout).
+          // (no plan) leaves it worktree-less (runs on the shared checkout) and must
+          // OWNER-INTEGRATE its touched bases from plan state — it holds no lane cwd
+          // to enable integrateEpicBases the ordinary (KEEPER_PLAN_WORKTREE) way, and
+          // faking one to a lane it does not own is forbidden.
           const sink = primaryGroup?.byNode.get(CLOSE_SINK_ID);
           if (primaryGroup !== undefined && sink !== undefined) {
             l.worktree = primaryGroup.infoFor(sink);
+          } else {
+            l.ownerIntegrate = true;
+          }
+          // Fan-in EVERY non-close-host worktree group's base BEFORE this close may
+          // launch, so its per-repo done-ancestry gate sees each foreign rib already
+          // merged into keeper/epic/<id> (never a still-unmerged leaf → an autonomous
+          // wedge: the close blocks the fan-in it needs). The close-host (the primary
+          // group a worktree-primary close dispatches into) assembles its own base, so
+          // it is excluded; a serial-primary close hosts none → every worktree group.
+          for (const stamp of worktreeGroups) {
+            if (stamp === primaryGroup) {
+              continue;
+            }
+            const groupSink = stamp.byNode.get(CLOSE_SINK_ID);
+            if (groupSink !== undefined) {
+              worktreePreCloseProvision.push(stamp.infoFor(groupSink));
+            }
           }
           continue;
         }

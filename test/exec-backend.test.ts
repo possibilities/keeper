@@ -748,6 +748,8 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     // ...and an empty branch entry (the durable-marker sibling), same reason.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
     // A prompt launch ALWAYS carries the EMPTY identity carrier (the 4th env
     // entry) — a fresh launch never inherits a stale KEEPER_JOB_ID from a reused
     // session env and folds onto someone else's row.
@@ -812,6 +814,8 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
     // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
@@ -881,6 +885,8 @@ test("buildKeeperAgentLaunchArgv: omits absent model/effort/name and the no-conf
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
+    "--x-tmux-env",
     "KEEPER_JOB_ID=",
     // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
@@ -928,6 +934,8 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
     "KEEPER_PLAN_WORKTREE=",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
+    "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
     // Resume mode with NO jobId still carries the identity slot, EMPTY — the value
     // is present only when the caller threads the original job id (pinned below).
     "--x-tmux-env",
@@ -999,6 +1007,8 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=",
     "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
+    "--x-tmux-env",
     "KEEPER_JOB_ID=",
     // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
     // EMPTY on an unconstrained launch (byte-inert).
@@ -1052,7 +1062,7 @@ test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical t
   );
 });
 
-test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JOB_ID=<id> as the 4th env carrier", () => {
+test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JOB_ID=<id> as the 5th env carrier", () => {
   // The identity carrier the revived non-claude harness folds onto its existing
   // row from — distinct from the harness-native resume target in the tail.
   const argv = buildKeeperAgentLaunchArgv({
@@ -1067,14 +1077,14 @@ test("buildKeeperAgentLaunchArgv: a resume launch with a jobId carries KEEPER_JO
   // Exactly one identity carrier, valued with the ORIGINAL job id.
   const idEntries = argv.filter((a) => a.startsWith("KEEPER_JOB_ID="));
   expect(idEntries).toEqual(["KEEPER_JOB_ID=45f94c4d-orig"]);
-  // It is the FOURTH repeated env entry (after session/lane/branch), each preceded
-  // by its own `--x-tmux-env`.
+  // It is the FIFTH repeated env entry (after session/lane/branch/owner-integrate),
+  // each preceded by its own `--x-tmux-env`.
   const idx = argv.indexOf("KEEPER_JOB_ID=45f94c4d-orig");
   expect(argv[idx - 1]).toBe("--x-tmux-env");
-  // Ten repeated env carriers: session/lane/branch/job-id +
+  // Eleven repeated env carriers: session/lane/branch/owner-integrate/job-id +
   // three dispatched-cell carriers + two wrapped-cell carriers + the always-empty
   // handoff-envelope stale-overwrite carrier.
-  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(10);
+  expect(argv.filter((a) => a === "--x-tmux-env")).toHaveLength(11);
   // Identity (job id) and the resume key (native target) stay DISTINCT.
   expect(argv.slice(-2)).toEqual(["--session", "d98a2d54-native"]);
   expect(idEntries[0]).not.toContain("d98a2d54-native");
@@ -1126,6 +1136,8 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     // The 3rd repeated env entry — the durable lane-branch marker.
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x",
+    "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
     // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,
@@ -1184,6 +1196,8 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode RESUME re-injects KEEPER_PLAN_
     "KEEPER_PLAN_WORKTREE=/private/var/wt/repo--keeper-epic-fn-1-x",
     "--x-tmux-env",
     "KEEPER_PLAN_WORKTREE_BRANCH=keeper/epic/fn-1-x--fn-1-x.2",
+    "--x-tmux-env",
+    "KEEPER_PLAN_OWNER_INTEGRATE=",
     "--x-tmux-env",
     "KEEPER_JOB_ID=",
     // Dispatched-cell carriers (ADR 0047) — the 5th/6th/7th always-present env,

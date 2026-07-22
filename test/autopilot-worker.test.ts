@@ -8737,10 +8737,10 @@ test("fn-978 reconcile: raw roots differing but resolving to ONE toplevel are NO
   );
 });
 
-test("fn-978 reconcile: tasks sharing a target_repo != project_dir derive the lane base from the RESOLVED target", () => {
+test("fn-978/16c reconcile: a foreign-primary epic (task target_repo resolves DIFFERENT from project_dir) — flag ON reroutes to clustered with the work lane still on the RESOLVED target; flag OFF fails CLOSED", () => {
   const epic = makeEpic({
     epic_id: "fn-1-foo",
-    project_dir: "/created-here", // where the epic was created — NOT a task root
+    project_dir: "/created-here", // primary_repo — NOT a task root (foreign primary)
     tasks: [
       makeTask({
         task_id: "fn-1-foo.1",
@@ -8749,21 +8749,26 @@ test("fn-978 reconcile: tasks sharing a target_repo != project_dir derive the la
       }),
     ],
   });
-  const snap = worktreeSnap([epic], (r) =>
+  const resolve = (r: string): string | null =>
     r.startsWith("/target")
       ? "/target"
       : r === "/created-here"
         ? "/created-here"
-        : null,
-  );
-  const decision = reconcile(snap, makeState(), 0);
+        : null;
+  // Flag ON: the foreign-primary reroute clusters — the work task still cuts its lane
+  // on the RESOLVED target "/target" (the close anchors to the /created-here primary).
+  const decision = reconcile(multiRepoSnap([epic], resolve), makeState(), 0);
   const launch = decision.launches.find((l) => l.id === "fn-1-foo.1");
   expect(launch?.worktreeReject).toBeUndefined();
-  // repoDir + the lane base use the RESOLVED target "/target", never raw project_dir.
   expect(launch?.worktree?.repoDir).toBe("/target");
   expect(launch?.worktree?.baseWorktreePath).toBe(
     worktreePathFor("/target", "keeper/epic/fn-1-foo"),
   );
+  // Flag OFF: the SAME foreign-primary epic fails CLOSED with the enable-flag sticky
+  // (16c) — never anchors the close to /target where the epic's plan state is absent.
+  const offDecision = reconcile(worktreeSnap([epic], resolve), makeState(), 0);
+  const offLaunch = offDecision.launches.find((l) => l.id === "fn-1-foo.1");
+  expect(offLaunch?.worktreeReject?.reason).toContain("worktree_multi_repo");
 });
 
 test("fn-978 reconcile: tasks resolving to >1 distinct toplevel are still rejected worktree-multi-repo", () => {
@@ -8844,7 +8849,7 @@ test("fn-1001 classifyWorktreeRepos: one toplevel but empty primary_repo → no-
   ).toBe(false);
 });
 
-test("fn-1001 classifyWorktreeRepos: one toplevel WITH primary_repo set → ok (byte-identical, even when base != primary_repo)", () => {
+test("fn-1001/16c classifyWorktreeRepos: one toplevel but base resolves DIFFERENT from primary_repo (foreign primary), flag OFF → REJECT (enable-flag sticky), NOT `ok` on the task base", () => {
   const epic = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/created-here", // a non-empty primary_repo, distinct from the base
@@ -8855,7 +8860,14 @@ test("fn-1001 classifyWorktreeRepos: one toplevel WITH primary_repo set → ok (
   const res = classifyWorktreeRepos([epic], (r) =>
     r === "/repo" ? "/repo" : r === "/created-here" ? "/created-here" : null,
   ).get("fn-1-foo");
-  expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
+  // 16c: a foreign primary would anchor the single close to /repo where the epic's
+  // plan state (at /created-here) does not exist → EPIC_NOT_FOUND at preflight. Flag
+  // OFF fails CLOSED with the enable-flag sticky (a subdir/trailing-slash base that
+  // resolves to the SAME toplevel as primary_repo stays `ok` — see fn-978).
+  expect(res?.kind).toBe("multi-repo");
+  expect(res?.kind === "multi-repo" && res.reason).toContain(
+    "worktree_multi_repo",
+  );
 });
 
 test("fn-1001 reconcile: worktree ON, single-toplevel epic with empty primary_repo → every launch stamped worktree-no-primary-repo, no lane", () => {
@@ -9661,17 +9673,19 @@ test("fn-16b classifyEpicRepo: a genuinely single-repo epic (task repo == primar
   ).toEqual({ kind: "ok", repoDir: "/repo-a" });
 });
 
-test("fn-16b classifyEpicRepo: the reroute is FLAG-GATED, disabled-preserving, and null-resolve-preserving", () => {
-  // (a) Flag OFF → the foreign-primary single-repo epic stays `ok` on the task repo
-  //     (the reroute produces a `clustered` resolution, which is the multi-repo
-  //     rollout's surface — off without the flag; a preserved boundary).
-  expect(
-    classifyWorktreeRepos([singleForeignEpic()], abcResolve).get(
-      "fn-1-foreign",
-    ),
-  ).toEqual({ kind: "ok", repoDir: "/repo-a" });
-  // (b) A worktree-INELIGIBLE (disabled) foreign task repo is NOT rerouted — its
-  //     close already runs on `project_dir` (primary) worktree-less; stays disabled.
+test("fn-16c classifyEpicRepo: flag-OFF foreign-primary REJECTS (enable-flag sticky); null-resolving primary fails CLOSED (typed unresolved); disabled foreign stays disabled", () => {
+  // (a) Flag OFF + foreign primary → REJECT with the enable-worktree_multi_repo
+  //     sticky (the same class the >1-toplevel flag-OFF path mints) — never
+  //     knowingly dispatch a closer into EPIC_NOT_FOUND. [16c overturns 16b's `ok`.]
+  const flagOff = classifyWorktreeRepos([singleForeignEpic()], abcResolve).get(
+    "fn-1-foreign",
+  );
+  expect(flagOff?.kind).toBe("multi-repo");
+  expect(flagOff?.kind === "multi-repo" && flagOff.reason).toContain(
+    "worktree_multi_repo",
+  );
+  // (b) A worktree-INELIGIBLE (disabled) foreign task repo is NOT rerouted/rejected —
+  //     its close already runs on `project_dir` (primary) worktree-less; stays disabled.
   const disabled = classifyWorktreeRepos(
     [singleForeignEpic()],
     abcResolve,
@@ -9684,19 +9698,165 @@ test("fn-16b classifyEpicRepo: the reroute is FLAG-GATED, disabled-preserving, a
   ).get("fn-1-foreign");
   expect(disabled?.kind).toBe("disabled");
   expect(disabled?.kind === "disabled" && disabled.repoDir).toBe("/repo-a");
-  // (c) A primary that fails to resolve keeps the degraded `ok` fallback on the task
-  //     repo (no real toplevel to anchor to) — unchanged from before the fix.
+  // (c) A primary_repo that fails to resolve fails CLOSED with a typed `unresolved`
+  //     reject — never the task-repo guess. [16c overturns 16b's degraded `ok`.]
   const nullPrimary = (r: string): string | null =>
-    r.startsWith("/repo-a") ? "/repo-a" : null; // /repo-c resolves null
+    r.startsWith("/repo-a") ? "/repo-a" : null; // /repo-c (primary) resolves null
+  const nullRes = classifyWorktreeRepos(
+    [singleForeignEpic()],
+    nullPrimary,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-foreign");
+  expect(nullRes?.kind).toBe("unresolved");
+  expect(nullRes?.kind === "unresolved" && nullRes.reason).toContain(
+    "primary_repo",
+  );
+});
+
+// 16c — the close-order wedge + the owner-integration marker. A serial-primary
+// clustered close must (a) fan-in EVERY non-close-host worktree group BEFORE it
+// launches (else its ancestry gate aborts on the unmerged rib — an autonomous wedge),
+// and (b) owner-integrate its touched bases via a marker (it holds no lane cwd).
+
+/** A close-READY primaryless epic: all tasks done, epic still open (close launches). */
+function closeReadyPrimarylessEpic(): Epic {
+  return primarylessEpic([
+    makeTask({
+      task_id: "fn-1-anchor.1",
+      task_number: 1,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-a",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+    makeTask({
+      task_id: "fn-1-anchor.2",
+      task_number: 2,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-b",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+  ]);
+}
+
+test("fn-16c reconcile: a serial-primary clustered close carries ownerIntegrate + pre-close-provisions EVERY worktree group before launch", () => {
+  const epic = closeReadyPrimarylessEpic();
+  const decision = reconcile(multiRepoSnap([epic], abcResolve), makeState(), 0);
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(closeLaunch).toBeDefined();
+  // Serial-primary close: no lane → it OWNER-INTEGRATES its bases from plan state.
+  expect(closeLaunch?.worktree).toBeUndefined();
+  expect(closeLaunch?.ownerIntegrate).toBe(true);
+  // BOTH worktree groups are fanned in BEFORE the close launches (neither hosts it).
   expect(
-    classifyWorktreeRepos(
-      [singleForeignEpic()],
-      nullPrimary,
-      undefined,
-      undefined,
-      true,
-    ).get("fn-1-foreign"),
-  ).toEqual({ kind: "ok", repoDir: "/repo-a" });
+    decision.worktreePreCloseProvision.map((s) => s.repoDir).sort(),
+  ).toEqual(["/repo-a", "/repo-b"]);
+});
+
+test("fn-16c reconcile: an ordinary clustered close (primary worktree) does NOT ownerIntegrate; pre-close provision covers only the NON-close-host group", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a", // primary hosts a task → worktree close-host
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(closeLaunch).toBeDefined();
+  // The close dispatches INTO the primary lane, so its lane cwd enables
+  // integrateEpicBases the ordinary way — no marker.
+  expect(closeLaunch?.worktree?.repoDir).toBe("/repo-a");
+  expect(closeLaunch?.ownerIntegrate).toBeUndefined();
+  // Only the NON-close-host /repo-b is pre-close-provisioned; /repo-a's close worker
+  // assembles its own base.
+  expect(decision.worktreePreCloseProvision.map((s) => s.repoDir)).toEqual([
+    "/repo-b",
+  ]);
+});
+
+test("fn-16c reconcile: a single-repo `ok` close carries no ownerIntegrate and no pre-close provision (byte-identical)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-solo",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-solo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(closeLaunch).toBeDefined();
+  expect(closeLaunch?.ownerIntegrate).toBeUndefined();
+  expect(closeLaunch?.worktree?.repoDir).toBe("/repo-a"); // close in the base lane
+  expect(decision.worktreePreCloseProvision).toEqual([]);
+});
+
+test("fn-16c runReconcileCycle: a pre-close provision FAILURE SUPPRESSES that cycle's close — no close launch, NO sticky (retry next cycle)", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    provisionFail: (info) =>
+      info.repoDir === "/repo-a"
+        ? "worktree-premerge-not-ready: fan-in base not assembled"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The close NEVER launched (its non-close-host fan-in was not ready)...
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeUndefined();
+  // ...and minted NO sticky — a not-ready pre-close fan-in is a plain retry-next-cycle.
+  expect(
+    depsLog.emissions.find((e) => e.verb === "close" && e.id === "fn-1-anchor"),
+  ).toBeUndefined();
+});
+
+test("fn-16c runReconcileCycle: pre-close provision SUCCESS → the serial-primary close launches carrying the ownerIntegrate marker (KEEPER_PLAN_OWNER_INTEGRATE)", async () => {
+  const { driver } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const snap = multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve);
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  const closeLaunch = depsLog.launches.find(
+    (l) => l.name === "close::fn-1-anchor",
+  );
+  expect(closeLaunch).toBeDefined();
+  expect(closeLaunch?.spec?.ownerIntegrate).toBe(true);
 });
 
 // fn-28 — a repo group that per-finalized and had its lane/branch torn down, then

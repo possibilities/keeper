@@ -3000,3 +3000,113 @@ describe("integrateEpicBases ancestor re-grade lease adoption (F2)", () => {
     expect(releasedLeases.length).toBe(0);
   });
 });
+
+// 16c — a CLUSTERED epic's serial-primary close runs worktree-less on the primary
+// shared checkout, so KEEPER_PLAN_WORKTREE is EMPTY. It carries
+// KEEPER_PLAN_OWNER_INTEGRATE=1 to still owner-integrate every plan-state touched
+// base (the repo set never came from the lane) — WITHOUT faking a lane it does not own.
+describe("integrateEpicBases owner-integrate marker (16c serial-primary close)", () => {
+  const getRepo = withTmpdir("trunk-lease-marker-");
+  let priorWorktree: string | undefined;
+  let priorMarker: string | undefined;
+  let priorSession: string | undefined;
+
+  beforeEach(() => {
+    priorWorktree = process.env.KEEPER_PLAN_WORKTREE;
+    priorMarker = process.env.KEEPER_PLAN_OWNER_INTEGRATE;
+    priorSession = process.env.CLAUDE_CODE_SESSION_ID;
+    // Serial-primary close: the lane path is EMPTY (it runs on the shared checkout).
+    delete process.env.KEEPER_PLAN_WORKTREE;
+    process.env.CLAUDE_CODE_SESSION_ID = TRUNK_CLAIMANT;
+  });
+
+  afterEach(() => {
+    const restore = (k: string, v: string | undefined): void => {
+      if (v === undefined) {
+        delete process.env[k];
+      } else {
+        process.env[k] = v;
+      }
+    };
+    restore("KEEPER_PLAN_WORKTREE", priorWorktree);
+    restore("KEEPER_PLAN_OWNER_INTEGRATE", priorMarker);
+    restore("CLAUDE_CODE_SESSION_ID", priorSession);
+  });
+
+  // Reaches the ancestor re-grade + lease adoption (already-integrated base).
+  function alreadyAncestorGit(repoRoot: string): TrunkIntegrationDeps["git"] {
+    return (args) => {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return gitOk(`${repoRoot}\n`);
+      }
+      if (
+        args[0] === "rev-parse" &&
+        args.includes(`refs/heads/${TRUNK_SOURCE_BRANCH}^{commit}`)
+      ) {
+        return gitOk("abc1234");
+      }
+      if (
+        args[0] === "symbolic-ref" &&
+        args.includes("refs/remotes/origin/HEAD")
+      ) {
+        return gitOk(`origin/${TRUNK_DEFAULT_BRANCH}\n`);
+      }
+      if (args[0] === "merge-base") return gitOk(); // already an ancestor
+      throw new Error(`unexpected git call: ${args.join(" ")}`);
+    };
+  }
+
+  test("empty lane + KEEPER_PLAN_OWNER_INTEGRATE=1 → OWNER-INTEGRATES (never early-returns)", () => {
+    process.env.KEEPER_PLAN_OWNER_INTEGRATE = "1";
+    const repoRoot = getRepo();
+    const lease = baseLeaseFor({
+      repo_root: repoRoot,
+      writable_root: repoRoot,
+    });
+    const releasedLeases: TrunkLeaseLeaf[] = [];
+    const deps: TrunkIntegrationDeps = {
+      git: alreadyAncestorGit(repoRoot),
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error(
+          "requestLease must not fire on the already-ancestor path",
+        );
+      },
+      releaseLease: (_stateDir, l) => {
+        releasedLeases.push(l);
+        return true;
+      },
+      readLeaseLeaf: () => lease,
+    };
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+    expect(result.code).toBeNull();
+    // Reached the lease adoption → it did NOT early-return on the empty lane gate.
+    expect(releasedLeases).toEqual([lease]);
+  });
+
+  test("empty lane + NO marker → NO-OP (never touches git or the lease)", () => {
+    delete process.env.KEEPER_PLAN_OWNER_INTEGRATE;
+    const repoRoot = getRepo();
+    let gitCalled = false;
+    const deps: TrunkIntegrationDeps = {
+      git: () => {
+        gitCalled = true;
+        return gitOk();
+      },
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error("requestLease must not fire on a no-op close");
+      },
+      releaseLease: () => true,
+      readLeaseLeaf: () => null,
+    };
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+    expect(result.code).toBeNull();
+    // Empty lane + no marker → OFF-mode close semantics: early return before any git.
+    expect(gitCalled).toBe(false);
+  });
+});

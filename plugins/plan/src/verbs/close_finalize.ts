@@ -1581,7 +1581,20 @@ export function integrateEpicBases(
   format: OutputFormat | null,
   deps: TrunkIntegrationDeps = realTrunkIntegrationDeps,
 ): void {
-  if ((process.env.KEEPER_PLAN_WORKTREE ?? "").trim() === "") return;
+  // A worktree-mode close owner-integrates every plan-state touched base (primary ∪
+  // `touched_repos`) into its LOCAL default under a fenced per-repo lease. Ordinarily
+  // it runs INSIDE a lane, so a non-empty KEEPER_PLAN_WORKTREE marks "worktree mode";
+  // an OFF-mode close (empty) no-ops (no epic bases to merge). A CLUSTERED epic's
+  // serial-primary close runs worktree-less on the primary shared checkout, so it
+  // carries KEEPER_PLAN_OWNER_INTEGRATE=1 to enable the SAME integration WITHOUT
+  // faking a lane it does not own — mechanically safe because the repo set comes from
+  // plan state (not cwd), the merge runs in a private scratch worktree (ADR 0102), the
+  // lease identity is KEEPER_PLAN_SESSION_ID (not the lane), and a repo lacking a
+  // `keeper/epic/<id>` base is skipped. Either signal enables it; neither → no-op.
+  const inLane = (process.env.KEEPER_PLAN_WORKTREE ?? "").trim() !== "";
+  const ownerIntegrateMarker =
+    (process.env.KEEPER_PLAN_OWNER_INTEGRATE ?? "").trim() === "1";
+  if (!inLane && !ownerIntegrateMarker) return;
   const claimantSessionId = resolvePlanSessionId();
   if (claimantSessionId === null) {
     emitFinalizeError(
