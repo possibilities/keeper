@@ -163,7 +163,7 @@
     "test/agent-self-invoke.test.ts": 1,
     "test/ansi-to-styled.test.ts": 1,
     "test/autoclose-worker.test.ts": 2,
-    "test/autopilot-worker.test.ts": 208,
+    "test/autopilot-worker.test.ts": 0,
     "test/autopilot.test.ts": 16,
     "test/await-conditions.test.ts": 26,
     "test/await.test.ts": 50,

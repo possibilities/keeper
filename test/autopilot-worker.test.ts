@@ -147,6 +147,7 @@ import {
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   isWrappedCell,
+  KNOWN_CLOSE_OUTCOMES,
   LANE_BACKUP_DISTRESS_REASON,
   LANE_OWNER_STALL_GRACE_SEC,
   LANE_TEARDOWN_DISTRESS_REASON,
@@ -301,6 +302,7 @@ import {
   parseMergeConflictReason,
 } from "../src/dispatch-failure-key";
 import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
+import { CLOSE_OUTCOMES as PLAN_CLOSE_OUTCOMES } from "../plugins/plan/src/verbs/close_finalize";
 import {
   buildProviderEquivalenceMap,
   type ProviderEquivalenceConfig,
@@ -7807,6 +7809,130 @@ test("latest close receipts are DURABLE: an UNREADABLE latest falls back to the 
     expect(
       loadLatestCloseReceipts(db, jobs).receipts.get("fn-9-dur")?.outcome,
     ).toBe("closed_clean");
+  });
+});
+
+test("latest close receipts: an UNKNOWN/typo outcome does NOT erase a prior fatal; only the known vocabulary stops the scan", async () => {
+  await withSeededDb((db) => {
+    const jobs = new Map([
+      [
+        "cj",
+        makeJob({
+          job_id: "cj",
+          state: "stopped",
+          plan_verb: "close",
+          plan_ref: "fn-8-vocab",
+        }),
+      ],
+    ]);
+    const finalize = (ts: number, body: Record<string, unknown>) =>
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+         VALUES (?, 'cj', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', 'fn-8-vocab')`,
+        [ts, JSON.stringify({ tool_response: { stdout: JSON.stringify(body) } })],
+      );
+    finalize(30, { outcome: "fatal_halt" });
+    // A newer NON-vocabulary outcome (a typo / future value) is UNKNOWN — the scan advances
+    // past it and the prior fatal STILL stands (it must NOT be accepted as a nonfatal result).
+    finalize(31, { outcome: "typo_not_a_real_outcome" });
+    expect(
+      loadLatestCloseReceipts(db, jobs).receipts.get("fn-8-vocab")?.outcome,
+    ).toBe("fatal_halt");
+    // Every one of the five KNOWN outcomes is a valid receipt that STOPS the scan.
+    for (const known of KNOWN_CLOSE_OUTCOMES) {
+      finalize(100, { outcome: known });
+      expect(
+        loadLatestCloseReceipts(db, jobs).receipts.get("fn-8-vocab")?.outcome,
+      ).toBe(known);
+    }
+  });
+});
+
+test("KNOWN_CLOSE_OUTCOMES mirrors the plan CloseOutcome vocabulary exactly (parity pin)", () => {
+  // src/ cannot import the plan plugin, so KNOWN_CLOSE_OUTCOMES is a mirror — this test pins
+  // it against the real plan source so a plan-side vocabulary change fails loudly here.
+  expect([...KNOWN_CLOSE_OUTCOMES].sort()).toEqual(
+    Object.values(PLAN_CLOSE_OUTCOMES).sort(),
+  );
+});
+
+test("latest close receipts: PREPARE construction throw → UNTRUSTED (arms the degraded wake), never escapes", () => {
+  const throwingDb = {
+    query: () => {
+      throw new Error("prepare/construction failure");
+    },
+  } as unknown as Parameters<typeof loadLatestCloseReceipts>[0];
+  const read = loadLatestCloseReceipts(throwingDb, new Map(), ["fn-1"]);
+  expect(read.trusted).toBe(false); // did not escape; the whole read is untrusted
+  expect(read.receipts.size).toBe(0);
+});
+
+test("latest close receipts: exhausted history (events exist, NO valid receipt) is UNKNOWN, not clean absence", async () => {
+  await withSeededDb((db) => {
+    const jobs = new Map([
+      [
+        "cj",
+        makeJob({
+          job_id: "cj",
+          state: "stopped",
+          plan_verb: "close",
+          plan_ref: "fn-7-exhaust",
+        }),
+      ],
+    ]);
+    // Several close-finalize events, ALL unreadable / non-vocabulary → no valid receipt.
+    for (let i = 0; i < 5; i++) {
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+         VALUES (?, 'cj', 'PostToolUse', 'post_tool_use', '{ not valid', 'close-finalize', 'fn-7-exhaust')`,
+        [30 + i],
+      );
+    }
+    const read = loadLatestCloseReceipts(db, jobs);
+    expect(read.receipts.has("fn-7-exhaust")).toBe(false); // no valid receipt
+    expect(read.unknownEpicIds.has("fn-7-exhaust")).toBe(true); // UNKNOWN, not clean absence
+    // An epic with NO close-finalize events at all is a clean absence (not unknown).
+    expect(
+      loadLatestCloseReceipts(db, new Map(), ["fn-never-closed"]).unknownEpicIds
+        .size,
+    ).toBe(0);
+  });
+});
+
+test("fatal-audit COLD-RESTART: a prior fatal behind 256 unreadable newer events + fresh daemon + cleared row => HELD", async () => {
+  await withSeededDb(async (db) => {
+    const epicId = "fn-80-deep";
+    seedEpicRow(db, epicId, {
+      epic_number: 80,
+      status: "open",
+      tasks: [
+        makeTask({
+          task_id: `${epicId}.1`,
+          epic_id: epicId,
+          worker_phase: "done",
+          runtime_status: "done",
+        }),
+      ],
+    });
+    // The prior fatal, THEN 256 newer UNREADABLE close-finalize events on top of it.
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (100, 'sess', 'PostToolUse', 'post_tool_use', ?, 'close-finalize', ?)`,
+      [fatalHookData({ outcome: "fatal_halt", fatal_reason: "boom" }), epicId],
+    );
+    const insert = db.query(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (?, 'sess', 'PostToolUse', 'post_tool_use', '{ unreadable', 'close-finalize', ?)`,
+    );
+    for (let i = 0; i < 256; i++) insert.run(200 + i, epicId);
+
+    // Fresh daemon: EMPTY memo, no open synthetic row. The durable scan runs PAST all 256
+    // unreadable events to the fatal at the bottom → current-fatal → the close is HELD.
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.currentFatalAuditEpicIds?.has(epicId)).toBe(true);
+    const decision = reconcile(snap, makeState(), 0);
+    expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
+    expect(decision.withholds.get(epicId)?.code).toBe("fatal-audit");
   });
 });
 

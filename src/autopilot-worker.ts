@@ -12132,7 +12132,23 @@ export function deriveResourceHoldObservations(
   return out;
 }
 
-/** Parse one durable close-finalize tool receipt without trusting its shape. The
+/** The EXACT plan close-finalize outcome vocabulary — the five `CloseOutcome` members
+ *  (`plugins/plan/src/verbs/close_finalize.ts::CLOSE_OUTCOMES`). Mirrored here as a local
+ *  const because `src/` must not import the plan plugin; a parity test pins it. ONLY these
+ *  values are a VALID receipt: an unknown / future / typo outcome is UNKNOWN (the durable scan
+ *  passes it, holds if nothing valid is found), never an automatic resolution of a prior
+ *  fatal. */
+export const KNOWN_CLOSE_OUTCOMES: ReadonlySet<string> = new Set([
+  "closed_clean",
+  "closed_with_followup",
+  "fatal_halt",
+  "partial_followup",
+  "followup_blocks_close",
+]);
+
+/** Parse one durable close-finalize tool receipt without trusting its shape. Returns a
+ *  receipt ONLY for an outcome in the exact {@link KNOWN_CLOSE_OUTCOMES} vocabulary — an
+ *  unknown/typo outcome yields null (UNKNOWN → the durable scan advances past it). The
  *  `eventId` (the receipt's own `events.id`) is the monotone watermark the fatal-audit
  *  staleness grade compares against the epic's newest commit-trailer fact; a `fatal_halt`
  *  receipt additionally yields its BOUNDED `fatal_reason` excerpt + `commit_set_hash`. */
@@ -12156,7 +12172,11 @@ export function extractCloseFinalizeReceipt(
     if (receipt == null || typeof receipt !== "object") return null;
     const body = receipt as Record<string, unknown>;
     const outcome = body.outcome;
-    if (typeof outcome !== "string" || outcome.length === 0) return null;
+    // VALID only for the exact plan vocabulary — an unknown/future/typo outcome is UNKNOWN,
+    // never accepted as a nonfatal result that would erase a prior fatal.
+    if (typeof outcome !== "string" || !KNOWN_CLOSE_OUTCOMES.has(outcome)) {
+      return null;
+    }
     const out: CloseReceipt = { outcome, ts };
     if (typeof eventId === "number" && Number.isSafeInteger(eventId)) {
       out.eventId = eventId;
@@ -12174,32 +12194,36 @@ export function extractCloseFinalizeReceipt(
   }
 }
 
-/** A fatal-audit fence read plus its TRUST: `trusted` is false ONLY when a query THREW (a
- *  transient read error), distinguishing it from a clean known-absence (a null row / a
- *  malformed-but-stable receipt). An untrusted read arms a bounded producer retry so the
- *  operator-free unjam is never stranded on a quiescent DB. */
+/** A fatal-audit fence read plus its grades. `trusted` is false ONLY when a query THREW / could
+ *  not be PREPARED (a transient read error) — the caller arms a bounded degraded wake.
+ *  `unknownEpicIds` is the EXHAUSTED grade: an epic that HAS close-finalize events but yielded NO
+ *  valid receipt (all unreadable / non-vocabulary, or the scan cap truncated), distinguished
+ *  from a CLEAN ABSENCE (no close-finalize events at all). An unknown epic is fenced
+ *  conservatively (a corrupt fatal history must never fail-open into a relaunch). */
 export interface CloseReceiptRead {
   receipts: Map<string, CloseReceipt>;
   trusted: boolean;
+  unknownEpicIds: Set<string>;
 }
 
-/** Chunk size + hard cap for the durable receipt scan. Most epics resolve on the first row of
- *  the first chunk (a valid receipt); only a pathological run of invalid events scans deeper.
- *  Exhausting the cap without a valid receipt resolves to UNKNOWN (no receipt) — HELD by the
- *  other fence arms, NEVER fail-open. */
+/** Chunk size for the durable receipt scan (most epics resolve on the first row) + a large
+ *  pathological-safety cap. The scan runs to HISTORY END for any realistic epic (a handful of
+ *  close attempts), so the LOCKED cold case — a fatal beyond hundreds of unreadable newer
+ *  events — is FOUND, not lost; only a genuinely unbounded corrupt history hits the cap, which
+ *  resolves to UNKNOWN (conservative HOLD), NEVER clean absence. */
 const DURABLE_RECEIPT_SCAN_CHUNK = 16;
-const DURABLE_RECEIPT_SCAN_CAP = 256;
+const DURABLE_RECEIPT_SCAN_CAP = 4096;
 
 /**
  * Join each close target to its most-recent VALID close-finalize receipt — DURABLE. The scan
- * advances DESC past ANY event that does NOT yield a valid parsed receipt (a real `outcome`):
- * a relocated/null blob, a JSON parse error, a missing/empty `stdout`, a `{success:false}`
- * failed-close-attempt, or a missing `outcome` are ALL UNKNOWN and NEVER erase a prior
- * standing fatal verdict. It stops ONLY on a valid receipt — a `fatal_halt` fences the epic,
- * a real non-fatal outcome (`closed_clean`, …) definitively supersedes. A bounded chunked scan
- * to the first valid receipt / history end / hard cap; cap exhaustion resolves conservatively
- * to UNKNOWN (never fail-open). A QUERY THROW marks the read UNTRUSTED so the caller arms a
- * retry.
+ * advances DESC past ANY event that does NOT yield a valid parsed receipt (a KNOWN-vocabulary
+ * `outcome`): a relocated/null blob, a JSON parse error, a missing/empty `stdout`, a
+ * `{success:false}` failed attempt, a missing outcome, or an unknown/typo outcome are ALL
+ * UNKNOWN and NEVER erase a prior standing fatal. It stops ONLY on a valid receipt — a
+ * `fatal_halt` fences the epic, a real non-fatal outcome supersedes. Runs to HISTORY END (a
+ * hard cap only bounds a pathologically corrupt history). An epic with events but NO valid
+ * receipt (exhausted / cap-truncated) is graded UNKNOWN (`unknownEpicIds`) for a conservative
+ * HOLD — never clean absence. A THROW (query or PREPARE) marks the read UNTRUSTED.
  */
 export function loadLatestCloseReceipts(
   db: Parameters<typeof runQuery>[0],
@@ -12224,43 +12248,56 @@ export function loadLatestCloseReceipts(
       if (epicId != null && epicId !== "") epicIds.add(epicId);
     }
   }
-  const stmt = db.query(
-    `SELECT id, ts, data
-       FROM events
-      WHERE plan_target = ? AND plan_op = 'close-finalize'
-      ORDER BY id DESC LIMIT ? OFFSET ?`,
-  );
   const receipts = new Map<string, CloseReceipt>();
+  const unknownEpicIds = new Set<string>();
+  // RIDER: the PREPARE rides the trust catch too — a construction throw must return
+  // UNTRUSTED (arming the degraded wake), never escape the reconciler.
+  let stmt: ReturnType<typeof db.query>;
+  try {
+    stmt = db.query(
+      `SELECT id, ts, data
+         FROM events
+        WHERE plan_target = ? AND plan_op = 'close-finalize'
+        ORDER BY id DESC LIMIT ? OFFSET ?`,
+    );
+  } catch {
+    return { receipts, trusted: false, unknownEpicIds };
+  }
   let trusted = true;
   for (const epicId of [...epicIds].sort()) {
     try {
       let offset = 0;
       let found = false;
+      let sawEvent = false;
       while (offset < DURABLE_RECEIPT_SCAN_CAP && !found) {
         const rows = stmt.all(epicId, DURABLE_RECEIPT_SCAN_CHUNK, offset) as {
           id: number;
           ts: number;
           data: string | null;
         }[];
-        if (rows.length === 0) break; // history exhausted → UNKNOWN
+        if (rows.length === 0) break; // history end (no more events)
         for (const row of rows) {
+          sawEvent = true;
           const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
           if (receipt != null) {
             receipts.set(epicId, receipt); // first VALID receipt → definitive, stop
             found = true;
             break;
           }
-          // else advance PAST this invalid event (unparseable / no outcome / failed attempt)
+          // else advance PAST this invalid event (unparseable / no or unknown outcome / failed)
         }
-        if (rows.length < DURABLE_RECEIPT_SCAN_CHUNK) break; // history end
+        if (found || rows.length < DURABLE_RECEIPT_SCAN_CHUNK) break; // history end
         offset += DURABLE_RECEIPT_SCAN_CHUNK;
       }
+      // Events existed but NONE yielded a valid receipt (all unreadable, or the cap truncated a
+      // pathological history) → EXHAUSTED/UNKNOWN, NOT clean absence → conservative HOLD.
+      if (!found && sawEvent) unknownEpicIds.add(epicId);
     } catch {
       // A transient read error is UNTRUSTED (not a known-absence) → arm a retry.
       trusted = false;
     }
   }
-  return { receipts, trusted };
+  return { receipts, trusted, unknownEpicIds };
 }
 
 /**
@@ -13348,6 +13385,19 @@ export async function loadReconcileSnapshot(
         receipt?.fatalReason ?? boundFatalAuditExcerpt(null),
       );
     }
+  }
+  // EXHAUSTED-UNKNOWN grade (defect: scan exhaustion must NEVER be clean absence): an OPEN epic
+  // whose close-finalize history exists but yielded no valid receipt is fenced conservatively —
+  // folded into the current-fatal set (only if not already there and NOT positively done) with
+  // a distinct excerpt, so it HOLDS + mints a VISIBLE, retry_dispatch-clearable row instead of
+  // fail-opening into a relaunch. A later valid receipt or the operator's retry reclassifies it.
+  for (const epicId of closeReceiptRead.unknownEpicIds) {
+    if (!openEpicIdSet.has(epicId)) continue;
+    if (currentFatalAuditEpicIds.has(epicId)) continue;
+    currentFatalAuditEpicIds.set(
+      epicId,
+      "close-audit history unreadable — the fatal verdict cannot be confirmed; retry_dispatch to re-audit",
+    );
   }
   // Positive resolution evidence for each OPEN fatal-audit row OR consumed-memo rehold episode
   // (graded even WITHOUT an open row, so a consumed episode can release). UNKNOWN (receipt read
