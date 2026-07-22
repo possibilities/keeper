@@ -248,15 +248,18 @@ import {
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
   commitWorkLockPath as gitCommitWorkLockPath,
   currentBranch as gitCurrentBranch,
+  currentBranchResult as gitCurrentBranchResult,
   deleteBranch as gitDeleteBranch,
   ensureWorktree as gitEnsureWorktree,
   ensureWorktreeDepLink as gitEnsureWorktreeDepLink,
+  ensureWorktreeResult as gitEnsureWorktreeResult,
   enumerateEpicLaneBranches as gitEnumerateEpicLaneBranches,
   isAncestorOf as gitIsAncestorOf,
   laneDirtSnapshotId as gitLaneDirtSnapshotId,
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
+  listWorktreesResult as gitListWorktreesResult,
   losslessPremergeClean as gitLosslessPremergeClean,
   measureBaseDrift as gitMeasureBaseDrift,
   mergeBranchInto as gitMergeBranchInto,
@@ -6342,16 +6345,18 @@ export async function runReconcileCycle(
   // Pre-close fan-in — a REAL producer-side assembly, not provision readiness alone.
   // A serial-primary close hosts NO worker in the non-close-host groups' lanes, so the
   // PRODUCER integrates every clean rib into each group's base HERE (under the shared
-  // lock/readiness discipline), then positively re-probes ancestry, BEFORE the close
-  // may launch. Otherwise the close launches AHEAD of the fan-in it depends on — its
-  // ancestry gate aborts on the unmerged rib and the typed-error closer keeps occupying
-  // its slot (an autonomous wedge). Outcomes: `assembled` clears the close;
-  // `defer` (transient/not-ready) SUPPRESSES this cycle's close with NO sticky (retry
-  // next cycle, bounded log); a GENUINE content `conflict` routes through the EXISTING
-  // `worktree-merge-conflict` incident machinery on the bare `close::<epic>` key (owner
-  // re-dispatch resolves it — reconcile then drops the sink from this pass, so the
-  // owner-close is never re-suppressed) and suppresses this cycle; a STRUCTURAL `failed`
-  // mints a visible sticky. Gated not-paused like refreshBase/finalize.
+  // lock/readiness discipline), then positively re-probes ancestry BEFORE the close may
+  // land. A NON-incident close is SUPPRESSED until its base is assembled (never launched
+  // into an ancestry abort). An incident-OWNER close (re-dispatched to claim + resolve
+  // its fan-in conflict) is NEVER suppressed — the producer keeps assembling its
+  // remaining CLEAN ribs across cycles (ITERATIVE re-entry) and re-points the incident
+  // at the CURRENT conflicting rib, so a one-source resolution progresses to the next
+  // rib instead of the ancestry gate wedging until epic-landed. Outcomes: `assembled`
+  // clears the close; `defer` (transient/not-ready) is a NO-sticky retry (bounded log);
+  // a GENUINE content `conflict` mints/re-points the `worktree-merge-conflict` incident
+  // on the bare `close::<epic>` key (the fold preserves its attach/paging markers across
+  // re-emits); a STRUCTURAL `failed` mints a visible sticky (skipped for an owner, whose
+  // live incident row must not be clobbered). Gated not-paused like refreshBase/finalize.
   const preCloseProvisionBlocked = new Set<string>();
   if (deps.worktree !== undefined && !state.paused) {
     for (const sink of decision.worktreePreCloseProvision) {
@@ -6362,13 +6367,20 @@ export async function runReconcileCycle(
       if (preCloseProvisionBlocked.has(epicId)) {
         continue; // this epic's close is already suppressed — skip its siblings
       }
+      const isIncidentOwner = decision.preCloseIncidentOwnerEpicIds.has(epicId);
+      // Suppress ONLY a non-incident-owner close: the owner MUST launch to resolve.
+      const suppressUnlessOwner = (): void => {
+        if (!isIncidentOwner) {
+          preCloseProvisionBlocked.add(epicId);
+        }
+      };
       const hold = probeLaneMaintenance(laneMaintenanceProbe, {
         path: sink.assignment.worktreePath,
         epicId,
         taskId: null,
       });
       if (hold.kind === "defer") {
-        preCloseProvisionBlocked.add(epicId);
+        suppressUnlessOwner();
         logLaneMaintenanceDeferralOnce(
           "worktree-preclose-provision-deferred",
           sink.assignment.worktreePath,
@@ -6385,9 +6397,9 @@ export async function runReconcileCycle(
         case "assembled":
           break; // this group's base is fanned in — its close may launch
         case "defer":
-          // A transient / not-ready fan-in — SUPPRESS this cycle's close, mint NO
-          // sticky, retry next cycle (bounded log).
-          preCloseProvisionBlocked.add(epicId);
+          // A transient / not-ready fan-in — mint NO sticky, retry next cycle
+          // (bounded log). Suppresses a non-owner; an owner keeps re-entering.
+          suppressUnlessOwner();
           logLaneMaintenanceDeferralOnce(
             "worktree-preclose-provision-deferred",
             sink.assignment.worktreePath,
@@ -6396,14 +6408,13 @@ export async function runReconcileCycle(
           );
           break;
         case "conflict":
-          // A GENUINE content conflict — mint/route the `worktree-merge-conflict`
+          // A GENUINE content conflict — mint/re-point the `worktree-merge-conflict`
           // incident on the BARE `close::<epic>` key (leading-token → merge-escalation
-          // routing, the same reason the fan-in resolver parses) and SUPPRESS this
-          // cycle. The merge-escalation sweep re-dispatches the close to own + resolve
-          // it; reconcile drops this epic's sink from worktreePreCloseProvision while
-          // the incident is owner-routed, so the owner-close is never re-suppressed —
-          // never a silent eternal retry.
-          preCloseProvisionBlocked.add(epicId);
+          // routing, the same reason the fan-in resolver parses; the fold preserves the
+          // attach/paging markers across this re-emit). A non-owner is suppressed until
+          // the merge-escalation sweep re-dispatches it as the owner; an owner keeps
+          // launching to resolve THIS rib, then the producer re-enters for the next.
+          suppressUnlessOwner();
           deps.emitDispatchFailed({
             verb: "close",
             id: epicId,
@@ -6414,17 +6425,26 @@ export async function runReconcileCycle(
           });
           break;
         case "failed":
-          // A STRUCTURAL provision failure — a visible operator sticky (close-plain),
-          // never a silent retry. SUPPRESS this cycle's launch.
-          preCloseProvisionBlocked.add(epicId);
-          deps.emitDispatchFailed({
-            verb: "close",
-            id: epicId,
-            reason: assembled.reason,
-            dir: sink.repoDir,
-            conflictedFiles: null,
-            ts: deps.now(),
-          });
+          // A STRUCTURAL provision failure. For a non-owner → a visible operator sticky
+          // (close-plain) + suppress. For an OWNER → do NOT mint a competing close-plain
+          // row (it would clobber the live merge-escalation incident on the same key)
+          // and do NOT suppress the resolver; log it and let recover/the operator own
+          // the broken base (the owner-close's own ancestry gate re-defers meanwhile).
+          if (isIncidentOwner) {
+            console.error(
+              `[autopilot-worker] pre-close assemble close::${epicId}: ${assembled.reason} (incident owner — not clobbering the live incident row)`,
+            );
+          } else {
+            preCloseProvisionBlocked.add(epicId);
+            deps.emitDispatchFailed({
+              verb: "close",
+              id: epicId,
+              reason: assembled.reason,
+              dir: sink.repoDir,
+              conflictedFiles: null,
+              ts: deps.now(),
+            });
+          }
           break;
         default:
           assertNever(assembled);
@@ -7240,6 +7260,7 @@ export function createWorktreeDriver(
             return { ok: true };
           case "conflict":
           case "abort-failed":
+          case "merge-failed":
             return retry(
               `worktree-base-refresh-${merge.kind}: default drift into ${baseBranch} deferred — ${merge.stderr}`,
             );
@@ -7396,12 +7417,44 @@ export function createWorktreeDriver(
           parentBranch === branch
             ? await gitResolveDefaultBranch(repoDir, run)
             : parentBranch;
-        await gitEnsureWorktree(repoDir, worktreePath, branch, forkSource, run);
+        // Structural preflight, TRI-STATED: a transient git wedge (a 124 SIGKILL) in
+        // the ensure / registration / HEAD reads DEFERS with no row; only a genuine
+        // structural miss is a VISIBLE `failed`. The plain reads collapse a timeout to
+        // []/"" — which would mint a PERMANENT close sticky for a transient stall.
+        const ensured = await gitEnsureWorktreeResult(
+          repoDir,
+          worktreePath,
+          branch,
+          forkSource,
+          run,
+        );
+        if (ensured.kind === "timeout") {
+          return {
+            kind: "defer",
+            reason: `worktree-preclose-ensure-timeout: git wedged ensuring ${worktreePath} on ${branch} — deferring the pre-close fan-in`,
+          };
+        }
+        if (ensured.kind === "error") {
+          return {
+            kind: "failed",
+            reason: `worktree-assemble-failed: ${ensured.detail}`,
+          };
+        }
         await gitEnsureWorktreeDepLink(repoDir, worktreePath);
-        // Assert the sink is a registered worktree on the derived base branch BEFORE
-        // any merge — a structural miss here is a visible `failed`, never a defer.
-        const registered = await gitListWorktrees(repoDir, run);
-        const entry = registered.find(
+        const registered = await gitListWorktreesResult(repoDir, run);
+        if (registered.kind === "timeout") {
+          return {
+            kind: "defer",
+            reason: `worktree-preclose-list-timeout: git wedged listing ${repoDir} worktrees — deferring the pre-close fan-in`,
+          };
+        }
+        if (registered.kind === "error") {
+          return {
+            kind: "failed",
+            reason: `worktree-list-failed: ${repoDir} — ${registered.detail}`,
+          };
+        }
+        const entry = registered.value.find(
           (e) =>
             stripTrailingSlashPath(e.path) ===
             stripTrailingSlashPath(worktreePath),
@@ -7412,11 +7465,23 @@ export function createWorktreeDriver(
             reason: `worktree-unregistered: ${worktreePath} is not a registered worktree`,
           };
         }
-        const head = await gitCurrentBranch(worktreePath, run);
-        if (head !== branch) {
+        const headRes = await gitCurrentBranchResult(worktreePath, run);
+        if (headRes.kind === "timeout") {
+          return {
+            kind: "defer",
+            reason: `worktree-preclose-head-timeout: git wedged reading ${worktreePath} HEAD — deferring the pre-close fan-in`,
+          };
+        }
+        if (headRes.kind === "error") {
           return {
             kind: "failed",
-            reason: `worktree-head-mismatch: ${worktreePath} HEAD is ${head}, expected ${branch}`,
+            reason: `worktree-head-read-failed: ${worktreePath} — ${headRes.detail}`,
+          };
+        }
+        if (headRes.value !== branch) {
+          return {
+            kind: "failed",
+            reason: `worktree-head-mismatch: ${worktreePath} HEAD is ${headRes.value}, expected ${branch}`,
           };
         }
         // INTEGRATE every clean rib into the base under the commit-work lock — the
@@ -7476,6 +7541,13 @@ export function createWorktreeDriver(
               return {
                 kind: "failed",
                 reason: `worktree-preclose-abort-failed: the guarded git merge --abort left ${worktreePath} mid-merge while merging ${source} into ${branch} — ${merge.stderr}`,
+              };
+            case "merge-failed":
+              // A non-content STRUCTURAL merge failure (no merge in flight) — a
+              // visible failure, NOT the content-conflict resolver path.
+              return {
+                kind: "failed",
+                reason: `worktree-preclose-merge-failed: merging ${source} into ${branch} in ${worktreePath} left no merge in flight (a non-content structural failure) — ${merge.stderr}`,
               };
             case "lock-timeout":
             case "local-timeout":

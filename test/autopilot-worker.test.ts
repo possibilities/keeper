@@ -10026,7 +10026,7 @@ test("fn-16c reconcile: a single-repo `ok` close keeps its base lane and has no 
   expect(decision.worktreePreCloseProvision).toEqual([]);
 });
 
-test("fn-16d reconcile: a close that ROUTES a merge-escalation incident is EXCLUDED from worktreePreCloseProvision (no deadlock — the owner-close resolves the conflict itself)", () => {
+test("fn-16e reconcile: an incident-owner close STAYS in worktreePreCloseProvision and is TAGGED for iterative re-entry (producer keeps assembling remaining ribs, resolver never re-suppressed)", () => {
   const epic = closeReadyPrimarylessEpic();
   const snap = makeSnapshot({
     epics: [epic],
@@ -10044,11 +10044,26 @@ test("fn-16d reconcile: a close that ROUTES a merge-escalation incident is EXCLU
     failedKeys: new Set<DispatchKey>(["close::fn-1-anchor"]),
   });
   const decision = reconcile(snap, makeState(), 0);
-  // The close still LAUNCHES (the incident forces it, bypassing the failed-key gate)...
+  // The close LAUNCHES (the incident forces it, bypassing the failed-key gate)...
   expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
-  // ...but its non-close-host groups are NOT pre-close-provisioned — re-assembling
-  // would re-mint the conflict and re-suppress the very launch that must resolve it.
-  expect(decision.worktreePreCloseProvision).toEqual([]);
+  // ...and its groups STAY in the fan-in set (a blanket bypass would strand later
+  // ribs and wedge the ancestry gate) — the producer keeps assembling them...
+  expect(
+    decision.worktreePreCloseProvision.map((s) => s.repoDir).sort(),
+  ).toEqual(["/repo-a", "/repo-b"]);
+  // ...tagged as an incident owner so the pre-close pass launches it WITHOUT
+  // re-suppressing the active resolver (iterative re-entry).
+  expect(decision.preCloseIncidentOwnerEpicIds.has("fn-1-anchor")).toBe(true);
+});
+
+test("fn-16e reconcile: a NON-incident clustered close is NOT tagged (preCloseIncidentOwnerEpicIds empty) so its base assembly still gates the launch", () => {
+  const epic = closeReadyPrimarylessEpic();
+  const decision = reconcile(multiRepoSnap([epic], abcResolve), makeState(), 0);
+  expect(decision.launches.find((l) => l.verb === "close")).toBeDefined();
+  expect(
+    decision.worktreePreCloseProvision.map((s) => s.repoDir).sort(),
+  ).toEqual(["/repo-a", "/repo-b"]);
+  expect(decision.preCloseIncidentOwnerEpicIds.size).toBe(0);
 });
 
 test("fn-16c runReconcileCycle: a pre-close assembly DEFER SUPPRESSES that cycle's close — no close launch, NO sticky (retry next cycle)", async () => {
@@ -10131,6 +10146,210 @@ test("fn-16c runReconcileCycle: a pre-close assembly SUCCESS → the serial-prim
     (l) => l.name === "close::fn-1-anchor",
   );
   expect(closeLaunch).toBeDefined();
+});
+
+// ITERATIVE multi-rib resolution. assembleBase stops at the FIRST conflicting rib (to
+// route the incident); the PRODUCER must re-enter across cycles so the remaining ribs
+// still get assembled once the resolver settles the named one, and must NEVER
+// re-suppress the active owner-close.
+
+/** A production-shaped runner over TWO ribs: `rib1` conflicts until `state.resolved`
+ * (the out-of-band merge-resolver settling it), `rib2` is clean. Ribs merged into the
+ * base accumulate in `inBase` so a subsequent pass reads them as ancestors. */
+function makeTwoRibAssembleRun(state: { resolved: boolean }): {
+  run: Parameters<typeof createWorktreeDriver>[0];
+  cmds: string[];
+} {
+  const rib1 = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const base = "keeper/epic/fn-1-foo";
+  const cmds: string[] = [];
+  const inBase = new Set<string>();
+  let added = false;
+  let midMerge = false;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.includes("MERGE_HEAD")) {
+      return midMerge
+        ? { code: 0, stdout: "deadbeef\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.includes("^{commit}")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      const src = args[args.length - 2] ?? "";
+      const isIn = inBase.has(src) || (src === rib1 && state.resolved);
+      return { code: isIn ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (joined === "merge --abort") {
+      midMerge = false;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "merge") {
+      const src = args[args.length - 1] ?? "";
+      if (src === rib1 && !state.resolved) {
+        midMerge = true;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+        };
+      }
+      inBase.add(src);
+      return { code: 0, stdout: "Merge made\n", stderr: "" };
+    }
+    if (joined.startsWith("diff --name-only")) {
+      return { code: 0, stdout: "src/x.ts\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: `${base}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, cmds };
+}
+
+function makeTwoRibSinkInfo(): WorktreeLaunchInfo {
+  const rib1 = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const rib2 = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const base = "keeper/epic/fn-1-foo";
+  return {
+    assignment: {
+      nodeId: "fn-1-foo.close",
+      isCloseSink: true,
+      branch: base,
+      worktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+      inherited: true,
+      preMerges: [rib1, rib2],
+      assertBranch: base,
+    },
+    baseBranch: base,
+    baseWorktreePath: "/repo.worktrees/keeper-epic-fn-1-foo",
+    repoDir: "/repo",
+    laneOrder: [
+      { nodeId: "fn-1-foo.1", branch: rib1, worktreePath: "/w1" },
+      { nodeId: "fn-1-foo.2", branch: rib2, worktreePath: "/w2" },
+      { nodeId: "fn-1-foo.close", branch: base, worktreePath: "/wc" },
+    ],
+    parentBranch: base,
+  };
+}
+
+test("fn-16e createWorktreeDriver: assembleBase stops at the FIRST conflicting rib, then a SUBSEQUENT pass (after the resolver settles it) assembles the SECOND rib and returns assembled", async () => {
+  const state = { resolved: false };
+  const { run, cmds } = makeTwoRibAssembleRun(state);
+  const driver = createWorktreeDriver(run, () => ({ release() {} }));
+  // Pass 1: rib1 conflicts → returns conflict on rib1; rib2 is NOT attempted yet.
+  const first = await driver.assembleBase(makeTwoRibSinkInfo(), null);
+  expect(first.kind).toBe("conflict");
+  expect(first.kind === "conflict" && first.sourceBranch).toBe(
+    "keeper/epic/fn-1-foo--fn-1-foo.1",
+  );
+  expect(
+    cmds.some((c) => c === "merge --no-edit keeper/epic/fn-1-foo--fn-1-foo.2"),
+  ).toBe(false);
+  // The merge-resolver settles rib1 out-of-band (now an ancestor of the base).
+  state.resolved = true;
+  // Pass 2: rib1 skips (already-merged), rib2 is ASSEMBLED, ancestry passes → assembled.
+  const second = await driver.assembleBase(makeTwoRibSinkInfo(), null);
+  expect(second).toEqual({ kind: "assembled" });
+  expect(cmds).toContain("merge --no-edit keeper/epic/fn-1-foo--fn-1-foo.2");
+});
+
+/** A close-ready primaryless epic whose close ROUTES an open merge-escalation incident. */
+function incidentOwnerCloseSnap(): ReconcileSnapshot {
+  const epic = closeReadyPrimarylessEpic();
+  return makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abcResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    incidentOwnerKeys: new Set<DispatchKey>(["close::fn-1-anchor"]),
+    failedKeys: new Set<DispatchKey>(["close::fn-1-anchor"]),
+  });
+}
+
+test("fn-16e runReconcileCycle: an incident-owner close STILL conflicting is NOT re-suppressed — it LAUNCHES to resolve, and the incident is re-pointed (producer re-entry)", async () => {
+  const { driver } = makeFakeWorktreeDriver({
+    assembleConflict: (info) =>
+      info.repoDir === "/repo-a"
+        ? {
+            sourceBranch: "keeper/epic/fn-1-anchor--fn-1-anchor.1",
+            baseBranch: "keeper/epic/fn-1-anchor",
+            laneDir: "/repo-a.worktrees/keeper-epic-fn-1-anchor",
+            conflictedFiles: ["src/x.ts"],
+            stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+          }
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    reconcile(incidentOwnerCloseSnap(), makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The owner-close LAUNCHES despite the still-unresolved conflict (never re-suppressed).
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeDefined();
+  // ...and the incident is re-pointed at the current conflicting rib.
+  const incident = depsLog.emissions.find(
+    (e) => e.verb === "close" && e.id === "fn-1-anchor",
+  );
+  expect(incident?.reason.startsWith("worktree-merge-conflict:")).toBe(true);
+});
+
+test("fn-16e runReconcileCycle: an incident-owner close whose remaining ribs now ASSEMBLE launches to land (no new sticky)", async () => {
+  const { driver } = makeFakeWorktreeDriver(); // assembleBase → assembled
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    reconcile(incidentOwnerCloseSnap(), makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeDefined();
+  // No fresh sticky minted this cycle — the base is assembled; the open incident clears
+  // on epic-landed, not here.
+  expect(
+    depsLog.emissions.find((e) => e.verb === "close" && e.id === "fn-1-anchor"),
+  ).toBeUndefined();
 });
 
 // 28b — the TRI-STATE lane epoch + FRESH-EPOCH re-cut. A re-opened worktree group
@@ -12116,6 +12335,9 @@ function makeBaseRefreshGitRun(
   } = {},
 ): { run: GitRunner; commands: string[][] } {
   const commands: string[][] = [];
+  // A conflicting merge leaves a MERGE_HEAD in flight until aborted — the
+  // authoritative content-conflict signal `mergeBranchInto` reads.
+  let midMerge = false;
   const run: GitRunner = async (args) => {
     commands.push([...args]);
     const command = args.join(" ");
@@ -12134,7 +12356,7 @@ function makeBaseRefreshGitRun(
       return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
     }
     if (command === "rev-parse --verify --quiet MERGE_HEAD") {
-      return opts.mergeHead
+      return opts.mergeHead || midMerge
         ? { code: 0, stdout: "merge-head\n", stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
     }
@@ -12158,14 +12380,15 @@ function makeBaseRefreshGitRun(
       return { code: 0, stdout: "src/conflict.ts\n", stderr: "" };
     }
     if (command === "merge --abort") {
+      midMerge = false;
       return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "merge") {
-      return {
-        code: opts.mergeCode ?? 0,
-        stdout: opts.mergeCode ? "" : "merged\n",
-        stderr: opts.mergeCode ? "CONFLICT" : "",
-      };
+      if (opts.mergeCode) {
+        midMerge = true; // a content conflict leaves a MERGE_HEAD until aborted
+        return { code: opts.mergeCode, stdout: "", stderr: "CONFLICT" };
+      }
+      return { code: 0, stdout: "merged\n", stderr: "" };
     }
     // Pseudo-ref probes: no merge/rebase operation is in flight.
     if (args[0] === "rev-parse") return { code: 1, stdout: "", stderr: "" };
@@ -14498,6 +14721,124 @@ test("fn-16d createWorktreeDriver: assembleBase defers a lost commit-work lock (
   );
   expect(res.kind).toBe("defer");
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("fn-16e createWorktreeDriver: assembleBase DEFERS a transient HEAD-read timeout (124) — no permanent structural sticky", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  let added = false;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 124, stdout: "", stderr: "" }; // SIGKILLed read → transient
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeAssembleSinkInfo(source), null);
+  expect(res.kind).toBe("defer"); // NOT a `failed` structural sticky
+});
+
+test("fn-16e createWorktreeDriver: assembleBase DEFERS a transient worktree-add timeout (124) in ensure — no permanent structural sticky", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return { code: 0, stdout: "", stderr: "" }; // not yet added → ensure runs add
+    }
+    if (joined.startsWith("worktree add")) {
+      return { code: 124, stdout: "", stderr: "" }; // SIGKILLed add → transient
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeAssembleSinkInfo(source), null);
+  expect(res.kind).toBe("defer"); // NOT a `failed` structural sticky
+});
+
+test("fn-16e createWorktreeDriver: assembleBase maps a NON-content merge failure (no MERGE_HEAD) to a structural failed, never a conflict incident", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.1";
+  let added = false;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined.includes("MERGE_HEAD")) {
+      return { code: 1, stdout: "", stderr: "" }; // NO merge ever in flight
+    }
+    if (joined.startsWith("status --porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.includes("^{commit}")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 1, stdout: "", stderr: "" }; // rib not yet an ancestor
+    }
+    if (args[0] === "merge") {
+      return {
+        code: 128,
+        stdout: "",
+        stderr: "fatal: refusing to merge (hook)",
+      };
+    }
+    if (joined.startsWith("worktree add")) {
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return added
+        ? {
+            code: 0,
+            stdout:
+              "worktree /repo.worktrees/keeper-epic-fn-1-foo\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1-foo\n\n",
+            stderr: "",
+          }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --abbrev-ref HEAD")) {
+      return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (joined.startsWith("rev-parse --verify --quiet refs/heads")) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).assembleBase(makeAssembleSinkInfo(source), null);
+  expect(res.kind).toBe("failed");
+  expect(res.kind === "failed" && res.reason).toContain(
+    "worktree-preclose-merge-failed",
+  );
 });
 
 test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the default branch", async () => {

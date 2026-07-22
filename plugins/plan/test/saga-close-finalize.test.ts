@@ -3151,4 +3151,35 @@ describe("integrateEpicBases state-derived owner integration (16d)", () => {
     expect(result.code).toBeNull(); // clean no-op — never demanded identity
     expect(result.stdout).toBe("");
   });
+
+  test("FAIL CLOSED: a show-toplevel exit 128 with a repo-shaped fatal stderr DEFERS (no close, no integration) — UNKNOWN is not absent", () => {
+    // git exits 128 for dubious ownership / corruption / bad config too, not just a
+    // genuine non-repo, so grading the base absent and closing WITHOUT integrating it
+    // is unsafe. A nonzero/unresolved toplevel must DEFER, never silently skip.
+    const repoRoot = getRepo();
+    const deps: TrunkIntegrationDeps = {
+      git: (args) => {
+        if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+          return gitFail(
+            128,
+            "fatal: detected dubious ownership in repository at '" +
+              repoRoot +
+              "'",
+          );
+        }
+        throw new Error(`unexpected git call: ${args.join(" ")}`);
+      },
+      acquireLock: () => ({ release: () => {} }),
+      requestLease: () => {
+        throw new Error("requestLease must not fire on a deferred close");
+      },
+      releaseLease: () => true,
+      readLeaseLeaf: () => null,
+    };
+    const result = runTrunkVerb(() =>
+      integrateEpicBases(TRUNK_EPIC_ID, repoRoot, null, "json", deps),
+    );
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain("TRUNK_INTEGRATION_DEFERRED");
+  });
 });

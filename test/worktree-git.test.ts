@@ -1256,11 +1256,11 @@ test("mergeBranchInto: conflict with MERGE_HEAD → abort, conflict, lock releas
   ]);
 });
 
-test("mergeBranchInto: merge fails with NO MERGE_HEAD → no spurious abort", async () => {
+test("mergeBranchInto: a non-content merge failure (exit 128, NO MERGE_HEAD) → structural merge-failed, never a content conflict, no spurious abort", async () => {
   const { run, calls } = fakeAsyncGit([
     {
-      // Source resolves — the genuine no-MERGE_HEAD conflict path stays covered
-      // (this is NOT classified as `missing-source`).
+      // Source resolves — this is NOT `missing-source`; the merge STARTS and fails
+      // structurally (never creating a MERGE_HEAD).
       when: (a) =>
         argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
         a.some((t) => t.endsWith("^{commit}")),
@@ -1281,11 +1281,15 @@ test("mergeBranchInto: merge fails with NO MERGE_HEAD → no spurious abort", as
     },
     {
       when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
-      result: { exitCode: 1 }, // no MERGE_HEAD
+      result: { exitCode: 1 }, // no MERGE_HEAD — the merge never entered a merge state
     },
   ]);
   const res = await mergeBranchInto("/wt", "src", run, recordingLock().acquire);
-  expect(res.kind).toBe("conflict");
+  // No merge in flight → a STRUCTURAL failure, NOT the content-conflict resolver path.
+  expect(res.kind).toBe("merge-failed");
+  expect(res.kind === "merge-failed" && res.stderr).toContain(
+    "not something we can merge",
+  );
   expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
     false,
   );

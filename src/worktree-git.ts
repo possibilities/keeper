@@ -105,11 +105,22 @@ export type MergeResult =
    */
   | { kind: "missing-source" }
   /**
-   * The merge hit a conflict and was ABORTED (`git merge --abort` ran iff a
-   * `MERGE_HEAD` was present). The caller fails loud + stops; `stderr` carries
-   * git's conflict output for the sticky DispatchFailed.
+   * The merge hit a genuine CONTENT conflict — a merge WAS in flight (a `MERGE_HEAD`
+   * was present) and `git merge --abort` cleared it cleanly. The caller routes it to
+   * the fan-in resolver incident; `stderr` carries git's conflict output and
+   * `conflictedFiles` the unmerged paths (best-effort — a timed-out probe leaves it
+   * empty, but the merge-state is the authoritative content-conflict signal).
    */
   | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
+  /**
+   * `git merge --no-edit` returned non-zero but left NO merge in flight (no
+   * `MERGE_HEAD`) — the merge NEVER STARTED. This is a STRUCTURAL, non-content
+   * failure (a pre-merge hook rejection, a bad/dubious config, an identity or index
+   * failure, an "untracked working tree files would be overwritten" abort), NOT a
+   * content conflict, so the caller mints a VISIBLE structural failure rather than
+   * routing it into the content-conflict resolver path. `stderr` carries git's output.
+   */
+  | { kind: "merge-failed"; stderr: string }
   /**
    * The bounded {@link LockAcquirer} could not take the per-worktree commit-work
    * flock within its deadline — another holder (a concurrent commit-work or a
@@ -1838,6 +1849,113 @@ export async function ensureWorktree(
   }
 }
 
+/**
+ * A TRI-STATE git read for a structural preflight (the pre-close assembly's ensure /
+ * registration / HEAD checks): a clean value, a TRANSIENT timeout (a 124 SIGKILL —
+ * the caller DEFERS with no row), or a genuine structural error (the caller mints a
+ * VISIBLE failure). The plain {@link listWorktrees} / {@link currentBranch} collapse
+ * BOTH failure classes into `[]` / `""`, so a transient git wedge would mint a
+ * PERMANENT sticky; these variants keep the two apart. Bounded by
+ * {@link GIT_LOCAL_TIMEOUT_MS}.
+ */
+export type GitReadOutcome<T> =
+  | { kind: "ok"; value: T }
+  | { kind: "timeout" }
+  | { kind: "error"; detail: string };
+
+/** {@link listWorktrees}, tri-stated — a 124 SIGKILL is `timeout`, any other
+ * non-zero is a structural `error`, else the parsed entries. */
+export async function listWorktreesResult(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<GitReadOutcome<WorktreeEntry[]>> {
+  const r = await run(["worktree", "list", "--porcelain"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (r.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+  if (r.code !== 0) {
+    return {
+      kind: "error",
+      detail:
+        (r.stdout + r.stderr).trim() || `git worktree list exited ${r.code}`,
+    };
+  }
+  return { kind: "ok", value: parseWorktreeList(r.stdout) };
+}
+
+/** {@link currentBranch}, tri-stated — a 124 SIGKILL is `timeout`, any other
+ * non-zero is a structural `error`, else the abbreviated HEAD branch. */
+export async function currentBranchResult(
+  cwd: string,
+  run: GitRunner = gitExec,
+): Promise<GitReadOutcome<string>> {
+  const r = await run(["rev-parse", "--abbrev-ref", "HEAD"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (r.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+  if (r.code !== 0) {
+    return {
+      kind: "error",
+      detail: (r.stdout + r.stderr).trim() || `git rev-parse exited ${r.code}`,
+    };
+  }
+  return { kind: "ok", value: r.stdout.trim() };
+}
+
+/** {@link ensureWorktree}, tri-stated — every git op is bounded, and a 124 SIGKILL
+ * in ANY of them is a `timeout` (the caller defers, never a false structural sticky);
+ * a genuine failure (a foreign-branch collision, a failed `worktree add`) is `error`. */
+export async function ensureWorktreeResult(
+  cwd: string,
+  path: string,
+  branch: string,
+  commitish: string,
+  run: GitRunner = gitExec,
+): Promise<GitReadOutcome<void>> {
+  const existing = await listWorktreesResult(cwd, run);
+  if (existing.kind !== "ok") return existing;
+  const atPath = existing.value.find((e) => samePath(e.path, path));
+  if (atPath !== undefined) {
+    if (atPath.branch === `refs/heads/${branch}`) {
+      return { kind: "ok", value: undefined };
+    }
+    return {
+      kind: "error",
+      detail: `path ${path} is already a worktree on ${atPath.branch ?? "(detached)"}, expected ${branch}`,
+    };
+  }
+  const prune = await run(["worktree", "prune", "--expire", "now"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (prune.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+  let hasBranch = existing.value.some(
+    (e) => e.branch === `refs/heads/${branch}`,
+  );
+  if (!hasBranch) {
+    const probe = await run(
+      ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+      { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (probe.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+    hasBranch = probe.code === 0;
+  }
+  const args = hasBranch
+    ? ["worktree", "add", path, branch]
+    : ["worktree", "add", "-b", branch, path, commitish];
+  const add = await run(args, { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS });
+  if (add.code === GIT_SPAWN_TIMEOUT_CODE) return { kind: "timeout" };
+  if (add.code !== 0) {
+    return {
+      kind: "error",
+      detail: `git ${args.join(" ")} failed (code ${add.code}): ${add.stderr.trim()}`,
+    };
+  }
+  return { kind: "ok", value: undefined };
+}
+
 /** Outcome of the consolidated guarded merge-abort helper. */
 type MergeAbortOutcome =
   /** No `MERGE_HEAD` was present — nothing was in flight to abort. */
@@ -2017,17 +2135,26 @@ export async function mergeBranchInto(
             .map((path) => path.trim())
             .filter((path) => path.length > 0)
         : [];
-    // Abort iff a MERGE_HEAD exists, so a merge that never started is not
-    // spuriously "aborted". A clean abort (or nothing to abort) → the sticky
-    // `conflict`; an abort that ITSELF failed left the checkout mid-merge → the
-    // distinct `abort-failed` wedge signal.
+    // The MERGE STATE is the authoritative content-conflict signal — a real content
+    // conflict leaves a `MERGE_HEAD` (and unmerged paths). Abort iff one exists, so a
+    // merge that NEVER STARTED is not spuriously "aborted":
+    //  - abort itself failed → the checkout is left mid-merge → `abort-failed` wedge.
+    //  - a merge WAS in flight and aborted cleanly → a genuine content `conflict`.
+    //  - NO merge was in flight (`no-merge`) → the non-zero exit is a STRUCTURAL,
+    //    non-content failure (a hook/config/identity/index/would-clobber refusal that
+    //    stopped before creating any merge state) → the visible `merge-failed`, NEVER
+    //    the content-conflict resolver path.
+    const merged = (merge.stdout + merge.stderr).trim();
     const aborted = await abortMergeIfInProgress(worktreePath, run);
     if (aborted.kind === "abort-failed") {
       return { kind: "abort-failed", stderr: aborted.stderr };
     }
+    if (aborted.kind === "no-merge") {
+      return { kind: "merge-failed", stderr: merged };
+    }
     return {
       kind: "conflict",
-      stderr: (merge.stdout + merge.stderr).trim(),
+      stderr: merged,
       conflictedFiles,
     };
   } finally {

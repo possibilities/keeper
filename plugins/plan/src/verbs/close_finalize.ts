@@ -1118,6 +1118,25 @@ export const realTrunkIntegrationDeps: TrunkIntegrationDeps = {
   runMergeSuite: runRealMergeSuite,
 };
 
+// The trunk-integration deps the CLI close-finalize path resolves at call time
+// (default {@link realTrunkIntegrationDeps}). A test harness overrides it via
+// {@link setTrunkIntegrationDeps} so a fake-VCS project's close never spawns real
+// git for the base probe — the SAME injectable-seam discipline the rest of the verb
+// uses through `getVcs`. A direct caller still passes explicit `deps`, which wins.
+let activeTrunkIntegrationDeps: TrunkIntegrationDeps = realTrunkIntegrationDeps;
+
+export function getTrunkIntegrationDeps(): TrunkIntegrationDeps {
+  return activeTrunkIntegrationDeps;
+}
+
+export function setTrunkIntegrationDeps(deps: TrunkIntegrationDeps): void {
+  activeTrunkIntegrationDeps = deps;
+}
+
+export function resetTrunkIntegrationDeps(): void {
+  activeTrunkIntegrationDeps = realTrunkIntegrationDeps;
+}
+
 function ancestryProbe(
   repoRoot: string,
   sourceBranch: string,
@@ -1579,7 +1598,7 @@ export function integrateEpicBases(
   primaryRepo: string,
   touchedRepos: string[] | null | undefined,
   format: OutputFormat | null,
-  deps: TrunkIntegrationDeps = realTrunkIntegrationDeps,
+  deps: TrunkIntegrationDeps = getTrunkIntegrationDeps(),
 ): void {
   // STATE-DERIVED owner integration: probe the bounded plan-state repo set (primary ∪
   // `touched_repos`) for THIS epic's exact `keeper/epic/<id>` base. ZERO bases → an
@@ -1622,13 +1641,12 @@ export function integrateEpicBases(
   for (const repoRoot of [...repos].sort()) {
     const toplevel = deps.git(["rev-parse", "--show-toplevel"], repoRoot);
     const observedRoot = toplevel.stdout.trim();
-    // A path git DEFINITIVELY reports is not a working tree (exit 128 — "not a git
-    // repository") holds no `keeper/epic/<id>` base by construction, so it contributes
-    // ZERO bases and is skipped. A plan close's repos are always real checkouts in
-    // production, so this only ever matches a non-git path; distinct from the DEFER
-    // below, which covers AMBIGUOUS states (a transient non-128 failure, empty output,
-    // or a resolved-but-mismatched toplevel) where grading "absent" would be unsafe.
-    if (toplevel.code === 128) continue;
+    // FAIL CLOSED on ANY unresolved checkout. git exits 128 not only for a genuine
+    // non-repo but for dubious ownership, corruption, bad config, and permission
+    // failures — UNKNOWN is NOT absent, so a nonzero / empty / realpath-mismatched
+    // toplevel must NEVER grade this repo's base as absent and close without
+    // integrating it. A plan-state touched repo is normally a real checkout, so a
+    // typed DEFER (retried next cycle) is the safe verdict, never a silent skip.
     if (
       toplevel.code !== 0 ||
       observedRoot === "" ||

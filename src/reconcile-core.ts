@@ -1630,6 +1630,15 @@ export interface ReconcileDecision {
    */
   worktreePreCloseProvision: WorktreeLaunchInfo[];
   /**
+   * The subset of {@link worktreePreCloseProvision} epics whose close ROUTES an open
+   * merge-escalation incident this cycle — an owner-close re-dispatched to claim and
+   * RESOLVE its fan-in conflict. The pre-close pass keeps assembling these epics'
+   * remaining clean ribs (ITERATIVE re-entry) but NEVER suppresses the owner-close
+   * (which must launch to resolve), so a one-source resolution can progress to the
+   * next rib instead of the ancestry gate wedging until epic-landed.
+   */
+  preCloseIncidentOwnerEpicIds: Set<string>;
+  /**
    * The OPEN per-repo worktree-finalize dispatch-failure ids (mirrored straight off
    * `snapshot.finalizeFailureIds`). The finalize driver clears any whose repo
    * finalizes clean this cycle — the level-triggered auto-clear, so an operator who
@@ -2382,6 +2391,7 @@ export function reconcile(
       worktreeFinalize: [],
       worktreeSinkProvision: [],
       worktreePreCloseProvision: [],
+      preCloseIncidentOwnerEpicIds: new Set(),
       finalizeFailureIds: new Set(),
       slotOccupancy: [],
       slotOccupancyClears: [],
@@ -2924,6 +2934,7 @@ export function reconcile(
   const worktreeFinalize: WorktreeLaunchInfo[] = [];
   const worktreeSinkProvision: WorktreeLaunchInfo[] = [];
   const worktreePreCloseProvision: WorktreeLaunchInfo[] = [];
+  const preCloseIncidentOwnerEpicIds = new Set<string>();
   // Gate ALL worktree producer work on not-paused, matching recover() (`:3126`):
   // finalize merges the epic base into the default branch and pushes, which a
   // paused autopilot must not do. Launches are already suppressed while paused, so
@@ -2984,6 +2995,7 @@ export function reconcile(
       worktreeSinkProvision,
       worktreePreCloseProvision,
       snapshot.incidentOwnerKeys ?? new Set<DispatchKey>(),
+      preCloseIncidentOwnerEpicIds,
       worktreeGeometry.byEpicId,
     );
     const epicById = new Map(
@@ -3067,6 +3079,7 @@ export function reconcile(
     worktreeFinalize,
     worktreeSinkProvision,
     worktreePreCloseProvision,
+    preCloseIncidentOwnerEpicIds,
     finalizeFailureIds: snapshot.finalizeFailureIds,
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
@@ -3334,6 +3347,7 @@ function attachWorktreeGeometry(
   worktreeSinkProvision: WorktreeLaunchInfo[],
   worktreePreCloseProvision: WorktreeLaunchInfo[],
   incidentOwnerCloseKeys: ReadonlySet<DispatchKey>,
+  preCloseIncidentOwnerEpicIds: Set<string>,
   byEpicId: ReadonlyMap<string, EpicWorktreeGeometry>,
 ): void {
   // Index launches by epic. A task launch belongs to the epic owning the task; a
@@ -3442,24 +3456,31 @@ function attachWorktreeGeometry(
             l.worktree = primaryGroup.infoFor(sink);
           }
           // Fan-in EVERY non-close-host worktree group's base BEFORE this close may
-          // launch, so its per-repo done-ancestry gate sees each foreign rib already
+          // land, so its per-repo done-ancestry gate sees each foreign rib already
           // merged into keeper/epic/<id> (never a still-unmerged leaf → an autonomous
           // wedge: the close blocks the fan-in it needs). The close-host (the primary
           // group a worktree-primary close dispatches into) assembles its own base, so
           // it is excluded; a serial-primary close hosts none → every worktree group.
           // A close that ROUTES a merge-escalation incident is a re-dispatch to OWN
           // and RESOLVE that conflict (it claims the incident + runs the merge-resolver
-          // in the named lane); pre-close-provisioning would re-mint the conflict and
-          // re-suppress the very launch that resolves it (a deadlock). Skip the pre-
-          // close fan-in for it — the SAME incident exclusion the finalize set applies.
-          if (!incidentOwnerCloseKeys.has(dispatchKey("close", epicId))) {
-            for (const stamp of worktreeGroups) {
-              if (stamp === primaryGroup) {
-                continue;
-              }
-              const groupSink = stamp.byNode.get(CLOSE_SINK_ID);
-              if (groupSink !== undefined) {
-                worktreePreCloseProvision.push(stamp.infoFor(groupSink));
+          // in the named lane). It STAYS in the fan-in set — the producer must keep
+          // assembling its remaining CLEAN ribs across cycles (ITERATIVE re-entry: a
+          // one-source resolution leaves later ribs unmerged and the close's ancestry
+          // gate wedging). Its epic is TAGGED so the pre-close pass launches it without
+          // re-suppressing the active resolver, and re-points the incident at the
+          // current conflicting rib each cycle until every rib lands.
+          const routesIncident = incidentOwnerCloseKeys.has(
+            dispatchKey("close", epicId),
+          );
+          for (const stamp of worktreeGroups) {
+            if (stamp === primaryGroup) {
+              continue;
+            }
+            const groupSink = stamp.byNode.get(CLOSE_SINK_ID);
+            if (groupSink !== undefined) {
+              worktreePreCloseProvision.push(stamp.infoFor(groupSink));
+              if (routesIncident) {
+                preCloseIncidentOwnerEpicIds.add(epicId);
               }
             }
           }

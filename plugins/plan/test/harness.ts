@@ -49,6 +49,46 @@ import {
 import { serializeStateJson } from "../src/store.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
+  resetTrunkIntegrationDeps,
+  setTrunkIntegrationDeps,
+  type TrunkIntegrationDeps,
+} from "../src/verbs/close_finalize.ts";
+
+// A CLI close-finalize never spawns real git for its state-derived base probe: the
+// project is a FAKE-VCS checkout (no real `.git`), so route `integrateEpicBases`
+// through a stub that reports the project IS a checkout but carries NO `keeper/epic/*`
+// base (worktree integration is exercised only by direct-injection saga tests). The
+// lease/lock/merge legs throw — a base-less OFF-mode close never reaches them.
+const harnessTrunkDeps: TrunkIntegrationDeps = {
+  git(args, cwd) {
+    if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+      return { code: 0, stdout: `${cwd}\n`, stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "" }; // no keeper/epic base → OFF-mode no-op
+  },
+  acquireLock() {
+    throw new Error(
+      "harnessTrunkDeps.acquireLock: no base to integrate in a CLI test",
+    );
+  },
+  requestLease() {
+    throw new Error(
+      "harnessTrunkDeps.requestLease: no base to integrate in a CLI test",
+    );
+  },
+  releaseLease() {
+    throw new Error(
+      "harnessTrunkDeps.releaseLease: no base to integrate in a CLI test",
+    );
+  },
+  readLeaseLeaf() {
+    throw new Error(
+      "harnessTrunkDeps.readLeaseLeaf: no base to integrate in a CLI test",
+    );
+  },
+};
+
+import {
   baselineRepo,
   fakeCommitTaskJson,
   fakeDirtyPaths,
@@ -332,6 +372,9 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
   // the fake (restored in finally) so no real git runs and no global install
   // leaks to a sibling file.
   setVcs(fakeVcs);
+  // Route close-finalize's trunk-integration base probe through the fake-VCS-shaped
+  // stub (restored in finally) so a CLI close never spawns real git on the fake repo.
+  setTrunkIntegrationDeps(harnessTrunkDeps);
   // Route external-command spawns (gist's gh / opener) through the driver
   // registry so no real binary or PATH shim runs.
   setExec(execDriver);
@@ -379,6 +422,7 @@ export function runCli(args: string[], opts: RunOptions): CliResult {
     setTTY(process.stdout, priorStdoutTTY);
     resetStdinProvider();
     resetVcs();
+    resetTrunkIntegrationDeps();
     resetExec();
     resetSessionMarkerProcessProbe();
   }
