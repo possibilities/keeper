@@ -5203,6 +5203,31 @@ function classifyEpicRepo(
       reason: `worktree-no-primary-repo: epic ${epic.epic_id} has no primary_repo — refusing to provision a lane (plan state would degrade to the lane checkout; set epic.primary_repo and retry)`,
     };
   }
+  // A would-be-`ok` (worktree-LANE) epic whose ONE task toplevel is NOT the resolved
+  // primary anchors its close to that FOREIGN task repo's base lane — where the
+  // epic's plan state does not exist — dying EPIC_NOT_FOUND at preflight (the
+  // single-repo sibling of the clustered close-anchor bug). Reroute through the
+  // clustered path so the primary becomes a task-less serial close-sink anchor (the
+  // close runs on the primary shared checkout) while the foreign task repo keeps its
+  // worktree lane + finalize. Gated on the multi-repo flag (producing a `clustered`
+  // resolution is that rollout's surface) and a resolving primary; a null-resolving
+  // primary keeps the degraded `ok` fallback below. This only fires for a would-be
+  // `ok` — a `disabled` foreign repo already runs its close on `project_dir`
+  // (primary) worktree-less, so its return below is untouched.
+  const primaryResolved = resolve(projectDir);
+  const anchorsForeignPrimary =
+    multiRepoEnabled && primaryResolved !== null && primaryResolved !== repoDir;
+  const okOrForeignAnchor = (): WorktreeRepoResolution =>
+    anchorsForeignPrimary
+      ? clusterEpicRepos(
+          epic,
+          resolve,
+          assessRepo,
+          isGrandfathered,
+          projectDir,
+          topByTask,
+        )
+      : { kind: "ok", repoDir };
   // A would-be-`ok` epic resolving to ONE primary-backed toplevel: the LAST gate
   // is repo eligibility. A not-worktree-friendly toplevel (workspace marker /
   // submodule / no manifest / probe error) downgrades to `disabled` — a NORMAL,
@@ -5217,13 +5242,14 @@ function classifyEpicRepo(
     // `worktreeFinalize` only for `ok`). The likelier flip is a TRANSIENT probe
     // error (fail-closed) on a healthy in-flight epic, not a marker appearing
     // mid-epic. The predicate is producer-side fs/git (base worktree dir OR
-    // `keeper/epic/<id>` branch exists) — never read here in the pure layer.
+    // `keeper/epic/<id>` branch exists) — never read here in the pure layer. A
+    // grandfathered foreign-primary epic reroutes just like the eligible one.
     if (isGrandfathered(epic.epic_id, repoDir)) {
-      return { kind: "ok", repoDir };
+      return okOrForeignAnchor();
     }
     return { kind: "disabled", repoDir, reason: eligibility.reason };
   }
-  return { kind: "ok", repoDir };
+  return okOrForeignAnchor();
 }
 
 /**

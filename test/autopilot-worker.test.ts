@@ -9539,6 +9539,164 @@ test("fn-16 reconcile: the ORDINARY clustered case (primary hosts tasks) is UNCH
   ]);
 });
 
+// fn-16b — the single-repo sibling: when ALL tasks resolve to ONE repo that is NOT
+// the epic's primary_repo, the plain single-toplevel `ok` path anchored the close to
+// that foreign task repo's base lane (`.keeper` absent → EPIC_NOT_FOUND). The
+// would-be-`ok` foreign case now reroutes through the SAME task-less serial anchor.
+
+/** A single-repo epic whose ONE task repo (/repo-a) is NOT the primary (/repo-c). */
+function singleForeignEpic(
+  opts: { tasksDone?: boolean; epicDone?: boolean } = {},
+): Epic {
+  const phase = opts.tasksDone
+    ? { worker_phase: "done" as const, runtime_status: "done" as const }
+    : {};
+  return makeEpic({
+    epic_id: "fn-1-foreign",
+    project_dir: "/repo-c", // primary_repo — hosts NO tasks
+    status: opts.epicDone ? "done" : "open",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foreign.1",
+        task_number: 1,
+        epic_id: "fn-1-foreign",
+        target_repo: "/repo-a", // the ONE task repo, foreign to the primary
+        ...phase,
+      }),
+      makeTask({
+        task_id: "fn-1-foreign.2",
+        task_number: 2,
+        epic_id: "fn-1-foreign",
+        target_repo: "/repo-a",
+        ...phase,
+      }),
+    ],
+  });
+}
+
+test("fn-16b classifyEpicRepo: a would-be-`ok` epic whose ONE task repo is NOT the primary reroutes to `clustered` — the foreign task repo is a worktree group + a task-less serial primary anchor, primaryRepoDir = primary (flag ON)", () => {
+  const res = classifyWorktreeRepos(
+    [singleForeignEpic()],
+    abcResolve,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-foreign");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  expect(res.groups).toEqual([
+    {
+      repoDir: "/repo-a",
+      taskIds: ["fn-1-foreign.1", "fn-1-foreign.2"],
+      mode: "worktree",
+    },
+    { repoDir: "/repo-c", taskIds: [], mode: "serial" },
+  ]);
+  expect(res.primaryRepoDir).toBe("/repo-c");
+});
+
+test("fn-16b reconcile: a tasks-done single-foreign-repo epic anchors the close to the primary SHARED CHECKOUT (cwd = primary, worktree-less), not the foreign /repo-a lane", () => {
+  // tasks done, epic NOT yet closed → the close launch fires.
+  const snap = multiRepoSnap(
+    [singleForeignEpic({ tasksDone: true })],
+    abcResolve,
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(closeLaunch).toBeDefined();
+  // The close runs on the primary shared checkout (where the plan state lives),
+  // NOT the foreign /repo-a lane it anchored to on the old `ok` path.
+  expect(closeLaunch?.cwd).toBe("/repo-c");
+  expect(closeLaunch?.worktree).toBeUndefined();
+});
+
+test("fn-16b reconcile: a done single-foreign-repo epic still finalizes the foreign task repo's lane AND sink-provisions it (the close no longer assembles its base)", () => {
+  const snap = multiRepoSnap(
+    [singleForeignEpic({ tasksDone: true, epicDone: true })],
+    abcResolve,
+  );
+  const decision = reconcile(snap, makeState(), 0);
+  // The foreign task repo still gets its worktree finalize; it now also sink-
+  // provisions (the close moved to the primary shared checkout, out of its lane).
+  expect(decision.worktreeFinalize.map((f) => f.repoDir)).toEqual(["/repo-a"]);
+  expect(decision.worktreeSinkProvision.map((s) => s.repoDir)).toEqual([
+    "/repo-a",
+  ]);
+  // The task-less primary anchor cuts NO lane → no finalize/provision for it.
+  expect(decision.worktreeFinalize.map((f) => f.repoDir)).not.toContain(
+    "/repo-c",
+  );
+});
+
+test("fn-16b reconcile: an OPEN single-foreign-repo epic still cuts the foreign task repo's worktree lane (work launches into /repo-a, not the primary)", () => {
+  const snap = multiRepoSnap([singleForeignEpic()], abcResolve);
+  const decision = reconcile(snap, makeState(), 0);
+  const work = decision.launches.filter((l) => l.verb === "work");
+  expect(work.length).toBeGreaterThan(0);
+  for (const l of work) {
+    expect(l.worktreeReject).toBeUndefined();
+    expect(l.worktree?.repoDir).toBe("/repo-a");
+  }
+});
+
+test("fn-16b classifyEpicRepo: a genuinely single-repo epic (task repo == primary) is UNCHANGED — stays `ok`, never reroutes", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-solo",
+    project_dir: "/repo-a", // primary == the task repo
+    tasks: [
+      makeTask({
+        task_id: "fn-1-solo.1",
+        task_number: 1,
+        epic_id: "fn-1-solo",
+        target_repo: "/repo-a",
+      }),
+    ],
+  });
+  expect(
+    classifyWorktreeRepos([epic], abcResolve, undefined, undefined, true).get(
+      "fn-1-solo",
+    ),
+  ).toEqual({ kind: "ok", repoDir: "/repo-a" });
+});
+
+test("fn-16b classifyEpicRepo: the reroute is FLAG-GATED, disabled-preserving, and null-resolve-preserving", () => {
+  // (a) Flag OFF → the foreign-primary single-repo epic stays `ok` on the task repo
+  //     (the reroute produces a `clustered` resolution, which is the multi-repo
+  //     rollout's surface — off without the flag; a preserved boundary).
+  expect(
+    classifyWorktreeRepos([singleForeignEpic()], abcResolve).get(
+      "fn-1-foreign",
+    ),
+  ).toEqual({ kind: "ok", repoDir: "/repo-a" });
+  // (b) A worktree-INELIGIBLE (disabled) foreign task repo is NOT rerouted — its
+  //     close already runs on `project_dir` (primary) worktree-less; stays disabled.
+  const disabled = classifyWorktreeRepos(
+    [singleForeignEpic()],
+    abcResolve,
+    (top) => ({
+      eligible: top !== "/repo-a",
+      reason: `worktree-disabled:no-manifest (${top})`,
+    }),
+    undefined,
+    true,
+  ).get("fn-1-foreign");
+  expect(disabled?.kind).toBe("disabled");
+  expect(disabled?.kind === "disabled" && disabled.repoDir).toBe("/repo-a");
+  // (c) A primary that fails to resolve keeps the degraded `ok` fallback on the task
+  //     repo (no real toplevel to anchor to) — unchanged from before the fix.
+  const nullPrimary = (r: string): string | null =>
+    r.startsWith("/repo-a") ? "/repo-a" : null; // /repo-c resolves null
+  expect(
+    classifyWorktreeRepos(
+      [singleForeignEpic()],
+      nullPrimary,
+      undefined,
+      undefined,
+      true,
+    ).get("fn-1-foreign"),
+  ).toEqual({ kind: "ok", repoDir: "/repo-a" });
+});
+
 test("fn-1034 classifyWorktreeRepos: a single-repo epic NEVER clusters (stays `ok`, byte-identical) even with the flag ON", () => {
   const epic = makeEpic({
     epic_id: "fn-1-solo",
