@@ -54,6 +54,7 @@ import { computeEligibleEpics } from "../src/armed-closure";
 import {
   BASE_REFRESH_COOLDOWN_SEC,
   type BaseDriftEntry,
+  beginContainmentCycle,
   buildCloseRecoveryStampArgv,
   buildLaunchArgv,
   buildPlannedLaunchSpec,
@@ -72,6 +73,7 @@ import {
   clearDeadZombieSessionMarker,
   clearPushTimeoutStreak,
   closerJobFinished,
+  commitsAheadOfOrigin,
   computeBaseDriftEntries,
   computeCloseRecoveryEligibleIds,
   computeDeferredEpicIds,
@@ -111,8 +113,11 @@ import {
   epicPresentAndNotDone,
   epicRecoverVerdictById,
   extractCloseFinalizeReceipt,
+  FINALIZE_PUSH_AHEAD_CAP,
+  FINALIZE_PUSH_PER_COMMIT_MS,
   FINALIZER_GUARD_S,
   type FoundJob,
+  finalizePushDeadlineMs,
   findShadowingWorkManifest,
   findWrappedDelegationSkips,
   gateWedgedLanesByLiveness,
@@ -155,17 +160,20 @@ import {
   type MergeSuiteVerdict,
   mergeEscalationFailuresToClear,
   mergeLaneBaseIntoDefault,
+  originDefaultRef,
   pendingIntegrationReason,
   planTipBaselineRequests,
   prepareWorktreeGeometry,
   probeSharedCheckoutDesync,
   probeWorkMergeIncidentResolutions,
+  pushDefaultToOrigin,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
   readClaimAcquireObservation,
   readPriorWorktreeLaneProof,
   reconcile,
+  reconcileOriginContainment,
   recordPushTimeout,
   recoverFailureDispatchId,
   recoverFailuresToClear,
@@ -238,6 +246,7 @@ import {
 import { readTestGateCommand, type SpawnFn } from "../src/baseline-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
+  GIT_PUSH_TIMEOUT_MS,
   GIT_SPAWN_TIMEOUT_CODE,
   type GitExecOptions,
   type GitRunner,
@@ -25155,4 +25164,275 @@ test("push-timeout streak: crosses the sticky threshold only on consecutive time
   clearPushTimeoutStreak(repo);
   expect(recordPushTimeout(repo)).toBe(false);
   clearPushTimeoutStreak(repo);
+});
+
+// --- finalize push deadline scaling + periodic origin-containment reconcile ---
+
+const CG_DEFAULT = "main";
+
+/**
+ * A recording git runner for the finalize-push-deadline scaling and the periodic
+ * origin-containment probe. Answers every command those two paths issue (HEAD probe,
+ * turn-key gate, non-ff precheck, ahead-count, resolve-default, push) and records each
+ * call's joined args, timeoutMs, and cwd so a test can assert the SCALED push deadline
+ * and the per-repo push targeting.
+ */
+function makeContainmentGit(
+  opts: {
+    headBranch?: string;
+    originResolves?: boolean;
+    originContainedExit?: number;
+    ffAncestorExit?: number;
+    aheadCount?: string;
+    aheadExit?: number;
+    turnKey?: boolean;
+    pushExit?: number;
+  } = {},
+): {
+  run: Parameters<typeof reconcileOriginContainment>[2];
+  calls: { args: string; timeoutMs?: number; cwd?: string }[];
+} {
+  const def = CG_DEFAULT;
+  const calls: { args: string; timeoutMs?: number; cwd?: string }[] = [];
+  const run: Parameters<typeof reconcileOriginContainment>[2] = async (
+    args,
+    o,
+  ) => {
+    const joined = args.join(" ");
+    calls.push({ args: joined, timeoutMs: o?.timeoutMs, cwd: o?.cwd });
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${opts.headBranch ?? def}\n`, stderr: "" };
+    }
+    if (joined === "symbolic-ref --short refs/remotes/origin/HEAD") {
+      return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (joined.startsWith("for-each-ref")) {
+      return { code: 0, stdout: `${def}\n`, stderr: "" };
+    }
+    if (joined === `rev-parse --verify --quiet ${originDefaultRef(def)}`) {
+      return opts.originResolves === false
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: "deadbeef\n", stderr: "" };
+    }
+    // Containment non-divergence probe (explicit refs/heads/<default>).
+    if (
+      joined ===
+      `merge-base --is-ancestor ${originDefaultRef(def)} refs/heads/${def}`
+    ) {
+      return { code: opts.originContainedExit ?? 0, stdout: "", stderr: "" };
+    }
+    // pushDefaultToOrigin's non-ff precheck (bare <default>).
+    if (joined === `merge-base --is-ancestor ${originDefaultRef(def)} ${def}`) {
+      return { code: opts.ffAncestorExit ?? 0, stdout: "", stderr: "" };
+    }
+    if (
+      joined === `rev-list --count ${originDefaultRef(def)}..refs/heads/${def}`
+    ) {
+      return {
+        code: opts.aheadExit ?? 0,
+        stdout: `${opts.aheadCount ?? "3"}\n`,
+        stderr: "",
+      };
+    }
+    if (joined === "remote get-url origin") {
+      return opts.turnKey === false
+        ? { code: 1, stdout: "", stderr: "no origin" }
+        : { code: 0, stdout: "git@host:repo.git\n", stderr: "" };
+    }
+    if (
+      joined.startsWith("rev-parse --abbrev-ref --symbolic-full-name @{push}")
+    ) {
+      return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
+    }
+    if (joined === "push --dry-run --no-progress") {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined === `push origin ${def}`) {
+      return { code: opts.pushExit ?? 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls };
+}
+
+test("fn-13 finalizePushDeadlineMs scales linearly with the ahead-count and caps", () => {
+  expect(finalizePushDeadlineMs(0)).toBe(GIT_PUSH_TIMEOUT_MS);
+  expect(finalizePushDeadlineMs(5)).toBe(
+    GIT_PUSH_TIMEOUT_MS + 5 * FINALIZE_PUSH_PER_COMMIT_MS,
+  );
+  expect(finalizePushDeadlineMs(FINALIZE_PUSH_AHEAD_CAP)).toBe(
+    GIT_PUSH_TIMEOUT_MS + FINALIZE_PUSH_AHEAD_CAP * FINALIZE_PUSH_PER_COMMIT_MS,
+  );
+  // A backlog past the cap never exceeds the capped deadline (bounded — so a genuine
+  // wedge still surfaces to the three-strike push-stuck streak).
+  expect(finalizePushDeadlineMs(FINALIZE_PUSH_AHEAD_CAP + 10_000)).toBe(
+    finalizePushDeadlineMs(FINALIZE_PUSH_AHEAD_CAP),
+  );
+  // Strictly monotonic inside the band.
+  expect(finalizePushDeadlineMs(10)).toBeGreaterThan(finalizePushDeadlineMs(9));
+  // Degenerate inputs floor to the base deadline.
+  expect(finalizePushDeadlineMs(-5)).toBe(GIT_PUSH_TIMEOUT_MS);
+  expect(finalizePushDeadlineMs(Number.NaN)).toBe(GIT_PUSH_TIMEOUT_MS);
+});
+
+test("fn-13 commitsAheadOfOrigin returns the count, null on any inconclusive read", async () => {
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadCount: "7" }).run,
+    ),
+  ).toBe(7);
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadExit: 128 }).run,
+    ),
+  ).toBeNull();
+  expect(
+    await commitsAheadOfOrigin(
+      "/repo",
+      "main",
+      makeContainmentGit({ aheadCount: "not-a-number" }).run,
+    ),
+  ).toBeNull();
+});
+
+test("fn-13 pushDefaultToOrigin scales the push deadline by the measured backlog", async () => {
+  const g = makeContainmentGit({ aheadCount: "12" });
+  expect(await pushDefaultToOrigin("/repo", "main", g.run)).toEqual({
+    kind: "pushed",
+  });
+  const pushCall = g.calls.find((c) => c.args === "push origin main");
+  expect(pushCall?.timeoutMs).toBe(finalizePushDeadlineMs(12));
+  // NOT the fixed base deadline — a 12-commit backlog gets extra headroom.
+  expect(pushCall?.timeoutMs).toBeGreaterThan(GIT_PUSH_TIMEOUT_MS);
+});
+
+test("fn-13 pushDefaultToOrigin provisions the CAPPED deadline when the backlog is unmeasurable", async () => {
+  // rev-list timed out → null count → the generous capped deadline (over-budgeting a
+  // deadline never kills a legit push; under-budgeting an unknown backlog re-spirals).
+  const g = makeContainmentGit({ aheadExit: GIT_SPAWN_TIMEOUT_CODE });
+  expect(await pushDefaultToOrigin("/repo", "main", g.run)).toEqual({
+    kind: "pushed",
+  });
+  const pushCall = g.calls.find((c) => c.args === "push origin main");
+  expect(pushCall?.timeoutMs).toBe(
+    finalizePushDeadlineMs(FINALIZE_PUSH_AHEAD_CAP),
+  );
+});
+
+test("fn-13 reconcileOriginContainment pushes on strictly-ahead + non-diverged positive evidence", async () => {
+  const g = makeContainmentGit({ aheadCount: "4", originContainedExit: 0 });
+  expect(await reconcileOriginContainment("/repo", "main", g.run)).toEqual({
+    kind: "pushed",
+  });
+  expect(g.calls.some((c) => c.args === "push origin main")).toBe(true);
+});
+
+test("fn-13 reconcileOriginContainment does NOT push a diverged/origin-ahead repo — sticky path preserved, never a force", async () => {
+  const g = makeContainmentGit({ originContainedExit: 1 });
+  expect(await reconcileOriginContainment("/repo", "main", g.run)).toEqual({
+    kind: "diverged",
+  });
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+  expect(
+    g.calls.some(
+      (c) => c.args.includes("--force") || c.args.split(" ").includes("-f"),
+    ),
+  ).toBe(false);
+  // It never counted commits ahead — divergence short-circuits before the push gate.
+  expect(g.calls.some((c) => c.args.startsWith("rev-list"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment DEFERS on an inconclusive non-divergence probe", async () => {
+  const g = makeContainmentGit({ originContainedExit: GIT_SPAWN_TIMEOUT_CODE });
+  const res = await reconcileOriginContainment("/repo", "main", g.run);
+  expect(res.kind).toBe("deferred");
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment DEFERS when origin/<default> is unresolved (never pushed)", async () => {
+  const g = makeContainmentGit({ originResolves: false });
+  const res = await reconcileOriginContainment("/repo", "main", g.run);
+  expect(res.kind).toBe("deferred");
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+  // Deferred BEFORE the divergence probe — the first-push case is finalize's, not ours.
+  expect(g.calls.some((c) => c.args.startsWith("merge-base"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment is a no-op when origin already contains local default", async () => {
+  const g = makeContainmentGit({ aheadCount: "0", originContainedExit: 0 });
+  expect(await reconcileOriginContainment("/repo", "main", g.run)).toEqual({
+    kind: "already-contained",
+  });
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment DEFERS when the ahead-count is inconclusive", async () => {
+  const g = makeContainmentGit({ aheadExit: 128, originContainedExit: 0 });
+  const res = await reconcileOriginContainment("/repo", "main", g.run);
+  expect(res.kind).toBe("deferred");
+  expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
+});
+
+test("fn-13 reconcileOriginContainment does NOT double-fire when a push is already in flight this cycle", async () => {
+  const g = makeContainmentGit({ aheadCount: "4" });
+  const res = await reconcileOriginContainment("/repo", "main", g.run, true);
+  expect(res.kind).toBe("deferred");
+  // A short-circuit BEFORE any git read — never re-probes or re-pushes.
+  expect(g.calls.length).toBe(0);
+});
+
+test("fn-13 reconcileOriginContainment leaves the push-stuck streak untouched on a containment push-timeout", async () => {
+  const repo = "/repo-fn13-streak";
+  clearPushTimeoutStreak(repo);
+  const g = makeContainmentGit({
+    aheadCount: "4",
+    pushExit: GIT_SPAWN_TIMEOUT_CODE,
+  });
+  expect(await reconcileOriginContainment(repo, "main", g.run)).toEqual({
+    kind: "push-timeout",
+  });
+  // The containment probe fed NO streak: escalation still needs the FULL threshold of
+  // recordPushTimeout calls — it never pre-incremented (existing semantics unchanged).
+  for (let i = 1; i < STUCK_PUSH_STICKY_THRESHOLD; i++) {
+    expect(recordPushTimeout(repo)).toBe(false);
+  }
+  expect(recordPushTimeout(repo)).toBe(true);
+  clearPushTimeoutStreak(repo);
+});
+
+test("fn-13 driver.reconcileOrigin defers a repo already pushed this cycle — no double-fire", async () => {
+  const repo = "/repo-fn13-driver-guard";
+  const g = makeContainmentGit({ aheadCount: "4" });
+  beginContainmentCycle();
+  // A finalize/recover leg pushes first — stamps the per-cycle guard.
+  await pushDefaultToOrigin(repo, "main", g.run);
+  const driver = createWorktreeDriver(g.run);
+  if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
+  const outcomes = await driver.reconcileOrigin([repo]);
+  expect(outcomes).toEqual([
+    { dir: repo, result: { kind: "deferred", reason: expect.any(String) } },
+  ]);
+  // Exactly ONE push origin this cycle — the finalize leg's, never a containment re-push.
+  expect(g.calls.filter((c) => c.args === "push origin main").length).toBe(1);
+});
+
+test("fn-13 driver.reconcileOrigin handles each repo independently, per-repo serialized", async () => {
+  const repoA = "/repo-fn13-A";
+  const repoB = "/repo-fn13-B";
+  const g = makeContainmentGit({ aheadCount: "2" });
+  beginContainmentCycle();
+  const driver = createWorktreeDriver(g.run);
+  if (!driver.reconcileOrigin) throw new Error("reconcileOrigin unimplemented");
+  const outcomes = await driver.reconcileOrigin([repoA, repoB]);
+  expect(outcomes.map((o) => ({ dir: o.dir, kind: o.result.kind }))).toEqual([
+    { dir: repoA, kind: "pushed" },
+    { dir: repoB, kind: "pushed" },
+  ]);
+  // Each repo's push targeted its OWN cwd — the per-repo serialization boundary.
+  const pushes = g.calls.filter((c) => c.args === "push origin main");
+  expect(pushes.map((p) => p.cwd)).toEqual([repoA, repoB]);
 });

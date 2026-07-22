@@ -1716,6 +1716,19 @@ export interface WorktreeDriver {
       dir: string;
     }[],
   ): Promise<WorktreeRecoveryOutcome>;
+  /**
+   * PERIODIC ORIGIN-CONTAINMENT reconcile (producer-only, once per cycle): for each
+   * repo, push local default to origin ONLY on positive evidence (local default STRICTLY
+   * ahead of origin AND non-diverged), so a finalize push that never landed no longer
+   * leaves origin frozen while local leads. Defers on any inconclusive probe and on a
+   * repo already pushed this cycle; a diverged / origin-ahead repo keeps its existing
+   * visible sticky path (never auto-reconciled, never a force). Reuses the SAME
+   * {@link reconcileOriginContainment} probe + {@link pushDefaultToOrigin} path per repo,
+   * never a fold. Optional so existing driver fakes stay byte-compatible.
+   */
+  reconcileOrigin?(
+    repos: readonly string[],
+  ): Promise<{ dir: string; result: OriginContainmentResult }[]>;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -1959,6 +1972,47 @@ export function recordPushTimeout(repoDir: string): boolean {
  * (pushed, or nothing to push). */
 export function clearPushTimeoutStreak(repoDir: string): void {
   pushTimeoutStreakByRepo.delete(repoDir);
+}
+
+/**
+ * Repos that already had an origin-push ATTEMPT in the CURRENT reconcile cycle —
+ * stamped inside {@link pushDefaultToOrigin} (the ONE finalize / recover / containment
+ * push chokepoint) and reset once per cycle by {@link beginContainmentCycle}. The
+ * periodic origin-containment probe skips a repo already attempted this cycle so a
+ * timed-out finalize / recover push is never IMMEDIATELY re-attempted, stacking a
+ * second scaled deadline into the same cycle ("no push in flight"). In-memory only;
+ * boots empty on restart.
+ */
+const pushAttemptedThisCycleByRepo = new Set<string>();
+
+/** Clear the per-cycle push-attempt guard at the TOP of a reconcile cycle so the
+ * containment probe sees only THIS cycle's finalize / recover push attempts. */
+export function beginContainmentCycle(): void {
+  pushAttemptedThisCycleByRepo.clear();
+}
+
+/**
+ * Deadline scaling for the finalize / recover origin push. The push (see
+ * {@link pushDefaultToOrigin}) uploads the WHOLE local-default backlog to origin in ONE
+ * shot; once that backlog outgrows the fixed {@link GIT_PUSH_TIMEOUT_MS} the push
+ * re-times-out every retry and re-pushes the same (still-growing) backlog forever — the
+ * spiral. So the deadline SCALES with the commits-ahead count: `base +
+ * FINALIZE_PUSH_PER_COMMIT_MS × min(ahead, cap)`. The cap keeps a pathological backlog
+ * from producing an UNBOUNDED deadline, which would defeat the push-stuck wedge
+ * detection (three consecutive timeouts). `commit-work`'s own push path keeps the fixed
+ * {@link GIT_PUSH_TIMEOUT_MS} — only finalize scales.
+ */
+export const FINALIZE_PUSH_PER_COMMIT_MS = 6_000;
+export const FINALIZE_PUSH_AHEAD_CAP = 40;
+
+/** The scaled finalize-push wall-clock deadline (ms) for a backlog of `ahead` commits —
+ *  `GIT_PUSH_TIMEOUT_MS` for a small push, growing linearly and capped. Pure. */
+export function finalizePushDeadlineMs(ahead: number): number {
+  const bounded = Math.min(
+    Math.max(Number.isFinite(ahead) ? Math.trunc(ahead) : 0, 0),
+    FINALIZE_PUSH_AHEAD_CAP,
+  );
+  return GIT_PUSH_TIMEOUT_MS + FINALIZE_PUSH_PER_COMMIT_MS * bounded;
 }
 
 /**
@@ -8157,6 +8211,31 @@ export function createWorktreeDriver(
         scheduleSuiteRetry,
       );
     },
+    async reconcileOrigin(repos) {
+      const outcomes: { dir: string; result: OriginContainmentResult }[] = [];
+      for (const repo of repos) {
+        try {
+          const defaultBranch = await gitResolveDefaultBranch(repo, run);
+          const result = await reconcileOriginContainment(
+            repo,
+            defaultBranch,
+            run,
+            pushAttemptedThisCycleByRepo.has(repo),
+          );
+          outcomes.push({ dir: repo, result });
+        } catch (err) {
+          // A producer git error must not wedge the cycle; degrade this repo to a defer.
+          outcomes.push({
+            dir: repo,
+            result: {
+              kind: "deferred",
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          });
+        }
+      }
+      return outcomes;
+    },
   };
 }
 
@@ -8246,6 +8325,32 @@ export function originDefaultRef(defaultBranch: string): string {
 }
 
 /**
+ * Commits LOCAL `defaultBranch` carries that `origin/<defaultBranch>` lacks — the
+ * backlog the finalize push must upload, via a CACHED `rev-list --count` (NO fetch,
+ * honoring the shared-checkout no-network invariant). Returns `null` on any
+ * INCONCLUSIVE read (origin ref unresolved / non-zero exit / unparseable count) so the
+ * caller provisions the GENEROUS capped deadline rather than under-budgeting a push
+ * whose backlog it could not measure. Pure git via the runner.
+ */
+export async function commitsAheadOfOrigin(
+  repo: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+): Promise<number | null> {
+  const r = await run(
+    [
+      "rev-list",
+      "--count",
+      `${originDefaultRef(defaultBranch)}..refs/heads/${defaultBranch}`,
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (r.code !== 0) return null;
+  const n = Number.parseInt(r.stdout.trim(), 10);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+/**
  * Push local `defaultBranch` to `origin/<defaultBranch>` — a PUSH-ONLY path (no
  * merge, so NO {@link mergeReadiness}: a push touches refs, not the working tree)
  * that REUSES the fn-990 push gating rather than duplicating it: the authoritative
@@ -8309,13 +8414,22 @@ export async function pushDefaultToOrigin(
     expectedTip === undefined
       ? defaultBranch
       : `${expectedTip}:refs/heads/${defaultBranch}`;
+  // SCALE the wall-clock deadline by the backlog size: a push whose backlog outgrows
+  // the fixed GIT_PUSH_TIMEOUT_MS would re-time-out every retry forever (the spiral).
+  // An inconclusive count (`null`) provisions the GENEROUS capped deadline — the safe
+  // direction, since over-budgeting a deadline never kills a legitimately-progressing
+  // push, while a bounded cap still surfaces a genuine wedge to the push-stuck streak.
+  const ahead = await commitsAheadOfOrigin(repo, defaultBranch, run);
+  // Stamp the per-cycle guard BEFORE issuing the push so the periodic containment probe
+  // never re-attempts a push this finalize / recover leg already tried this cycle.
+  pushAttemptedThisCycleByRepo.add(repo);
   const push = await run(["push", "origin", refspec], {
     cwd: repo,
     env: {
       GIT_TERMINAL_PROMPT: "0",
       GIT_SSH_COMMAND: "ssh -o BatchMode=yes -o ConnectTimeout=10",
     },
-    timeoutMs: GIT_PUSH_TIMEOUT_MS,
+    timeoutMs: finalizePushDeadlineMs(ahead ?? FINALIZE_PUSH_AHEAD_CAP),
   });
   if (push.code === GIT_SPAWN_TIMEOUT_CODE) {
     return { kind: "push-timeout" };
@@ -8324,6 +8438,96 @@ export async function pushDefaultToOrigin(
     return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
   }
   return { kind: "pushed" };
+}
+
+/**
+ * The verdict of {@link reconcileOriginContainment}. `pushed` / `already-contained` /
+ * `diverged` / `deferred` are the probe's own arms; every remaining member is a
+ * non-`pushed` {@link PushDefaultResult} degrade returned straight (the containment
+ * push reuses {@link pushDefaultToOrigin} verbatim).
+ */
+export type OriginContainmentResult =
+  | { kind: "pushed" }
+  // Origin already contains local default (nothing to push) — the healthy steady state.
+  | { kind: "already-contained" }
+  // Origin/<default> is NOT an ancestor of local default (diverged / origin-ahead) — NO
+  // push: the existing VISIBLE non-ff sticky path owns this, never a force, never here.
+  | { kind: "diverged" }
+  // An inconclusive probe (origin ref unresolved / a 124/128 read / an unparseable
+  // count) OR a push already attempted this cycle — DEFER, no push (tri-state discipline).
+  | { kind: "deferred"; reason: string }
+  | Exclude<PushDefaultResult, { kind: "pushed" }>;
+
+/**
+ * PERIODIC ORIGIN-CONTAINMENT reconcile for ONE repo (producer-only, run once per
+ * cycle by {@link WorktreeDriver.reconcileOrigin}). Today an origin push happens ONLY
+ * as a finalize / recover side effect, so a push that never lands leaves origin FROZEN
+ * while local default leads and no lane remains to re-trigger it. This fires the SAME
+ * {@link pushDefaultToOrigin} path ONLY on POSITIVE EVIDENCE — local default STRICTLY
+ * ahead of origin AND non-diverged — and DEFERS on every inconclusive probe:
+ *  1. `pushInFlight` (a finalize / recover push already ran this cycle for this repo) →
+ *     defer, so a timed-out push is not re-attempted, stacking a second deadline.
+ *  2. origin/<default> must RESOLVE locally (cached, NO fetch); a never-pushed default
+ *     is the finalize FIRST-push case, not a containment re-push → defer.
+ *  3. TRI-STATE non-divergence via `merge-base --is-ancestor origin/<default> <default>`:
+ *     exit 0 → non-diverged (a push is a pure fast-forward); exit 1 → diverged /
+ *     origin-ahead → `diverged`, NO push; any other exit → inconclusive → defer.
+ *  4. STRICTLY-ahead via {@link commitsAheadOfOrigin}: `null` → inconclusive → defer;
+ *     0 → `already-contained`; > 0 → positive evidence → {@link pushDefaultToOrigin}
+ *     (which re-verifies HEAD-safety + turn-key + non-ff before it touches origin).
+ * Pure git side effects — never a fetch / rebase / force. The existing push-stuck
+ * streak / sticky semantics are UNTOUCHED: this is a best-effort re-push; when its push
+ * times out it simply defers, and the finalize / recover paths remain the sole owners
+ * of the streak and the visible `worktree-finalize-push-stuck` escalation.
+ */
+export async function reconcileOriginContainment(
+  repo: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+  pushInFlight = false,
+): Promise<OriginContainmentResult> {
+  if (pushInFlight) {
+    return {
+      kind: "deferred",
+      reason: `a finalize/recover push already ran this cycle for ${repo}`,
+    };
+  }
+  const remoteRef = originDefaultRef(defaultBranch);
+  const exists = await run(["rev-parse", "--verify", "--quiet", remoteRef], {
+    cwd: repo,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (exists.code !== 0) {
+    return {
+      kind: "deferred",
+      reason: `origin/${defaultBranch} is unresolved locally (never pushed) — finalize owns the first push`,
+    };
+  }
+  const contains = await run(
+    ["merge-base", "--is-ancestor", remoteRef, `refs/heads/${defaultBranch}`],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (contains.code === 1) {
+    return { kind: "diverged" };
+  }
+  if (contains.code !== 0) {
+    return {
+      kind: "deferred",
+      reason: `could not prove origin/${defaultBranch} is contained in local ${defaultBranch} (exit ${contains.code})`,
+    };
+  }
+  const ahead = await commitsAheadOfOrigin(repo, defaultBranch, run);
+  if (ahead === null) {
+    return {
+      kind: "deferred",
+      reason: `could not count commits ahead of origin/${defaultBranch}`,
+    };
+  }
+  if (ahead === 0) {
+    return { kind: "already-contained" };
+  }
+  const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
+  return pushed.kind === "pushed" ? { kind: "pushed" } : pushed;
 }
 
 type OwnerIntegratedTeardownResult =
@@ -13071,6 +13275,10 @@ function main(): void {
         // Wrapped so a producer git failure can't wedge the wake loop.
         if (snapshot.worktreeMode && !state.paused && deps.worktree) {
           try {
+            // Reset the per-cycle push-attempt guard so the origin-containment probe
+            // below sees only THIS cycle's recover push attempts (stamped inside
+            // pushDefaultToOrigin), never a stale one — "no push in flight".
+            beginContainmentCycle();
             const openRecoverRows = snapshot.openRecoverRows ?? [];
             const repos = reposForRecovery(
               snapshot.epics,
@@ -13385,6 +13593,25 @@ function main(): void {
                   c.dir,
                 ),
               );
+            }
+            // PERIODIC ORIGIN-CONTAINMENT reconcile: after recover's lane-tied
+            // re-pushes, sweep every managed repo and re-push local default to origin
+            // on positive evidence alone (strictly ahead + non-diverged), so a repo
+            // whose finalize push never landed — and whose lanes are already gone —
+            // no longer leaves origin frozen while local leads. Producer-only, best
+            // effort: it fires the same push path, defers on any inconclusive probe or
+            // a push already attempted this cycle, and leaves the push-stuck streak /
+            // sticky ownership entirely with finalize / recover.
+            if (deps.worktree.reconcileOrigin) {
+              for (const { dir, result } of await deps.worktree.reconcileOrigin(
+                repos,
+              )) {
+                if (result.kind === "pushed") {
+                  console.error(
+                    `[autopilot-worker] origin-containment: re-pushed ${dir} — origin was behind local default`,
+                  );
+                }
+              }
             }
           } catch (err) {
             console.error(
