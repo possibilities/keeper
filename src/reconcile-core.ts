@@ -1700,6 +1700,13 @@ export interface ReconcileDecision {
    * reason-scoped upstream so it never touches a genuine `close::<epic>` conflict.
    */
   slotOccupancyClears: { verb: Verb; id: string }[];
+  /**
+   * The earliest wall-clock second a held stopped-live occupant crosses into
+   * reap-eligibility (from {@link computeSlotOccupancy}), or `null` when nothing is
+   * pending / the cycle is degraded or paused. The producer arms ONE coalesced wake
+   * for it so the age-driven reap fires in a quiescent DB.
+   */
+  slotNextExpiryAt: number | null;
 }
 /**
  * One recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
@@ -2100,10 +2107,15 @@ export const SLOT_RECLAIM_GRACE_SEC = 120;
  * idle before reaping. Sits in the 5-minute worktree/lane grace family
  * (`LANE_WEDGE_GRACE_SEC` / `LANE_OWNER_STALL_GRACE_SEC` / `SHARED_CHECKOUT_*_GRACE_SEC`),
  * the apt family since the corrosive harm is a dead session squatting a worktree lane
- * or concurrency slot from ready siblings. The SAME window the lane-maintenance probe
- * treats a stopped sibling's hold as expired, so the reap and the lane-provision
- * release stay in lockstep. Anchored on `job.updated_at`, exactly like the contended
- * grace; a `fatal_halt` receipt still bypasses BOTH graces.
+ * or concurrency slot from ready siblings. Anchored on `job.updated_at`, exactly like
+ * the contended grace; a `fatal_halt` receipt still bypasses BOTH graces.
+ *
+ * Grace makes a stopped session reap-ELIGIBLE only — it never authorizes a worktree
+ * lane release by age. The lane-maintenance probe stays fail-closed on a positively
+ * live pane and lifts a hold ONLY on a later positive gone/terminal observation (the
+ * bounded occupancy reaper having actually cleared the pane), so a target still
+ * within the reap ladder — over the blast cap, mid TERM→KILL, or failing act-time
+ * identity — never has its lane reset out from under a live process.
  */
 export const SLOT_RECLAIM_UNCONTENDED_GRACE_SEC = 5 * 60;
 
@@ -2198,6 +2210,17 @@ export interface SlotOccupancyInput {
 export interface SlotOccupancyDecision {
   failures: SlotOccupancySignal[];
   clears: { verb: Verb; id: string }[];
+  /**
+   * The earliest wall-clock second (same unix-seconds domain as `input.now`) at
+   * which a currently-NOT-eligible stopped-live candidate crosses into
+   * reap-eligibility — the minimum `updated_at + applicable-grace` over every held
+   * stopped candidate. The producer arms ONE coalesced wake for it so the age
+   * boundary is actually re-evaluated in a quiescent DB (`watchLoop` wakes only on
+   * `data_version`, so a stopped session left alone would never re-cross its grace).
+   * `null` when nothing is pending — no held candidate, or the paused / degraded
+   * early return (fail-closed: no wake armed, hence no wake-driven reap while paused).
+   */
+  nextExpiryAt: number | null;
 }
 
 const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
@@ -2236,11 +2259,15 @@ export function computeSlotOccupancy(
   const clears: { verb: Verb; id: string }[] = [];
   const { livePaneIds, paneCommandById } = input;
   if (input.paused || livePaneIds === null || paneCommandById === null) {
-    return { failures, clears };
+    return { failures, clears, nextExpiryAt: null };
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
   const uncontendedGraceSec =
     input.uncontendedGraceSec ?? SLOT_RECLAIM_UNCONTENDED_GRACE_SEC;
+  // Earliest second a currently-held stopped candidate becomes reap-eligible; the
+  // producer arms a coalesced wake for it. Tracked for BOTH contended-within-grace
+  // and uncontended-within-grace candidates (both are held this cycle).
+  let nextExpiryAt: number | null = null;
   const activeKeys = new Set<string>();
   const allCandidates: {
     key: string;
@@ -2279,8 +2306,15 @@ export function computeSlotOccupancy(
     // time-driven arm — reap-eligible only past the longer uncontended grace (or on
     // fatal_halt), and SILENT (no candidate, no occupied signal) within it so a
     // normal recently-ended turn's inspection window is left alone.
-    const reapEligible =
-      immediate || idleSec >= (contended ? graceSec : uncontendedGraceSec);
+    const applicableGrace = contended ? graceSec : uncontendedGraceSec;
+    const reapEligible = immediate || idleSec >= applicableGrace;
+    if (!reapEligible) {
+      // A held stopped-live candidate — arm the wake for the second it crosses its
+      // grace, so the reap fires without waiting on a `data_version` change.
+      const expiry = job.updated_at + applicableGrace;
+      nextExpiryAt =
+        nextExpiryAt === null ? expiry : Math.min(nextExpiryAt, expiry);
+    }
     if (!contended && !reapEligible) continue;
 
     const key = slotKey(verb, id);
@@ -2355,7 +2389,7 @@ export function computeSlotOccupancy(
       clears.push({ verb: open.verb, id: open.id });
     }
   }
-  return { failures, clears };
+  return { failures, clears, nextExpiryAt };
 }
 
 /**
@@ -2485,6 +2519,7 @@ export function reconcile(
       preCloseFenceClears: [],
       slotOccupancy: [],
       slotOccupancyClears: [],
+      slotNextExpiryAt: null,
     };
   }
 
@@ -3210,6 +3245,7 @@ export function reconcile(
     preCloseFenceClears,
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
+    slotNextExpiryAt: slot.nextExpiryAt,
   };
 }
 /**

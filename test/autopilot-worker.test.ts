@@ -94,6 +94,7 @@ import {
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createStaleBaseLaneTracker,
+  createStoppedExpiryWaker,
   createWithholdFrameState,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
@@ -111,6 +112,7 @@ import {
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
+  type ExpiryWakeClock,
   epicFrameVerdict,
   epicPresentAndNotDone,
   epicRecoverVerdictById,
@@ -2317,6 +2319,172 @@ test("computeSlotOccupancy: SLOT_RECLAIM_UNCONTENDED_GRACE_SEC gates the time-dr
     slotInput({ ...occ, wantsDispatch: () => false, uncontendedGraceSec: 1 }),
   );
   expect(out.failures[0].reapTarget?.jobId).toBe("j");
+});
+
+// ---------------------------------------------------------------------------
+// computeSlotOccupancy — nextExpiryAt (the coalesced-wake arming input)
+// ---------------------------------------------------------------------------
+
+test("computeSlotOccupancy: nextExpiryAt is the uncontended grace boundary for a held uncontended session", () => {
+  const occ = oneOccupant({ command: "claude", updated_at: 950 }); // idle 50 < 300
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(out.failures).toEqual([]); // silent within grace
+  expect(out.nextExpiryAt).toBe(950 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC);
+});
+
+test("computeSlotOccupancy: nextExpiryAt uses the SHORT grace for a held contended session", () => {
+  const occ = oneOccupant({ command: "claude", updated_at: 950 }); // idle 50 < 120
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => true }),
+  );
+  expect(out.failures[0].reapTarget).toBeNull(); // occupied within short grace
+  expect(out.nextExpiryAt).toBe(950 + SLOT_RECLAIM_GRACE_SEC);
+});
+
+test("computeSlotOccupancy: nextExpiryAt is the MINIMUM across held candidates", () => {
+  const a = oneOccupant({
+    id: "fn-1-foo.1",
+    jobId: "ja",
+    pane: "%1",
+    command: "claude",
+    updated_at: 900,
+  });
+  const b = oneOccupant({
+    id: "fn-1-foo.2",
+    jobId: "jb",
+    pane: "%2",
+    command: "claude",
+    updated_at: 970,
+  });
+  const out = computeSlotOccupancy(
+    slotInput({
+      jobs: new Map([...a.jobs, ...b.jobs]),
+      livePaneIds: new Set(["%1", "%2"]),
+      paneCommandById: new Map([
+        ["%1", "claude"],
+        ["%2", "claude"],
+      ]),
+      wantsDispatch: () => false,
+    }),
+  );
+  // Both within the 300s uncontended grace; the earlier-stopped job's expiry wins.
+  expect(out.nextExpiryAt).toBe(900 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC);
+});
+
+test("computeSlotOccupancy: a reap-eligible (past-grace) candidate contributes no expiry", () => {
+  const occ = oneOccupant({ command: "claude", updated_at: 600 }); // idle 400 > 300
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(out.failures[0].reapTarget?.jobId).toBe("j"); // reaped now
+  expect(out.nextExpiryAt).toBeNull(); // nothing left pending a future wake
+});
+
+test("computeSlotOccupancy: nextExpiryAt is null when paused, degraded, or idle", () => {
+  const occ = oneOccupant({ command: "claude", updated_at: 950 });
+  expect(
+    computeSlotOccupancy(slotInput({ ...occ, paused: true })).nextExpiryAt,
+  ).toBeNull();
+  expect(
+    computeSlotOccupancy(slotInput({ ...occ, livePaneIds: null })).nextExpiryAt,
+  ).toBeNull();
+  expect(computeSlotOccupancy(slotInput({})).nextExpiryAt).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// createStoppedExpiryWaker — the coalesced quiescent-DB clock-edge wake
+// ---------------------------------------------------------------------------
+
+/** A single-slot fake timer scheduler + fake unix-seconds clock. */
+function fakeExpiryClock(startSec: number): {
+  clock: ExpiryWakeClock;
+  setNow: (sec: number) => void;
+  armed: () => { delayMs: number; fire: () => void } | null;
+} {
+  let nowSec = startSec;
+  let slot: { delayMs: number; fire: () => void } | null = null;
+  return {
+    setNow: (sec) => {
+      nowSec = sec;
+    },
+    armed: () => slot,
+    clock: {
+      now: () => nowSec,
+      setTimer: (delayMs, fire) => {
+        slot = { delayMs, fire };
+        return slot;
+      },
+      clearTimer: () => {
+        slot = null;
+      },
+    },
+  };
+}
+
+test("createStoppedExpiryWaker: fires a reap cycle past grace with ZERO DB writes (clock-edge closed)", () => {
+  const { clock, setNow, armed } = fakeExpiryClock(1000);
+  // The "DB": one uncontended stopped-live session, within grace at t=1000.
+  const occ = oneOccupant({ command: "claude", updated_at: 950 }); // idle 50 < 300
+  let lastDecision = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false, now: clock.now() }),
+  );
+  // A cycle recomputes occupancy at the CURRENT fake time and re-arms — exactly what
+  // driveCycle does — but touches NO database.
+  const runCycle = (): void => {
+    lastDecision = computeSlotOccupancy(
+      slotInput({ ...occ, wantsDispatch: () => false, now: clock.now() }),
+    );
+    waker.arm(lastDecision.nextExpiryAt);
+  };
+  const waker = createStoppedExpiryWaker(clock, runCycle, () => false);
+
+  // First cycle: silent within grace, but a wake is armed for the expiry.
+  expect(lastDecision.failures).toEqual([]);
+  waker.arm(lastDecision.nextExpiryAt);
+  expect(armed()?.delayMs).toBe((950 + 300 - 1000) * 1000); // 250s out
+
+  // Advance the fake clock past grace with NO DB write, then fire the timer.
+  setNow(950 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC + 1); // 1251
+  armed()?.fire();
+
+  // The wake ran a reap cycle: the slot is now reclaimed, no data_version change.
+  expect(lastDecision.failures).toHaveLength(1);
+  expect(lastDecision.failures[0].reapTarget?.jobId).toBe("j");
+  expect(lastDecision.failures[0].reason.startsWith("slot-reclaimed")).toBe(
+    true,
+  );
+});
+
+test("createStoppedExpiryWaker: coalesces to ONE timer, disarms on null, and never fires after shutdown", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  let cycles = 0;
+  let down = false;
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {
+      cycles++;
+    },
+    () => down,
+  );
+
+  // Re-arming replaces the single timer (coalesced — never a per-job timer).
+  waker.arm(1100);
+  const first = armed();
+  waker.arm(1050);
+  expect(armed()).not.toBe(first); // the prior timer is cleared, then a new one set
+  expect(armed()?.delayMs).toBe(50 * 1000);
+
+  // A null expiry (paused/degraded) disarms — fail closed, no wake.
+  waker.arm(null);
+  expect(armed()).toBeNull();
+
+  // A fired timer after shutdown runs no cycle.
+  waker.arm(1100);
+  down = true;
+  armed()?.fire();
+  expect(cycles).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -16039,67 +16207,48 @@ test("lane maintenance probe holds live claims and fails closed on inconclusive 
   ).toMatchObject({ kind: "defer" });
 });
 
-test("lane maintenance probe expires a past-grace stopped sibling's hold, keeping within-grace / inconclusive / no-clock holds", () => {
+test("lane maintenance HOLDS a past-grace stopped sibling occupancy would reap — age never resets a live lane (positive-gone invariant)", () => {
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const pane = "%7";
   const target = { path: lane, epicId: "fn-1-foo", taskId: "fn-1-foo.2" };
-  // A stopped-but-live sibling squatting the lane with no live claim of its own — the
-  // exact dead-claim shape the occupancy sweep reaps.
+  // A stopped-but-live sibling squatting the lane, aged well past every reap grace.
   const stopped = makeJob({
     job_id: "sib",
     plan_verb: "work",
     plan_ref: "fn-1-foo.2",
     cwd: lane,
     state: "stopped",
-    backend_exec_pane_id: "%7",
+    backend_exec_pane_id: pane,
     updated_at: 100,
   });
   const jobs = new Map([[stopped.job_id, stopped]]);
-  const live = new Set(["%7"]);
-  const pastGrace = 100 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC; // idle === grace
+  const live = new Set([pane]);
+  const now = 100 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC + 50; // past grace
 
-  // Genuine liveness picture, clock present, stop-age past grace → hold EXPIRES so the
-  // epic's lane provision proceeds.
-  const expired = createLaneMaintenanceProbe(
-    jobs,
-    new Map(),
-    live,
-    new Set(),
-    pastGrace,
+  // Occupancy SELECTS it for reap (grace makes it eligible)…
+  const occ = computeSlotOccupancy(
+    slotInput({
+      jobs,
+      livePaneIds: live,
+      paneCommandById: new Map([[pane, "claude"]]),
+      wantsDispatch: () => false,
+      now,
+    }),
   );
-  expect(expired(target)).toEqual({ kind: "clear" });
+  expect(occ.failures[0].reapTarget?.jobId).toBe("sib");
 
-  // Within grace → still held (fail-closed; provision stays blocked).
-  const withinGrace = createLaneMaintenanceProbe(
-    jobs,
-    new Map(),
-    live,
-    new Set(),
-    pastGrace - 1,
-  );
-  expect(withinGrace(target)).toMatchObject({
-    kind: "defer",
-    reason: expect.stringContaining("live claimed session"),
-  });
+  // …yet the lane probe STILL DEFERS while the pane is positively live: age makes the
+  // target reap-ELIGIBLE only; the lane lifts solely on a later positive gone. This
+  // holds identically when occupancy could NOT actually reap it — a degraded command
+  // map (occupancy inert) is still a live pane to the lane probe.
+  for (const panes of [live, null]) {
+    const held = createLaneMaintenanceProbe(jobs, new Map(), panes);
+    expect(held(target)).toMatchObject({ kind: "defer" });
+  }
 
-  // Inconclusive liveness (null panes) → still held even past grace (fail-closed).
-  const inconclusive = createLaneMaintenanceProbe(
-    jobs,
-    new Map(),
-    null,
-    new Set(),
-    pastGrace,
-  );
-  expect(inconclusive(target)).toMatchObject({
-    kind: "defer",
-    reason: expect.stringContaining("liveness probe inconclusive"),
-  });
-
-  // No clock supplied → the expiry is off entirely, the hold stays (fail-closed).
-  const noClock = createLaneMaintenanceProbe(jobs, new Map(), live, new Set());
-  expect(noClock(target)).toMatchObject({
-    kind: "defer",
-    reason: expect.stringContaining("live claimed session"),
-  });
+  // Positive gone next cycle (the reaper cleared the pane) → the lane releases.
+  const gone = createLaneMaintenanceProbe(jobs, new Map(), new Set());
+  expect(gone(target)).toEqual({ kind: "clear" });
 });
 
 test("recoverWorktrees: a task-scoped live claim plus MERGE_HEAD protects the lane from every recovery mutation", async () => {

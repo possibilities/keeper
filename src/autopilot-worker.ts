@@ -195,7 +195,6 @@ import {
   recoverFailureDispatchId,
   SLOT_RECLAIM_GRACE_SEC,
   SLOT_RECLAIM_MAX_PER_SWEEP,
-  SLOT_RECLAIM_UNCONTENDED_GRACE_SEC,
   type StaleBaseLaneEntry,
   type Verb,
   type WithholdReason,
@@ -898,7 +897,6 @@ export function createLaneMaintenanceProbe(
   dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> | undefined,
   livePaneIds: ReadonlySet<string> | null,
   claimedIncidentKeys: ReadonlySet<DispatchKey> = new Set(),
-  now?: number,
 ): LaneMaintenanceProbe {
   return (target) => {
     const lanePath = normalizeLanePath(target.path);
@@ -964,21 +962,15 @@ export function createLaneMaintenanceProbe(
         // live), shared with the occupancy gate and the dirty-attribution pass
         // rather than forked here. `null` panes stay a DISTINCT reason: the hold
         // is fail-closed on an unavailable probe, not a witnessed live owner.
+        //
+        // A positively-live pane HOLDS the lane regardless of stop-age: grace only
+        // makes the session reap-ELIGIBLE for the bounded occupancy reaper, and the
+        // lane must not be reset out from under a target still inside that ladder
+        // (over the blast cap, mid TERM→KILL, or failing act-time identity). The
+        // hold lifts only on a later positive gone here — a reaped-away pane trips
+        // `!isStoppedJobLive` above and clears (the positive-gone / live-lane-no-reset
+        // invariant).
         if (!isStoppedJobLive(job, livePaneIds)) continue;
-        // A stopped-but-live sibling whose turn ended past the uncontended reap
-        // grace is a dead claim the occupancy sweep will reap; its lane hold has
-        // EXPIRED and must not block the epic's lane provision. Gated on a GENUINE
-        // liveness picture (`livePaneIds !== null`) and the SAME `updated_at`
-        // stop-age anchor + grace the reap uses, so reap and lane release stay in
-        // lockstep. A probe with no clock (`now` absent), an inconclusive probe
-        // (`null` panes), and a within-grace stop all stay fail-closed held.
-        if (
-          now !== undefined &&
-          livePaneIds !== null &&
-          now - job.updated_at >= SLOT_RECLAIM_UNCONTENDED_GRACE_SEC
-        ) {
-          continue;
-        }
         return {
           kind: "defer",
           reason: boundedLaneMaintenanceReason(
@@ -1014,6 +1006,67 @@ function probeLaneMaintenance(
       ),
     };
   }
+}
+
+/**
+ * Injected timer primitives for the coalesced stopped-job expiry wake — real
+ * wall-clock `setTimeout` in `main()`, a fake scheduler in tests. `now()` is unix
+ * SECONDS (the same domain as `reconcile`'s `now`); `setTimer`/`clearTimer` model a
+ * SINGLE coalesced timer (never a per-job timer). `unref` is left to the production
+ * adapter so the timer never keeps the worker thread alive.
+ */
+export interface ExpiryWakeClock {
+  now: () => number;
+  setTimer: (delayMs: number, fire: () => void) => unknown;
+  clearTimer: (handle: unknown) => void;
+}
+
+/** The coalesced stopped-job expiry waker: one re-armable timer. */
+export interface StoppedExpiryWaker {
+  /** Re-arm the single timer for the earliest stopped-job reap expiry (unix
+   *  seconds). `null` disarms — the paused / degraded fail-closed case. */
+  arm: (nextExpiryAt: number | null) => void;
+  /** Cancel the timer outright (shutdown). */
+  disarm: () => void;
+}
+
+/**
+ * Build the coalesced stopped-job expiry waker. autopilot's `watchLoop` wakes ONLY
+ * on a `data_version` change, so a stopped session sitting in a quiescent DB would
+ * never re-cross its reap grace — the age predicate {@link computeSlotOccupancy}
+ * applies would never be re-evaluated. This arms ONE re-armable timer at the earliest
+ * durable stopped-job reap expiry the last cycle computed and fires a fresh cycle
+ * when it elapses, closing that clock edge WITHOUT a DB write. Coalesced by
+ * construction: {@link StoppedExpiryWaker.arm} clears the prior timer before setting
+ * the next, so there is only ever one timer (never per-job), re-armed to the running
+ * minimum each cycle and re-derived from the durable jobs projection (restart-safe —
+ * the boot cycle re-arms it). A `null` expiry (paused / degraded — the slot pass
+ * returns null there) disarms, so no wake-driven reap fires while paused.
+ */
+export function createStoppedExpiryWaker(
+  clock: ExpiryWakeClock,
+  runCycle: () => void,
+  isShutdown: () => boolean,
+): StoppedExpiryWaker {
+  let handle: unknown = null;
+  const disarm = (): void => {
+    if (handle !== null) {
+      clock.clearTimer(handle);
+      handle = null;
+    }
+  };
+  return {
+    disarm,
+    arm: (nextExpiryAt): void => {
+      disarm();
+      if (nextExpiryAt === null || isShutdown()) return;
+      const delayMs = Math.max(0, (nextExpiryAt - clock.now()) * 1000);
+      handle = clock.setTimer(delayMs, () => {
+        handle = null;
+        if (!isShutdown()) runCycle();
+      });
+    },
+  };
 }
 
 /**
@@ -13343,12 +13396,35 @@ function main(): void {
   // and `runReconcileCycle` owns the one-at-a-time stagger.
   let cycleRunning = false;
   let wakePending = false;
+  // Coalesced stopped-job expiry wake — closing the quiescent-DB clock edge: one
+  // re-armable wall-clock timer fired at the earliest stopped-job reap expiry so the
+  // age-driven reap runs even when no `data_version` change wakes `watchLoop`.
+  // `unref`'d so it never keeps the worker thread alive.
+  const stoppedExpiryWaker = createStoppedExpiryWaker(
+    {
+      now: () => deps.now(),
+      setTimer: (delayMs, fire) => {
+        const timer = setTimeout(fire, delayMs);
+        (timer as { unref?: () => void }).unref?.();
+        return timer;
+      },
+      clearTimer: (handle) =>
+        clearTimeout(handle as ReturnType<typeof setTimeout>),
+    },
+    () => {
+      if (!shutdown) void driveCycle();
+    },
+    () => shutdown,
+  );
   const driveCycle = async (): Promise<void> => {
     if (cycleRunning) {
       wakePending = true;
       return;
     }
     cycleRunning = true;
+    // The last cycle's earliest held stopped-job expiry; the wake is (re-)armed for
+    // it in `finally`, so a quiescent DB still re-crosses the reap grace.
+    let latestSlotExpiry: number | null = null;
     try {
       do {
         wakePending = false;
@@ -13384,7 +13460,6 @@ function main(): void {
           snapshot.dispatchClaims,
           snapshot.livePaneIds,
           snapshot.claimedIncidentKeys,
-          deps.now(),
         );
         dispatchFailedGate.observeProjection(snapshot.dispatchFailureFences);
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
@@ -14103,6 +14178,7 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
+        latestSlotExpiry = decision.slotNextExpiryAt;
         // Reap the union of the done-monitor candidates and this cycle's
         // exact occupancy targets. Slot targets take precedence for a shared job
         // because their stopped proof needs no monitor-staleness inference. The
@@ -14443,6 +14519,10 @@ function main(): void {
       console.error("[autopilot-worker] reconcile cycle threw:", err);
     } finally {
       cycleRunning = false;
+      // Re-arm the coalesced expiry wake from THIS cycle's earliest held stopped-job
+      // expiry (null while paused/degraded → disarmed, failing closed). Restart-safe:
+      // the boot cycle re-derives it from the durable jobs projection.
+      stoppedExpiryWaker.arm(latestSlotExpiry);
     }
   };
 
@@ -14480,6 +14560,7 @@ function main(): void {
     .then(() => {
       clearInterval(rollupTimer);
       clearInterval(terminalPaneGcTimer);
+      stoppedExpiryWaker.disarm();
       // Final rollup flush so the on-shutdown denominator lands before exit.
       flushBackstopRollups();
       closeDb();
@@ -14489,6 +14570,7 @@ function main(): void {
       console.error("[autopilot-worker] watch loop crashed:", err);
       clearInterval(rollupTimer);
       clearInterval(terminalPaneGcTimer);
+      stoppedExpiryWaker.disarm();
       flushBackstopRollups();
       closeDb();
       process.exit(1);
