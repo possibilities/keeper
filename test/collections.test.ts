@@ -36,6 +36,7 @@ import {
   GIT_DESCRIPTOR,
   getCollection,
   JOBS_DESCRIPTOR,
+  liveKeyAccessor,
   liveKeyExpr,
   liveKeyOf,
   PENDING_DISPATCHES_DESCRIPTOR,
@@ -1993,6 +1994,47 @@ test("worktree_repo_status: same-epic sibling groups retain distinct live identi
       seedWorktreeRepoStatus(db, "fn-1", "/repo-b", 7);
     },
   );
+});
+
+test("liveKeyAccessor: accepts only wire scalars (string incl. empty / finite number) and returns null on any missing / non-scalar key component (fn-28 part 4e)", () => {
+  // Composite: byte-identical to a `col ⟨char31⟩ col` join for well-formed rows; a
+  // missing / null / object / array / non-finite component → null (the caller drops
+  // the row rather than forging a `[object Object]` / `undefined` colliding key).
+  const composite = liveKeyAccessor("epic_id", ["epic_id", "repo_dir"]);
+  expect(composite({ epic_id: "fn-1", repo_dir: "/repo-a" })).toBe(
+    "fn-1\u001f/repo-a",
+  );
+  // Empty string is a VALID component (repo_dir is NOT NULL DEFAULT '').
+  expect(composite({ epic_id: "fn-1", repo_dir: "" })).toBe("fn-1\u001f");
+  // A finite number component stringifies (byte-identical to liveKeyOf).
+  expect(composite({ epic_id: "fn-1", repo_dir: 3 })).toBe("fn-1\u001f3");
+  for (const bad of [
+    { epic_id: "fn-1" }, // missing repo_dir
+    { epic_id: "fn-1", repo_dir: null },
+    { epic_id: "fn-1", repo_dir: undefined },
+    { epic_id: "fn-1", repo_dir: { x: 1 } },
+    { epic_id: "fn-1", repo_dir: ["/r"] },
+    { epic_id: "fn-1", repo_dir: Number.NaN },
+    { epic_id: "fn-1", repo_dir: Number.POSITIVE_INFINITY },
+    { epic_id: "fn-1", repo_dir: true },
+    { epic_id: { y: 2 }, repo_dir: "/repo-a" }, // non-scalar epic_id
+  ]) {
+    expect(composite(bad as Record<string, unknown>)).toBeNull();
+  }
+  // Scalar: same predicate on the single pk column.
+  const scalar = liveKeyAccessor("epic_id");
+  expect(scalar({ epic_id: "fn-1" })).toBe("fn-1");
+  expect(scalar({ epic_id: 1 })).toBe("1");
+  expect(scalar({ epic_id: "" })).toBe("");
+  for (const bad of [
+    {}, // missing
+    { epic_id: null },
+    { epic_id: { x: 1 } },
+    { epic_id: ["a"] },
+    { epic_id: Number.NaN },
+  ]) {
+    expect(scalar(bad as Record<string, unknown>)).toBeNull();
+  }
 });
 
 function expectStableCompositePageOrder({

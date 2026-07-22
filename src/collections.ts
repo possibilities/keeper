@@ -1167,15 +1167,29 @@ export function liveKeyOf(descriptor: CollectionDescriptor, row: Row): string {
 }
 
 /**
+ * A key component is USABLE only if it is a wire SCALAR the descriptors actually
+ * key on — a string (including `""`, which the schema permits for a NOT-NULL
+ * DEFAULT '' column like `repo_dir`) or a FINITE number. Anything else (null /
+ * undefined / object / array / boolean / NaN / ±Infinity) is malformed: it would
+ * `String()`-fold to garbage like `"[object Object]"` and forge a colliding key,
+ * so the accessor treats it as absent (returns `null`) and the caller drops the row.
+ */
+function isScalarKeyComponent(v: unknown): v is string | number {
+  return typeof v === "string" || (typeof v === "number" && Number.isFinite(v));
+}
+
+/**
  * Build a live-key accessor for a `(pk, liveKeyColumns)` pair — byte-identical to
- * {@link liveKeyOf}'s output for a well-formed row, but returning `null` when any
- * key component is missing so a malformed row is dropped rather than keyed on the
- * literal string `"undefined"`. The subscribe client (`readiness-client.ts`) keys
- * `byId` / `order` / the per-row version cursor / direct-patch merges by this, so a
- * composite-identity collection's same-`pk` sibling rows (e.g. one epic's two
- * downgraded `worktree_repo_status` repo groups) never collapse onto one slot. Kept
- * here so the identity contract has ONE home — the SQL side (`liveKeyExpr`), the
- * server diff (`liveKeyOf`), and the client all agree on the same bytes.
+ * {@link liveKeyOf}'s output for a well-formed row (every component a wire scalar),
+ * but returning `null` when ANY key component is missing OR non-scalar so a
+ * malformed row is DROPPED rather than keyed on a `String()`-folded garbage token
+ * (`"undefined"` / `"[object Object]"`). The subscribe client
+ * (`readiness-client.ts`) keys `byId` / `order` / the per-row version cursor /
+ * direct-patch merges by this, so a composite-identity collection's same-`pk`
+ * sibling rows (e.g. one epic's two downgraded `worktree_repo_status` repo groups)
+ * never collapse onto one slot, and a malformed row never forges a colliding key.
+ * Kept here so the identity contract has ONE home — the SQL side (`liveKeyExpr`),
+ * the server diff (`liveKeyOf`), and the client all agree on the same bytes.
  */
 export function liveKeyAccessor(
   pk: string,
@@ -1184,14 +1198,14 @@ export function liveKeyAccessor(
   if (!liveKeyColumns || liveKeyColumns.length === 0) {
     return (row) => {
       const v = row[pk];
-      return v == null ? null : String(v);
+      return isScalarKeyComponent(v) ? String(v) : null;
     };
   }
   return (row) => {
     const parts: string[] = [];
     for (const c of liveKeyColumns) {
       const v = row[c];
-      if (v == null) return null;
+      if (!isScalarKeyComponent(v)) return null;
       parts.push(String(v));
     }
     return parts.join(LIVE_KEY_DELIM);

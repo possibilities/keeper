@@ -3063,6 +3063,114 @@ test("subscribeCollection: a clustered epic's two same-epic worktree_repo_status
   handle.dispose();
 });
 
+test("subscribeCollection: MALFORMED composite key components are dropped from the seed and inert as patches; valid siblings keep independent versions + order throughout (fn-28 part 4e fail-safe key hygiene)", () => {
+  const { sock, rowsLog, handle } = makeWrsSidecar("test-wrs-malformed");
+  const subId = "test-wrs-malformed-worktree_repo_status";
+
+  expect(sock.takeOutbound()).toHaveLength(1);
+  // Seed: two VALID siblings PLUS rows with a malformed key component — a missing
+  // repo_dir, a null one, an object, an array, a non-finite number, and an object
+  // epic_id. Every malformed row must be DROPPED from `rows` (never `String()`-folded
+  // into a colliding `[object Object]` / `undefined` key).
+  sock.deliver([
+    wrsResult(subId, [
+      { epic_id: "fn-1", repo_dir: "/repo-a", reason: "A1", last_event_id: 5 },
+      { epic_id: "fn-1", repo_dir: "/repo-b", reason: "B1", last_event_id: 5 },
+      { epic_id: "fn-1", reason: "MISSING", last_event_id: 5 },
+      { epic_id: "fn-1", repo_dir: null, reason: "NULL", last_event_id: 5 },
+      { epic_id: "fn-1", repo_dir: { x: 1 }, reason: "OBJ", last_event_id: 5 },
+      { epic_id: "fn-1", repo_dir: ["/r"], reason: "ARR", last_event_id: 5 },
+      {
+        epic_id: "fn-1",
+        repo_dir: Number.NaN,
+        reason: "NONFINITE",
+        last_event_id: 5,
+      },
+      {
+        epic_id: { y: 2 },
+        repo_dir: "/repo-c",
+        reason: "OBJEPIC",
+        last_event_id: 5,
+      },
+    ]),
+  ]);
+  // Only the two VALID-key rows render; every malformed row is filtered out.
+  expect(rowsLog).toHaveLength(1);
+  const seeded = rowsLog[0] as Record<string, unknown>[];
+  expect(seeded).toHaveLength(2);
+  expect(seeded.map((r) => r.repo_dir)).toEqual(["/repo-a", "/repo-b"]);
+  sock.takeOutbound();
+
+  // Sequential SAME-EVENT patches for BOTH valid siblings → both update, distinct,
+  // independent version cursors, order preserved (fail-safe filtering never disturbed
+  // the valid siblings' identities).
+  sock.deliver([
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: "/repo-a",
+      reason: "A2",
+      last_event_id: 8,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: "/repo-b",
+      reason: "B2",
+      last_event_id: 8,
+    }),
+  ]);
+  expect(sock.takeOutbound()).toHaveLength(0);
+  const afterValid = rowsLog[rowsLog.length - 1] as Record<string, unknown>[];
+  expect(afterValid).toHaveLength(2);
+  expect(afterValid.find((r) => r.repo_dir === "/repo-a")?.reason).toBe("A2");
+  expect(afterValid.find((r) => r.repo_dir === "/repo-b")?.reason).toBe("B2");
+  expect(afterValid.map((r) => r.repo_dir)).toEqual(["/repo-a", "/repo-b"]);
+
+  // MALFORMED patches (each with a bad key component) are fully INERT: no merge, no
+  // render, no refetch — the valid siblings are untouched.
+  const rendersBefore = rowsLog.length;
+  sock.deliver([
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      reason: "P-MISSING",
+      last_event_id: 20,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: null,
+      reason: "P-NULL",
+      last_event_id: 20,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: { z: 3 },
+      reason: "P-OBJ",
+      last_event_id: 20,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: ["/z"],
+      reason: "P-ARR",
+      last_event_id: 20,
+    }),
+    wrsPatch(subId, {
+      epic_id: "fn-1",
+      repo_dir: Number.POSITIVE_INFINITY,
+      reason: "P-INF",
+      last_event_id: 20,
+    }),
+  ]);
+  // No new render, no refetch — every malformed patch was dropped.
+  expect(rowsLog).toHaveLength(rendersBefore);
+  expect(sock.takeOutbound()).toHaveLength(0);
+  // The valid siblings are exactly as the last valid patch left them.
+  const final = rowsLog[rowsLog.length - 1] as Record<string, unknown>[];
+  expect(final.map((r) => r.repo_dir)).toEqual(["/repo-a", "/repo-b"]);
+  expect(final.find((r) => r.repo_dir === "/repo-a")?.reason).toBe("A2");
+  expect(final.find((r) => r.repo_dir === "/repo-b")?.reason).toBe("B2");
+
+  handle.dispose();
+});
+
 test("subscribeCollection: meta still triggers a refetch", () => {
   const { sock, rowsLog, handle } = makeJobsSidecar("test-meta");
   const subId = "test-meta-jobs";

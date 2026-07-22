@@ -1480,14 +1480,20 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       state.order.length = 0;
       state.byId.clear();
       state.lastSeenVersion.clear();
-      // Re-snapshot `rows` from this frame — see module docstring.
-      state.rows = frame.rows.slice();
+      // Re-snapshot `rows` from this frame — see module docstring. Seed by the
+      // composite live identity so same-`pk` sibling rows keep DISTINCT `byId` /
+      // `order` / version-cursor slots (matching the direct patch merge). A MALFORMED
+      // row (null key — a missing / non-scalar key component, never for a NOT-NULL
+      // scalar-typed PK) is DROPPED from `rows` too, so `rows` / `order` stay
+      // index-aligned and a garbage-keyed row can never enter the projection or
+      // collide a valid sibling's slot.
+      const seededRows: unknown[] = [];
       for (const row of frame.rows) {
-        // Seed by the composite live identity so same-`pk` sibling rows keep
-        // DISTINCT `byId` / `order` / version-cursor slots (matching the direct
-        // patch merge). A malformed row (null key — never for a NOT-NULL composite
-        // PK) falls back to the scalar pk so `order` stays index-aligned with `rows`.
-        const id = state.liveKey(row) ?? String(row[state.pk]);
+        const id = state.liveKey(row);
+        if (id === null) {
+          continue;
+        }
+        seededRows.push(row);
         state.order.push(id);
         state.byId.set(id, row);
         // Re-arm the per-pk version cursor from the authoritative page so a
@@ -1497,6 +1503,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
           state.lastSeenVersion.set(id, v);
         }
       }
+      state.rows = seededRows;
       state.gotResult = true;
       // FIRST PAINT clears the give-up anchor. Keyed off the first `result`
       // (the only `gotResult` false→true site), NOT socket `open` — a half-up

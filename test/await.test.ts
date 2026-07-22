@@ -3417,9 +3417,18 @@ test("await drained --fail-on-stuck: jam sticky → stuck exit 5", async () => {
   sock.takeOutbound();
 
   // A jam-reason sticky present on the snapshot, board otherwise at rest → the
-  // first-paint gate holds until dispatch_failures paints, then stuck exit 5.
+  // first-paint gate holds until dispatch_failures paints, then stuck exit 5. The
+  // row carries its real NOT-NULL (verb, id) composite key so it survives the
+  // client's fail-safe key filter (a keyless fixture is dropped as malformed).
   deliverFiveWith(sock, idPrefix, {
-    dispatchFailures: [{ reason: "worktree-finalize-non-fast-forward" }],
+    dispatchFailures: [
+      {
+        verb: "close",
+        id: "fn-1",
+        reason: "worktree-finalize-non-fast-forward",
+        last_event_id: 1,
+      },
+    ],
   });
 
   const failed = h.stdout.filter((l) => l.includes("[keeper-await] failed"));
@@ -3446,7 +3455,14 @@ test("await drained --fail-on-stuck: recover* sticky is NOT a jam → met", asyn
   sock.takeOutbound();
 
   deliverFiveWith(sock, idPrefix, {
-    dispatchFailures: [{ reason: "worktree-recover-conflict" }],
+    dispatchFailures: [
+      {
+        verb: "close",
+        id: "fn-2",
+        reason: "worktree-recover-conflict",
+        last_event_id: 1,
+      },
+    ],
   });
 
   // recover* is auto-clearing, never an operator jam → drained met, not stuck.
@@ -4039,7 +4055,14 @@ test("--probe --fail-on-stuck: a jam sticky surfaces as its own exit 5, not a ge
   sock.takeOutbound();
 
   deliverFiveWith(sock, idPrefix, {
-    dispatchFailures: [{ reason: "worktree-finalize-non-fast-forward" }],
+    dispatchFailures: [
+      {
+        verb: "close",
+        id: "fn-1",
+        reason: "worktree-finalize-non-fast-forward",
+        last_event_id: 1,
+      },
+    ],
   });
 
   expect(h.exitCode).toBe(5);
