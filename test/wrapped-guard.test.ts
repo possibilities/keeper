@@ -281,10 +281,14 @@ describe("evaluateWrappedBash — quality-auditor per-task submit carve-out", ()
   // The per-task audit gate's static `plan:quality-auditor` inherits the wrapped
   // parent's marker; the carve-out admits ONLY its findings submit, ONLY in the
   // `submit-task --file <path> --status <s>` shape, and ONLY for that agent_type.
+  // The file-class probe fails closed (absence denies), so the pure shape tests
+  // inject a permissive probe; the fs-backed class enforcement is covered by the
+  // production-path and real-fs suites below.
   const auditor = {
     taskId: "fn-1-x.2",
     envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
     agentType: "plan:quality-auditor",
+    auditFileProbe: () => true,
   };
 
   const allow = [
@@ -400,6 +404,18 @@ describe("evaluateWrappedBash — quality-auditor per-task submit carve-out", ()
     for (const cmd of dup) {
       expect(evaluateWrappedBash(cmd, auditor)).not.toBeNull();
     }
+  });
+
+  test("fails CLOSED when the file-class probe is not wired (absent probe → deny)", () => {
+    // an otherwise-valid submit whose context omits auditFileProbe: the guard
+    // cannot positively clear the file class, so it denies rather than allowing.
+    const { auditFileProbe: _omit, ...noProbe } = auditor;
+    expect(
+      evaluateWrappedBash(
+        "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild",
+        noProbe,
+      ),
+    ).not.toBeNull();
   });
 });
 
@@ -920,13 +936,17 @@ describe("decideWrappedGuard — auditor submit --file class (real fs, productio
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("ALLOWS the submit when --file is an existing private-scratch .json", () => {
-    const f = join(dir, "finding.json");
-    writeFileSync(f, '{"findings":[]}', { mode: 0o600 });
+  test("FLOW: writeAtomicWrappedHandoff creates the leaf → auditSubmitFileSafe accepts it → submit is admitted", () => {
+    // The whole procedure through the PRODUCTION creation path (never a
+    // writeFileSync fabrication): the guard's atomic handoff materializes the
+    // descriptor-bound .json, the class probe clears it, and the submit lands.
+    const leaf = join(dir, "finding.json");
+    expect(writeAtomicWrappedHandoff(leaf, '{"findings":[]}', REPO)).toBe(true);
+    expect(auditSubmitFileSafe(leaf)).toBe(true);
     expect(
       decideWrappedGuard(
         auditorBash(
-          `keeper plan audit submit-task fn-1-x.2 --file ${f} --status mild`,
+          `keeper plan audit submit-task fn-1-x.2 --file ${leaf} --status mild`,
         ),
         env,
         fsProbe(),

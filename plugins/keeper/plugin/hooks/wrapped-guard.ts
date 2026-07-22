@@ -405,8 +405,9 @@ export interface WrappedCommandContext {
  *  submit-task`. `agent_type` is set by the harness, not the subagent (the same
  *  trust anchor grant-guard uses for its escalation set), so admitting exactly
  *  this value cannot be forged by the wrapped courier or any other marked
- *  subagent, and the auditor authors no source (Edit/Write/Task are off in its
- *  agent definition; the guard's other denials stay intact for it). */
+ *  subagent. Edit and Task are off in its agent definition; Write is deliberately
+ *  on, but the guard confines it to an inert `.json` under the auditor's
+ *  owner-private system-temp scratchpad, and every other denial stays intact. */
 const WRAPPED_AUDIT_AGENT_TYPE = "plan:quality-auditor";
 
 /**
@@ -702,7 +703,9 @@ function wrappedAuditSubmitViolation(
   if (!isAbsolute(file)) {
     return "wrapped `keeper plan audit submit-task --file` must be an absolute scratchpad path";
   }
-  if (context.auditFileProbe && !context.auditFileProbe(file)) {
+  // Fail closed: an unwired probe cannot positively clear the file class, so its
+  // absence denies (a marked caller that reaches here must supply the probe).
+  if (!context.auditFileProbe || !context.auditFileProbe(file)) {
     return "wrapped `keeper plan audit submit-task --file` must point at an existing inert .json findings file under your private system-temp scratchpad";
   }
   return null;
