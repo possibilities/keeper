@@ -1156,6 +1156,33 @@ export function slotWakeArm(input: {
 }
 
 /**
+ * The SLOT and CONTAINMENT wake arms for a readiness-DEGRADED (a DB collection read errored)
+ * cycle — which derives no trustworthy decision. The two surfaces DIFFER on pause:
+ *  - SLOT: `paused → idle` (via {@link slotWakeArm}); no reap is PERMITTED while paused, so a
+ *    disarm is correct (`play` re-kicks). Otherwise `unknown` (preserve / bounded retry).
+ *  - CONTAINMENT: ALWAYS `unknown`, EVEN paused. Mode-off row RETIREMENT *is* permitted while
+ *    paused (the pause-independent disable), so a degraded snapshot that could neither read nor
+ *    retire the open rows must keep the wake alive (bounded retry) until a COMPLETE snapshot can
+ *    retire (mode false) or positively idle (mode true) — never disarm and strand the obsolete
+ *    non-retryable row on a quiescent paused board. This is bounded recovery from UNKNOWN, not a
+ *    wake-driven push while paused (the sweep stays `!paused`-gated, so no push fires).
+ */
+export function readinessDegradedWakeArms(paused: boolean): {
+  slot: WakeArm;
+  containment: WakeArm;
+} {
+  return {
+    slot: slotWakeArm({
+      paused,
+      degraded: true,
+      expiryAt: null,
+      expiryTrusted: false,
+    }),
+    containment: "unknown",
+  };
+}
+
+/**
  * Per-(pass, lane) latch for lane-maintenance deferral logging, keyed
  * `<pass>\0<normalized lane path>` → the last reason logged. A held lane rides a
  * `data_version`-level-triggered loop the live owner's OWN job updates keep
@@ -13686,16 +13713,14 @@ function main(): void {
           async () => observedPanes,
         );
         if (snapshot.readinessDegraded) {
-          // A DB-degraded cycle derives no trustworthy decision: PRESERVE both wakes (bounded
-          // retry) rather than disarm — unless PAUSED, which is independently known and wins
-          // (disarm; `play` re-kicks). Never freeze a live clock edge on a transient DB read.
-          latestSlotArm = slotWakeArm({
-            paused: state.paused,
-            degraded: true,
-            expiryAt: null,
-            expiryTrusted: false,
-          });
-          latestContainmentArm = state.paused ? "idle" : "unknown";
+          // A DB-degraded cycle derives no trustworthy decision. The SLOT arm may disarm while
+          // paused (no reap is permitted paused); the CONTAINMENT arm stays `unknown` EVEN paused,
+          // because mode-off row retirement IS permitted paused — disarming would strand an
+          // obsolete non-retryable row on a quiescent paused board. Both preserve / bounded-retry
+          // rather than freeze a live clock edge on a transient DB read.
+          const degradedArms = readinessDegradedWakeArms(state.paused);
+          latestSlotArm = degradedArms.slot;
+          latestContainmentArm = degradedArms.containment;
           continue;
         }
         const laneMaintenanceProbe = createLaneMaintenanceProbe(

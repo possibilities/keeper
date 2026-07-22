@@ -185,6 +185,7 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   readClaimAcquireObservation,
+  readinessDegradedWakeArms,
   readPriorWorktreeLaneProof,
   reconcile,
   reconcileOriginContainment,
@@ -26554,4 +26555,46 @@ test("13d mode-off-while-paused: clears + reset fire on explicit disable regardl
       nowSec: 10_000,
     }).mint,
   ).toEqual([]);
+});
+
+// --- 13d: containment degraded arm stays unknown under pause (retirement is pause-independent) ---
+
+test("13d readinessDegradedWakeArms: SLOT disarms while paused, CONTAINMENT stays unknown even paused", () => {
+  // The interaction created by pause-independent mode-off retirement: containment must NOT
+  // disarm on a paused+degraded cycle (that would strand an obsolete non-retryable row on a
+  // quiescent paused board), while slot correctly disarms (no reap permitted while paused).
+  expect(readinessDegradedWakeArms(true)).toEqual({
+    slot: "idle",
+    containment: "unknown",
+  });
+  // Not paused: both preserve / bounded-retry.
+  expect(readinessDegradedWakeArms(false)).toEqual({
+    slot: "unknown",
+    containment: "unknown",
+  });
+});
+
+test("13d degraded chain: paused+degraded containment → bounded retry; a later complete cycle retires or idles", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {},
+    () => false,
+    60,
+  );
+  // Regression (1): paused + degraded, no handle → 60s bounded retry.
+  applyWakeArm(waker, readinessDegradedWakeArms(true).containment);
+  expect(armed()?.delayMs).toBe(60 * 1000);
+  // Regression (2): a COMPLETE paused + mode-FALSE cycle retires rows (helper clears regardless
+  // of paused) AND resets the tracker (glue gate is worktreeMode===false), then idles.
+  const open = new Set(["/repo-deg"]);
+  expect(originContainmentModeOffClears(false, open)).toEqual([
+    { id: originContainmentDistressId("/repo-deg"), dir: "/repo-deg" },
+  ]);
+  applyWakeArm(waker, "idle"); // the else-branch idle after retirement
+  expect(armed()).toBeNull();
+  // Regression (3): a COMPLETE paused + mode-TRUE cycle clears nothing and idles.
+  expect(originContainmentModeOffClears(true, open)).toEqual([]);
+  applyWakeArm(waker, "idle");
+  expect(armed()).toBeNull();
 });
