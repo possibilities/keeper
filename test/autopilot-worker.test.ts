@@ -140,6 +140,7 @@ import {
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_GRACE_SEC,
   type LaneMaintenanceProbe,
+  type LaneProbeResult,
   type LaneWedgeObservation,
   type LaunchResult,
   type LiveDispatch,
@@ -8495,6 +8496,20 @@ test("fn-959 reconcile: worktree ON multi-repo epic → every launch stamped wor
 /** A worktree-ON snapshot whose repo classification uses a synthetic resolver
  *  (and an optional synthetic eligibility probe — defaults to always-eligible —
  *  plus an optional synthetic grandfather predicate, defaults to never). */
+/** Adapt a boolean grandfather predicate to the tri-state lane probe: true → a
+ *  `present` epoch (a live lane grandfathers a `disabled` repo to worktree, full
+ *  graph), false → `inconclusive` (the default: eligible→worktree, disabled→serial —
+ *  and never a fresh epoch). Tests that need a POSITIVELY-absent epoch / prior-lane
+ *  proof pass a laneProbe directly. */
+function grandfatherLaneProbe(
+  isGrand: (epicId: string, repoDir: string) => boolean,
+): (epicId: string, repoDir: string) => LaneProbeResult {
+  return (epicId, repoDir) =>
+    isGrand(epicId, repoDir)
+      ? { epoch: "present", priorLane: false }
+      : { epoch: "inconclusive", priorLane: false };
+}
+
 function worktreeSnap(
   epics: Epic[],
   resolve: (root: string) => string | null,
@@ -8508,7 +8523,7 @@ function worktreeSnap(
       epics,
       resolve,
       assessRepo,
-      isGrandfathered,
+      isGrandfathered ? grandfatherLaneProbe(isGrandfathered) : undefined,
     ),
   });
 }
@@ -9156,7 +9171,8 @@ test("fn-1013.3 classifyWorktreeRepos: assessRepo=disabled + grandfather TRUE �
     () => ({ eligible: false, reason: "worktree-disabled:workspace-marker" }),
     (epicId, repoDir) => {
       seen.push([epicId, repoDir]);
-      return true; // a live lane exists for this epic
+      // a live lane exists for this epic → a `present` epoch grandfathers it
+      return { epoch: "present", priorLane: false };
     },
   ).get("fn-1-foo");
   expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
@@ -9178,7 +9194,7 @@ test("fn-1013.3 classifyWorktreeRepos: a TRANSIENT probe error on a grandfathere
     [epic],
     (r) => (r === "/repo" ? "/repo" : null),
     () => ({ eligible: false, reason: "worktree-disabled:probe-error" }),
-    () => true,
+    grandfatherLaneProbe(() => true),
   ).get("fn-1-foo");
   expect(res).toEqual({ kind: "ok", repoDir: "/repo" });
 });
@@ -9195,7 +9211,7 @@ test("fn-1013.3 classifyWorktreeRepos: assessRepo=disabled + grandfather FALSE �
     [epic],
     (r) => (r === "/repo" ? "/repo" : null),
     () => ({ eligible: false, reason: "worktree-disabled:no-manifest" }),
-    () => false, // no live lane
+    grandfatherLaneProbe(() => false), // no live lane
   ).get("fn-1-foo");
   expect(res?.kind).toBe("disabled");
   expect(res?.kind === "disabled" && res.repoDir).toBe("/repo");
@@ -9244,7 +9260,7 @@ test("fn-1013.3 classifyWorktreeRepos: grandfather is consulted ONLY on a would-
             ? "/repo"
             : null,
     (top) => ({ eligible: top === "/repo", reason: "x" }),
-    grandfather,
+    grandfatherLaneProbe(grandfather),
   );
   expect(map.get("fn-1-ok")).toEqual({ kind: "ok", repoDir: "/repo" });
   expect(map.get("fn-1-multi")?.kind).toBe("multi-repo");
@@ -9274,7 +9290,7 @@ test("fn-1013.3 reposForRecovery: a grandfathered (ok) epic IS swept; a disabled
     [grand, disabled],
     (r) => r,
     (top) => ({ eligible: false, reason: `worktree-disabled (${top})` }),
-    (epicId) => epicId === "fn-1-grand", // only the grandfathered epic has a lane
+    grandfatherLaneProbe((epicId) => epicId === "fn-1-grand"), // only the grandfathered epic has a lane
   );
   // The grandfathered epic stayed `ok` → swept; the disabled epic provisioned no
   // lane → skipped (nothing to recover).
@@ -9357,7 +9373,7 @@ function multiRepoSnap(
       epics,
       resolve,
       assessRepo,
-      isGrandfathered,
+      isGrandfathered ? grandfatherLaneProbe(isGrandfathered) : undefined,
       true,
     ),
   });
@@ -9859,6 +9875,235 @@ test("fn-16c runReconcileCycle: pre-close provision SUCCESS → the serial-prima
   expect(closeLaunch?.spec?.ownerIntegrate).toBe(true);
 });
 
+// 28b — the TRI-STATE lane epoch + FRESH-EPOCH re-cut. A re-opened worktree group
+// (base + `keeper/epic/<id>` ref POSITIVELY torn down) derives over its NON-DONE tasks
+// only, so a new task OWNS a fresh base (cut from current default) instead of a rib
+// forked off the missing ref. Assignment + provision are asserted, not just repoDir.
+const absentEpoch = (): LaneProbeResult => ({
+  epoch: "absent",
+  priorLane: false,
+});
+const absentWithProof = (): LaneProbeResult => ({
+  epoch: "absent",
+  priorLane: true,
+});
+const presentEpoch = (): LaneProbeResult => ({
+  epoch: "present",
+  priorLane: false,
+});
+const inconclusiveEpoch = (): LaneProbeResult => ({
+  epoch: "inconclusive",
+  priorLane: false,
+});
+
+/** A re-opened single-repo epic: an old DONE root + a NEW independent todo task. */
+function reopenedEpic(): Epic {
+  return makeEpic({
+    epic_id: "fn-1-reopen",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-reopen.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-reopen.2",
+        task_number: 2,
+        target_repo: "/repo-a",
+      }),
+    ],
+  });
+}
+
+test("fn-28b prepareWorktreeGeometry: an eligible RE-OPENED group (done root + POSITIVELY-absent epoch) derives a FRESH epoch — the new task OWNS the base lane, the done task is EXCLUDED (no phantom rib off the missing ref)", () => {
+  const epic = reopenedEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    absentEpoch,
+    true,
+  );
+  // Single-repo eligible → `ok` carrying the fresh-epoch marker.
+  expect(repoMap.get("fn-1-reopen")).toEqual({
+    kind: "ok",
+    repoDir: "/repo-a",
+    freshEpoch: true,
+  });
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  // ASSIGNMENT: the new task OWNS the base lane (`keeper/epic/<id>`), never a rib.
+  expect(prepared.laneKeyById.get("fn-1-reopen.2")).toBe(
+    worktreePathFor("/repo-a", "keeper/epic/fn-1-reopen"),
+  );
+  // The already-done task is EXCLUDED from the fresh plan — no phantom rib whose
+  // parent ref (its torn-down branch) is gone.
+  expect(prepared.laneKeyById.has("fn-1-reopen.1")).toBe(false);
+});
+
+test("fn-28b prepareWorktreeGeometry: a LIVE epoch (present) derives the FULL graph — byte-identical (the new independent task is a RIB, the done task keeps the base)", () => {
+  const epic = reopenedEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    presentEpoch,
+    true,
+  );
+  // No fresh-epoch marker on a present epoch.
+  expect(repoMap.get("fn-1-reopen")).toEqual({
+    kind: "ok",
+    repoDir: "/repo-a",
+  });
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  // Full graph: the done root keeps the base; the new independent task is a rib.
+  expect(prepared.laneKeyById.get("fn-1-reopen.1")).toBe(
+    worktreePathFor("/repo-a", "keeper/epic/fn-1-reopen"),
+  );
+  expect(prepared.laneKeyById.get("fn-1-reopen.2")).toBe(
+    worktreePathFor("/repo-a", "keeper/epic/fn-1-reopen--fn-1-reopen.2"),
+  );
+});
+
+test("fn-28b prepareWorktreeGeometry: an INCONCLUSIVE epoch NEVER re-cuts — it defers to the full graph (no fresh-epoch marker)", () => {
+  const repoMap = classifyWorktreeRepos(
+    [reopenedEpic()],
+    abResolve,
+    undefined,
+    inconclusiveEpoch,
+    true,
+  );
+  expect(repoMap.get("fn-1-reopen")).toEqual({
+    kind: "ok",
+    repoDir: "/repo-a",
+  });
+});
+
+test("fn-28b prepareWorktreeGeometry: multiple new tasks keep their internal DAG in the fresh epoch (the first new root owns the base, its dependent forks a rib off it — never off a done task)", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-reopen",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-reopen.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      // Two NEW tasks with an internal dep .3 → .2 (and a dangling dep on the done .1).
+      makeTask({
+        task_id: "fn-1-reopen.2",
+        task_number: 2,
+        target_repo: "/repo-a",
+        depends_on: ["fn-1-reopen.1"],
+      }),
+      makeTask({
+        task_id: "fn-1-reopen.3",
+        task_number: 3,
+        target_repo: "/repo-a",
+        depends_on: ["fn-1-reopen.2"],
+      }),
+    ],
+  });
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    absentEpoch,
+    true,
+  );
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  // .2's dep on the done .1 collapses (dangling → dropped) so .2 OWNS the base; .3
+  // inherits/forks off .2's lane — its internal DAG survives, never a rib off .1.
+  expect(prepared.laneKeyById.get("fn-1-reopen.2")).toBe(
+    worktreePathFor("/repo-a", "keeper/epic/fn-1-reopen"),
+  );
+  expect(prepared.laneKeyById.get("fn-1-reopen.3")).toBe(
+    worktreePathFor("/repo-a", "keeper/epic/fn-1-reopen"),
+  );
+  expect(prepared.laneKeyById.has("fn-1-reopen.1")).toBe(false);
+});
+
+test("fn-28b classifyEpicRepo: a `no-manifest` disabled repo re-cuts a fresh worktree epoch ONLY with a restart-safe prior-lane PROOF; without proof it stays serial; a workspace-marker/submodule/probe-error repo NEVER re-cuts even with proof", () => {
+  const epic = reopenedEpic();
+  const noManifest = () => ({
+    eligible: false,
+    reason: "worktree-disabled:no-manifest",
+  });
+  // no-manifest + absent + PROOF → worktree (fresh epoch).
+  expect(
+    classifyWorktreeRepos(
+      [epic],
+      abResolve,
+      noManifest,
+      absentWithProof,
+      true,
+    ).get("fn-1-reopen"),
+  ).toEqual({ kind: "ok", repoDir: "/repo-a", freshEpoch: true });
+  // no-manifest + absent, NO proof → serial (disabled).
+  expect(
+    classifyWorktreeRepos([epic], abResolve, noManifest, absentEpoch, true).get(
+      "fn-1-reopen",
+    )?.kind,
+  ).toBe("disabled");
+  // submodules (an UNSAFE dep-tree hazard) + absent + PROOF → STILL serial.
+  const submodules = () => ({
+    eligible: false,
+    reason: "worktree-disabled:submodules",
+  });
+  expect(
+    classifyWorktreeRepos(
+      [epic],
+      abResolve,
+      submodules,
+      absentWithProof,
+      true,
+    ).get("fn-1-reopen")?.kind,
+  ).toBe("disabled");
+});
+
+test("fn-28b runReconcileCycle: the eligible re-opened group PROVISIONS the new task off a FRESH base (assignment branch = the base, never a rib forked off the torn-down ref)", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps } = makeFakeDeps({ worktree: driver });
+  const epic = reopenedEpic();
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abResolve,
+      undefined,
+      absentEpoch,
+      true,
+    ),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workLaunch = decision.launches.find((l) => l.id === "fn-1-reopen.2");
+  // The new task launches into the BASE lane (its own fresh base), not a rib whose
+  // parent branch was torn down.
+  expect(workLaunch?.worktree?.assignment.branch).toBe(
+    "keeper/epic/fn-1-reopen",
+  );
+  expect(workLaunch?.worktree?.assignment.isCloseSink).toBe(false);
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The producer provisioned that base lane (no phantom-rib provision off a gone ref).
+  expect(
+    log.provisions.some(
+      (p) => p.assignment.branch === "keeper/epic/fn-1-reopen",
+    ),
+  ).toBe(true);
+});
+
 // fn-28 — a repo group that per-finalized and had its lane/branch torn down, then
 // GAINED a todo task (refine-apply after finalize), must not SILENTLY dispatch
 // worktree:None onto the shared checkout. A worktree-ELIGIBLE re-opened group re-cuts
@@ -9906,7 +10151,7 @@ test("fn-28 reconcile: a worktree-ELIGIBLE re-opened group (done + new todo task
     [epic],
     abcResolve,
     undefined,
-    () => false,
+    grandfatherLaneProbe(() => false),
     true,
   );
   const snap = makeSnapshot({
@@ -9955,7 +10200,7 @@ test("fn-28 clusteredSerialReopenDegrades: a `disabled` (no-manifest) re-opened 
     [epic],
     abcResolve,
     bDisabledNoManifest,
-    () => false,
+    grandfatherLaneProbe(() => false),
     true,
   );
   // /repo-b: disabled + no grandfather + done(.2) + pending(.3) → a NAMED degrade.
@@ -10006,14 +10251,14 @@ test("fn-28 reportSerialReopenDegrades: names the degrade with its disable reaso
     [epic],
     abcResolve,
     bDisabledNoManifest,
-    () => false,
+    grandfatherLaneProbe(() => false),
     true,
   );
   const emptyMap = classifyWorktreeRepos(
     [],
     abcResolve,
     bDisabledNoManifest,
-    () => false,
+    grandfatherLaneProbe(() => false),
     true,
   );
   const lines: string[] = [];
@@ -10073,7 +10318,7 @@ test("fn-28 clusteredSerialReopenDegrades: NOT a degrade — a grandfathered re-
     [gf],
     abcResolve,
     bDisabledNoManifest,
-    (_e, repo) => repo === "/repo-b",
+    grandfatherLaneProbe((_e, repo) => repo === "/repo-b"),
     true,
   );
   expect(clusteredSerialReopenDegrades([gf], gfMap)).toEqual([]);
@@ -10106,7 +10351,7 @@ test("fn-28 clusteredSerialReopenDegrades: NOT a degrade — a grandfathered re-
     [fresh],
     abcResolve,
     bDisabledNoManifest,
-    () => false,
+    grandfatherLaneProbe(() => false),
     true,
   );
   expect(clusteredSerialReopenDegrades([fresh], freshMap)).toEqual([]);
@@ -10220,7 +10465,10 @@ test("fn-1034 classifyWorktreeRepos: grandfather runs per (epic, repoDir) — on
     () => ({ eligible: false, reason: "worktree-disabled:probe-error" }),
     (epicId, repoDir) => {
       seen.push([epicId, repoDir]);
-      return repoDir === "/repo-a"; // only /repo-a has a live lane
+      // only /repo-a has a live lane → `present`; the sibling is positively `absent`
+      return repoDir === "/repo-a"
+        ? { epoch: "present" as const, priorLane: false }
+        : { epoch: "absent" as const, priorLane: false };
     },
     true,
   ).get("fn-1-foo");

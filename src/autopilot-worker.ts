@@ -146,7 +146,7 @@ import {
   type PaneInfo,
   type TmuxPaneOps,
 } from "./exec-backend";
-import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
+import { localBranchState, memoizedNullableGitToplevel } from "./git-toplevel";
 import { readTrunkLeaseLeaf } from "./grant-leaf";
 import { keeperStateDir } from "./keeper-state-dir";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
@@ -4061,20 +4061,17 @@ export function classifyWorktreeRepos(
     eligible: true,
     reason: ELIGIBLE_REASON,
   }),
-  isGrandfathered: (epicId: string, repoDir: string) => boolean = () => false,
+  laneProbe: (epicId: string, repoDir: string) => LaneProbeResult = () => ({
+    epoch: "inconclusive",
+    priorLane: false,
+  }),
   multiRepoEnabled = false,
 ): Map<string, WorktreeRepoResolution> {
   const out = new Map<string, WorktreeRepoResolution>();
   for (const epic of epics) {
     out.set(
       epic.epic_id,
-      classifyEpicRepo(
-        epic,
-        resolve,
-        assessRepo,
-        isGrandfathered,
-        multiRepoEnabled,
-      ),
+      classifyEpicRepo(epic, resolve, assessRepo, laneProbe, multiRepoEnabled),
     );
   }
   return out;
@@ -5107,7 +5104,7 @@ function classifyEpicRepo(
   epic: Epic,
   resolve: (root: string) => string | null,
   assessRepo: (toplevel: string) => WorktreeEligibility,
-  isGrandfathered: (epicId: string, repoDir: string) => boolean,
+  laneProbe: (epicId: string, repoDir: string) => LaneProbeResult,
   multiRepoEnabled: boolean,
 ): WorktreeRepoResolution {
   const projectDir = epic.project_dir ?? "";
@@ -5175,7 +5172,7 @@ function classifyEpicRepo(
       epic,
       resolve,
       assessRepo,
-      isGrandfathered,
+      laneProbe,
       projectDir,
       topByTask,
     );
@@ -5230,16 +5227,22 @@ function classifyEpicRepo(
     };
   }
   const foreignPrimary = primaryResolved !== repoDir;
-  const okOrForeignAnchor = (): WorktreeRepoResolution => {
+  const okOrForeignAnchor = (freshEpoch: boolean): WorktreeRepoResolution => {
     if (!foreignPrimary) {
-      return { kind: "ok", repoDir };
+      // A FRESH epoch (torn-down base + ref) re-cuts the single-repo lane over its
+      // NON-DONE tasks only; `freshEpoch` rides the `ok` resolution so the derivation
+      // excludes already-finalized tasks (whose branches are gone) instead of forking
+      // a new task off a missing ref.
+      return freshEpoch
+        ? { kind: "ok", repoDir, freshEpoch: true }
+        : { kind: "ok", repoDir };
     }
     if (multiRepoEnabled) {
       return clusterEpicRepos(
         epic,
         resolve,
         assessRepo,
-        isGrandfathered,
+        laneProbe,
         projectDir,
         topByTask,
       );
@@ -5255,22 +5258,38 @@ function classifyEpicRepo(
   // NON-error sequential-on-shared-checkout fallback, never a sticky reject. Only
   // ever downgrades `ok`; the loud rejects above already returned.
   const eligibility = assessRepo(repoDir);
-  if (!eligibility.eligible) {
-    // GRANDFATHER: an epic that ALREADY has live worktree lanes keeps `ok` even on
-    // a `disabled` verdict — flipping it mid-flight would strand work on its
-    // `~/worktrees` lanes while new tasks dispatch on the shared checkout AND lose
-    // the merge-to-default finalize (`attachWorktreeGeometry` builds
-    // `worktreeFinalize` only for `ok`). The likelier flip is a TRANSIENT probe
-    // error (fail-closed) on a healthy in-flight epic, not a marker appearing
-    // mid-epic. The predicate is producer-side fs/git (base worktree dir OR
-    // `keeper/epic/<id>` branch exists) — never read here in the pure layer. A
-    // grandfathered foreign-primary epic reroutes just like the eligible one.
-    if (isGrandfathered(epic.epic_id, repoDir)) {
-      return okOrForeignAnchor();
-    }
-    return { kind: "disabled", repoDir, reason: eligibility.reason };
+  // A fresh-epoch re-cut only matters when there IS an already-done task to EXCLUDE:
+  // a brand-new epic (all tasks todo) derives IDENTICALLY under the fresh or the full
+  // graph, so an ELIGIBLE such epic skips the lane probe entirely (no git/db read for
+  // every pending epic every cycle). A `disabled` epic still probes unconditionally —
+  // the grandfather decides its very mode.
+  const hasDoneTask = epic.tasks.some((t) => t.worker_phase === "done");
+  if (eligibility.eligible) {
+    const freshEpoch =
+      hasDoneTask && laneProbe(epic.epic_id, repoDir).epoch === "absent";
+    return okOrForeignAnchor(freshEpoch);
   }
-  return okOrForeignAnchor();
+  const lane = laneProbe(epic.epic_id, repoDir);
+  // GRANDFATHER: a live lane epoch (`present`) keeps a `disabled` repo on worktree —
+  // flipping it mid-flight would strand work on its `~/worktrees` lanes and lose the
+  // merge-to-default finalize. `present` is the ONLY grandfather; an `inconclusive`
+  // probe (ref timeout/error, dir absent) is NOT-present → serial, byte-identical to
+  // the prior fail-closed `localBranchExists` — never a spurious worktree promotion.
+  if (lane.epoch === "present") {
+    return okOrForeignAnchor(false);
+  }
+  // NO-MANIFEST RE-CUT: a torn-down (positively-absent) epoch with a restart-safe,
+  // repo-bound prior-lane proof bootstraps a FRESH worktree epoch — but ONLY for the
+  // `no-manifest` disable. A workspace-marker / submodule / probe-error repo STAYS
+  // serial: a fresh worktree checkout there would carry the wrong dependency tree.
+  if (
+    lane.epoch === "absent" &&
+    lane.priorLane &&
+    eligibility.reason.includes("no-manifest")
+  ) {
+    return okOrForeignAnchor(true);
+  }
+  return { kind: "disabled", repoDir, reason: eligibility.reason };
 }
 
 /**
@@ -5296,7 +5315,7 @@ function clusterEpicRepos(
   epic: Epic,
   resolve: (root: string) => string | null,
   assessRepo: (toplevel: string) => WorktreeEligibility,
-  isGrandfathered: (epicId: string, repoDir: string) => boolean,
+  laneProbe: (epicId: string, repoDir: string) => LaneProbeResult,
   projectDir: string,
   topByTask: ReadonlyArray<{ taskId: string; top: string }>,
 ): WorktreeRepoResolution {
@@ -5312,16 +5331,46 @@ function clusterEpicRepos(
     }
     bucket.push(taskId);
   }
+  const donePhaseById = new Map(
+    epic.tasks.map((t) => [t.task_id, t.worker_phase === "done"]),
+  );
   const groups: WorktreeRepoGroup[] = order.map((repoDir) => {
-    // Per-group worktree-eligibility, mirroring the single-repo `disabled`
-    // downgrade + grandfather: an ineligible repo whose epic has no live lane runs
-    // `serial` (shared checkout); a grandfathered one stays `worktree`.
+    // Per-group worktree-eligibility, mirroring the single-repo arm: an eligible repo
+    // is `worktree`; a `disabled` repo grandfathers to `worktree` on a live (`present`)
+    // lane epoch; a `no-manifest` `disabled` repo with a POSITIVELY-absent epoch AND a
+    // restart-safe repo-bound prior-lane proof re-cuts a fresh worktree epoch; else
+    // `serial`. An `inconclusive` epoch never re-cuts (it grandfathers only if a live
+    // dir/ref already makes it `present`).
     const eligibility = assessRepo(repoDir);
-    const mode: "worktree" | "serial" =
-      eligibility.eligible || isGrandfathered(epic.epic_id, repoDir)
-        ? "worktree"
-        : "serial";
-    return { repoDir, taskIds: taskIdsByRepo.get(repoDir) ?? [], mode };
+    const groupTaskIds = taskIdsByRepo.get(repoDir) ?? [];
+    // An ELIGIBLE group with NO done task derives identically fresh or full, so it
+    // skips the lane probe (no git/db read per pending group per cycle); a `disabled`
+    // group probes unconditionally — the grandfather decides its very mode.
+    const groupHasDone = groupTaskIds.some(
+      (id) => donePhaseById.get(id) === true,
+    );
+    const lane =
+      eligibility.eligible && !groupHasDone
+        ? ({ epoch: "inconclusive", priorLane: false } as LaneProbeResult)
+        : laneProbe(epic.epic_id, repoDir);
+    const worktree =
+      eligibility.eligible ||
+      lane.epoch === "present" ||
+      (lane.epoch === "absent" &&
+        lane.priorLane &&
+        eligibility.reason.includes("no-manifest"));
+    const group: WorktreeRepoGroup = {
+      repoDir,
+      taskIds: groupTaskIds,
+      mode: worktree ? "worktree" : "serial",
+    };
+    // A worktree group whose base epoch is positively ABSENT (torn down) re-cuts a
+    // FRESH epoch over its NON-DONE tasks only — deps on already-done tasks collapse
+    // to a base cut from current default. `present` / `inconclusive` → full graph.
+    if (worktree && lane.epoch === "absent") {
+      group.freshEpoch = true;
+    }
+    return group;
   });
   // The PRIMARY group hosts the single plan-close, which reads the epic's plan
   // state from `primary_repo` (mirrored onto `project_dir`). When the primary
@@ -5463,26 +5512,88 @@ export function reportSerialReopenDegrades(
 }
 
 /**
- * PRODUCER: the per-epic grandfather predicate threaded into
- * {@link classifyWorktreeRepos} — true IFF epic `epicId` ALREADY has a live
- * worktree lane on `repoDir`, so a `disabled` verdict must NOT flip it (see the
- * grandfather note in {@link classifyEpicRepo}). Two robust signals OR'd, so the
- * costly false NEGATIVE (an in-flight epic missed → split-brain / lost work) needs
- * BOTH to miss:
- *  - the deterministic base worktree dir exists (`existsSync` — pure fs), or
- *  - the `keeper/epic/<id>` base branch exists (a fail-closed `git` ref peek;
- *    only spawned when the cheap dir check misses).
- * Both mirror the recover scan's notion of a live lane. A stale leftover dir/branch
- * is a BOUNDED false POSITIVE — it keeps ONE now-disabled epic on worktree mode
- * until the recover sweep reaps its dead lane; acceptable. Producer-only (fs+git),
- * NEVER read inside the pure classify layer or a fold.
+ * PRODUCER: the per-(epic, repoDir) LANE PROBE threaded into
+ * {@link classifyWorktreeRepos}. Its TRI-STATE base-lane epoch (never conflating a
+ * timeout/error with positive absence — an inconclusive probe defers to the full
+ * graph + prior mode, NEVER a fresh epoch) decides both the `disabled` grandfather
+ * and the re-cut derivation:
+ *  - PRESENT — the base worktree dir OR the `keeper/epic/<id>` ref exists (a live
+ *    lane epoch): a `disabled` verdict is GRANDFATHERED to `worktree`, derived over
+ *    the FULL DAG (a mid-flight marker change / transient probe error never strands
+ *    the live `~/worktrees` lanes or loses the merge-to-default finalize).
+ *  - ABSENT — base dir absent AND the ref DEFINITIVELY gone (`rev-parse` exit 1): a
+ *    torn-down epoch. A worktree group re-cuts a FRESH epoch over its NON-DONE tasks
+ *    only (deps on already-done tasks collapse to a fresh base cut from current
+ *    default). Additionally reads {@link readPriorWorktreeLaneProof} so a serial
+ *    `no-manifest` group may re-cut ONLY when a restart-safe repo-bound worktree lane
+ *    is PROVEN.
+ *  - INCONCLUSIVE — a probe timeout/error: retains the full graph + prior mode.
+ * Producer-only (fs + git + a bounded db read), NEVER read inside the pure classify
+ * layer or a fold.
  */
-function worktreeEpicGrandfathered(epicId: string, repoDir: string): boolean {
+export type LaneEpochState = "present" | "absent" | "inconclusive";
+export interface LaneProbeResult {
+  epoch: LaneEpochState;
+  /** Only meaningful when `epoch === "absent"`: a restart-safe repo-bound proof that
+   *  a prior worktree lane ran here (gates the `no-manifest` fresh-epoch re-cut). */
+  priorLane: boolean;
+}
+
+function worktreeEpicLaneProbe(
+  db: Parameters<typeof runQuery>[0],
+  epicId: string,
+  repoDir: string,
+): LaneProbeResult {
   const baseBranch = baseBranchFor(epicId);
-  return (
-    existsSync(worktreePathFor(repoDir, baseBranch)) ||
-    localBranchExists(repoDir, baseBranch)
-  );
+  if (existsSync(worktreePathFor(repoDir, baseBranch))) {
+    return { epoch: "present", priorLane: false };
+  }
+  const refState = localBranchState(repoDir, baseBranch);
+  if (refState === "present") {
+    return { epoch: "present", priorLane: false };
+  }
+  if (refState === "inconclusive") {
+    return { epoch: "inconclusive", priorLane: false };
+  }
+  // Positively absent (dir absent + ref exit-1): read the prior-lane proof so a
+  // no-manifest group may bootstrap a fresh worktree epoch. Every other group ignores
+  // `priorLane` (an eligible group re-cuts regardless; an unsafe group stays serial).
+  return {
+    epoch: "absent",
+    priorLane: readPriorWorktreeLaneProof(db, epicId, repoDir),
+  };
+}
+
+/**
+ * PRODUCER read: a RESTART-SAFE, repo-bound proof that a prior worktree lane ran for
+ * `epicId` in `repoDir`. A bounded INDEXED read of TERMINAL (ended / killed) jobs'
+ * durable `worktree` lane marker — the default `jobs` collection hides terminal rows,
+ * so a direct query is required, and the marker survives a daemon restart (unlike an
+ * in-memory latch). Bound to the repo AND the epic via the deterministic lane `cwd`
+ * prefix ({@link worktreePathFor} folds the repo-dir hash + the `keeper/epic/<id>`
+ * slug), so a MOVED target repo (a different dir → a different hash → a different lane
+ * path) can never inherit another repo's history. `created_at DESC` + `LIMIT 1` off
+ * `idx_jobs_created_state` keeps the read bounded. A PRODUCER read; never a fold.
+ */
+function readPriorWorktreeLaneProof(
+  db: Parameters<typeof runQuery>[0],
+  epicId: string,
+  repoDir: string,
+): boolean {
+  const laneBase = worktreePathFor(repoDir, baseBranchFor(epicId));
+  // Match the base + every rib lane under the repo+epic prefix; escape LIKE metachars.
+  const prefix = `${laneBase.replace(/[\\%_]/g, "\\$&")}%`;
+  const row = db
+    .query(
+      `SELECT 1 FROM jobs
+         WHERE state IN ('ended', 'killed')
+           AND worktree IS NOT NULL
+           AND cwd LIKE ? ESCAPE '\\'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+    )
+    .get(prefix);
+  return row != null;
 }
 
 /**
@@ -11701,7 +11812,7 @@ export async function loadReconcileSnapshot(
         epics,
         toplevelResolver,
         assessResolver,
-        worktreeEpicGrandfathered,
+        (epicId, repoDir) => worktreeEpicLaneProbe(db, epicId, repoDir),
         worktreeMultiRepo,
       )
     : new Map<string, WorktreeRepoResolution>();

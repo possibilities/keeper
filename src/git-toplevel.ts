@@ -117,7 +117,24 @@ export function memoizedNullableGitToplevel(): (root: string) => string | null {
  * predicate as the branch-side OR signal; NEVER call from a fold.
  */
 export function localBranchExists(repoDir: string, branch: string): boolean {
-  if (repoDir === "" || branch === "") return false;
+  return localBranchState(repoDir, branch) === "present";
+}
+
+/**
+ * TRI-STATE local-branch probe: `present` (ref exists), `absent` (the ref
+ * DEFINITIVELY does not exist — `rev-parse --verify --quiet` exit 1), or
+ * `inconclusive` (a timeout / non-1 error / throw / empty input). Distinct from
+ * {@link localBranchExists}, which fail-CLOSES a timeout/error into `false` and so
+ * conflates "positively absent" with "could not tell" — a conflation a lane-epoch
+ * decision must NOT make (an inconclusive probe defers to the full graph, never a
+ * fresh epoch). Same env-stripped / `--no-optional-locks` / time-bound producer peek;
+ * NEVER call from a fold.
+ */
+export function localBranchState(
+  repoDir: string,
+  branch: string,
+): "present" | "absent" | "inconclusive" {
+  if (repoDir === "" || branch === "") return "inconclusive";
   try {
     const res = Bun.spawnSync(
       [
@@ -137,8 +154,12 @@ export function localBranchExists(repoDir: string, branch: string): boolean {
         env: gitResolveEnv(),
       },
     );
-    return res.success && res.exitCode === 0;
+    if (res.exitCode === 0) return "present";
+    // Exit 1 is git's DEFINITIVE "no such ref" (with `--verify --quiet`); any other
+    // code (timeout SIGKILL, a non-repo error) is NOT proof of absence.
+    if (res.exitCode === 1) return "absent";
+    return "inconclusive";
   } catch {
-    return false;
+    return "inconclusive";
   }
 }

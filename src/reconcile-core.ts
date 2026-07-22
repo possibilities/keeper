@@ -1219,7 +1219,7 @@ export interface ReconcileSnapshot {
  *    multi-repo / unresolved / no-primary-repo rejects).
  */
 export type WorktreeRepoResolution =
-  | { kind: "ok"; repoDir: string }
+  | { kind: "ok"; repoDir: string; freshEpoch?: boolean }
   | {
       kind: "clustered";
       groups: WorktreeRepoGroup[];
@@ -1255,10 +1255,19 @@ export interface WorktreeRepoGroup {
    * `serial` — a not-worktree-friendly repo (the per-group analogue of the
    * whole-epic `disabled` fallback): dispatch its tasks sequentially on the shared
    * checkout (cap-1 on the bare `repoDir`), provisioning no lane. Assessed per
-   * group via `assessRepo` (+ the per-(epic, repoDir) grandfather), so one group
+   * group via `assessRepo` (+ the per-(epic, repoDir) lane-epoch probe), so one group
    * can be `worktree` while a sibling is `serial`.
    */
   mode: "worktree" | "serial";
+  /**
+   * Set on a `worktree` group whose base-lane epoch is positively ABSENT (torn-down
+   * base dir + `keeper/epic/<id>` ref) — a RE-OPENED group. Its plan is derived over
+   * the NON-DONE tasks only, so the already-finalized tasks (whose branches are gone)
+   * are excluded and a newly-added task OWNS a fresh base cut from current default
+   * rather than a rib forked from a missing ref. Undefined ⇒ the full-graph
+   * (present / inconclusive epoch) derivation.
+   */
+  freshEpoch?: boolean;
 }
 /**
  * The RESOLVED git toplevel a task's lane lives in — how the per-(epic, repoDir)
@@ -3192,12 +3201,21 @@ export function prepareWorktreeGeometry(
         const groupTasks = group.taskIds
           .map((id) => taskById.get(id))
           .filter((t): t is Task => t !== undefined);
+        // A FRESH EPOCH (torn-down base + ref) derives over the NON-DONE tasks only:
+        // the already-finalized tasks' branches are gone, so keeping them would fork a
+        // new task off a missing ref. Excluding them lets a new task OWN a fresh base
+        // (their landed work is already in default, which the base is cut from), while
+        // the active tasks' internal DAG survives (their mutual deps are preserved;
+        // deps on excluded done tasks are dropped as dangling).
+        const planTasks = group.freshEpoch
+          ? groupTasks.filter((t) => t.worker_phase !== "done")
+          : groupTasks;
         let plan: WorktreePlan;
         try {
           plan = deriveWorktreePlan(
             epic.epic_id,
             group.repoDir,
-            groupTasks,
+            planTasks,
             worktreesRoot,
           );
         } catch (err) {
@@ -3241,14 +3259,15 @@ export function prepareWorktreeGeometry(
       continue;
     }
     const repoDir = resolution.repoDir;
+    // A FRESH EPOCH (torn-down base + ref) re-cuts the single-repo lane over its
+    // NON-DONE tasks only (same rationale as the clustered arm) — a newly-added task
+    // OWNS a fresh base rather than a rib forked from the deleted ref.
+    const okTasks = resolution.freshEpoch
+      ? epic.tasks.filter((t) => t.worker_phase !== "done")
+      : epic.tasks;
     let plan: WorktreePlan;
     try {
-      plan = deriveWorktreePlan(
-        epic.epic_id,
-        repoDir,
-        epic.tasks,
-        worktreesRoot,
-      );
+      plan = deriveWorktreePlan(epic.epic_id, repoDir, okTasks, worktreesRoot);
     } catch (err) {
       if (err instanceof WorktreeCycleError) {
         byEpicId.set(epic.epic_id, { kind: "cycle", error: err });
