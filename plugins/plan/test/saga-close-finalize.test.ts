@@ -1965,6 +1965,75 @@ describe("close-finalize per-task ancestry gate", () => {
     expect(env.outcome).toBe("closed_clean");
     expect(epicStatus(proj.root, epicId)).toBe("done");
   });
+
+  test("a no-op receipt does NOT rescue an un-fanned-in rib (objective outranks)", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Receipt over dangling rib", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    // A receipt claiming no code, but a live rib whose tip was never fanned in.
+    markDone(proj.root, taskId, { no_op_reason: "claims no code" });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    const laneRef = `keeper/epic/${epicId}`;
+    const ribRef = `${laneRef}--${taskId}`;
+    fakeSourceCommit(proj.root, "chore: epic base\n", { refs: [laneRef] });
+    fakeSourceCommit(proj.root, "wip: lane work\n", { refs: [ribRef] });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("TASK_ANCESTRY_UNVERIFIED");
+    const offenders = (err.details as Record<string, unknown>)
+      .offending_tasks as Array<Record<string, unknown>>;
+    expect(offenders[0]).toMatchObject({
+      task_id: taskId,
+      reason: "unreachable-branch",
+    });
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("the abort bounds per-task unreachable commits with total/omitted counts", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Bounded abort", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    // Eight recorded evidence commits, all on an unrelated ref (unreachable).
+    const shas: string[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      shas.push(
+        fakeSourceCommit(proj.root, `orphan ${i}\n`, {
+          refs: ["refs/heads/orphan"],
+        }),
+      );
+    }
+    markDone(proj.root, taskId, {
+      evidence: { commits: shas, tests: [], prs: [] },
+    });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    const details = err.details as Record<string, unknown>;
+    const off = (details.offending_tasks as Array<Record<string, unknown>>)[0];
+    expect(off.reason).toBe("unreachable-commits");
+    // Named slice is capped, but the true total + omitted count are reported.
+    expect((off.commits as string[]).length).toBe(5);
+    expect(off.commits_total).toBe(8);
+    expect(off.commits_omitted).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------

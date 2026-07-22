@@ -743,8 +743,12 @@ function wrappedPlanViolation(
     if (option === "--force" || option.startsWith("--force=")) {
       return "wrapped `keeper plan done --force` is forbidden";
     }
-    if (option !== "--summary" && option !== "--evidence") {
-      return "wrapped `keeper plan done` permits only --summary/--evidence metadata";
+    if (
+      option !== "--summary" &&
+      option !== "--evidence" &&
+      option !== "--no-op-reason"
+    ) {
+      return "wrapped `keeper plan done` permits only --summary/--evidence/--no-op-reason metadata";
     }
     if (tokens[index + 1] === undefined) {
       return `wrapped \`keeper plan done ${option}\` requires a value`;

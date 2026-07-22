@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { failNextCommit } from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
+  fakeSourceCommit,
   firstJsonPayload,
   gitBaseline,
   gitFilesInHead,
@@ -403,5 +404,64 @@ describe("done — empty-evidence integrity gate", () => {
     expect((rt.evidence as Record<string, unknown>).commits).toEqual([
       "abc1234",
     ]);
+  });
+});
+
+describe("done — server-derived evidence", () => {
+  function seedInProgress(epicId: string): string {
+    const [, taskIds] = seedState(root, { epicId, nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    seedRuntime(root, taskId, {
+      status: "in_progress",
+      assignee: "test@example.com",
+    });
+    gitBaseline(root);
+    return taskId;
+  }
+
+  test("a Task-trailed landing commit + bare `done --summary` records the sha", () => {
+    // The production-shaped close-out: the worker's source commit landed, then a
+    // bare `done --summary` (no --evidence, no --no-op-reason). done derives the
+    // task's own target-repo commit and records it, so the empty-evidence gate
+    // passes objectively.
+    const taskId = seedInProgress("fn-12-atomic");
+    const sha = fakeSourceCommit(root, `feat: real work\n\nTask: ${taskId}\n`, {
+      refs: ["HEAD"],
+    });
+
+    const r = runCli(["done", taskId, "--summary", "shipped it"], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+    });
+    expect(r.code).toBe(0);
+    const rt = runtime(root, taskId) as Record<string, unknown>;
+    expect(rt.status).toBe("done");
+    expect((rt.evidence as Record<string, unknown>).commits).toContain(sha);
+    // Objective evidence → the receipt stays null.
+    expect(rt.no_op_reason).toBeNull();
+  });
+
+  test("a landing commit DROPS a supplied --no-op-reason (objective outranks receipt)", () => {
+    const taskId = seedInProgress("fn-13-atomic");
+    const sha = fakeSourceCommit(root, `feat: work\n\nTask: ${taskId}\n`, {
+      refs: ["HEAD"],
+    });
+
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "shipped",
+        "--no-op-reason",
+        "claims no code but there is a commit",
+      ],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).toBe(0);
+    const rt = runtime(root, taskId) as Record<string, unknown>;
+    expect((rt.evidence as Record<string, unknown>).commits).toContain(sha);
+    // The receipt is dropped — a task with real commits closes on the commit.
+    expect(rt.no_op_reason).toBeNull();
   });
 });

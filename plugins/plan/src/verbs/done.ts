@@ -29,6 +29,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { deriveTaskTargetRepoCommits } from "../audit_gate_commits.ts";
 import { acquirePlanCommitGuard, restoreForRollback } from "../commit.ts";
 import { emitFailureEnvelope, emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
@@ -223,25 +224,55 @@ export function runDone(args: DoneArgs): void {
         emitError("Evidence must be a JSON object", format);
       }
 
-      // Empty-evidence integrity gate. A done code task with no recorded landing
-      // commits must carry an explicit typed no-op receipt — never a silent empty
-      // success. The reason comes from --no-op-reason, or (heal re-run with none
-      // supplied) is carried forward from the prior done's stored receipt, mirroring
-      // the evidence carry-forward above; a heal that would re-carry an
-      // empty-evidence, receipt-less prior done stays refused (covers the reset-
-      // after-fatal re-mark). close-finalize's per-task ancestry gate accepts this
-      // receipt as its typed no-op branch.
+      // Server-derive the task's OWN Task-trailed source commits (the reconcile /
+      // audit-gate seam, target+lane-aware) and union them into the evidence commit
+      // set — constrained to the task's resolved target repo so a flat evidence
+      // list never mixes repos close then validates against a single base. A normal
+      // worker close-out (a landed source commit + a bare `done --summary`) thus
+      // records its sha automatically, needing neither --evidence nor a receipt.
+      // Best-effort: an unexpected git-read failure leaves the inline/carried set
+      // intact (the auto-commit below surfaces a real git fault).
+      let derivedCommits: string[] = [];
+      try {
+        derivedCommits = deriveTaskTargetRepoCommits(
+          taskId,
+          dataDir,
+          ctx.projectPath,
+        );
+      } catch (exc) {
+        if (!(exc instanceof GitError)) {
+          throw exc;
+        }
+      }
+      for (const sha of derivedCommits) {
+        if (!evidence.commits.includes(sha)) {
+          evidence.commits.push(sha);
+        }
+      }
+
+      // Empty-evidence integrity gate + receipt precedence. Objective evidence
+      // OUTRANKS the receipt: with any recorded landing commit the task closes on
+      // that commit and the no-op receipt is dropped (null); only a genuinely
+      // commit-less done may record an explicit typed no-op receipt — never a silent
+      // empty success. The reason comes from --no-op-reason, or (a heal re-run
+      // supplying none) is carried forward from the prior done's stored receipt,
+      // mirroring the evidence carry-forward above; a heal that would re-carry a
+      // commit-less, receipt-less prior done stays refused (covers the reset-after-
+      // fatal re-mark). close-finalize's per-task ancestry gate reads this receipt as
+      // its typed no-op branch, but only for a truly empty attributable set.
       const suppliedReason = (noOpReason ?? "").trim();
       const carriedReason =
         typeof merged.no_op_reason === "string"
           ? merged.no_op_reason.trim()
           : "";
       const noOpReasonText =
-        suppliedReason !== ""
-          ? suppliedReason
-          : healUncommittedDone
-            ? carriedReason
-            : "";
+        evidence.commits.length > 0
+          ? ""
+          : suppliedReason !== ""
+            ? suppliedReason
+            : healUncommittedDone
+              ? carriedReason
+              : "";
       if (evidence.commits.length === 0 && noOpReasonText === "") {
         emitError(
           `Task ${taskId} has no evidence commits — supply --evidence with the ` +

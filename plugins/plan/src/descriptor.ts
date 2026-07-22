@@ -468,6 +468,11 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
       { name: "--summary", takesValue: true, summary: "Done summary text" },
       { name: "--evidence", takesValue: true, summary: "Evidence text" },
       {
+        name: "--no-op-reason",
+        takesValue: true,
+        summary: "Typed no-op receipt for a task that landed no code",
+      },
+      {
         name: "--force",
         takesValue: false,
         summary: "Complete despite gate failures",

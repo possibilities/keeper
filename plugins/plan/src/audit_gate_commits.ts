@@ -111,3 +111,28 @@ export function deriveTaskCommitGroups(
   }
   return { epicId, commitGroups };
 }
+
+/** `taskId`'s OWN Task-trailed source commit shas in its RESOLVED target repo
+ * ONLY (target+lane-aware, the reconcile seam) — the flat list `done` unions into
+ * evidence so a normal worker close-out records its landing sha without any
+ * --evidence. Constrained to the single target repo by construction: close later
+ * validates every recorded sha against THAT repo's composed base, so a flat
+ * evidence list can never carry a commit close would then test against the wrong
+ * repo (a task committing outside its own target repo is a one-task/one-repo
+ * contract violation, intentionally not recorded here). Fail-closed like
+ * deriveTaskCommitGroups: propagates GitError (absent binary / unexpected git
+ * failure) — the caller decides whether to surface or best-effort skip it. */
+export function deriveTaskTargetRepoCommits(
+  taskId: string,
+  dataDir: string,
+  primaryRepo: string,
+): string[] {
+  const epicId = epicIdFromTask(taskId);
+  const taskDef = normalizeTask(
+    loadJson(join(dataDir, "tasks", `${taskId}.json`)),
+  );
+  const epicPath = join(dataDir, "epics", `${epicId}.json`);
+  const epicDef = existsSync(epicPath) ? (loadJsonSafe(epicPath) ?? {}) : {};
+  const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, primaryRepo);
+  return findSourceCommits(taskId, targetRepo);
+}

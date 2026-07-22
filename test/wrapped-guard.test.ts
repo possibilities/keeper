@@ -71,6 +71,8 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     // close-out surface
     "keeper commit-work --task-id fn-1-x.2 'feat(scope): implement X'",
     "keeper plan done fn-1-x.2 --summary 'done'",
+    "keeper plan done fn-1-x.2 --summary 'done' --no-op-reason 'no code landed'",
+    "keeper plan done fn-1-x.2 --no-op-reason 'doc-only follow-up'",
     // reads / orientation
     "keeper plan cat fn-1-x.2",
     "keeper plan show fn-1-x.2",
@@ -212,6 +214,9 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "keeper plan done fn-1-other.9 --summary done",
     "keeper plan done fn-1-x.2 --force",
     "keeper plan done fn-1-x.2 --project /tmp/other",
+    // --no-op-reason is a split-form value option; the glued form is off-list.
+    "keeper plan done fn-1-x.2 --no-op-reason=escape",
+    "keeper plan done fn-1-x.2 --no-op-reason",
     "keeper prompt render",
     "keeper tabs restore",
     "keeper dispatch work::fn-1-x.2",

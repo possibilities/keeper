@@ -1685,12 +1685,35 @@ interface UnreachableTask {
   reason: "unreachable-branch" | "unreachable-commits" | "no-evidence";
   /** The un-fanned-in `keeper/epic/<epic>--<task>` rib (unreachable-branch). */
   branch?: string;
-  /** The recorded evidence commits not contained in the composed base
-   * (unreachable-commits). */
+  /** A bounded, de-duplicated slice of the unreachable evidence commits. */
   commits?: string[];
+  /** Total distinct unreachable commits for this task (>= commits.length). */
+  commits_total?: number;
+  /** Distinct unreachable commits omitted from `commits` (0 when none). */
+  commits_omitted?: number;
 }
 
+/** Overall offending-task cap in the abort envelope. */
 const MAX_UNREACHABLE_NAMED = 20;
+/** Per-task unreachable-commit cap — the abort names a bounded slice, not the
+ * full (potentially large) set a runaway rebase could produce. */
+const MAX_COMMITS_PER_TASK = 5;
+
+/** De-dupe + cap a task's unreachable commit shas to a bounded slice, carrying
+ * the true total and the omitted count so the abort stays bounded. */
+function boundUnreachableCommits(shas: string[]): {
+  commits: string[];
+  total: number;
+  omitted: number;
+} {
+  const deduped = [...new Set(shas)];
+  const commits = deduped.slice(0, MAX_COMMITS_PER_TASK);
+  return {
+    commits,
+    total: deduped.length,
+    omitted: deduped.length - commits.length,
+  };
+}
 
 /** The evidence commit shas on a merged task's runtime `evidence` overlay —
  * non-empty strings only (done stores `{commits, tests, prs}`; only commits
@@ -1715,15 +1738,17 @@ function evidenceCommitsOf(task: Record<string, unknown>): string[] {
  * For each done task, in its repo (`target_repo` ?? primary), the composed base
  * is the epic lane branch `keeper/epic/<epic>` when it resolves there, else HEAD
  * — IDENTICAL to the commit-set scan ref, so a trailer-scan commit is reachable
- * by construction. A task passes when EITHER (a) it has at least one attributable
- * commit (recorded evidence ∪ `Task:`-trailer scan ∪ an existing rib tip) AND
- * every attributable commit is an ancestor of that base, OR (b) it carries an
- * explicit typed no-op receipt (`no_op_reason`). An existing
- * `keeper/epic/<epic>--<task>` rib whose tip is NOT an ancestor is positive proof
- * the lane was never fanned in — offending even with empty evidence/trailers; an
- * empty attributable set with no receipt is the silent-empty-success this gate
- * refuses to publish. Fail-closed throughout: `isAncestor` treats anything it
- * cannot prove reachable as unreachable. */
+ * by construction. OBJECTIVE evidence OUTRANKS the receipt: repo/rib/evidence are
+ * resolved FIRST, and an existing `keeper/epic/<epic>--<task>` rib whose tip is
+ * NOT an ancestor, or ANY recorded evidence commit not an ancestor, ALWAYS fails
+ * — a generic no-op receipt never masks a dangling rib or an unreachable commit
+ * (abandon by RETIRING the rib, not by prose). A task with any objectively
+ * reachable attributable commit (recorded evidence ∪ `Task:`-trailer scan ∪ rib
+ * tip) passes. ONLY a truly EMPTY attributable set may fall back to an explicit
+ * typed no-op receipt (`no_op_reason`); empty + no receipt is the
+ * silent-empty-success this gate refuses to publish. Fail-closed throughout:
+ * `isAncestor` treats anything it cannot prove reachable as unreachable, and an
+ * unreadable target repo passes only under a receipt. */
 function assertDoneTaskAncestry(
   epicId: string,
   stateCtx: ProjectContext,
@@ -1741,19 +1766,18 @@ function assertDoneTaskAncestry(
     if (task.status !== "done") {
       continue;
     }
-    // (b) typed no-op receipt — a recorded reason, never an empty commits array.
-    const noOp = task.no_op_reason;
-    if (typeof noOp === "string" && noOp.trim() !== "") {
-      continue;
-    }
+    const hasReceipt =
+      typeof task.no_op_reason === "string" && task.no_op_reason.trim() !== "";
     const repo = realpathOr(
       (task.target_repo as string | null | undefined) || primaryRepo,
     );
     if (!vcs.isGitRepo(repo)) {
-      // A repo the scan cannot read cannot prove reachability. The fresh-hash /
-      // AllReposBroken guards already fail a wholly-broken scan set; a single
-      // unreadable repo here fails the tasks it owns closed rather than silently
-      // publishing them.
+      // A repo the scan cannot read cannot prove reachability. A declared no-op
+      // (no code to place) still passes; otherwise fail-closed. The fresh-hash /
+      // AllReposBroken guards already fail a wholly-broken scan set.
+      if (hasReceipt) {
+        continue;
+      }
       offenders.push({ task_id: taskId, reason: "no-evidence" });
       continue;
     }
@@ -1765,6 +1789,7 @@ function assertDoneTaskAncestry(
     const ribBranch = `${laneRef}--${taskId}`;
     const ribTip = vcs.resolveRef(ribBranch, repo);
 
+    // Objective-unreachability FIRST — a receipt never rescues these.
     if (ribTip !== null && !vcs.isAncestor(ribTip, base, repo)) {
       offenders.push({
         task_id: taskId,
@@ -1777,20 +1802,29 @@ function assertDoneTaskAncestry(
       (sha) => !vcs.isAncestor(sha, base, repo),
     );
     if (unreachableCommits.length > 0) {
+      const bounded = boundUnreachableCommits(unreachableCommits);
       offenders.push({
         task_id: taskId,
         reason: "unreachable-commits",
-        commits: unreachableCommits,
+        commits: bounded.commits,
+        commits_total: bounded.total,
+        commits_omitted: bounded.omitted,
       });
       continue;
     }
-    if (
+    // Any objectively reachable attributable evidence → pass (a).
+    const attributableEmpty =
       evidenceCommits.length === 0 &&
       trailerCommits.length === 0 &&
-      ribTip === null
-    ) {
-      offenders.push({ task_id: taskId, reason: "no-evidence" });
+      ribTip === null;
+    if (!attributableEmpty) {
+      continue;
     }
+    // Truly empty attributable set: the typed no-op receipt is the ONLY pass (b).
+    if (hasReceipt) {
+      continue;
+    }
+    offenders.push({ task_id: taskId, reason: "no-evidence" });
   }
   if (offenders.length === 0) {
     return;
@@ -1802,23 +1836,28 @@ function assertDoneTaskAncestry(
         return `${o.task_id} (branch ${o.branch} not fanned in)`;
       }
       if (o.reason === "unreachable-commits") {
-        return `${o.task_id} (commits ${o.commits?.join(", ")} unreachable)`;
+        const shown = o.commits?.join(", ") ?? "";
+        const extra =
+          (o.commits_omitted ?? 0) > 0 ? ` +${o.commits_omitted} more` : "";
+        return `${o.task_id} (commits ${shown}${extra} unreachable)`;
       }
       return `${o.task_id} (no landing evidence and no typed no-op receipt)`;
     })
     .join("; ");
-  const more =
-    offenders.length > named.length
-      ? ` (+${offenders.length - named.length} more)`
-      : "";
+  const omittedTasks = offenders.length - named.length;
+  const more = omittedTasks > 0 ? ` (+${omittedTasks} more task(s))` : "";
   emitFinalizeError(
     "TASK_ANCESTRY_UNVERIFIED",
     `refusing to publish ${epicId}: ${offenders.length} done task(s) whose code ` +
       `is not provably in the composed base — ${summary}${more}. Fan in the ` +
-      "missing branch/commits, or mark the task done with --no-op-reason " +
-      '"<why no code landed>", then re-run /plan:close.',
+      "missing branch/commits (or retire an abandoned rib), or mark the task " +
+      'done with --no-op-reason "<why no code landed>", then re-run /plan:close.',
     format,
-    { offending_tasks: offenders },
+    {
+      offending_tasks: named,
+      offending_total: offenders.length,
+      offending_omitted: omittedTasks,
+    },
   );
 }
 
