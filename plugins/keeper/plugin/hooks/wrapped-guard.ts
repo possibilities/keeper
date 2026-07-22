@@ -109,6 +109,11 @@ export interface TreeProbe {
   repoToplevel(resolved: string): string | null;
   /** Existing scratch targets must be inert, singly linked regular files. */
   scratchFileSafe(resolved: string): boolean;
+  /** The quality-auditor's submit `--file` must be an EXISTING, singly linked,
+   *  non-symlink `.json` under an owner-private system-temp parent — the exact
+   *  class of file its scratch Write is allowed to create. `absPath` is the raw
+   *  lexical `--file` value so a symlink at the leaf is caught (not followed). */
+  auditSubmitFile(absPath: string): boolean;
 }
 
 /** Optional private-log sink threaded through the pure core (noop in tests). */
@@ -387,6 +392,11 @@ export interface WrappedCommandContext {
    *  narrow per-task audit-submit carve-out below — the same unspoofable identity
    *  anchor grant-guard keys the four escalation agents on. */
   agentType?: string;
+  /** Injected filesystem seam binding the auditor's submit `--file` to the class
+   *  of file it may create (an existing inert `.json` under its owner-private
+   *  system-temp scratchpad). Absent in the pure table tests (shape-only); wired
+   *  to the TreeProbe in `decideWrappedGuard`. */
+  auditFileProbe?: (absoluteFilePath: string) => boolean;
 }
 
 /** The static per-task audit gate's `plan:quality-auditor` subagent inherits its
@@ -584,11 +594,15 @@ function wrappedCommitWorkHasTaskId(
 /**
  * Narrow jurisdiction carve-out for the per-task audit gate. Admit the findings
  * submit for ONLY the harness-identified `plan:quality-auditor` (see
- * WRAPPED_AUDIT_AGENT_TYPE) and ONLY the `submit-task --file <path> --status <s>`
- * shape. The `--file -`/stdin form is denied on purpose so the auditor uses a
- * real path and the courier lexer's heredoc/redirect denial stays untouched;
- * every other agent_type — the wrapped courier included — and every other
- * `keeper plan audit` shape (submit, gate-check, …) stays denied.
+ * WRAPPED_AUDIT_AGENT_TYPE), ONLY the `submit-task` verb, and ONLY when: the
+ * positional TASK_ID equals the launch-bound task; exactly one `--file` and one
+ * `--status` (at most one `--project`/`--format`) so no duplicate authority flag
+ * slips a value past the guard; and the `--file` is an absolute path the injected
+ * `auditFileProbe` confirms is an existing inert `.json` under the auditor's
+ * owner-private scratchpad. The `--file -`/stdin form is denied on purpose so the
+ * courier lexer's heredoc/redirect denial stays untouched; every other agent_type
+ * — the wrapped courier included — and every other `keeper plan audit` shape
+ * (submit, gate-check, …) stays denied.
  */
 function wrappedAuditSubmitViolation(
   tokens: string[],
@@ -600,9 +614,15 @@ function wrappedAuditSubmitViolation(
   if (tokens[3] !== "submit-task") {
     return "wrapped `keeper plan audit` permits only the `submit-task` findings submit";
   }
-  let sawFile = false;
-  let sawStatus = false;
-  let positionals = 0;
+  // Track occurrence COUNTS, not booleans, so a duplicate authority flag in
+  // EITHER the glued (`--file=x`) or split (`--file x`) form is denied — the CLI
+  // parser's precedence can never resolve a value the guard did not reason over.
+  let fileCount = 0;
+  let statusCount = 0;
+  let projectCount = 0;
+  let formatCount = 0;
+  let fileValue: string | undefined;
+  const positionals: string[] = [];
   for (let index = 4; index < tokens.length; index += 1) {
     const token = tokens[index] as string;
     const eq = token.startsWith("--") ? token.indexOf("=") : -1;
@@ -618,7 +638,8 @@ function wrappedAuditSubmitViolation(
       ) {
         return "wrapped `keeper plan audit submit-task --file` requires a real file PATH (the `-`/stdin+heredoc form is denied — write the findings JSON to a scratch file, then submit that path)";
       }
-      sawFile = true;
+      fileCount += 1;
+      fileValue = value;
       if (glued === undefined) index += 1;
       continue;
     }
@@ -627,34 +648,62 @@ function wrappedAuditSubmitViolation(
       if (value !== "clean" && value !== "mild" && value !== "severe") {
         return "wrapped `keeper plan audit submit-task --status` must be one of clean/mild/severe";
       }
-      sawStatus = true;
+      statusCount += 1;
       if (glued === undefined) index += 1;
       continue;
     }
-    if (flag === "--project" || flag === "--format") {
+    if (flag === "--project") {
       const value = glued ?? tokens[index + 1];
       if (value === undefined || value.startsWith("--")) {
-        return `wrapped \`keeper plan audit submit-task ${flag}\` requires a value`;
+        return "wrapped `keeper plan audit submit-task --project` requires a value";
       }
+      projectCount += 1;
+      if (glued === undefined) index += 1;
+      continue;
+    }
+    if (flag === "--format") {
+      const value = glued ?? tokens[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return "wrapped `keeper plan audit submit-task --format` requires a value";
+      }
+      formatCount += 1;
       if (glued === undefined) index += 1;
       continue;
     }
     if (token.startsWith("--")) {
       return `wrapped \`keeper plan audit submit-task\` rejects the unrecognized option '${token}'`;
     }
-    positionals += 1;
-    if (positionals > 1) {
-      return "wrapped `keeper plan audit submit-task` permits exactly one TASK_ID positional";
-    }
+    positionals.push(token);
   }
-  if (positionals !== 1) {
+  if (fileCount !== 1) {
+    return "wrapped `keeper plan audit submit-task` requires exactly one --file <path>";
+  }
+  if (statusCount !== 1) {
+    return "wrapped `keeper plan audit submit-task` requires exactly one --status";
+  }
+  if (projectCount > 1) {
+    return "wrapped `keeper plan audit submit-task` permits at most one --project";
+  }
+  if (formatCount > 1) {
+    return "wrapped `keeper plan audit submit-task` permits at most one --format";
+  }
+  if (positionals.length !== 1) {
     return "wrapped `keeper plan audit submit-task` requires exactly one TASK_ID positional";
   }
-  if (!sawFile) {
-    return "wrapped `keeper plan audit submit-task` requires --file <path>";
+  // Bind the submit to the launch-bound task — a marked auditor for task A can
+  // never submit or overwrite task B's finding (the same binding done/block use).
+  if (context.taskId === undefined || positionals[0] !== context.taskId) {
+    return "wrapped `keeper plan audit submit-task` must name the launch-bound task";
   }
-  if (!sawStatus) {
-    return "wrapped `keeper plan audit submit-task` requires --status";
+  // The findings file is an absolute scratchpad path so the class probe has no
+  // cwd ambiguity, and it must point at the exact class of file the auditor may
+  // create: an existing inert `.json` under its owner-private system-temp parent.
+  const file = fileValue as string;
+  if (!isAbsolute(file)) {
+    return "wrapped `keeper plan audit submit-task --file` must be an absolute scratchpad path";
+  }
+  if (context.auditFileProbe && !context.auditFileProbe(file)) {
+    return "wrapped `keeper plan audit submit-task --file` must point at an existing inert .json findings file under your private system-temp scratchpad";
   }
   return null;
 }
@@ -1342,7 +1391,21 @@ export function decideWrappedGuard(
     const inTree = writeTargetInTree(fp, cwd, resolvedProbe, log);
     if (inTree === null) return denyEnvelope(MALFORMED_REASON); // unresolvable → fail closed
     if (!inTree) {
-      if (scratchWriteAllowed(fp, cwd, resolvedProbe)) return null;
+      if (scratchWriteAllowed(fp, cwd, resolvedProbe)) {
+        // The quality-auditor's scratch Write is its findings file only — an
+        // inert `.json`, narrower than the courier's `.json/.txt/.md` handoff
+        // class — binding what it can create to what the submit carve-out reads.
+        if (p.agent_type === WRAPPED_AUDIT_AGENT_TYPE) {
+          const abs = isAbsolute(fp) ? fp : resolve(cwd, fp);
+          const resolved = resolvedProbe.realpath(abs);
+          if (resolved === null || !/\.json$/i.test(resolved)) {
+            return denyEnvelope(
+              "Wrapped quality-auditor BLOCKED: its scratch Write is limited to an inert .json findings file under its private system temporary scratchpad (.txt/.md are not the findings class).",
+            );
+          }
+        }
+        return null;
+      }
       return denyEnvelope(
         "Wrapped-cell worker BLOCKED: out-of-tree Write is limited to inert .json/.txt/.md handoff files under the system temporary directory.",
       );
@@ -1363,6 +1426,8 @@ export function decideWrappedGuard(
     // can gate on it (env carries the task/envelope binding; agent_type is the
     // payload's, the same anchor grant-guard trusts for its escalation set).
     if (typeof p.agent_type === "string") context.agentType = p.agent_type;
+    // Bind the auditor's submit `--file` to the file class it may create.
+    context.auditFileProbe = (abs) => resolvedProbe.auditSubmitFile(abs);
     const violation = evaluateWrappedBash(command, context);
     if (violation === null) return null; // allowlisted → allow
     return denyEnvelope(bashReason(violation));
@@ -1451,11 +1516,42 @@ function scratchFileSafe(resolved: string): boolean {
   }
 }
 
+/** The submit `--file` must be the class of file the auditor's scratch Write
+ *  creates: an EXISTING regular non-symlink `.json`, single-linked, under an
+ *  owner-private system-temp parent. `lexicalAbs` is lstat'd directly (never
+ *  realpath'd first) so a symlink AT the leaf is rejected, not followed. */
+export function auditSubmitFileSafe(lexicalAbs: string): boolean {
+  try {
+    if (!/\.json$/i.test(lexicalAbs)) return false;
+    const leaf = lstatSync(lexicalAbs);
+    if (!leaf.isFile() || leaf.nlink !== 1) return false;
+    const parentReal = realpathSync(dirname(lexicalAbs));
+    const parent = lstatSync(parentReal);
+    const getuid = process.getuid;
+    const ownerPrivate =
+      parent.isDirectory() &&
+      (parent.mode & 0o077) === 0 &&
+      (getuid === undefined || parent.uid === getuid.call(process));
+    if (!ownerPrivate) return false;
+    const tempRoots = SYSTEM_TMP_ROOTS.map((root) => {
+      try {
+        return realpathSync(root);
+      } catch {
+        return null;
+      }
+    }).filter((root): root is string => root !== null);
+    return tempRoots.some((root) => pathInside(root, parentReal));
+  } catch {
+    return false;
+  }
+}
+
 export function fsProbe(): TreeProbe {
   return {
     realpath: realpathNearest,
     repoToplevel: repoToplevelOf,
     scratchFileSafe,
+    auditSubmitFile: auditSubmitFileSafe,
   };
 }
 

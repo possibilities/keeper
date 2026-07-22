@@ -12,19 +12,22 @@
 // state intent. The Write tree check runs against an injected fake TreeProbe over
 // a virtual repo layout.
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  auditSubmitFileSafe,
   decideWrappedGuard,
   evaluateWrappedBash,
   fsProbe,
@@ -358,6 +361,46 @@ describe("evaluateWrappedBash — quality-auditor per-task submit carve-out", ()
       }),
     ).not.toBeNull();
   });
+
+  test("binds the submit to the launch-bound task id", () => {
+    // a marked auditor for task A cannot submit/overwrite task B's finding
+    const wrongTask = evaluateWrappedBash(
+      "keeper plan audit submit-task fn-1-other.9 --file /tmp/finding.json --status mild",
+      auditor,
+    );
+    expect(wrongTask).not.toBeNull();
+    expect(wrongTask).toContain("launch-bound task");
+    // absent launch-bound context → denied (no id to bind against)
+    expect(
+      evaluateWrappedBash(
+        "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild",
+        { agentType: "plan:quality-auditor" },
+      ),
+    ).not.toBeNull();
+    // a relative --file has no unambiguous absolute scratchpad path → denied
+    expect(
+      evaluateWrappedBash(
+        "keeper plan audit submit-task fn-1-x.2 --file rel/finding.json --status mild",
+        auditor,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("denies a duplicate authority flag in either the split or glued form", () => {
+    const dup = [
+      // two --file (split), so parser precedence can't pick an unreasoned value
+      "keeper plan audit submit-task fn-1-x.2 --file /tmp/a.json --file /tmp/b.json --status mild",
+      // glued + split duplicate of --file
+      "keeper plan audit submit-task fn-1-x.2 --file=/tmp/a.json --status mild --file /tmp/b.json",
+      // duplicate --status
+      "keeper plan audit submit-task fn-1-x.2 --file /tmp/a.json --status mild --status clean",
+      // duplicate --project
+      "keeper plan audit submit-task fn-1-x.2 --file /tmp/a.json --status mild --project /a --project /b",
+    ];
+    for (const cmd of dup) {
+      expect(evaluateWrappedBash(cmd, auditor)).not.toBeNull();
+    }
+  });
 });
 
 describe("evaluateWrappedBash — observed launch shapes and static POSIX word reference", () => {
@@ -597,13 +640,17 @@ const OUTSIDE = join(tmpdir(), "keeper-wrapped-test"); // inert scratch root
 
 /** A virtual repo layout: identity realpath (a sentinel resolves to null), and a
  *  longest-prefix `.git`-toplevel over the single tracked repo root. */
-function fakeProbe(opts?: { unresolvable?: string[] }): TreeProbe {
+function fakeProbe(opts?: {
+  unresolvable?: string[];
+  auditSubmitFile?: (abs: string) => boolean;
+}): TreeProbe {
   const unresolvable = new Set(opts?.unresolvable ?? []);
   return {
     realpath: (abs) => (unresolvable.has(abs) ? null : abs),
     repoToplevel: (resolved) =>
       resolved === REPO || resolved.startsWith(`${REPO}/`) ? REPO : null,
     scratchFileSafe: () => true,
+    auditSubmitFile: opts?.auditSubmitFile ?? (() => true),
   };
 }
 
@@ -787,6 +834,134 @@ describe("decideWrappedGuard — quality-auditor audit-submit carve-out (full ma
     );
     expect(decision).not.toBeNull();
     expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("DENIES the auditor's out-of-tree NON-.json scratch Write (.txt/.md are not the findings class)", () => {
+    const txt = decide(
+      writePayload(`${OUTSIDE}/finding.txt`, {
+        agent_type: "plan:quality-auditor",
+      }),
+    );
+    expect(txt).not.toBeNull();
+    expect(txt?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("the courier's broader out-of-tree .txt/.md handoff class is UNCHANGED (the .json narrowing is auditor-only)", () => {
+    expect(decide(writePayload(`${OUTSIDE}/contract.md`))).toBeNull();
+    expect(
+      decide(
+        writePayload(`${OUTSIDE}/handoff.txt`, { agent_type: "work:worker" }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("auditSubmitFileSafe — submit --file must be an existing private-scratch .json", () => {
+  // Real fs, sandboxed under a per-test mkdtemp (mode 0700 → owner-private).
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kw-audit-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("accepts an existing regular .json under an owner-private temp parent", () => {
+    const f = join(dir, "finding.json");
+    writeFileSync(f, "{}", { mode: 0o600 });
+    expect(auditSubmitFileSafe(f)).toBe(true);
+  });
+
+  test("rejects a non-existent path", () => {
+    expect(auditSubmitFileSafe(join(dir, "ghost.json"))).toBe(false);
+  });
+
+  test("rejects a symlink at the leaf (lstat, never followed)", () => {
+    const real = join(dir, "real.json");
+    writeFileSync(real, "{}");
+    const link = join(dir, "link.json");
+    symlinkSync(real, link);
+    expect(auditSubmitFileSafe(link)).toBe(false);
+  });
+
+  test("rejects a non-.json file", () => {
+    const f = join(dir, "finding.txt");
+    writeFileSync(f, "{}");
+    expect(auditSubmitFileSafe(f)).toBe(false);
+  });
+
+  test("rejects a group/other-accessible (non-owner-private) parent", () => {
+    chmodSync(dir, 0o755);
+    const f = join(dir, "finding.json");
+    writeFileSync(f, "{}");
+    expect(auditSubmitFileSafe(f)).toBe(false);
+  });
+});
+
+describe("decideWrappedGuard — auditor submit --file class (real fs, production probe)", () => {
+  const env = {
+    KEEPER_WRAPPED_CELL: "gpt-5::high",
+    KEEPER_WRAPPED_ENVELOPE:
+      "/repo/.keeper/state/wrapped-envelopes/fn-1-x.2.json",
+  };
+  const auditorBash = (command: string) =>
+    ({
+      tool_name: "Bash",
+      agent_type: "plan:quality-auditor",
+      cwd: REPO,
+      tool_input: { command },
+    }) as WrappedGuardPayload;
+
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "kw-audit-decide-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("ALLOWS the submit when --file is an existing private-scratch .json", () => {
+    const f = join(dir, "finding.json");
+    writeFileSync(f, '{"findings":[]}', { mode: 0o600 });
+    expect(
+      decideWrappedGuard(
+        auditorBash(
+          `keeper plan audit submit-task fn-1-x.2 --file ${f} --status mild`,
+        ),
+        env,
+        fsProbe(),
+      ),
+    ).toBeNull();
+  });
+
+  test("DENIES the submit when --file is a symlink or missing", () => {
+    const real = join(dir, "real.json");
+    writeFileSync(real, "{}");
+    const link = join(dir, "link.json");
+    symlinkSync(real, link);
+    for (const path of [link, join(dir, "ghost.json")]) {
+      expect(
+        decideWrappedGuard(
+          auditorBash(
+            `keeper plan audit submit-task fn-1-x.2 --file ${path} --status mild`,
+          ),
+          env,
+          fsProbe(),
+        ),
+      ).not.toBeNull();
+    }
+  });
+
+  test("DENIES the submit when the file-class probe rejects --file (e.g. outside the private scratchpad)", () => {
+    expect(
+      decideWrappedGuard(
+        auditorBash(
+          "keeper plan audit submit-task fn-1-x.2 --file /tmp/finding.json --status mild",
+        ),
+        env,
+        fakeProbe({ auditSubmitFile: () => false }),
+      ),
+    ).not.toBeNull();
   });
 });
 
