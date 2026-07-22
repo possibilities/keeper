@@ -52,6 +52,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
 import {
+  applyWakeArm,
   BASE_REFRESH_COOLDOWN_SEC,
   type BaseDriftEntry,
   beginContainmentCycle,
@@ -112,6 +113,7 @@ import {
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
+  EXPIRY_WAKE_UNKNOWN_RETRY_SEC,
   type ExpiryWakeClock,
   epicFrameVerdict,
   epicPresentAndNotDone,
@@ -219,6 +221,7 @@ import {
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
   type StaleBaseLaneObservation,
+  type StoppedExpiryWaker,
   selectTerminalPaneOwnerScan,
   sharedCheckoutDistressObservations,
   sharedDesyncDistressId,
@@ -236,6 +239,7 @@ import {
   type TipObservation,
   updateWithholdFrameState,
   verbForVerdict,
+  type WakeArm,
   type WithholdReason,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -2487,6 +2491,96 @@ test("createStoppedExpiryWaker: coalesces to ONE timer, disarms on null, and nev
   down = true;
   armed()?.fire();
   expect(cycles).toBe(0);
+});
+
+test("13c RACE 1: armUnknown PRESERVES a live timer (a transient unknown never erases the clock edge)", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {},
+    () => false,
+  );
+  waker.arm(1100);
+  const live = armed();
+  expect(live?.delayMs).toBe(100 * 1000);
+  // An untrustworthy cycle while a definite edge is armed: keep the SAME timer, unchanged.
+  waker.armUnknown();
+  expect(armed()).toBe(live);
+  expect(armed()?.delayMs).toBe(100 * 1000);
+});
+
+test("13c RACE 1: armUnknown after a FIRED boundary arms a bounded retry (re-probes, never freezes)", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  let cycles = 0;
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {
+      cycles++;
+    },
+    () => false,
+  );
+  waker.arm(1100);
+  armed()?.fire(); // the boundary cycle fired → handle now null
+  expect(cycles).toBe(1);
+  // That fired cycle came back UNKNOWN (a degraded probe / a throw). With no live timer, arm
+  // ONE bounded retry so the quiescent DB is re-probed rather than frozen forever.
+  waker.armUnknown();
+  expect(armed()?.delayMs).toBe(EXPIRY_WAKE_UNKNOWN_RETRY_SEC * 1000);
+  // The bounded retry fires a fresh probe cycle.
+  armed()?.fire();
+  expect(cycles).toBe(2);
+});
+
+test("13c RACE 1: armUnknown while shut down disarms (never keeps a timer alive on shutdown)", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  let down = false;
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {},
+    () => down,
+  );
+  waker.arm(1100);
+  down = true;
+  waker.armUnknown();
+  expect(armed()).toBeNull();
+});
+
+test("13c RACE 2: a STALE queued callback no-ops and does NOT orphan the newer timer (generation fence)", () => {
+  const { clock, armed } = fakeExpiryClock(1000);
+  let cycles = 0;
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {
+      cycles++;
+    },
+    () => false,
+  );
+  // Timer A armed; capture its callback as if the event loop already QUEUED it.
+  waker.arm(1100);
+  const staleFire = armed()?.fire;
+  // A DB wake re-arms → newer timer B supersedes A.
+  waker.arm(1050);
+  const newer = armed();
+  // The stale (already-queued) A callback now runs: generation-fenced → no cycle, no orphan.
+  staleFire?.();
+  expect(cycles).toBe(0); // stale callback ran no cycle
+  expect(armed()).toBe(newer); // the newer timer is still owned (not wiped by the stale one)
+  // And the newer timer, when it legitimately fires, still runs exactly one cycle.
+  newer?.fire();
+  expect(cycles).toBe(1);
+});
+
+test("13c applyWakeArm maps the three-state intent onto the waker verbs", () => {
+  const calls: string[] = [];
+  const fake: StoppedExpiryWaker = {
+    arm: (at) => calls.push(at === null ? "arm(null)" : `arm(${at})`),
+    armUnknown: () => calls.push("armUnknown"),
+    disarm: () => calls.push("disarm"),
+  };
+  applyWakeArm(fake, { at: 1234 } satisfies WakeArm);
+  applyWakeArm(fake, "idle");
+  applyWakeArm(fake, "unknown");
+  expect(calls).toEqual(["arm(1234)", "arm(null)", "armUnknown"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -16251,6 +16345,28 @@ test("lane maintenance HOLDS a past-grace stopped sibling occupancy would reap �
   // Positive gone next cycle (the reaper cleared the pane) → the lane releases.
   const gone = createLaneMaintenanceProbe(jobs, new Map(), new Set());
   expect(gone(target)).toEqual({ kind: "clear" });
+
+  // 13c cascade boundary: an ACQUIRED dispatch claim outranks pane-gone. Even with the pane
+  // positively gone AND no live job, a live (non-released) claim on the lane HOLDS it — the
+  // claim, not the pane, is the release authority. Only a POSITIVELY-RELEASED claim clears.
+  const claimHeld = createLaneMaintenanceProbe(
+    new Map(), // no live job
+    new Map([["work::fn-1-foo.2", makeLaneClaim({ dir: lane })]]), // acquired claim
+    new Set(), // pane positively gone
+  );
+  expect(claimHeld(target)).toMatchObject({ kind: "defer" });
+
+  const claimReleased = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([
+      [
+        "work::fn-1-foo.2",
+        makeLaneClaim({ dir: lane, state: "released", released_at: 5 }),
+      ],
+    ]),
+    new Set(),
+  );
+  expect(claimReleased(target)).toEqual({ kind: "clear" });
 });
 
 test("recoverWorktrees: a task-scoped live claim plus MERGE_HEAD protects the lane from every recovery mutation", async () => {

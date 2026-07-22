@@ -1021,52 +1021,116 @@ export interface ExpiryWakeClock {
   clearTimer: (handle: unknown) => void;
 }
 
-/** The coalesced stopped-job expiry waker: one re-armable timer. */
+/** Default bounded re-probe (seconds) a waker arms when a cycle's decision is UNTRUSTWORTHY
+ *  and NO timer is currently held — so a fired-then-unknown boundary re-probes rather than
+ *  freezing forever on a quiescent DB. */
+export const EXPIRY_WAKE_UNKNOWN_RETRY_SEC = 60;
+
+/** The coalesced stopped-job expiry waker: one re-armable, generation-fenced timer. */
 export interface StoppedExpiryWaker {
-  /** Re-arm the single timer for the earliest stopped-job reap expiry (unix
-   *  seconds). `null` disarms — the paused / degraded fail-closed case. */
+  /** Re-arm the single timer for the earliest expiry (unix seconds). `null` DISARMS — the
+   *  positively-nothing-pending case (paused / no candidate); `play` delivers the explicit
+   *  re-kick. Distinct from {@link armUnknown}, which never disarms a live edge. */
   arm: (nextExpiryAt: number | null) => void;
+  /** UNTRUSTWORTHY decision (a cycle error, a degraded/inconclusive probe): PRESERVE the
+   *  prior timer if one is armed, else arm ONE bounded retry — never erase a live clock edge,
+   *  so a transient unknown that fired the boundary cycle re-probes instead of freezing. */
+  armUnknown: () => void;
   /** Cancel the timer outright (shutdown). */
   disarm: () => void;
 }
 
 /**
- * Build the coalesced stopped-job expiry waker. autopilot's `watchLoop` wakes ONLY
- * on a `data_version` change, so a stopped session sitting in a quiescent DB would
- * never re-cross its reap grace — the age predicate {@link computeSlotOccupancy}
- * applies would never be re-evaluated. This arms ONE re-armable timer at the earliest
- * durable stopped-job reap expiry the last cycle computed and fires a fresh cycle
- * when it elapses, closing that clock edge WITHOUT a DB write. Coalesced by
- * construction: {@link StoppedExpiryWaker.arm} clears the prior timer before setting
- * the next, so there is only ever one timer (never per-job), re-armed to the running
- * minimum each cycle and re-derived from the durable jobs projection (restart-safe —
- * the boot cycle re-arms it). A `null` expiry (paused / degraded — the slot pass
- * returns null there) disarms, so no wake-driven reap fires while paused.
+ * Build the coalesced expiry waker. autopilot's `watchLoop` wakes ONLY on a `data_version`
+ * change, so a deadline sitting in a quiescent DB would never be re-evaluated. This arms ONE
+ * re-armable timer at the earliest durable expiry the last cycle computed and fires a fresh
+ * cycle when it elapses, closing that clock edge WITHOUT a DB write. Coalesced by
+ * construction: every {@link StoppedExpiryWaker.arm} clears the prior timer before setting the
+ * next, so there is only ever one timer (never per-job), re-derived from the durable
+ * projection (restart-safe — the boot cycle re-arms it).
+ *
+ * TWO liveness invariants:
+ *  - THREE-STATE arming: a definite `arm(expiry)` sets the edge; `arm(null)` DISARMS (a
+ *    positive no-candidate / paused, re-kicked by `play`); {@link armUnknown} for an
+ *    untrustworthy decision (a cycle error, a degraded/inconclusive probe) PRESERVES the prior
+ *    timer or, if none, arms one bounded retry — so a single transient null that fired the
+ *    boundary cycle can never erase the clock edge forever.
+ *  - GENERATION FENCING: every arm/disarm bumps a monotonic generation the armed callback
+ *    captures; a callback ALREADY QUEUED when a newer arm supersedes it checks its generation
+ *    first and no-ops, so a stale expiry callback can neither run a cycle nor orphan the newer
+ *    timer (the two-live-timers coalescing violation).
  */
 export function createStoppedExpiryWaker(
   clock: ExpiryWakeClock,
   runCycle: () => void,
   isShutdown: () => boolean,
+  unknownRetrySec: number = EXPIRY_WAKE_UNKNOWN_RETRY_SEC,
 ): StoppedExpiryWaker {
   let handle: unknown = null;
-  const disarm = (): void => {
+  // Monotonic generation. Bumped on EVERY arm/disarm; the armed callback captures the
+  // generation of ITS timer and runs only while it is still current — a callback queued
+  // before a superseding arm sees a stale generation and no-ops.
+  let generation = 0;
+  const clearHandle = (): void => {
     if (handle !== null) {
       clock.clearTimer(handle);
       handle = null;
     }
   };
+  const disarm = (): void => {
+    generation += 1;
+    clearHandle();
+  };
+  const armDelay = (delayMs: number): void => {
+    // Supersede any queued stale callback, then replace the single timer.
+    generation += 1;
+    clearHandle();
+    if (isShutdown()) return;
+    const myGen = generation;
+    handle = clock.setTimer(delayMs, () => {
+      if (myGen !== generation) return; // superseded — a newer arm/disarm invalidated us
+      handle = null;
+      if (!isShutdown()) runCycle();
+    });
+  };
   return {
     disarm,
     arm: (nextExpiryAt): void => {
-      disarm();
-      if (nextExpiryAt === null || isShutdown()) return;
-      const delayMs = Math.max(0, (nextExpiryAt - clock.now()) * 1000);
-      handle = clock.setTimer(delayMs, () => {
-        handle = null;
-        if (!isShutdown()) runCycle();
-      });
+      if (nextExpiryAt === null || isShutdown()) {
+        disarm();
+        return;
+      }
+      armDelay(Math.max(0, (nextExpiryAt - clock.now()) * 1000));
+    },
+    armUnknown: (): void => {
+      if (isShutdown()) {
+        disarm();
+        return;
+      }
+      // PRESERVE a live edge: a still-armed timer is the last trustworthy deadline; an
+      // untrustworthy cycle must not erase it. Only when NO timer is held (e.g. the boundary
+      // cycle fired then came back unknown) arm ONE bounded retry so a probe re-runs.
+      if (handle !== null) return;
+      armDelay(Math.max(0, unknownRetrySec) * 1000);
     },
   };
+}
+
+/** A cycle's THREE-STATE wake intent: a definite deadline (`{ at }`, unix seconds), a positive
+ *  no-candidate (`idle` → disarm), or an UNTRUSTWORTHY cycle (`unknown` → preserve the prior
+ *  timer / bounded retry, never erase a live edge). */
+export type WakeArm = { at: number } | "idle" | "unknown";
+
+/** Apply a {@link WakeArm} to a waker — the one mapping the driveCycle `finally` uses so both
+ *  the stopped-expiry and origin-containment edges share identical liveness semantics. */
+export function applyWakeArm(waker: StoppedExpiryWaker, arm: WakeArm): void {
+  if (arm === "unknown") {
+    waker.armUnknown();
+  } else if (arm === "idle") {
+    waker.arm(null);
+  } else {
+    waker.arm(arm.at);
+  }
 }
 
 /**
@@ -13524,15 +13588,19 @@ function main(): void {
       return;
     }
     cycleRunning = true;
-    // The last cycle's earliest held stopped-job expiry; the wake is (re-)armed for
-    // it in `finally`, so a quiescent DB still re-crosses the reap grace.
-    let latestSlotExpiry: number | null = null;
-    // The last cycle's earliest origin-containment episode/retry wake (BLOCKER 2), armed in
-    // `finally` so a quiescent DB still crosses the containment grace and re-probes open rows.
-    let latestContainmentWake: number | null = null;
+    // THREE-STATE wake targets, applied in `finally`. `{ at }` is a definite deadline; `idle`
+    // is a positive no-candidate (disarm); `unknown` is an UNTRUSTWORTHY cycle (a throw, or a
+    // degraded/inconclusive probe) that must NOT erase a live clock edge — the waker preserves
+    // its prior timer or arms one bounded retry. Each is INITIALIZED to `unknown` and RE-SET to
+    // unknown at the TOP of every loop iteration, so a cycle that throws before deriving a
+    // trustworthy value leaves the prior edge intact (the transient-null clock-edge race).
+    let latestSlotArm: WakeArm = "unknown";
+    let latestContainmentArm: WakeArm = "unknown";
     try {
       do {
         wakePending = false;
+        latestSlotArm = "unknown";
+        latestContainmentArm = "unknown";
         if (shutdown) {
           return;
         }
@@ -14283,7 +14351,13 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
-        latestSlotExpiry = decision.slotNextExpiryAt;
+        // A TRUSTWORTHY decision this cycle: a definite expiry arms the edge; a null expiry is
+        // a positive no-candidate (paused / nothing stopped) → `idle` disarm. (A degraded probe
+        // never reaches here — it `continue`d above, leaving the per-iteration `unknown`.)
+        latestSlotArm =
+          decision.slotNextExpiryAt !== null
+            ? { at: decision.slotNextExpiryAt }
+            : "idle";
         // Reap the union of the done-monitor candidates and this cycle's
         // exact occupancy targets. Slot targets take precedence for a shared job
         // because their stopped proof needs no monitor-staleness inference. The
@@ -14613,9 +14687,14 @@ function main(): void {
                 ),
               );
             }
-            // BLOCKER 2: hand the earliest episode/retry deadline to the coalesced waker so a
-            // quiescent DB still crosses the grace + re-probes an open row (armed in finally).
-            latestContainmentWake = containmentDecision.nextWakeAt;
+            // BLOCKER 2: a TRUSTWORTHY sweep — hand the earliest episode/retry deadline to the
+            // coalesced waker (`{ at }`), or `idle` when nothing is stuck/open, so a quiescent DB
+            // still crosses the grace + re-probes an open row (armed in finally). A sweep that
+            // THREW leaves the per-iteration `unknown` (the catch below) so the prior edge stands.
+            latestContainmentArm =
+              containmentDecision.nextWakeAt !== null
+                ? { at: containmentDecision.nextWakeAt }
+                : "idle";
           } catch (err) {
             console.error(
               "[autopilot-worker] origin-containment sweep threw (non-fatal):",
@@ -14637,6 +14716,9 @@ function main(): void {
               claimlessDistressClear(snapshot.dispatchFailureFences, id, dir),
             );
           }
+          // A DISABLED sweep (mode-off / paused / no driver) is a positive no-candidate — disarm
+          // the containment edge; `play` / a mode flip delivers the explicit re-kick.
+          latestContainmentArm = "idle";
         }
       } while (wakePending && !shutdown);
     } catch (err) {
@@ -14647,14 +14729,13 @@ function main(): void {
       console.error("[autopilot-worker] reconcile cycle threw:", err);
     } finally {
       cycleRunning = false;
-      // Re-arm the coalesced expiry wake from THIS cycle's earliest held stopped-job
-      // expiry (null while paused/degraded → disarmed, failing closed). Restart-safe:
-      // the boot cycle re-derives it from the durable jobs projection.
-      stoppedExpiryWaker.arm(latestSlotExpiry);
-      // Re-arm the containment waker from THIS cycle's earliest episode/retry deadline (null
-      // when nothing is stuck / open → disarmed). Restart-safe: the boot cycle re-derives it
-      // from the durable open-row set unioned into the sweep.
-      containmentExpiryWaker.arm(latestContainmentWake);
+      // Re-arm both coalesced wakes from THIS cycle's THREE-STATE intent: a definite deadline
+      // arms the edge, a positive no-candidate disarms, and an UNTRUSTWORTHY cycle (a throw
+      // leaves the per-iteration `unknown`, a degraded probe `continue`d to it) preserves the
+      // prior edge / arms one bounded retry — never erasing a live clock edge on a transient
+      // null. Restart-safe: the boot cycle re-derives both from the durable projections.
+      applyWakeArm(stoppedExpiryWaker, latestSlotArm);
+      applyWakeArm(containmentExpiryWaker, latestContainmentArm);
     }
   };
 
