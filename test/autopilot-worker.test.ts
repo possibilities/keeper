@@ -166,9 +166,11 @@ import {
   mergeEscalationFailuresToClear,
   mergeLaneBaseIntoDefault,
   ORIGIN_CONTAINMENT_DISTRESS_REASON,
+  ORIGIN_CONTAINMENT_RETRY_INTERVAL_SEC,
   ORIGIN_CONTAINMENT_STUCK_GRACE_SEC,
   type OriginContainmentResult,
   originContainmentDistressId,
+  originContainmentModeOffClears,
   originContainmentSweepEnabled,
   originDefaultRef,
   pendingIntegrationReason,
@@ -25700,13 +25702,19 @@ test("fn-13 reconcileOriginContainment DEFERS on an inconclusive non-divergence 
   expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
 });
 
-test("fn-13 reconcileOriginContainment DEFERS when origin/<default> is unresolved (never pushed)", async () => {
+test("fn-13 reconcileOriginContainment flags an unresolved origin as first-push-needed (never auto-pushed)", async () => {
   const g = makeContainmentGit({ originResolves: false });
   const res = await reconcileOriginContainment("/repo", "main", g.run);
-  expect(res.kind).toBe("deferred");
+  // Ownerless first-push case: actionable-after-grace, NOT an eternal neutral defer — but
+  // NEVER auto-pushed (no cached positive-lead evidence exists).
+  expect(res.kind).toBe("first-push-needed");
   expect(g.calls.some((c) => c.args.startsWith("push origin"))).toBe(false);
-  // Deferred BEFORE the divergence probe — the first-push case is finalize's, not ours.
+  // Short-circuits BEFORE the divergence probe — there is no cached origin ref to compare.
   expect(g.calls.some((c) => c.args.startsWith("merge-base"))).toBe(false);
+  // And it is classified ACTIONABLE.
+  expect(classifyOriginContainment("/repo", "main", res).class).toBe(
+    "actionable",
+  );
 });
 
 test("fn-13 reconcileOriginContainment is a no-op when origin already contains local default", async () => {
@@ -25854,29 +25862,41 @@ test("13b ordering: beginContainmentCycle re-arms the guard so the NEXT cycle re
   expect((await driver.reconcileOrigin([repo]))[0].result.kind).toBe("pushed");
 });
 
-test("13b classifyOriginContainment: healthy / actionable / neutral partition", () => {
+test("13b classifyOriginContainment: healthy / actionable / neutral partition (ownerless publication blockers are actionable)", () => {
   const h = (r: OriginContainmentResult) =>
     classifyOriginContainment("/r", "main", r).class;
+  // HEALTHY — positive evidence.
   expect(h({ kind: "pushed" })).toBe("healthy");
   expect(h({ kind: "already-contained" })).toBe("healthy");
   expect(h({ kind: "remote-ahead" })).toBe("healthy");
+  // ACTIONABLE — every ownerless publication blocker (BLOCKER 4): no finalize exists to
+  // surface them, so they must all reach the visible fallback.
   expect(h({ kind: "push-timeout" })).toBe("actionable");
   expect(h({ kind: "push-failed", detail: "x" })).toBe("actionable");
   expect(h({ kind: "diverged", ahead: 3 })).toBe("actionable");
-  expect(h({ kind: "deferred", reason: "x" })).toBe("neutral");
-  expect(h({ kind: "off-branch", head: "feat" })).toBe("neutral");
+  expect(h({ kind: "off-branch", head: "feat" })).toBe("actionable");
   expect(h({ kind: "not-turn-key", reason: { kind: "no-remote" } })).toBe(
-    "neutral",
+    "actionable",
   );
-  // The actionable reason carries the paging token so isJamReason surfaces it.
-  const actionable = classifyOriginContainment("/r", "main", {
-    kind: "push-timeout",
-  });
-  if (actionable.class !== "actionable") throw new Error("expected actionable");
-  expect(actionable.reason.startsWith(ORIGIN_CONTAINMENT_DISTRESS_REASON)).toBe(
-    true,
-  );
-  expect(isJamReason(actionable.reason)).toBe(true);
+  expect(h({ kind: "non-ff" })).toBe("actionable");
+  expect(h({ kind: "first-push-needed" })).toBe("actionable");
+  // NEUTRAL — genuinely inconclusive (probe error / owner-attempt guard) stays neutral.
+  expect(h({ kind: "deferred", reason: "x" })).toBe("neutral");
+  // Every actionable reason carries the paging token so isJamReason surfaces it (needs-human).
+  for (const r of [
+    { kind: "push-timeout" },
+    { kind: "diverged", ahead: 1 },
+    { kind: "off-branch", head: "feat" },
+    { kind: "not-turn-key", reason: { kind: "no-remote" } },
+    { kind: "non-ff" },
+    { kind: "first-push-needed" },
+  ] as OriginContainmentResult[]) {
+    const c = classifyOriginContainment("/r", "main", r);
+    if (c.class !== "actionable")
+      throw new Error(`expected actionable: ${r.kind}`);
+    expect(c.reason.startsWith(ORIGIN_CONTAINMENT_DISTRESS_REASON)).toBe(true);
+    expect(isJamReason(c.reason)).toBe(true);
+  }
 });
 
 test("13b origin-containment tracker mints past the grace and level-clears on positive evidence", () => {
@@ -25885,7 +25905,7 @@ test("13b origin-containment tracker mints past the grace and level-clears on po
   const reason = `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: stuck`;
   const unhealthy = new Map([[dir, reason]]);
   const empty = new Set<string>();
-  // Before the grace: no mint.
+  // Before the grace: no mint; the waker arms for the exact grace deadline (0 + 600).
   expect(
     tracker.step({
       unhealthy,
@@ -25893,7 +25913,7 @@ test("13b origin-containment tracker mints past the grace and level-clears on po
       openDistressDirs: empty,
       nowSec: 0,
     }),
-  ).toEqual({ mint: [], clear: [] });
+  ).toEqual({ mint: [], clear: [], nextWakeAt: 600 });
   // Past the grace: mint exactly once, keyed per-repo.
   const minted = tracker.step({
     unhealthy,
@@ -25937,7 +25957,8 @@ test("13b origin-containment tracker does NOT clear on an inconclusive (deferred
     openDistressDirs: new Set([dir]),
     nowSec: 1000,
   });
-  expect(decision).toEqual({ mint: [], clear: [] });
+  // No mint, no clear — but the still-open row arms the bounded retry wake (1000 + 60).
+  expect(decision).toEqual({ mint: [], clear: [], nextWakeAt: 1060 });
 });
 
 test("13b origin-containment tracker clears a PRE-RESTART open row on positive evidence (in-memory latch empty)", () => {
@@ -25983,4 +26004,89 @@ test("13b SCOPE BOUNDARY: the containment sweep is inert with worktree mode OFF"
 test("13b ORIGIN_CONTAINMENT_STUCK_GRACE_SEC is a bounded positive window", () => {
   expect(ORIGIN_CONTAINMENT_STUCK_GRACE_SEC).toBeGreaterThan(0);
   expect(Number.isFinite(ORIGIN_CONTAINMENT_STUCK_GRACE_SEC)).toBe(true);
+});
+
+// --- 13c: waker clock edge, mode-off retire, ownerless reclassification ---
+
+test("13c waker: an un-minted episode arms the exact grace deadline, and the deadline cycle mints (zero DB events)", () => {
+  // BLOCKER 2 regression: watchLoop is data_version-only, so a quiescent DB never re-crosses
+  // the grace. The tracker hands the coalesced waker the exact deadline; the fired cycle
+  // re-probes and mints — no DB write in between.
+  const grace = 600;
+  const tracker = createOriginContainmentStuckTracker(grace);
+  const dir = "/repo-13c-wake";
+  const reason = `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: stuck`;
+  const unhealthy = new Map([[dir, reason]]);
+  const empty = new Set<string>();
+  // t0: first failure — no mint, waker armed for t0 + grace.
+  const first = tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: 0,
+  });
+  expect(first.mint).toEqual([]);
+  expect(first.nextWakeAt).toBe(grace);
+  // The waker fires at the deadline → the re-armed cycle re-probes (still unhealthy) → mints.
+  const atDeadline = tracker.step({
+    unhealthy,
+    healthy: empty,
+    openDistressDirs: empty,
+    nowSec: grace,
+  });
+  expect(atDeadline.mint).toEqual([
+    { id: originContainmentDistressId(dir), dir, reason },
+  ]);
+  // A minted (still-open) episode then arms the bounded retry cadence so the DB stays quiet.
+  expect(atDeadline.nextWakeAt).toBe(
+    grace + ORIGIN_CONTAINMENT_RETRY_INTERVAL_SEC,
+  );
+});
+
+test("13c waker: a fully-quiescent cycle (no episodes, no open rows) disarms the waker", () => {
+  const tracker = createOriginContainmentStuckTracker(600);
+  const decision = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set<string>(),
+    openDistressDirs: new Set<string>(),
+    nowSec: 500,
+  });
+  expect(decision).toEqual({ mint: [], clear: [], nextWakeAt: null });
+});
+
+test("13c waker: a positive clear this cycle drops the retry wake (nothing left open)", () => {
+  const tracker = createOriginContainmentStuckTracker(600);
+  const dir = "/repo-13c-clear-wake";
+  const decision = tracker.step({
+    unhealthy: new Map(),
+    healthy: new Set([dir]),
+    openDistressDirs: new Set([dir]),
+    nowSec: 900,
+  });
+  expect(decision.clear).toEqual([
+    { id: originContainmentDistressId(dir), dir },
+  ]);
+  // The only open row cleared → nothing left to re-probe → disarm.
+  expect(decision.nextWakeAt).toBeNull();
+});
+
+test("13c mode-off: a POSITIVE worktree-mode disable retires every open origin-containment row", () => {
+  // BLOCKER 3b: a deliberately-disabled feature clears its own rows; nothing stranded.
+  const open = new Set(["/repo-a", "/repo-b"]);
+  expect(originContainmentModeOffClears(false, false, open)).toEqual([
+    { id: originContainmentDistressId("/repo-a"), dir: "/repo-a" },
+    { id: originContainmentDistressId("/repo-b"), dir: "/repo-b" },
+  ]);
+  // Mode ON or an UNKNOWN/degraded read never dismisses a live jam; paused never clears.
+  expect(originContainmentModeOffClears(true, false, open)).toEqual([]);
+  expect(originContainmentModeOffClears(undefined, false, open)).toEqual([]);
+  expect(originContainmentModeOffClears(false, true, open)).toEqual([]);
+});
+
+test("13c open-row union: a repo with an open row but no epic/root is still re-probed (via reposForRecovery union)", () => {
+  // BLOCKER 3a is wired by unioning snapshot.originContainmentDistressDirs into the sweep set.
+  // reposForRecovery de-dupes and preserves an extra root with no epic — pin that contract.
+  const orphanRoot = "/repo-13c-orphan-open-row";
+  const repos = reposForRecovery([], new Map(), [orphanRoot]);
+  expect(repos).toContain(orphanRoot);
 });

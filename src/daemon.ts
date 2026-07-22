@@ -209,6 +209,7 @@ import {
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isMonitorSlotWedgeDistressKey,
+  isOriginContainmentDistressKey,
   isPagingChannelDownDistressKey,
   isRepeatedNativeCrashDistressKey,
   isSharedDesyncDistressKey,
@@ -219,6 +220,7 @@ import {
   LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
   PAGING_CHANNEL_DOWN_DISTRESS_REASON,
   PAGING_CHANNEL_DOWN_DISTRESS_VERB,
@@ -958,6 +960,15 @@ export function gcUnretryableDispatchFailures(
     // (the checkout observed clean) owns dropping it, so the orphan sweep must not reap it
     // out from under its signal. (Its mid-merge WEDGE sibling stays DRAINED above.)
     if (isSharedDirtyDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // And the per-repo origin-containment-stuck distress row — a LIVE producer (the
+    // periodic origin-containment sweep, clocked by its own coalesced waker) owns it: its
+    // own `origin-containment-stuck:` id prefix rides the synthetic `daemon` verb, and the
+    // sweep's level-trigger (positive containment — origin observed to contain / be ahead
+    // of local) owns dropping it, so the orphan sweep must not reap it out from under its
+    // signal.
+    if (isOriginContainmentDistressKey(row.verb, row.id)) {
       continue;
     }
     // The monitor-slot paging row is likewise producer-owned: only positive
@@ -2489,6 +2500,18 @@ export function buildSharedCheckoutPageBody(row: {
       ``,
       `Inspect the lane and its lane dirt spool state. The row clears itself only`,
       `after the recover pass observes the lane gone.`,
+    ].join("\n");
+  }
+  if (row.id.startsWith(ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX)) {
+    return [
+      `🔴 keeper: ${row.id} needs you — repo ${repo} cannot publish to origin:`,
+      `local default leads a frozen origin and the periodic containment push has`,
+      `not landed (a stuck push, a genuine divergence, or a never-pushed default).`,
+      row.reason,
+      ``,
+      `Reconcile origin by hand (probe: git push --dry-run origin HEAD:<default>).`,
+      `Keeper never fetches/rebases/force-pushes; the row clears once origin is`,
+      `observed to contain (or be ahead of) local default.`,
     ].join("\n");
   }
   const isDesync = row.id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX);
@@ -15528,7 +15551,7 @@ function startDaemonWithExitAttribution(
         db
           .query(
             `SELECT id, dir, reason FROM dispatch_failures
-               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
                  AND human_notified_at IS NULL`,
           )
           .all(
@@ -15539,6 +15562,7 @@ function startDaemonWithExitAttribution(
             `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
             `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}%`,
             `${ZOMBIE_SESSION_DISTRESS_ID_PREFIX}%`,
+            `${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}%`,
           ) as SharedCheckoutPageRow[]
       ).filter((row) => !excludeIds.has(row.id));
     } catch {

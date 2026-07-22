@@ -265,6 +265,9 @@ import {
   isMergeEscalationReason,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
+  ORIGIN_CONTAINMENT_DISTRESS_REASON,
+  ORIGIN_CONTAINMENT_DISTRESS_VERB,
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
   PAGING_CHANNEL_DOWN_DISTRESS_REASON,
   PAGING_CHANNEL_DOWN_DISTRESS_VERB,
@@ -12422,4 +12425,71 @@ test("checkKeeperAgentPresence: a throwing spawn (unlaunchable launcher) returns
   expect(logs).toHaveLength(1);
   expect(logs[0]).toContain("WARNING");
   expect(logs[0]).toContain("/no/keeper.ts");
+});
+
+// ---- 13c: origin-containment-stuck daemon lifecycle wiring ----
+
+test("gcUnretryableDispatchFailures: the origin-containment-stuck row survives boot GC (producer-owned)", () => {
+  const { db } = freshMemDb();
+  const insert = db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 100, ?, 100, 100)`,
+  );
+  const originId = `${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}abc123`;
+  insert.run(
+    ORIGIN_CONTAINMENT_DISTRESS_VERB,
+    originId,
+    `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: /repo origin is behind local main`,
+    "/repo",
+    30,
+  );
+  const cleared: { verb: string; id: string }[] = [];
+  const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
+    cleared.push({ verb, id }),
+  );
+  // A LIVE producer (the containment sweep + its waker) owns the clear — boot GC must not
+  // reap it out from under the level-trigger.
+  expect(swept).toBe(0);
+  expect(cleared.some((c) => c.id === originId)).toBe(false);
+  db.close();
+});
+
+test("buildSharedCheckoutPageBody: an origin-containment row pages ORIGIN wording, never dirty/desync", () => {
+  const body = buildSharedCheckoutPageBody({
+    id: `${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}abc123`,
+    dir: "/repo",
+    reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: /repo local main leads origin`,
+  });
+  expect(body).toContain("/repo");
+  expect(body).toContain("origin");
+  expect(body.toLowerCase()).toContain("publish");
+  // NOT the shared-checkout dirty/desync hazard wording (the false-page hazard this arm avoids).
+  expect(body).not.toContain("DIRTY");
+  expect(body).not.toContain("DESYNCED");
+  expect(body).not.toContain("sweep landed work back");
+});
+
+test("runSharedCheckoutPageSweep: an origin-containment-stuck row pages EXACTLY once, notify-failure retries, positive clear re-arms", async () => {
+  let attempt = 0;
+  const { deps, mints, pages, live } = fakeSharedCheckoutPageDeps({
+    rows: [sharedCheckoutRow(`${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}abc`)],
+    notify: async () => (++attempt === 1 ? "notify_failed" : "notified"),
+  });
+  const id = `${ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX}abc`;
+  // Tick 1: the agentbot send FAILS → non-terminal, the row stays unpaged.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([id]);
+  expect(mints).toEqual([{ id, outcome: "notify_failed" }]);
+  // Tick 2: still unpaged → pages AGAIN, succeeds, stamped → drops out.
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([id, id]);
+  expect(mints[1]).toEqual({ id, outcome: "notified" });
+  // Tick 3: stamped → silent (page-once per row instance).
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toHaveLength(2);
+  // The producer's positive-containment level-clear DELETEs the row; a fresh episode re-mints
+  // at human_notified_at NULL → pages ANEW.
+  live.set(id, sharedCheckoutRow(id));
+  await runSharedCheckoutPageSweep(deps);
+  expect(pages).toEqual([id, id, id]);
 });

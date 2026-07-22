@@ -4027,6 +4027,11 @@ export function createSharedCheckoutDesyncTracker(
  *  the window; sustained past it, origin is genuinely stuck falling behind and needs a human. */
 export const ORIGIN_CONTAINMENT_STUCK_GRACE_SEC = 10 * 60;
 
+/** Bounded re-probe cadence (producer-`ts` seconds) for a repo with a live episode or an OPEN
+ *  origin-containment row: the coalesced waker arms this so a quiescent DB (no data_version
+ *  edge) still re-probes to clear a landed row or confirm a persistent jam — never busier. */
+export const ORIGIN_CONTAINMENT_RETRY_INTERVAL_SEC = 60;
+
 /**
  * Grace tracker escalating a repo whose periodic origin-containment reconcile cannot make
  * origin reflect local default — a push that keeps timing out / failing while local leads
@@ -4044,6 +4049,13 @@ export const ORIGIN_CONTAINMENT_STUCK_GRACE_SEC = 10 * 60;
  * (`healthy` — pushed / already-contained / remote-ahead), NEVER on "not unhealthy" — an
  * INCONCLUSIVE (`deferred`) cycle must not reset the jam clock nor dismiss a live row.
  */
+/** A {@link SharedWedgeDistressDecision} plus the earliest producer-`ts` second a FUTURE
+ *  cycle would change containment state — the coalesced waker's arm target (`null` ⇒ nothing
+ *  pending ⇒ disarm). It is the clock edge a quiescent, data_version-only DB otherwise misses. */
+export type OriginContainmentDecision = SharedWedgeDistressDecision & {
+  nextWakeAt: number | null;
+};
+
 export interface OriginContainmentStuckTracker {
   step(input: {
     /** This cycle's still-stuck repos: `repoDir` → the actionable reason (mint attribution). */
@@ -4054,18 +4066,23 @@ export interface OriginContainmentStuckTracker {
     /** `repoDir`s that currently have an OPEN origin-containment distress row. */
     openDistressDirs: ReadonlySet<string>;
     nowSec: number;
-  }): SharedWedgeDistressDecision;
+  }): OriginContainmentDecision;
 }
 
 export function createOriginContainmentStuckTracker(
   graceSec: number = ORIGIN_CONTAINMENT_STUCK_GRACE_SEC,
+  retryIntervalSec: number = ORIGIN_CONTAINMENT_RETRY_INTERVAL_SEC,
 ): OriginContainmentStuckTracker {
   // repoDir → the first cycle-ts it was seen stuck + whether we minted for THIS continuous
   // stuck episode. In-worker memory only; a restart re-seeds the clear off the open-row set.
   const firstStuck = new Map<string, { sinceSec: number; minted: boolean }>();
   return {
     step({ unhealthy, healthy, openDistressDirs, nowSec }) {
-      const decision: SharedWedgeDistressDecision = { mint: [], clear: [] };
+      const decision: OriginContainmentDecision = {
+        mint: [],
+        clear: [],
+        nextWakeAt: null,
+      };
       // MINT layer: advance each stuck repo's grace clock; cross the watermark once.
       for (const [dir, reason] of unhealthy) {
         let entry = firstStuck.get(dir);
@@ -4094,6 +4111,29 @@ export function createOriginContainmentStuckTracker(
           decision.clear.push({ id: originContainmentDistressId(dir), dir });
         }
       }
+      // WAKE layer: the earliest producer-ts a future cycle changes state, so a quiescent DB
+      // still crosses the grace and re-probes an open row. An UN-minted episode wakes at its
+      // exact grace deadline (fire → re-probe → mint). Any still-open row (a minted episode,
+      // OR a durable open row after a restart with an empty latch, minus those cleared this
+      // cycle) wakes at the bounded retry cadence (fire → re-probe → clear or confirm).
+      const cleared = new Set(decision.clear.map((c) => c.dir));
+      const candidates: number[] = [];
+      let hasOpenAfterClear = false;
+      for (const [, entry] of firstStuck) {
+        if (!entry.minted) {
+          candidates.push(entry.sinceSec + graceSec);
+        } else {
+          hasOpenAfterClear = true;
+        }
+      }
+      for (const dir of openDistressDirs) {
+        if (!cleared.has(dir)) hasOpenAfterClear = true;
+      }
+      if (hasOpenAfterClear) {
+        candidates.push(nowSec + retryIntervalSec);
+      }
+      decision.nextWakeAt =
+        candidates.length > 0 ? Math.min(...candidates) : null;
       return decision;
     },
   };
@@ -8645,11 +8685,17 @@ export type OriginContainmentResult =
   // the other) — keeper cannot reconcile without a human (no fetch/rebase/force). NO push;
   // sustained past the grace it pages the operator. `ahead` is the local lead for context.
   | { kind: "diverged"; ahead: number }
-  // NEUTRAL: an inconclusive probe (origin ref unresolved / a 124/128 read / an
-  // unparseable count) OR a push already attempted this cycle — DEFER, no push, no page.
+  // ACTIONABLE: origin/<default> was NEVER pushed and no owner (finalize/recover) exists to
+  // make the first push, so it can never self-resolve — sustained past the grace it pages a
+  // FIRST-PUSH-NEEDED row. NEVER auto-pushed (no cached positive-lead evidence exists).
+  | { kind: "first-push-needed" }
+  // NEUTRAL: a genuinely INCONCLUSIVE probe (a 124/128 git read, an unparseable count) OR a
+  // push already attempted this cycle by an owner — DEFER, no push, no page (tri-state).
   | { kind: "deferred"; reason: string }
-  // The push-side degrades: `push-timeout` / `push-failed` are ACTIONABLE (local leads but
-  // the push will not land — the silent-lag jam); `not-turn-key` / `non-ff` are NEUTRAL.
+  // The push-side degrades. ALL are ACTIONABLE in the ownerless containment context (no
+  // finalize owner exists to surface them): `push-timeout`/`push-failed` (local leads but
+  // the push will not land — silent-lag), `off-branch` (checkout off default), `not-turn-key`
+  // (auth/remote/target), `non-ff` (origin moved after the positive-lead probe).
   | Exclude<PushDefaultResult, { kind: "pushed" }>;
 
 /**
@@ -8696,10 +8742,10 @@ export async function reconcileOriginContainment(
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
   if (exists.code !== 0) {
-    return {
-      kind: "deferred",
-      reason: `origin/${defaultBranch} is unresolved locally (never pushed) — finalize owns the first push`,
-    };
+    // origin/<default> was never pushed. In the ownerless containment context there is no
+    // finalize to make the first push, so this can never self-resolve — it is ACTIONABLE
+    // (a first-push-needed row past the grace), NOT auto-pushed (no cached lead to prove).
+    return { kind: "first-push-needed" };
   }
   const contains = await run(
     ["merge-base", "--is-ancestor", remoteRef, localRef],
@@ -8749,12 +8795,14 @@ export async function reconcileOriginContainment(
  * Classify a containment outcome for the fallback distress tracker:
  *  - `healthy` — POSITIVE evidence origin reflects (or is ahead of) local: `pushed`,
  *    `already-contained`, `remote-ahead`. Clears any open distress row.
- *  - `actionable` — origin is genuinely stuck falling behind and needs an operator: a
- *    `push-timeout` / `push-failed` while local leads (silent-lag jam), or a true `diverged`.
- *    Advances the grace clock, carrying the paging `reason`.
- *  - `neutral` — inconclusive / transient (`deferred`, `off-branch`, `not-turn-key`,
- *    `non-ff`): neither clears nor advances (tri-state discipline — an unknown state is never
- *    a licence to page OR to dismiss a live row). Pure.
+ *  - `actionable` — a PUBLICATION BLOCKER an operator must clear (in the ownerless
+ *    containment context no finalize exists to surface it): a `push-timeout`/`push-failed`
+ *    while local leads (silent-lag), a true `diverged`, an `off-branch` checkout, a
+ *    `not-turn-key` push (auth/remote/target), a `non-ff` after the positive-lead probe, or
+ *    a `first-push-needed` never-pushed origin. Advances the grace clock, carrying the reason.
+ *  - `neutral` — a genuinely INCONCLUSIVE probe (`deferred`: a 124/128 git read, an
+ *    unparseable count, OR the owner-attempt guard): neither clears nor advances (tri-state
+ *    discipline — an unknown state is never a licence to page OR to dismiss a live row). Pure.
  */
 export function classifyOriginContainment(
   repo: string,
@@ -8766,6 +8814,8 @@ export function classifyOriginContainment(
   | { class: "actionable"; reason: string }
   | { class: "neutral" } {
   const graceMin = Math.round(graceSec / 60);
+  const prefix = `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: ${repo} `;
+  const tail = `(no fetch/rebase/force); probe with git push --dry-run origin HEAD:${defaultBranch}`;
   switch (result.kind) {
     case "pushed":
     case "already-contained":
@@ -8775,17 +8825,34 @@ export function classifyOriginContainment(
     case "push-failed":
       return {
         class: "actionable",
-        reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: ${repo} local ${defaultBranch} leads origin/${defaultBranch} but the containment push has not landed past the ${graceMin}min grace (${result.kind}) — origin is silently falling behind; needs an operator to probe (git push --dry-run origin HEAD:${defaultBranch}) and reconcile (no fetch/rebase/force)`,
+        reason: `${prefix}local ${defaultBranch} leads origin/${defaultBranch} but the containment push has not landed past the ${graceMin}min grace (${result.kind}) — origin is silently falling behind ${tail}`,
       };
     case "diverged":
       return {
         class: "actionable",
-        reason: `${ORIGIN_CONTAINMENT_DISTRESS_REASON}: ${repo} local ${defaultBranch} and origin/${defaultBranch} have DIVERGED past the ${graceMin}min grace (local leads by ${result.ahead}) — keeper cannot reconcile without a human (no fetch/rebase/force); reconcile origin/${defaultBranch}`,
+        reason: `${prefix}local ${defaultBranch} and origin/${defaultBranch} have DIVERGED past the ${graceMin}min grace (local leads by ${result.ahead}) — keeper cannot reconcile without a human ${tail}`,
+      };
+    case "off-branch":
+      return {
+        class: "actionable",
+        reason: `${prefix}the shared checkout is on ${result.head}, not ${defaultBranch}, past the ${graceMin}min grace — publication is blocked until it returns to ${defaultBranch} ${tail}`,
+      };
+    case "not-turn-key":
+      return {
+        class: "actionable",
+        reason: `${prefix}the push to origin/${defaultBranch} is not turn-key past the ${graceMin}min grace (${describePushNotReady(result.reason)}) — publication is blocked ${tail}`,
+      };
+    case "non-ff":
+      return {
+        class: "actionable",
+        reason: `${prefix}origin/${defaultBranch} rejected the push non-fast-forward past the ${graceMin}min grace — origin moved and keeper never reconciles it ${tail}`,
+      };
+    case "first-push-needed":
+      return {
+        class: "actionable",
+        reason: `${prefix}origin/${defaultBranch} has never been pushed and no owner exists to make the first push past the ${graceMin}min grace — push ${defaultBranch} to origin once ${tail}`,
       };
     case "deferred":
-    case "off-branch":
-    case "not-turn-key":
-    case "non-ff":
       return { class: "neutral" };
     default:
       return assertNever(result);
@@ -8807,6 +8874,25 @@ export function originContainmentSweepEnabled(
   driverImplementsSweep: boolean,
 ): boolean {
   return worktreeMode === true && !paused && driverImplementsSweep;
+}
+
+/**
+ * BLOCKER 3b: the origin-containment rows a POSITIVE worktree-mode disable retires. A
+ * deliberately-disabled feature must not strand its own paging jam, so when `worktreeMode` is
+ * EXPLICITLY `false` (never an unknown / degraded read, which must not dismiss a live jam)
+ * every OPEN row level-clears. Empty otherwise (mode on / unknown, or paused). Pure — the
+ * caller emits the clears; the sweep itself never runs mode-off, so this is its ONLY retire path.
+ */
+export function originContainmentModeOffClears(
+  worktreeMode: boolean | undefined,
+  paused: boolean,
+  openDistressDirs: ReadonlySet<string>,
+): { id: string; dir: string }[] {
+  if (worktreeMode !== false || paused) return [];
+  return [...openDistressDirs].map((dir) => ({
+    id: originContainmentDistressId(dir),
+    dir,
+  }));
 }
 
 type OwnerIntegratedTeardownResult =
@@ -13400,17 +13486,33 @@ function main(): void {
   // re-armable wall-clock timer fired at the earliest stopped-job reap expiry so the
   // age-driven reap runs even when no `data_version` change wakes `watchLoop`.
   // `unref`'d so it never keeps the worker thread alive.
-  const stoppedExpiryWaker = createStoppedExpiryWaker(
-    {
-      now: () => deps.now(),
-      setTimer: (delayMs, fire) => {
-        const timer = setTimeout(fire, delayMs);
-        (timer as { unref?: () => void }).unref?.();
-        return timer;
-      },
-      clearTimer: (handle) =>
-        clearTimeout(handle as ReturnType<typeof setTimeout>),
+  // One real wall-clock adapter shared by both coalesced wakers (stopped-job expiry and
+  // origin-containment episode/retry). `unref` keeps neither timer alive on shutdown.
+  const wakeClock: ExpiryWakeClock = {
+    now: () => deps.now(),
+    setTimer: (delayMs, fire) => {
+      const timer = setTimeout(fire, delayMs);
+      (timer as { unref?: () => void }).unref?.();
+      return timer;
     },
+    clearTimer: (handle) =>
+      clearTimeout(handle as ReturnType<typeof setTimeout>),
+  };
+  const stoppedExpiryWaker = createStoppedExpiryWaker(
+    wakeClock,
+    () => {
+      if (!shutdown) void driveCycle();
+    },
+    () => shutdown,
+  );
+  // PARALLEL coalesced waker for the origin-containment fallback (BLOCKER 2): watchLoop is
+  // data_version-only, so a repo whose containment sweep failed sits in a quiescent DB and
+  // never re-crosses its grace / re-probes an open row. This arms ONE re-armable timer at the
+  // earliest containment episode deadline (or the bounded retry cadence) the sweep computes,
+  // firing a fresh cycle with ZERO DB writes. Same idiom as {@link createStoppedExpiryWaker},
+  // a distinct instance so the two clock edges never clobber each other's timer.
+  const containmentExpiryWaker = createStoppedExpiryWaker(
+    wakeClock,
     () => {
       if (!shutdown) void driveCycle();
     },
@@ -13425,6 +13527,9 @@ function main(): void {
     // The last cycle's earliest held stopped-job expiry; the wake is (re-)armed for
     // it in `finally`, so a quiescent DB still re-crosses the reap grace.
     let latestSlotExpiry: number | null = null;
+    // The last cycle's earliest origin-containment episode/retry wake (BLOCKER 2), armed in
+    // `finally` so a quiescent DB still crosses the containment grace and re-probes open rows.
+    let latestContainmentWake: number | null = null;
     try {
       do {
         wakePending = false;
@@ -14438,6 +14543,8 @@ function main(): void {
         // shared default with no keeper push path at all (a pre-existing design boundary,
         // reported separately to the human), so the sweep is inert there. Producer-only; a
         // git error degrades to a defer and never wedges the cycle.
+        const openContainmentDirs =
+          snapshot.originContainmentDistressDirs ?? new Set<string>();
         if (
           deps.worktree?.reconcileOrigin &&
           originContainmentSweepEnabled(
@@ -14448,12 +14555,16 @@ function main(): void {
         ) {
           try {
             const openRows = snapshot.openRecoverRows ?? [];
+            // BLOCKER 3a: UNION the durable open-row dirs into the sweep set so a repo whose
+            // row outlived its epic/git-status roots is still re-probed (else it is never
+            // cleared). reposForRecovery de-dupes; the open dirs re-seed after a restart.
             const containmentRepos = reposForRecovery(
               snapshot.epics,
               snapshot.worktreeRepoByEpicId,
               [
                 ...(snapshot.worktreeKnownRoots ?? []),
                 ...openRows.map((row) => row.dir),
+                ...openContainmentDirs,
               ],
             );
             const unhealthy = new Map<string, string>();
@@ -14482,8 +14593,7 @@ function main(): void {
             const containmentDecision = originContainmentStuckTracker.step({
               unhealthy,
               healthy,
-              openDistressDirs:
-                snapshot.originContainmentDistressDirs ?? new Set<string>(),
+              openDistressDirs: openContainmentDirs,
               nowSec: deps.now(),
             });
             for (const m of containmentDecision.mint) {
@@ -14503,10 +14613,28 @@ function main(): void {
                 ),
               );
             }
+            // BLOCKER 2: hand the earliest episode/retry deadline to the coalesced waker so a
+            // quiescent DB still crosses the grace + re-probes an open row (armed in finally).
+            latestContainmentWake = containmentDecision.nextWakeAt;
           } catch (err) {
             console.error(
               "[autopilot-worker] origin-containment sweep threw (non-fatal):",
               err,
+            );
+          }
+        } else {
+          // BLOCKER 3b: the sweep is disabled this cycle. A POSITIVE worktree-mode disable
+          // retires the feature's own rows (a deliberately-disabled feature must not strand a
+          // paging jam) — level-clear every OPEN row, keyed straight off the durable open set
+          // (the in-memory latch is irrelevant). Empty on an unknown/degraded mode read or
+          // while paused, so a live jam is never dismissed.
+          for (const { id, dir } of originContainmentModeOffClears(
+            snapshot.worktreeMode,
+            state.paused,
+            openContainmentDirs,
+          )) {
+            deps.clearSharedWedgeDistress?.(
+              claimlessDistressClear(snapshot.dispatchFailureFences, id, dir),
             );
           }
         }
@@ -14523,6 +14651,10 @@ function main(): void {
       // expiry (null while paused/degraded → disarmed, failing closed). Restart-safe:
       // the boot cycle re-derives it from the durable jobs projection.
       stoppedExpiryWaker.arm(latestSlotExpiry);
+      // Re-arm the containment waker from THIS cycle's earliest episode/retry deadline (null
+      // when nothing is stuck / open → disarmed). Restart-safe: the boot cycle re-derives it
+      // from the durable open-row set unioned into the sweep.
+      containmentExpiryWaker.arm(latestContainmentWake);
     }
   };
 
@@ -14561,6 +14693,7 @@ function main(): void {
       clearInterval(rollupTimer);
       clearInterval(terminalPaneGcTimer);
       stoppedExpiryWaker.disarm();
+      containmentExpiryWaker.disarm();
       // Final rollup flush so the on-shutdown denominator lands before exit.
       flushBackstopRollups();
       closeDb();
@@ -14571,6 +14704,7 @@ function main(): void {
       clearInterval(rollupTimer);
       clearInterval(terminalPaneGcTimer);
       stoppedExpiryWaker.disarm();
+      containmentExpiryWaker.disarm();
       flushBackstopRollups();
       closeDb();
       process.exit(1);
