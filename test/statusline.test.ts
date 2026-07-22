@@ -169,6 +169,51 @@ describe("statusline render", () => {
     expect(plain).not.toContain("claude-2");
   });
 
+  test("a wrapped worker surfaces the effective cell verbatim after the courier model", () => {
+    const plain = stripAnsi(
+      renderStatusline(payload("/Users/test/code/keeper"), {
+        env: { KEEPER_WRAPPED_CELL: "gpt-5.5::high" },
+        cwd: "/Users/test/code/keeper",
+        palette: null,
+        runGit: fakeGit("keeper"),
+      }),
+    );
+
+    // Courier model + effort stay; the exact cell string rides a new segment
+    // right after them, so `opus 4.8` is not misread as a provider-pin violation.
+    expect(plain).toContain(
+      `opus 4.8 ${SEP} xhigh ${SEP} ⇢ gpt-5.5::high ${SEP} 2.1.204`,
+    );
+  });
+
+  test("a native worker (no KEEPER_WRAPPED_CELL) renders byte-identically", () => {
+    const WRAP_GLYPH = "⇢";
+    const args = {
+      cwd: "/Users/test/code/jobsearch",
+      palette: null,
+      runGit: fakeGit("jobsearch"),
+    } as const;
+    // Absent carrier = pre-change native output; an empty carrier is inert,
+    // producing the byte-identical string. The wrap segment fires ONLY on a
+    // non-empty carrier, so a native worker never grows one.
+    const absentCarrier = renderStatusline(
+      payload("/Users/test/code/jobsearch"),
+      { env: { KEEPER_ACCOUNT_ROUTE: "default" }, ...args },
+    );
+    const emptyCarrier = renderStatusline(
+      payload("/Users/test/code/jobsearch"),
+      {
+        env: { KEEPER_ACCOUNT_ROUTE: "default", KEEPER_WRAPPED_CELL: "" },
+        ...args,
+      },
+    );
+    expect(emptyCarrier).toBe(absentCarrier);
+    expect(absentCarrier).not.toContain(WRAP_GLYPH);
+    expect(stripAnsi(absentCarrier)).toContain(
+      `opus 4.8 ${SEP} xhigh ${SEP} 2.1.204`,
+    );
+  });
+
   test("help is a non-empty machine-command description", () => {
     expect(HELP).toContain("keeper statusline");
     expect(HELP).toContain("Machine-invoked");

@@ -26,6 +26,12 @@ const KEEPER_LANE_PREFIX = "keeper/epic/";
 const LANE_GLYPH = "⑂";
 const CONTEXT_GLYPH = "\uf295";
 const NETWORK_GLYPH = "\uf0ec";
+// Marks the wrapped-worker EFFECTIVE cell: a courier claude carries a
+// non-native provider leg, so `modelName` reports the courier (e.g. `sonnet`),
+// not the cell doing the work. Rendered only when `KEEPER_WRAPPED_CELL` is set,
+// so an operator reads `sonnet \u21e2 gpt-5.5::high` rather than misreading the
+// courier's model as a provider-pin violation.
+const WRAP_GLYPH = "\u21e2";
 
 interface Theme {
   ctx: string;
@@ -349,6 +355,17 @@ export function renderStatusline(
     if (input.effort !== "") {
       parts += `${sep}${theme.version}${input.effort}`;
     }
+  }
+
+  // Wrapped-worker EFFECTIVE cell. A courier claude runs the wrapper (its
+  // `modelName` above), but a non-native provider leg does the work; surface
+  // the exact `<model>::<effort>` cell verbatim so the courier's model is not
+  // misread as a provider-pin violation. Native launches carry no
+  // `KEEPER_WRAPPED_CELL`, so this segment is absent and their output is
+  // byte-identical.
+  const wrappedCell = (env.KEEPER_WRAPPED_CELL ?? "").trim();
+  if (wrappedCell !== "") {
+    parts += `${sep}${theme.model}${WRAP_GLYPH} ${wrappedCell}`;
   }
 
   const statusChunks: string[] = [];
