@@ -1,0 +1,71 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The native FFI seam must derive and validate subtle return-authority and resource-ownership invariants under unreliable errno behavior.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1404-harden-shared-flock-outcomes.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "This is a cross-cutting architectural cascade whose mixed-deadline and fail-closed policies must remain correct across several integrity-critical subsystems.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1404-harden-shared-flock-outcomes.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.93,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Migrating many heterogeneous callers requires cross-module discovery and careful adjudication of distinct mutation, admission, and optional-work policies.",
+      "spark_exclusion": "cross-module-discovery",
+      "spark_fit": false,
+      "task_id": "fn-1404-harden-shared-flock-outcomes.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "The accepted contract makes this a substantial well-specified multi-file package migration with explicit lock-order, rollback, and refusal tests.",
+      "spark_exclusion": "fixed-shape-too-large",
+      "spark_fit": false,
+      "task_id": "fn-1404-harden-shared-flock-outcomes.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.87,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "The bounded workflow and manifest changes also require judgment-heavy operator recovery wording and consistent machine-facing documentation.",
+      "spark_exclusion": "ambiguous-or-judgment-heavy",
+      "spark_fit": false,
+      "task_id": "fn-1404-harden-shared-flock-outcomes.5",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-22T14:57:36.761000Z",
+  "epic_id": "fn-1404-harden-shared-flock-outcomes",
+  "input_hash": "8ff8898fb8e523110c931c818eead479f93cf814a4a33bf5c0d5af86f2e11830",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2415430031,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1404-harden-shared-flock-outcomes.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The native FFI seam must derive and validate subtle return-authority and resource-ownership invariants under unreliable errno behavior.\",\"confidence\":0.96,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"},{\"task_id\":\"fn-1404-harden-shared-flock-outcomes.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"This is a cross-cutting architectural cascade whose mixed-deadline and fail-closed policies must remain correct across several integrity-critical subsystems.\",\"confidence\":0.94,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"},{\"task_id\":\"fn-1404-harden-shared-flock-outcomes.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Migrating many heterogeneous callers requires cross-module discovery and careful adjudication of distinct mutation, admission, and optional-work policies.\",\"confidence\":0.93,\"spark_fit\":false,\"spark_exclusion\":\"cross-module-discovery\"},{\"task_id\":\"fn-1404-harden-shared-flock-outcomes.4\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"The accepted contract makes this a substantial well-specified multi-file package migration with explicit lock-order, rollback, and refusal tests.\",\"confidence\":0.9,\"spark_fit\":false,\"spark_exclusion\":\"fixed-shape-too-large\"},{\"task_id\":\"fn-1404-harden-shared-flock-outcomes.5\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"The bounded workflow and manifest changes also require judgment-heavy operator recovery wording and consistent machine-facing documentation.\",\"confidence\":0.87,\"spark_fit\":false,\"spark_exclusion\":\"ambiguous-or-judgment-heavy\"}]}\n"
+}
