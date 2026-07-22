@@ -1805,6 +1805,48 @@ test("MergeHumanNotified instance fence: a STALE completion never stamps the REP
   expect(getHumanNotifiedAt("close", "fn-if-1")).toBe(1860);
 });
 
+test("MergeHumanNotified fence tri-state: present-but-invalid is INERT, absent stays legacy", () => {
+  const mkNotified = (fence: unknown, ts: number): void => {
+    insertEvent({
+      hook_event: "MergeHumanNotified",
+      session_id: "reconciler",
+      ts,
+      // Explicitly PRESENT the property (even when the value is malformed) so the fold sees
+      // present-but-invalid, distinct from an absent field.
+      data: JSON.stringify({
+        id: "fn-tri-1",
+        outcome: "notified",
+        expectedInstanceEventId: fence,
+      }),
+    });
+  };
+  dispatchFailedEvent(
+    "close",
+    "fn-tri-1",
+    "worktree-merge-conflict",
+    "/r",
+    1700,
+  );
+  drainAll();
+  // Present-but-invalid fence values NEVER downgrade to a legacy unfenced stamp — each folds
+  // INERT, leaving human_notified_at NULL (the row is not the paged instance's match).
+  for (const [i, bad] of [
+    "bad", // string
+    null, // explicit null
+    -5, // negative
+    3.5, // non-integer
+    0, // non-positive
+  ].entries()) {
+    mkNotified(bad, 1710 + i);
+    drainAll();
+    expect(getHumanNotifiedAt("close", "fn-tri-1")).toBeNull();
+  }
+  // An ABSENT field is the ONLY legacy/unfenced path — it stamps (byte-identical historical).
+  mergeHumanNotifiedEvent("fn-tri-1", "notified", 1800);
+  drainAll();
+  expect(getHumanNotifiedAt("close", "fn-tri-1")).toBe(1800);
+});
+
 test("fatal-audit synthetic id and a bare close conflict coexist on distinct PKs (no aliasing)", () => {
   // A standing merge conflict on the bare close key.
   dispatchFailedEvent(
@@ -2722,6 +2764,133 @@ test("BlockHumanNotified is INSTANCE-FENCED: a stale page for a cleared block in
   );
   drainAll();
   expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBe(1960);
+});
+
+test("block chain fence tri-state: a PRESENT-but-invalid instance fence is INERT on both Attempted and HumanNotified; an ABSENT fence stays legacy/unfenced", () => {
+  const epicId = "fn-be-tri";
+  const taskId = "fn-be-tri.1";
+  armBlockLatch(epicId, taskId, 1700);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.status).toBe("pending");
+
+  // Attempted: each present-but-invalid instance fence NEVER downgrades to an unfenced
+  // terminalize — the row stays `pending` (only a valid or absent fence can advance it).
+  const mkAttempted = (fence: unknown, ts: number): void => {
+    insertEvent({
+      hook_event: "BlockEscalationAttempted",
+      session_id: `${epicId}::${taskId}`,
+      ts,
+      data: JSON.stringify({
+        epic_id: epicId,
+        task_id: taskId,
+        outcome: "owner_exhausted",
+        expectedInstanceEventId: fence,
+      }),
+    });
+  };
+  for (const [i, bad] of ["bad", null, -5, 3.5, 0].entries()) {
+    mkAttempted(bad, 1710 + i);
+    drainAll();
+    expect(getBlockLatch(epicId, taskId)?.status).toBe("pending");
+  }
+  // An ABSENT instance fence is the ONLY legacy/unfenced path — it terminalizes.
+  blockAttemptedEvent(epicId, taskId, "owner_exhausted", 1750);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)).toEqual({
+    status: "attempted",
+    outcome: "owner_exhausted",
+    human_notified_at: null,
+  });
+
+  // HumanNotified: each present-but-invalid instance fence is INERT — never stamps.
+  const mkNotified = (fence: unknown, ts: number): void => {
+    insertEvent({
+      hook_event: "BlockHumanNotified",
+      session_id: `${epicId}::${taskId}`,
+      ts,
+      data: JSON.stringify({
+        epic_id: epicId,
+        task_id: taskId,
+        outcome: "notified",
+        expectedInstanceEventId: fence,
+      }),
+    });
+  };
+  for (const [i, bad] of ["bad", null, -5, 3.5, 0].entries()) {
+    mkNotified(bad, 1760 + i);
+    drainAll();
+    expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBeNull();
+  }
+  // An ABSENT fence is the ONLY legacy/unfenced path — it stamps (byte-identical historical).
+  blockHumanNotifiedEvent(epicId, taskId, "notified", 1800);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBe(1800);
+});
+
+test("BlockHumanNotified OUTCOME fence: a stale page about a transitioned outcome never mis-stamps (an exhausted page can't stamp a now-dispatched row)", () => {
+  const epicId = "fn-be-of";
+  const taskId = "fn-be-of.1";
+  const instanceA = armBlockLatch(epicId, taskId, 1700);
+  drainAll();
+  // Terminalize to owner_exhausted (the outcome a page is about to be sent about), then a
+  // same-instance transition to dispatched (a delayed re-terminalization on the same row).
+  blockAttemptedEvent(
+    epicId,
+    taskId,
+    "owner_exhausted",
+    1710,
+    "reconciler",
+    instanceA,
+  );
+  blockAttemptedEvent(
+    epicId,
+    taskId,
+    "dispatched",
+    1720,
+    "reconciler",
+    instanceA,
+  );
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)).toEqual({
+    status: "attempted",
+    outcome: "dispatched",
+    human_notified_at: null,
+  });
+
+  const notify = (
+    expectedOutcome: unknown,
+    ts: number,
+    presentOutcome = true,
+  ): void => {
+    insertEvent({
+      hook_event: "BlockHumanNotified",
+      session_id: `${epicId}::${taskId}`,
+      ts,
+      data: JSON.stringify({
+        epic_id: epicId,
+        task_id: taskId,
+        outcome: "notified",
+        expectedInstanceEventId: instanceA,
+        ...(presentOutcome ? { expectedOutcome } : {}),
+      }),
+    });
+  };
+
+  // A STALE page about the owner_exhausted outcome (same instance) must NOT stamp the
+  // now-`dispatched` row — the OUTCOME fence catches the same-instance transition.
+  notify("owner_exhausted", 1750);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBeNull();
+
+  // A present-but-malformed outcome fence is INERT — never downgraded to an unfenced stamp.
+  notify(42, 1755);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBeNull();
+
+  // A page whose expectedOutcome matches the CURRENT outcome (same instance) stamps.
+  notify("dispatched", 1760);
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBe(1760);
 });
 
 test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {

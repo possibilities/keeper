@@ -6161,15 +6161,35 @@ function foldInstantDeathTerminal(
 }
 
 /**
- * Parse the OPTIONAL `expectedInstanceEventId` block-instance fence off a payload — a
- * positive safe integer, else null (absent / malformed → no fence, byte-identical to the
- * pre-fence fold). The shared reader for all three block chain payloads (Requested /
- * Attempted / HumanNotified), mirroring the `MergeHumanNotified` fence.
+ * The ONE shared TRI-STATE fence-field reader for every synthetic once-marker/latch
+ * payload (the block chain — Requested / Attempted / HumanNotified — AND
+ * `MergeHumanNotified`). Distinguishes the property being ABSENT on the wire (`present:
+ * false` → the fold takes its legacy/unfenced path, byte-identical to the pre-fence fold)
+ * from PRESENT-but-malformed (`present: true, value: null` → the fold is INERT, NEVER
+ * downgraded to legacy authority — a `{expectedInstanceEventId:"bad"}` must not silently
+ * stamp/mutate the current row unfenced). Presence is the JSON property's presence
+ * (`Object.hasOwn`), NOT `value !== undefined` — the exact distinction the tri-state turns on.
+ * `validate` maps a present value to its trusted form or null. Pure; never throws.
  */
-function parseBlockInstanceFence(value: unknown): number | null {
+function parseFenceField<T>(
+  parsed: Record<string, unknown>,
+  key: string,
+  validate: (value: unknown) => T | null,
+): { present: boolean; value: T | null } {
+  if (!Object.hasOwn(parsed, key)) return { present: false, value: null };
+  return { present: true, value: validate(parsed[key]) };
+}
+
+/** A trusted instance fence token — a positive safe integer, else null. */
+function validInstanceToken(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
     ? value
     : null;
+}
+
+/** A trusted outcome fence token — a non-empty string, else null. */
+function validOutcomeToken(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /**
@@ -6194,12 +6214,16 @@ function extractBlockEscalationRequestedPayload(
     if (typeof parsed.task_id !== "string" || parsed.task_id.length === 0) {
       return null;
     }
+    const fence = parseFenceField(
+      parsed as Record<string, unknown>,
+      "expectedInstanceEventId",
+      validInstanceToken,
+    );
     return {
       epic_id: parsed.epic_id,
       task_id: parsed.task_id,
-      expectedInstanceEventId: parseBlockInstanceFence(
-        parsed.expectedInstanceEventId,
-      ),
+      fencePresent: fence.present,
+      expectedInstanceEventId: fence.value,
     };
   } catch (err) {
     console.error(
@@ -6214,10 +6238,10 @@ function extractBlockEscalationRequestedPayload(
  * `block_escalations` latch `pending → requested` for the matching
  * `(epic_id, task_id)`. Idempotent: a missing latch row (the leave-blocked
  * DELETE already cleared it, or a malformed payload) folds to a safe no-op — the
- * UPDATE matches zero rows. Optional instance fence: when the payload names the exact
- * block instance, the UPDATE also conditions on `instance_event_id` so a stale sweep for
- * a cleared instance A never touches the replacement instance B (absent field → no extra
- * predicate, byte-identical historical fold). Pure function of the payload + the persisted
+ * UPDATE matches zero rows. TRI-STATE instance fence: PRESENT+valid conditions the
+ * UPDATE on `instance_event_id` (a stale sweep for a cleared instance A never touches its
+ * replacement B); PRESENT+malformed is INERT (never legacy authority); ABSENT is the only
+ * unfenced/historical path (byte-identical). Pure function of the payload + the persisted
  * row (`event.id` only, no wall-clock/fs/liveness), so re-fold is byte-deterministic.
  */
 function foldBlockEscalationRequested(db: Database, event: Event): void {
@@ -6225,7 +6249,10 @@ function foldBlockEscalationRequested(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
-  if (payload.expectedInstanceEventId != null) {
+  if (payload.fencePresent) {
+    if (payload.expectedInstanceEventId == null) {
+      return; // present-but-malformed fence → inert, never legacy authority
+    }
     db.run(
       `UPDATE dispatch_failures
           SET block_status = 'requested', last_event_id = ?, updated_at = ?
@@ -6267,13 +6294,17 @@ function extractBlockEscalationAttemptedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
+    const fence = parseFenceField(
+      parsed as Record<string, unknown>,
+      "expectedInstanceEventId",
+      validInstanceToken,
+    );
     return {
       epic_id: parsed.epic_id,
       task_id: parsed.task_id,
       outcome: parsed.outcome,
-      expectedInstanceEventId: parseBlockInstanceFence(
-        parsed.expectedInstanceEventId,
-      ),
+      fencePresent: fence.present,
+      expectedInstanceEventId: fence.value,
     };
   } catch (err) {
     console.error(
@@ -6290,17 +6321,20 @@ function extractBlockEscalationAttemptedPayload(
  * and the `skipped_*` surface-and-stop terminals. Ordinary non-terminal launch failures
  * reset to pending. Owning-work re-attach outcomes (`owner_redispatched` /
  * `owner_redispatch_failed`) also reset to pending while incrementing the durable
- * attachment count, whether the launch succeeded or failed. Optional instance fence: when
- * the payload names the exact block instance, every UPDATE also conditions on
- * `instance_event_id` so a stale attempt for a cleared instance A never terminalizes /
- * counts against the replacement instance B (absent field → no extra predicate,
- * byte-identical historical fold). Every branch reads only the payload, event id, and
- * persisted row, so replay is deterministic; a missing latch is a safe no-op.
+ * attachment count, whether the launch succeeded or failed. TRI-STATE instance fence:
+ * PRESENT+valid conditions every UPDATE on `instance_event_id` (a stale attempt for a
+ * cleared instance A never terminalizes / counts against its replacement B);
+ * PRESENT+malformed is INERT (never legacy authority); ABSENT is the only unfenced
+ * historical path. Every branch reads only the payload, event id, and persisted row, so
+ * replay is deterministic; a missing latch is a safe no-op.
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
     return;
+  }
+  if (payload.fencePresent && payload.expectedInstanceEventId == null) {
+    return; // present-but-malformed fence → inert, never legacy authority
   }
   const fence = payload.expectedInstanceEventId;
   const ownerRedispatch =
@@ -6508,18 +6542,22 @@ function extractMergeHumanNotifiedPayload(
       typeof parsed.verb === "string" && parsed.verb.length > 0
         ? parsed.verb
         : "close";
-    // `expectedInstanceEventId` is OPTIONAL: historical payloads carry none (no instance
-    // check), the fatal-audit page sweep mints it to fence the stamp to the exact row.
-    const expectedInstanceEventId =
-      typeof parsed.expectedInstanceEventId === "number" &&
-      Number.isSafeInteger(parsed.expectedInstanceEventId)
-        ? parsed.expectedInstanceEventId
-        : null;
+    // TRI-STATE instance fence via the ONE shared {@link parseFenceField} reader (the same
+    // helper the block chain uses): ABSENT (legacy/unfenced, byte-identical historical) is
+    // distinguished from PRESENT-BUT-INVALID (an INERT fold in {@link foldMergeHumanNotified},
+    // never legacy authority) — a malformed `{expectedInstanceEventId:"bad"}` must NOT
+    // silently stamp the row unfenced.
+    const fence = parseFenceField(
+      parsed as Record<string, unknown>,
+      "expectedInstanceEventId",
+      validInstanceToken,
+    );
     return {
       id: parsed.id,
       outcome: parsed.outcome,
       verb,
-      expectedInstanceEventId,
+      fencePresent: fence.present,
+      expectedInstanceEventId: fence.value,
     };
   } catch (err) {
     console.error(
@@ -6557,11 +6595,17 @@ function foldMergeHumanNotified(db: Database, event: Event): void {
   if (payload.outcome !== "notified") {
     return;
   }
-  // Optional instance fence: when the payload names the exact row instance the page was
-  // sent about, stamp ONLY if the current row still carries it — so a stale page completion
-  // (row A cleared + replacement B minted during the async send) never stamps B, preserving
-  // B's required page. Absent field → no extra predicate (byte-identical historical fold).
-  if (payload.expectedInstanceEventId != null) {
+  // TRI-STATE instance fence.
+  //  - PRESENT + valid → stamp ONLY if the current row still carries that instance, so a
+  //    stale page completion (row A cleared + replacement B minted during the async send)
+  //    never stamps B, preserving B's required page.
+  //  - PRESENT + malformed (null value) → INERT: a `{expectedInstanceEventId:"bad"}` event
+  //    must NEVER be downgraded to a legacy unfenced stamp.
+  //  - ABSENT → the ONLY legacy/unfenced path (byte-identical historical fold).
+  if (payload.fencePresent) {
+    if (payload.expectedInstanceEventId == null) {
+      return; // present-but-malformed → no-op, never legacy authority
+    }
     db.run(
       `UPDATE dispatch_failures
           SET human_notified_at = ?
@@ -6784,13 +6828,24 @@ function extractBlockHumanNotifiedPayload(
     if (typeof parsed.outcome !== "string" || parsed.outcome.length === 0) {
       return null;
     }
+    const instanceFence = parseFenceField(
+      parsed as Record<string, unknown>,
+      "expectedInstanceEventId",
+      validInstanceToken,
+    );
+    const outcomeFence = parseFenceField(
+      parsed as Record<string, unknown>,
+      "expectedOutcome",
+      validOutcomeToken,
+    );
     return {
       epic_id: parsed.epic_id,
       task_id: parsed.task_id,
       outcome: parsed.outcome,
-      expectedInstanceEventId: parseBlockInstanceFence(
-        parsed.expectedInstanceEventId,
-      ),
+      fencePresent: instanceFence.present,
+      expectedInstanceEventId: instanceFence.value,
+      outcomeFencePresent: outcomeFence.present,
+      expectedOutcome: outcomeFence.value,
     };
   } catch (err) {
     console.error(
@@ -6809,16 +6864,19 @@ function extractBlockHumanNotifiedPayload(
  * on the block incident row, gated `human_notified_at IS NULL` so the page fires
  * exactly once per block instance and a re-fold reproduces it byte-identically. Every
  * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
- * leaving the marker NULL so the sweep re-attempts on the next tick. Optional instance
- * fence: when the payload names the exact block instance the page was sent about, the
- * stamp also conditions on `instance_event_id` so a page about a cleared instance A that
- * completes after a replacement instance B is minted never stamps B — preserving B's
- * required page (absent field → no extra predicate, byte-identical historical fold). The
- * branch reads ONLY the payload + `event.ts` (no wall-clock/fs/liveness), so re-fold
- * stays byte-deterministic. The UPDATE no-ops on a missing incident row (the
- * leave-blocked DELETE already cleared it) and NEVER clears the incident — only the
- * leave-blocked `TaskSnapshot` transition does, which re-arms the marker at NULL.
- * Malformed/missing payload → safe no-op.
+ * leaving the marker NULL so the sweep re-attempts on the next tick. TWO independent
+ * TRI-STATE fences narrow the stamp to the EXACT thing the page was sent about:
+ *  - the INSTANCE fence (`expectedInstanceEventId`) — a page about a cleared instance A
+ *    that completes after a replacement instance B is minted never stamps B;
+ *  - the OUTCOME fence (`expectedOutcome`) — a delayed same-instance outcome transition
+ *    can't let an exhausted page stamp a `dispatched` row (or vice versa).
+ * Each fence: PRESENT+valid conditions the UPDATE; PRESENT+malformed is INERT (never
+ * legacy authority); ABSENT adds no predicate (byte-identical historical fold — pre-fence
+ * events have neither, 08b events have the instance fence only). The branch reads ONLY the
+ * payload + `event.ts` (no wall-clock/fs/liveness), so re-fold stays byte-deterministic.
+ * The UPDATE no-ops on a missing incident row (the leave-blocked DELETE already cleared
+ * it) and NEVER clears the incident — only the leave-blocked `TaskSnapshot` transition
+ * does, which re-arms the marker at NULL. Malformed/missing payload → safe no-op.
  */
 function foldBlockHumanNotified(db: Database, event: Event): void {
   const payload = extractBlockHumanNotifiedPayload(event);
@@ -6828,21 +6886,30 @@ function foldBlockHumanNotified(db: Database, event: Event): void {
   if (payload.outcome !== "notified") {
     return;
   }
-  if (payload.expectedInstanceEventId != null) {
-    db.run(
-      `UPDATE dispatch_failures
-          SET human_notified_at = ?
-        WHERE verb = 'block' AND id = ? AND human_notified_at IS NULL
-          AND instance_event_id = ?`,
-      [event.ts, payload.task_id, payload.expectedInstanceEventId],
-    );
+  // Present-but-malformed fences → inert (never downgraded to an unfenced stamp).
+  if (payload.fencePresent && payload.expectedInstanceEventId == null) {
     return;
   }
+  if (payload.outcomeFencePresent && payload.expectedOutcome == null) {
+    return;
+  }
+  const predicates: string[] = [];
+  const args: (number | string)[] = [event.ts, payload.task_id];
+  if (payload.expectedInstanceEventId != null) {
+    predicates.push("instance_event_id = ?");
+    args.push(payload.expectedInstanceEventId);
+  }
+  if (payload.expectedOutcome != null) {
+    predicates.push("block_outcome = ?");
+    args.push(payload.expectedOutcome);
+  }
+  const fenceClause =
+    predicates.length > 0 ? ` AND ${predicates.join(" AND ")}` : "";
   db.run(
     `UPDATE dispatch_failures
         SET human_notified_at = ?
-      WHERE verb = 'block' AND id = ? AND human_notified_at IS NULL`,
-    [event.ts, payload.task_id],
+      WHERE verb = 'block' AND id = ? AND human_notified_at IS NULL${fenceClause}`,
+    args,
   );
 }
 

@@ -8622,10 +8622,6 @@ function fakeSweepDeps(opts: {
   const deps: BlockEscalationSweepDeps = {
     selectPending: () => opts.pending,
     readBlockedReason: (_projectDir, taskId) => opts.reasons?.[taskId] ?? null,
-    mintRequested: (epicId, taskId, instanceEventId) => {
-      mints.push({ kind: "requested", epicId, taskId });
-      mintInstances.push(instanceEventId);
-    },
     mintAttempted: (epicId, taskId, outcome, instanceEventId) => {
       mints.push({ kind: "attempted", epicId, taskId, outcome });
       mintInstances.push(instanceEventId);
@@ -8672,7 +8668,6 @@ test("runBlockEscalationSweep: an escalatable block DISPATCHES one owner redispa
   ]);
   // Requested STRICTLY before Attempted; the terminal outcome is `owner_redispatched`.
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -8691,7 +8686,6 @@ test("runBlockEscalationSweep: TOOLING_FAILURE never dispatches an agent (skippe
 
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -8774,8 +8768,7 @@ test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and 
   expect(ownerDispatches).toEqual([
     { epicId: "fn-1-rearm", taskId: "fn-1-rearm.1" },
   ]);
-  expect(mints.slice(-2)).toEqual([
-    { kind: "requested", epicId: "fn-1-rearm", taskId },
+  expect(mints.slice(-1)).toEqual([
     {
       kind: "attempted",
       epicId: "fn-1-rearm",
@@ -8876,7 +8869,6 @@ test("runBlockEscalationSweep: the durable suppression is once-only — skipped 
   expect(suppressions).toEqual([]);
   // ... but the latch still advances pending→requested→attempted exactly once.
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -8911,7 +8903,6 @@ test("runBlockEscalationSweep: cancellation guard — a task that left blocked i
 
   expect(dispatches).toEqual([]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -8945,7 +8936,6 @@ test("runBlockEscalationSweep: per-epic serialization — two blocked tasks in o
   // pending, re-sweeps once the live session goes terminal — no starvation, no
   // collision).
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -8986,7 +8976,6 @@ test("runBlockEscalationSweep: once the epic's unblock terminates, a pending sib
     { epicId: "fn-1-foo", taskId: "fn-1-foo.2" },
   ]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.2" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -9057,7 +9046,6 @@ test("runBlockEscalationSweep: a dispatch_failed outcome mints Requested→Attem
   // dispatch_failed mints attempted{owner_redispatch_failed} — the fold resets the
   // latch to pending, so the next sweep retries.
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -9156,7 +9144,6 @@ test("runBlockEscalationSweep: witnessed owner deaths consume two durable attach
   expect(ownerDispatches).toEqual([{ epicId: "fn-30-lease", taskId }]);
   expect(dispatches).toEqual([]);
   expect(mints.slice(-2)).toEqual([
-    { kind: "requested", epicId: "fn-30-lease", taskId },
     {
       kind: "attempted",
       epicId: "fn-30-lease",
@@ -9218,9 +9205,8 @@ test("runBlockEscalationSweep: every mint threads the row's block instance token
 
   await runBlockEscalationSweep(deps);
 
-  // One owner re-dispatch → Requested + Attempted, each fenced to the exact instance.
+  // One owner re-dispatch → ONE Attempted (no Requested pair), fenced to the exact instance.
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-30b-fence", taskId },
     {
       kind: "attempted",
       epicId: "fn-30b-fence",
@@ -9228,7 +9214,34 @@ test("runBlockEscalationSweep: every mint threads the row's block instance token
       outcome: "owner_redispatched",
     },
   ]);
-  expect(mintInstances).toEqual([9090, 9090]);
+  expect(mintInstances).toEqual([9090]);
+});
+
+test("runBlockEscalationSweep: HOLDS a row with a null/untrusted instance token — no dispatch, no mint (never an unfenced event)", async () => {
+  for (const badInstance of [null, 0, -3] as (number | null)[]) {
+    const taskId = "fn-30c-null.1";
+    const { deps, mints, dispatches, ownerDispatches, notes } = fakeSweepDeps({
+      pending: [
+        blockedRow("fn-30c-null", taskId, {
+          owner_redispatch_attempts: 0,
+          instance_event_id: badInstance,
+        }),
+      ],
+      reasons: { [taskId]: "SPEC_UNCLEAR: fixture" },
+      owner: { [taskId]: { state: "dead", diedAtMs: 0 } },
+      nowMs: BLOCK_OWNER_GRACE_MS,
+    });
+
+    await runBlockEscalationSweep(deps);
+
+    // A row we cannot fence is HELD: no dispatch, no mint — never an unfenced event.
+    expect(dispatches).toEqual([]);
+    expect(ownerDispatches).toEqual([]);
+    expect(mints).toEqual([]);
+    expect(notes.some((n) => n.includes("class=untrusted_instance"))).toBe(
+      true,
+    );
+  }
 });
 
 test("runBlockEscalationSweep: an owner launch failure consumes a bounded attachment attempt", async () => {
@@ -9324,7 +9337,6 @@ test("runBlockEscalationSweep: EXTERNAL_BLOCKED re-dispatches the owning work ve
   expect(dispatches).toEqual([]);
   expect(ownerDispatches).toEqual([{ epicId: "fn-41-quota", taskId }]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-41-quota", taskId },
     {
       kind: "attempted",
       epicId: "fn-41-quota",
@@ -9479,7 +9491,6 @@ test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace d
     { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
   ]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -9665,7 +9676,6 @@ test("runBlockEscalationSweep: AUDIT_SEVERE escalates immediately like any block
     { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
   ]);
   expect(mints).toEqual([
-    { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
@@ -11691,6 +11701,7 @@ function fakeBlockHumanNotifySweepDeps(opts: {
     epicId: string,
     taskId: string,
     instanceEventId: number | null,
+    outcome: string,
   ) => boolean;
   unblockOutcome?: (taskId: string) => ResolverOutcome;
   notify?: (
@@ -11938,11 +11949,12 @@ test("runBlockHumanNotifySweep: RE-FENCES after the async notify — a clear + r
   expect(stillPendingCalls).toEqual([42, 42]);
 });
 
-test("runBlockHumanNotifySweep: the terminal mint carries the exact instance token (fenced fold)", async () => {
+test("runBlockHumanNotifySweep: the terminal mint carries the exact instance token AND block-outcome (both fences threaded)", async () => {
   const mints: {
     taskId: string;
     outcome: BlockHumanNotifiedOutcome;
     instance: number | null;
+    blockOutcome: string;
   }[] = [];
   await runBlockHumanNotifySweep({
     selectPending: () => [
@@ -11958,12 +11970,140 @@ test("runBlockHumanNotifySweep: the terminal mint carries the exact instance tok
       throw new Error("owner_exhausted must page directly");
     },
     notifyHuman: async () => "notified",
-    mintAttempted: (_epicId, taskId, outcome, instanceEventId) =>
-      mints.push({ taskId, outcome, instance: instanceEventId }),
+    mintAttempted: (_epicId, taskId, outcome, instanceEventId, blockOutcome) =>
+      mints.push({ taskId, outcome, instance: instanceEventId, blockOutcome }),
   });
   expect(mints).toEqual([
-    { taskId: "fn-9-mint.1", outcome: "notified", instance: 77 },
+    {
+      taskId: "fn-9-mint.1",
+      outcome: "notified",
+      instance: 77,
+      blockOutcome: "owner_exhausted",
+    },
   ]);
+});
+
+test("runBlockHumanNotifySweep: HOLDS a row with a null/untrusted instance token — no page, no mint", async () => {
+  for (const badInstance of [null, 0, -1] as (number | null)[]) {
+    const { deps, mints, notifies } = fakeBlockHumanNotifySweepDeps({
+      pending: [
+        {
+          epic_id: "fn-10-null",
+          task_id: "fn-10-null.1",
+          outcome: "owner_exhausted",
+          instance_event_id: badInstance,
+        },
+      ],
+      stillPending: () => {
+        throw new Error("must HOLD before stillPending on an untrusted token");
+      },
+    });
+    await runBlockHumanNotifySweep(deps);
+    expect(notifies).toEqual([]);
+    expect(mints).toEqual([]);
+  }
+});
+
+test("runBlockHumanNotifySweep: stillPending receives the EXACT selected outcome and re-checks it after the await (outcome fence)", async () => {
+  const stillPendingCalls: { instance: number | null; outcome: string }[] = [];
+  const notifies: string[] = [];
+  const mints: string[] = [];
+  await runBlockHumanNotifySweep({
+    selectPending: () => [
+      {
+        epic_id: "fn-11-of",
+        task_id: "fn-11-of.1",
+        outcome: "owner_exhausted",
+        instance_event_id: 55,
+      },
+    ],
+    stillPending: (_epicId, _taskId, instanceEventId, outcome) => {
+      stillPendingCalls.push({ instance: instanceEventId, outcome });
+      return true;
+    },
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly");
+    },
+    notifyHuman: async () => {
+      notifies.push("sent");
+      return "notified";
+    },
+    mintAttempted: (_epicId, _taskId, _o, _i, blockOutcome) =>
+      mints.push(blockOutcome),
+  });
+  // Both the pre-await gate and the post-await re-fence carried the exact instance+outcome.
+  expect(stillPendingCalls).toEqual([
+    { instance: 55, outcome: "owner_exhausted" },
+    { instance: 55, outcome: "owner_exhausted" },
+  ]);
+  expect(notifies).toEqual(["sent"]);
+  expect(mints).toEqual(["owner_exhausted"]);
+});
+
+test("runBlockHumanNotifySweep: a same-instance outcome transition during the send (stillPending true then false) sends the page but mints NOTHING for the transitioned row", async () => {
+  const stillPendingReturns = [true, false];
+  const notifies: string[] = [];
+  const mints: string[] = [];
+  await runBlockHumanNotifySweep({
+    selectPending: () => [
+      {
+        epic_id: "fn-12-tx",
+        task_id: "fn-12-tx.1",
+        outcome: "owner_exhausted",
+        instance_event_id: 61,
+      },
+    ],
+    stillPending: () => stillPendingReturns.shift() ?? false,
+    unblockOutcome: () => {
+      throw new Error("owner_exhausted must page directly");
+    },
+    notifyHuman: async () => {
+      notifies.push("sent");
+      return "notified";
+    },
+    mintAttempted: (_epicId, _taskId, _o, _i, blockOutcome) =>
+      mints.push(blockOutcome),
+  });
+  expect(notifies).toEqual(["sent"]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockHumanNotifySweep: wrapped in the non-reentrant tick, an overlapping send fires the page exactly ONCE (page-once under a hung/slow send)", async () => {
+  let sends = 0;
+  let releaseSend = () => {};
+  const sendBlocked = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  const runOnce = () =>
+    runBlockHumanNotifySweep({
+      selectPending: () => [
+        {
+          epic_id: "fn-13-re",
+          task_id: "fn-13-re.1",
+          outcome: "owner_exhausted",
+          instance_event_id: 88,
+        },
+      ],
+      stillPending: () => true,
+      unblockOutcome: () => {
+        throw new Error("owner_exhausted must page directly");
+      },
+      notifyHuman: async () => {
+        sends += 1;
+        if (sends === 1) await sendBlocked; // simulate a slow / hung send
+        return "notified";
+      },
+      mintAttempted: () => {},
+    });
+  // Same wrapper the production tick uses.
+  const tick = createNonReentrantRepairSweepTick(runOnce);
+
+  const first = tick(); // enters the send and blocks
+  await tick(); // overlapping heartbeat → no-op, no second send
+  expect(sends).toBe(1);
+
+  releaseSend();
+  await first;
 });
 
 // ---------------------------------------------------------------------------

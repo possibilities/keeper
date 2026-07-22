@@ -1231,12 +1231,16 @@ export interface BlockEscalationRequestedPayload {
   epic_id: string;
   /** Blocked task id — part of the `block_escalations` pk. */
   task_id: string;
-  /** OPTIONAL instance fence: the block latch's `instance_event_id` at selection. When
-   *  present the fold updates the row ONLY if it still carries that instance — so a stale
-   *  in-flight sweep for a cleared block instance A never mutates the REPLACEMENT instance B
-   *  (same task id, fresh `instance_event_id` after an unblock→re-block). Absent (historical
-   *  payloads) → no instance check, byte-identical to the pre-fence fold. */
-  expectedInstanceEventId?: number | null;
+  /** TRI-STATE instance fence — was `expectedInstanceEventId` PRESENT on the wire?
+   *  `false` (ABSENT) is the ONLY legacy/unfenced path (byte-identical historical fold);
+   *  `true` with a valid positive-safe-integer {@link expectedInstanceEventId} fences the
+   *  UPDATE to the exact block instance; `true` with a null value (present-but-malformed)
+   *  is an INERT fold — NEVER downgraded to legacy authority. */
+  fencePresent: boolean;
+  /** The block latch's `instance_event_id` at selection — a valid positive safe integer,
+   *  else null. When {@link fencePresent} and non-null, the fold updates ONLY the matching
+   *  instance, so a stale sweep for a cleared instance A never mutates its replacement B. */
+  expectedInstanceEventId: number | null;
 }
 
 /**
@@ -1260,11 +1264,12 @@ export interface BlockEscalationAttemptedPayload {
   task_id: string;
   /** Producer-recorded attempt outcome, recorded onto the latch `outcome` column. */
   outcome: string;
-  /** OPTIONAL instance fence: the block latch's `instance_event_id` at selection. When
-   *  present the fold updates the row ONLY if it still carries that instance — so a stale
-   *  attempt for a cleared block instance A never terminalizes the REPLACEMENT instance B.
-   *  Absent (historical payloads) → no instance check, byte-identical to the pre-fence fold. */
-  expectedInstanceEventId?: number | null;
+  /** TRI-STATE instance fence (see {@link BlockEscalationRequestedPayload.fencePresent}):
+   *  ABSENT → unfenced historical fold; PRESENT+valid → fenced to the exact instance;
+   *  PRESENT+malformed → INERT. */
+  fencePresent: boolean;
+  /** The block latch's `instance_event_id` — a valid positive safe integer, else null. */
+  expectedInstanceEventId: number | null;
 }
 
 /**
@@ -1288,13 +1293,22 @@ export interface BlockHumanNotifiedPayload {
   task_id: string;
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
-  /** OPTIONAL instance fence: the block latch's `instance_event_id` the page was sent
-   *  about. When present the fold stamps `human_notified_at` ONLY if the current row still
-   *  carries that instance — so a page sent about block instance A that completed AFTER A
-   *  was cleared and a REPLACEMENT instance B minted (same task id) never stamps B,
-   *  suppressing B's required page. Absent (historical payloads) → no instance check,
-   *  byte-identical to the pre-fence fold. */
-  expectedInstanceEventId?: number | null;
+  /** TRI-STATE instance fence (see {@link BlockEscalationRequestedPayload.fencePresent}):
+   *  ABSENT → unfenced historical fold; PRESENT+valid → stamps ONLY the matching instance
+   *  (a stale page about a cleared instance A never stamps its replacement B);
+   *  PRESENT+malformed → INERT. */
+  fencePresent: boolean;
+  /** The block latch's `instance_event_id` the page was sent about — a valid positive safe
+   *  integer, else null. */
+  expectedInstanceEventId: number | null;
+  /** TRI-STATE OUTCOME fence — was `expectedOutcome` PRESENT on the wire? When present and
+   *  valid the fold stamps ONLY if the row's `block_outcome` STILL equals the outcome the
+   *  page was sent about, so a delayed same-instance outcome transition (an exhausted page
+   *  never stamps a dispatched row, or vice versa) cannot mis-stamp. ABSENT (historical /
+   *  pre-outcome-fence payloads) → no outcome predicate; PRESENT+malformed → INERT. */
+  outcomeFencePresent: boolean;
+  /** The `block_outcome` the page was sent about — a non-empty string, else null. */
+  expectedOutcome: string | null;
 }
 
 /**
@@ -1380,13 +1394,17 @@ export interface MergeHumanNotifiedPayload {
   outcome: string;
   /** Which `dispatch_failures` verb-row the marker stamps — `close` (default) or `work`. */
   verb: string;
-  /** OPTIONAL instance fence: the `dispatch_failures.instance_event_id` of the EXACT row
-   *  the page was sent about. When present, the fold stamps `human_notified_at` ONLY if the
-   *  current row's `instance_event_id` still matches — so a page sent about row A that
-   *  completed AFTER A was cleared and a REPLACEMENT row B minted (same `(verb,id)`) never
-   *  stamps B, suppressing B's required page. Absent (historical payloads) → no instance
-   *  check, byte-identical to the pre-fence fold. */
-  expectedInstanceEventId?: number | null;
+  /** TRI-STATE instance fence — was the `expectedInstanceEventId` property PRESENT on the
+   *  wire? `false` (ABSENT) is the ONLY legacy/unfenced path (byte-identical historical
+   *  fold); `true` with a valid positive-safe-integer {@link expectedInstanceEventId} fences
+   *  the stamp; `true` with a null {@link expectedInstanceEventId} (present-but-malformed:
+   *  string/null/negative/unsafe) is an INERT fold — NEVER downgraded to legacy authority. */
+  fencePresent: boolean;
+  /** The `dispatch_failures.instance_event_id` of the EXACT row the page was sent about — a
+   *  valid positive safe integer, else null. When {@link fencePresent} and non-null, the
+   *  fold stamps `human_notified_at` ONLY if the current row's `instance_event_id` still
+   *  matches, so a page about a cleared row A never stamps its replacement B. */
+  expectedInstanceEventId: number | null;
 }
 
 /**
