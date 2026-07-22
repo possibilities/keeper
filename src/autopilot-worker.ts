@@ -1134,6 +1134,28 @@ export function applyWakeArm(waker: StoppedExpiryWaker, arm: WakeArm): void {
 }
 
 /**
+ * Map a slot-occupancy cycle's evidence to a THREE-STATE {@link WakeArm} — the SINGLE seam
+ * that decides the stopped-job wake, so a pane-probe-degraded cycle no longer collapses to a
+ * false disarm. Precedence:
+ *  - `paused` → `idle` (a positively-known no-candidate; `play` re-kicks) — WINS over degraded,
+ *    since the pause flag is independently known even when DB / pane reads degrade.
+ *  - `degraded` (readinessDegraded — the DB read) OR NOT `expiryTrusted` (the pane liveness
+ *    probe was null, so the scan could not run) → `unknown` (preserve the prior wake / bounded
+ *    retry — a fired boundary + transient null-probe must never freeze the clock edge).
+ *  - a trusted probe with an expiry → `{ at }`; a trusted probe with none → `idle`. Pure.
+ */
+export function slotWakeArm(input: {
+  paused: boolean;
+  degraded: boolean;
+  expiryAt: number | null;
+  expiryTrusted: boolean;
+}): WakeArm {
+  if (input.paused) return "idle";
+  if (input.degraded || !input.expiryTrusted) return "unknown";
+  return input.expiryAt !== null ? { at: input.expiryAt } : "idle";
+}
+
+/**
  * Per-(pass, lane) latch for lane-maintenance deferral logging, keyed
  * `<pass>\0<normalized lane path>` → the last reason logged. A held lane rides a
  * `data_version`-level-triggered loop the live owner's OWN job updates keep
@@ -13655,6 +13677,16 @@ function main(): void {
           async () => observedPanes,
         );
         if (snapshot.readinessDegraded) {
+          // A DB-degraded cycle derives no trustworthy decision: PRESERVE both wakes (bounded
+          // retry) rather than disarm — unless PAUSED, which is independently known and wins
+          // (disarm; `play` re-kicks). Never freeze a live clock edge on a transient DB read.
+          latestSlotArm = slotWakeArm({
+            paused: state.paused,
+            degraded: true,
+            expiryAt: null,
+            expiryTrusted: false,
+          });
+          latestContainmentArm = state.paused ? "idle" : "unknown";
           continue;
         }
         const laneMaintenanceProbe = createLaneMaintenanceProbe(
@@ -14380,13 +14412,16 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
-        // A TRUSTWORTHY decision this cycle: a definite expiry arms the edge; a null expiry is
-        // a positive no-candidate (paused / nothing stopped) → `idle` disarm. (A degraded probe
-        // never reaches here — it `continue`d above, leaving the per-iteration `unknown`.)
-        latestSlotArm =
-          decision.slotNextExpiryAt !== null
-            ? { at: decision.slotNextExpiryAt }
-            : "idle";
+        // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;
+        // a trusted no-candidate (or paused) disarms; a DEGRADED PANE probe (untrusted null,
+        // distinct from readinessDegraded's DB path above) preserves the wake / bounded retry
+        // instead of a false disarm. `readinessDegraded` is false here — it `continue`d above.
+        latestSlotArm = slotWakeArm({
+          paused: state.paused,
+          degraded: false,
+          expiryAt: decision.slotNextExpiryAt,
+          expiryTrusted: decision.slotNextExpiryTrusted,
+        });
         // Reap the union of the done-monitor candidates and this cycle's
         // exact occupancy targets. Slot targets take precedence for a shared job
         // because their stopped proof needs no monitor-staleness inference. The

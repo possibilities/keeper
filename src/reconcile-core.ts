@@ -1707,6 +1707,14 @@ export interface ReconcileDecision {
    * for it so the age-driven reap fires in a quiescent DB.
    */
   slotNextExpiryAt: number | null;
+  /**
+   * Whether {@link slotNextExpiryAt} is TRUSTWORTHY (from {@link
+   * SlotOccupancyDecision.nextExpiryTrusted}): `false` ONLY when the pane liveness probe was
+   * degraded, so a `null` expiry is UNKNOWN (preserve the wake / bounded retry), not a positive
+   * no-candidate (disarm). The `readinessDegraded` early return is likewise `false` (DB read
+   * degraded). The producer maps (paused, this flag, expiry) to a three-state wake.
+   */
+  slotNextExpiryTrusted: boolean;
 }
 /**
  * One recovery-pass failure surfaced by {@link WorktreeDriver.recover}.
@@ -2221,6 +2229,15 @@ export interface SlotOccupancyDecision {
    * early return (fail-closed: no wake armed, hence no wake-driven reap while paused).
    */
   nextExpiryAt: number | null;
+  /**
+   * Whether `nextExpiryAt` is TRUSTWORTHY evidence for the coalesced wake. `true` for a
+   * COMPLETE probe (paused → a positive no-candidate; or a real held-candidate scan). `false`
+   * ONLY when the pane liveness probe was DEGRADED (`livePaneIds === null` or
+   * `paneCommandById === null`): the scan could not run, so a `null` expiry is UNKNOWN, not a
+   * positive no-candidate — the producer must PRESERVE its prior wake / arm a bounded retry
+   * rather than disarm (a fired-boundary + transient null-probe must not freeze the clock edge).
+   */
+  nextExpiryTrusted: boolean;
 }
 
 const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
@@ -2258,8 +2275,15 @@ export function computeSlotOccupancy(
   const failures: SlotOccupancySignal[] = [];
   const clears: { verb: Verb; id: string }[] = [];
   const { livePaneIds, paneCommandById } = input;
-  if (input.paused || livePaneIds === null || paneCommandById === null) {
-    return { failures, clears, nextExpiryAt: null };
+  // PAUSED is a POSITIVE no-candidate (trusted → disarm; `play` re-kicks) and wins over a
+  // degraded probe — the pause flag is independently known even when the pane read is null.
+  if (input.paused) {
+    return { failures, clears, nextExpiryAt: null, nextExpiryTrusted: true };
+  }
+  // A DEGRADED pane probe (no liveness read) could not scan, so a `null` expiry is UNKNOWN,
+  // not a positive no-candidate — mark it UNTRUSTED so the producer preserves its edge.
+  if (livePaneIds === null || paneCommandById === null) {
+    return { failures, clears, nextExpiryAt: null, nextExpiryTrusted: false };
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
   const uncontendedGraceSec =
@@ -2389,7 +2413,7 @@ export function computeSlotOccupancy(
       clears.push({ verb: open.verb, id: open.id });
     }
   }
-  return { failures, clears, nextExpiryAt };
+  return { failures, clears, nextExpiryAt, nextExpiryTrusted: true };
 }
 
 /**
@@ -2520,6 +2544,9 @@ export function reconcile(
       slotOccupancy: [],
       slotOccupancyClears: [],
       slotNextExpiryAt: null,
+      // A DB-degraded cycle is UNKNOWN, not a positive no-candidate — the producer preserves
+      // its wake / arms a bounded retry (paused still wins to disarm, decided by the producer).
+      slotNextExpiryTrusted: false,
     };
   }
 
@@ -3246,6 +3273,7 @@ export function reconcile(
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
     slotNextExpiryAt: slot.nextExpiryAt,
+    slotNextExpiryTrusted: slot.nextExpiryTrusted,
   };
 }
 /**

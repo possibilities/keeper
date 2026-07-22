@@ -227,6 +227,7 @@ import {
   sharedDesyncDistressId,
   sharedDirtyDistressId,
   sharedWedgeDistressId,
+  slotWakeArm,
   staleBaseLaneDistressId,
   stuckSentinelJobId,
   stuckSentinelOrphansToClear,
@@ -2397,6 +2398,124 @@ test("computeSlotOccupancy: nextExpiryAt is null when paused, degraded, or idle"
     computeSlotOccupancy(slotInput({ ...occ, livePaneIds: null })).nextExpiryAt,
   ).toBeNull();
   expect(computeSlotOccupancy(slotInput({})).nextExpiryAt).toBeNull();
+});
+
+test("13d computeSlotOccupancy: nextExpiryTrusted distinguishes a positive no-candidate from a degraded pane probe", () => {
+  const occ = oneOccupant({ command: "claude", updated_at: 950 });
+  // PAUSED → a TRUSTED no-candidate (disarm; play re-kicks).
+  expect(
+    computeSlotOccupancy(slotInput({ ...occ, paused: true })).nextExpiryTrusted,
+  ).toBe(true);
+  // A held candidate within grace → a TRUSTED definite expiry.
+  const held = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(held.nextExpiryTrusted).toBe(true);
+  expect(held.nextExpiryAt).not.toBeNull();
+  // A DEGRADED pane probe (either null) → UNTRUSTED, even though nextExpiryAt is null.
+  for (const degraded of [{ livePaneIds: null }, { paneCommandById: null }]) {
+    const out = computeSlotOccupancy(slotInput({ ...occ, ...degraded }));
+    expect(out.nextExpiryAt).toBeNull();
+    expect(out.nextExpiryTrusted).toBe(false);
+  }
+  // A complete probe with no candidate → TRUSTED idle.
+  expect(computeSlotOccupancy(slotInput({})).nextExpiryTrusted).toBe(true);
+});
+
+test("13d slotWakeArm: the three-state seam (paused wins; degraded/untrusted → unknown; trusted → at/idle)", () => {
+  const base = { expiryAt: 1234, expiryTrusted: true };
+  // Paused wins over everything — even a degraded/untrusted cycle disarms while paused.
+  expect(slotWakeArm({ ...base, paused: true, degraded: false })).toBe("idle");
+  expect(
+    slotWakeArm({
+      paused: true,
+      degraded: true,
+      expiryAt: null,
+      expiryTrusted: false,
+    }),
+  ).toBe("idle");
+  // DB-degraded (readinessDegraded) or an untrusted pane probe → unknown (preserve/retry).
+  expect(
+    slotWakeArm({
+      paused: false,
+      degraded: true,
+      expiryAt: null,
+      expiryTrusted: false,
+    }),
+  ).toBe("unknown");
+  expect(
+    slotWakeArm({
+      paused: false,
+      degraded: false,
+      expiryAt: null,
+      expiryTrusted: false,
+    }),
+  ).toBe("unknown");
+  // Trusted probe: a definite expiry arms the edge; a trusted no-candidate disarms.
+  expect(slotWakeArm({ ...base, paused: false, degraded: false })).toEqual({
+    at: 1234,
+  });
+  expect(
+    slotWakeArm({
+      paused: false,
+      degraded: false,
+      expiryAt: null,
+      expiryTrusted: true,
+    }),
+  ).toBe("idle");
+});
+
+test("13d slot-wake chain: a fired boundary + degraded pane probe → bounded re-arm, then a COMPLETE probe selects the reap", () => {
+  // The full compute → (slotWakeArm) → applyWakeArm chain the driveCycle runs.
+  const { clock, setNow, armed } = fakeExpiryClock(1000);
+  const occ = oneOccupant({ command: "claude", updated_at: 950 }); // idle 50 < grace
+  const waker = createStoppedExpiryWaker(
+    clock,
+    () => {},
+    () => false,
+    60,
+  );
+
+  // Healthy within-grace cycle → a TRUSTED expiry arms the exact boundary.
+  const healthy = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false, now: clock.now() }),
+  );
+  applyWakeArm(
+    waker,
+    slotWakeArm({
+      paused: false,
+      degraded: false,
+      expiryAt: healthy.nextExpiryAt,
+      expiryTrusted: healthy.nextExpiryTrusted,
+    }),
+  );
+  expect(armed()?.delayMs).toBe(
+    (950 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC - 1000) * 1000,
+  );
+
+  // The boundary fires; that cycle's pane probe comes back DEGRADED (livePaneIds null). Old
+  // behavior disarmed forever; now it maps to `unknown` → a bounded 60s re-arm.
+  armed()?.fire(); // handle now null
+  setNow(950 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC + 1);
+  const degraded = computeSlotOccupancy(
+    slotInput({ ...occ, livePaneIds: null, now: clock.now() }),
+  );
+  applyWakeArm(
+    waker,
+    slotWakeArm({
+      paused: false,
+      degraded: false,
+      expiryAt: degraded.nextExpiryAt,
+      expiryTrusted: degraded.nextExpiryTrusted,
+    }),
+  );
+  expect(armed()?.delayMs).toBe(60 * 1000); // bounded retry, NOT frozen
+
+  // A later COMPLETE probe (pane read back) past grace selects the reap.
+  const complete = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false, now: clock.now() }),
+  );
+  expect(complete.failures[0]?.reapTarget?.jobId).toBe("j");
 });
 
 // ---------------------------------------------------------------------------
