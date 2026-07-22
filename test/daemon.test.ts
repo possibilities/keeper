@@ -6735,78 +6735,138 @@ test("recordedOrBarePidIdentity: a group / malformed pid is inconclusive and nev
   }
 });
 
-test("wrapperWitnessGoneNow: missing row and revived state HOLD; a cross-generation event pair takes the bare-pid HOLD; a gone witness proceeds", () => {
+function insertWitnessJob(
+  db: ReturnType<typeof freshMemDb>["db"],
+  jobId: string,
+  state: string,
+  pid: number | null,
+  start: string | null,
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, title, title_source, transcript_path, start_time)
+       VALUES (?, 1, NULL, ?, ?, 0, 2, NULL, NULL, NULL, ?)`,
+    [jobId, pid, state, start],
+  );
+}
+function insertWitnessSessionStart(
+  db: ReturnType<typeof freshMemDb>["db"],
+  sessionId: string,
+  pid: number | null,
+  start: string | null,
+  attempt: number | null,
+): number {
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time, data)
+       VALUES (1, ?, ?, 'SessionStart', 'session_start', ?, ?)`,
+    [
+      sessionId,
+      pid,
+      start,
+      attempt == null ? null : JSON.stringify({ dispatch_attempt_id: attempt }),
+    ],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+function bumpWitnessCursor(
+  db: ReturnType<typeof freshMemDb>["db"],
+  toId?: number,
+): void {
+  db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [
+    toId ??
+      (
+        db.query("SELECT COALESCE(MAX(id), 0) AS m FROM events").get() as {
+          m: number;
+        }
+      ).m,
+  ]);
+}
+
+test("wrapperWitnessGoneNow: missing/revived/attempt-mismatch/cross-gen/half-pidless all HOLD; truly-pidless and a gone same-attempt witness proceed", () => {
   const { db } = freshMemDb();
-  const insertJob = (
-    jobId: string,
-    state: string,
-    pid: number | null,
-    start: string | null,
-  ): void => {
-    db.run(
-      `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
-                         updated_at, title, title_source, transcript_path, start_time)
-         VALUES (?, 1, NULL, ?, ?, 0, 2, NULL, NULL, NULL, ?)`,
-      [jobId, pid, state, start],
-    );
-  };
-  const insertSessionStart = (
-    sessionId: string,
-    tsVal: number,
-    pid: number | null,
-    start: string | null,
-  ): void => {
-    db.run(
-      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time)
-         VALUES (?, ?, ?, 'SessionStart', 'session_start', ?)`,
-      [tsVal, sessionId, pid, start],
-    );
-  };
-  // A start-aware probe: a STALE-start pair (the jobs-column trap) reads gone; a
-  // NULL-start pair (the true resume generation) reads inconclusive (bare-pid live).
+  // A start-aware probe: a present-start pair reads gone; a NULL-start pair reads
+  // inconclusive (bare-pid live). Expected attempt is 1 throughout.
   const startAware = (
     _pid: number,
     startTime: string | null,
   ): RecordedProcessIdentityVerdict =>
     startTime == null ? "inconclusive" : "gone";
+  const row = (jobId: string) => ({
+    wrapper_job_id: jobId,
+    wrapper_dispatch_attempt_id: 1,
+  });
 
   // Missing wrapper row → UNKNOWN, not positive gone → HOLD.
-  expect(
-    wrapperWitnessGoneNow(db, { wrapper_job_id: "absent" }, startAware),
-  ).toBe(false);
+  expect(wrapperWitnessGoneNow(db, row("absent"), startAware)).toBe(false);
 
   // Revived (non-terminal) wrapper → HOLD.
-  insertJob("w-revived", "stopped", 5000, "linux:old");
-  insertSessionStart("w-revived", 1, 5000, "linux:new");
+  insertWitnessJob(db, "w-revived", "stopped", 5000, "linux:old");
+  insertWitnessSessionStart(db, "w-revived", 5000, "linux:new", 1);
+
+  // Newest folded SessionStart belongs to ANOTHER attempt (2) → UNKNOWN → HOLD,
+  // even though attempt-2's present-start pair would probe gone; we never borrow it.
+  insertWitnessJob(db, "w-mismatch", "killed", 1000, "linux:old");
+  insertWitnessSessionStart(db, "w-mismatch", 1000, "linux:old", 1);
+  insertWitnessSessionStart(db, "w-mismatch", 7000, "linux:b", 2);
+
+  // Cross-generation trap: jobs (killed, new pid 5000, STALE start), but the latest
+  // same-attempt SessionStart EVENT is (5000, NULL) → bare-pid HOLD.
+  insertWitnessJob(db, "w-crossgen", "killed", 5000, "linux:old");
+  insertWitnessSessionStart(db, "w-crossgen", 1000, "linux:old", 1);
+  insertWitnessSessionStart(db, "w-crossgen", 5000, null, 1);
+
+  // Half-pidless: a NULL-pid resume generation coalesced OVER a non-null jobs pid is
+  // an unknown resume, not a truly-pidless row → HOLD (its stale jobs pid may live).
+  insertWitnessJob(db, "w-half-pidless", "killed", 1000, "linux:old");
+  insertWitnessSessionStart(db, "w-half-pidless", null, null, 1);
+
+  // Truly pidless: BOTH the terminal projection and the atomic generation pidless.
+  insertWitnessJob(db, "w-pidless", "killed", null, null);
+  insertWitnessSessionStart(db, "w-pidless", null, null, 1);
+
+  // Gone: a present-start same-attempt witness probes gone → proceed.
+  insertWitnessJob(db, "w-gone", "killed", 1000, "linux:old");
+  insertWitnessSessionStart(db, "w-gone", 1000, "linux:old", 1);
+
+  bumpWitnessCursor(db); // fold cursor covers every seeded event
+
+  expect(wrapperWitnessGoneNow(db, row("w-revived"), startAware)).toBe(false);
+  expect(wrapperWitnessGoneNow(db, row("w-mismatch"), startAware)).toBe(false);
+  expect(wrapperWitnessGoneNow(db, row("w-crossgen"), startAware)).toBe(false);
+  expect(wrapperWitnessGoneNow(db, row("w-half-pidless"), startAware)).toBe(
+    false,
+  );
+  expect(wrapperWitnessGoneNow(db, row("w-pidless"), startAware)).toBe(true);
+  expect(wrapperWitnessGoneNow(db, row("w-gone"), startAware)).toBe(true);
+  db.close();
+});
+
+test("wrapperWitnessGoneNow: cursor-bound — an UNFOLDED tail SessionStart is never current authority", () => {
+  const { db } = freshMemDb();
+  // A pid-aware probe: the folded projected generation (pid 1000) is MATCHING (live);
+  // the unfolded tail generation (pid 9000) would probe gone.
+  const pidAware = (pid: number): RecordedProcessIdentityVerdict =>
+    pid === 1000 ? "matching" : "gone";
+  insertWitnessJob(db, "w-cursor", "killed", 1000, "linux:live");
+  const foldedId = insertWitnessSessionStart(
+    db,
+    "w-cursor",
+    1000,
+    "linux:live",
+    1,
+  );
+  bumpWitnessCursor(db, foldedId); // cursor stops AT the folded generation
+  // A newer, same-attempt, gone-looking SessionStart lands but is NOT folded yet.
+  insertWitnessSessionStart(db, "w-cursor", 9000, "linux:tail", 1);
+  // The gate must witness the folded generation (matching → HOLD), never the tail.
   expect(
-    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-revived" }, startAware),
+    wrapperWitnessGoneNow(
+      db,
+      { wrapper_job_id: "w-cursor", wrapper_dispatch_attempt_id: 1 },
+      pidAware,
+    ),
   ).toBe(false);
-
-  // Cross-generation trap: jobs carries (killed, new pid 5000, STALE start
-  // "linux:old") from independent COALESCE, but the latest SessionStart EVENT is
-  // (5000, NULL). A jobs-column read would probe (5000, "linux:old") → gone; the
-  // atomic event pair (5000, NULL) routes to the bare-pid HOLD.
-  insertJob("w-crossgen", "killed", 5000, "linux:old");
-  insertSessionStart("w-crossgen", 1, 1000, "linux:old"); // original generation
-  insertSessionStart("w-crossgen", 2, 5000, null); // resume: new pid, failed scrape
-  expect(
-    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-crossgen" }, startAware),
-  ).toBe(false);
-
-  // Terminal + a truly-pidless latest SessionStart → terminal-state trust.
-  insertJob("w-pidless", "killed", null, null);
-  insertSessionStart("w-pidless", 1, null, null);
-  expect(
-    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-pidless" }, startAware),
-  ).toBe(true);
-
-  // Terminal + a gone (present-start) event witness → proceed.
-  insertJob("w-gone", "killed", 1000, "linux:old");
-  insertSessionStart("w-gone", 1, 1000, "linux:old");
-  expect(
-    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-gone" }, startAware),
-  ).toBe(true);
-
   db.close();
 });
 
@@ -6871,6 +6931,117 @@ test("cross-generation witness (non-provider): a resumed live bare pid yields ZE
       db,
       { verb: "work", id: "fn-xg.1", attempt_id: 60, session_id: "sess-xg" },
       startAware,
+    ),
+  ).toBe(false);
+  db.close();
+});
+
+test("attempt-correlated witness (non-provider): a newest SessionStart on ANOTHER attempt never releases attempt A's claim", () => {
+  const { db } = freshMemDb();
+  const ss = (
+    ts: number,
+    pid: number | null,
+    start: string | null,
+    attempt: number,
+  ): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time,
+                           spawn_name, data)
+         VALUES (?, 'sess-am', ?, 'SessionStart', 'session_start', ?,
+                 'work::fn-am.1', ?)`,
+      [ts, pid, start, JSON.stringify({ dispatch_attempt_id: attempt })],
+    );
+  };
+  ss(1000, 1000, "linux:1000", 80); // attempt A generation
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (2000, 'sess-am', NULL, 'Killed', 'killed', ?)`,
+    [
+      JSON.stringify({
+        pid: 1000,
+        start_time: "linux:1000",
+        close_kind: "pid_died",
+        reason: "exit_watched",
+      }),
+    ],
+  );
+  ss(500, 7000, "linux:7000", 81); // NEWEST SessionStart belongs to attempt B, below the stamp
+  while (drain(db) > 0) {
+    // fold to head
+  }
+  // Jobs stays terminal but carries attempt B's pid/start.
+  expect(
+    db
+      .query("SELECT state, pid, start_time FROM jobs WHERE job_id = 'sess-am'")
+      .get(),
+  ).toEqual({ state: "killed", pid: 7000, start_time: "linux:7000" });
+  db.run(
+    `INSERT INTO dispatch_claims (verb, id, attempt_id, state, session_id, dir,
+                                  legacy_unfenced, acquired_at, bound_at,
+                                  last_event_id, updated_at)
+       VALUES ('work', 'fn-am.1', 80, 'bound', 'sess-am', '/repo', 0, 1, 1, 1, 2)`,
+  );
+  // The newest generation is attempt B; borrowing its gone verdict for attempt A's
+  // claim is exactly the divergence being closed. A probe that would call B's pair
+  // gone must NOT release attempt A → UNKNOWN → HOLD.
+  expect(
+    terminalSessionClaimIsReleaseable(
+      db,
+      { verb: "work", id: "fn-am.1", attempt_id: 80, session_id: "sess-am" },
+      () => "gone",
+    ),
+  ).toBe(false);
+  db.close();
+});
+
+test("half-pidless witness (non-provider): a same-attempt NULL-pid resume over a non-null jobs pid never releases", () => {
+  const { db } = freshMemDb();
+  const ss = (ts: number, pid: number | null, start: string | null): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time,
+                           spawn_name, data)
+         VALUES (?, 'sess-hp', ?, 'SessionStart', 'session_start', ?,
+                 'work::fn-hp.1', ?)`,
+      [ts, pid, start, JSON.stringify({ dispatch_attempt_id: 90 })],
+    );
+  };
+  ss(1000, 1000, "linux:1000"); // original generation
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (2000, 'sess-hp', NULL, 'Killed', 'killed', ?)`,
+    [
+      JSON.stringify({
+        pid: 1000,
+        start_time: "linux:1000",
+        close_kind: "pid_died",
+        reason: "exit_watched",
+      }),
+    ],
+  );
+  ss(500, null, null); // same-attempt resume: pid NULL + start NULL, below the stamp
+  while (drain(db) > 0) {
+    // fold to head
+  }
+  // Jobs stays terminal with the OLD pid (the NULL resume pid coalesced away).
+  expect(
+    db
+      .query("SELECT state, pid, start_time FROM jobs WHERE job_id = 'sess-hp'")
+      .get(),
+  ).toEqual({ state: "killed", pid: 1000, start_time: "linux:1000" });
+  db.run(
+    `INSERT INTO dispatch_claims (verb, id, attempt_id, state, session_id, dir,
+                                  legacy_unfenced, acquired_at, bound_at,
+                                  last_event_id, updated_at)
+       VALUES ('work', 'fn-hp.1', 90, 'bound', 'sess-hp', '/repo', 0, 1, 1, 1, 2)`,
+  );
+  // The atomic generation is NULL-pid, but the terminal projection still carries a
+  // non-null (possibly-live) pid — NOT truly pidless → HOLD. Even a gone probe (never
+  // consulted here) must not release.
+  expect(
+    terminalSessionClaimIsReleaseable(
+      db,
+      { verb: "work", id: "fn-hp.1", attempt_id: 90, session_id: "sess-hp" },
+      () => "gone",
     ),
   ).toBe(false);
   db.close();

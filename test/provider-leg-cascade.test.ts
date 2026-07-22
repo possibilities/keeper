@@ -948,3 +948,44 @@ test("marker survives an inert (fence-blocked) release; the LIVE resumed wrapper
     expect(existsSync(sessionMarkerPath(home, wrapper))).toBe(true);
   });
 });
+
+test("half-pidless wrapper witness: a same-attempt NULL-pid resume over a non-null jobs pid yields ZERO cascade/signal/release", async () => {
+  seedAttempt({
+    task: "fn-1385-halfpidless.1",
+    attempt: 65,
+    wrapper: "wrapper-65",
+    wrapperState: "killed",
+    legs: [{ id: "leg-65", session: "leg-session-65", pid: 700 }],
+  });
+  // Same-attempt resume with pid=NULL + start=NULL below the kill stamp: jobs stays
+  // killed with the OLD pid (165), the NULL resume pid coalesced away.
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data,
+                         start_time, spawn_name, harness)
+       VALUES (500, 'wrapper-65', NULL, 'SessionStart', 'session_start', ?, NULL,
+               'work::fn-1385-halfpidless.1', 'claude')`,
+    [JSON.stringify({ dispatch_attempt_id: 65 })],
+  );
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT state, pid, start_time FROM jobs WHERE job_id = 'wrapper-65'",
+      )
+      .get(),
+  ).toEqual({ state: "killed", pid: 165, start_time: "linux:1065" });
+
+  // The atomic generation is NULL-pid while the terminal projection carries a
+  // non-null (possibly-live) pid — NOT truly pidless → HOLD. A gone witness (never
+  // consulted, short-circuited by the dual-pidless predicate) must not proceed.
+  const d = deps({ probeRecordedIdentity: () => "gone" });
+  await runProviderLegCascadeSweep(db, d);
+  await runProviderLegCascadeSweep(db, d);
+  d.advance(PROVIDER_LEG_TERM_GRACE_SEC + 1);
+  await runProviderLegCascadeSweep(db, d);
+  expect(cascade("leg-65")).toBeNull();
+  expect(d.signals).toEqual([]);
+  expect(
+    db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 65").get(),
+  ).toEqual({ state: "bound" });
+});

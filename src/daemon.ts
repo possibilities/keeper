@@ -1458,33 +1458,67 @@ export function recordedOrBarePidIdentity(
   return "inconclusive";
 }
 
+/** The atomic generation pair from an attempt-correlated, cursor-bound witness read,
+ *  or `"unknown"` when the newest folded SessionStart belongs to a different/invalid
+ *  attempt (the caller HOLDS), or `null` when the session has no folded SessionStart
+ *  event at all (the caller falls back to the coherent jobs columns). */
+type SessionStartWitness =
+  | { pid: number | null; start_time: string | null }
+  | "unknown";
+
 /**
- * Read the latest SessionStart EVENT's `(pid, start_time)` for a session as ONE
- * atomic generation pair. This is DELIBERATELY not `jobs.pid` / `jobs.start_time`:
- * the SessionStart UPSERT coalesces those two columns INDEPENDENTLY
- * (`COALESCE(excluded.pid, jobs.pid)` / `COALESCE(excluded.start_time, jobs.start_time)`),
- * so a resume that lands a NEW pid but a FAILED (NULL) start-time scrape synthesizes
- * a CROSS-GENERATION pair `(pid = new, start_time = old)`. A full witness on that
- * pair sees a LIVE new pid whose observed start-time differs from the stale recorded
- * one and falsely classifies it `gone` — authorizing a reap of a live process. The
- * event carries the pair atomically (`pid = new, start_time = NULL`), so reading it
- * routes a scrape-failed resume onto the bare-pid HOLD path instead. Returns null
- * when the session has no SessionStart event at all (a synthetic/legacy row) — the
- * caller then falls back to the jobs columns, which for such a row carry a single
- * coherent generation (a cross-generation pair can only be produced BY a resume
- * event, which this read would have found).
+ * Read the latest FOLDED SessionStart EVENT for a session as ONE atomic generation
+ * pair, correlated to the gate's expected dispatch attempt. Three fail-closed
+ * properties:
+ *
+ *  - ATOMIC PAIR: `(pid, start_time)` come from the SAME event, never the
+ *    independently-COALESCEd `jobs.pid` / `jobs.start_time` — a resume with a new pid
+ *    but a FAILED (NULL) start-time scrape synthesizes a cross-generation
+ *    `(new, old)` jobs pair that a full witness falsely reads as `gone`. The event
+ *    carries `(new, NULL)`, routing a scrape-failed resume onto the bare-pid HOLD.
+ *  - CURSOR-BOUND: only events `id <= reducer_state.last_event_id` — the current
+ *    PROJECTED generation. An unfolded tail event is future authority, never current;
+ *    reading it would break the `terminal_session_only` fold-fence ordering.
+ *  - ATTEMPT-CORRELATED: the newest folded SessionStart's canonical dispatch attempt
+ *    must EXACTLY equal `expectedAttemptId`. One session id can carry a newer
+ *    SessionStart from ANOTHER attempt whose gone verdict an older attempt's claim/leg
+ *    must never borrow — a missing/invalid/mismatched newest attempt is `"unknown"`
+ *    (→ HOLD), never skipped back to an older matching row.
+ *
+ * Returns `null` only when the session has NO folded SessionStart at all (a
+ * synthetic/legacy row): the caller then falls back to the jobs columns, which for
+ * such a row carry a single coherent generation (a cross-generation pair can only be
+ * produced BY a resume event, which this read would have found).
  */
 function latestSessionStartWitness(
   db: Database,
   sessionId: string,
-): { pid: number | null; start_time: string | null } | null {
-  return db
+  expectedAttemptId: number,
+): SessionStartWitness | null {
+  const row = db
     .query(
-      `SELECT pid, start_time FROM events
-         WHERE session_id = ? AND hook_event = 'SessionStart'
-         ORDER BY id DESC LIMIT 1`,
+      `SELECT pid, start_time,
+              CASE WHEN json_valid(data) THEN COALESCE(
+                json_extract(data, '$.dispatch_attempt_id'),
+                json_extract(data, '$.attempt_id'),
+                json_extract(data, '$.dispatch.attempt_id')
+              ) END AS attempt
+         FROM events
+        WHERE session_id = ? AND hook_event = 'SessionStart'
+          AND id <= (SELECT last_event_id FROM reducer_state WHERE id = 1)
+        ORDER BY id DESC LIMIT 1`,
     )
-    .get(sessionId) as { pid: number | null; start_time: string | null } | null;
+    .get(sessionId) as {
+    pid: number | null;
+    start_time: string | null;
+    attempt: number | string | null;
+  } | null;
+  if (row == null) return null;
+  const attempt = row.attempt == null ? Number.NaN : Number(row.attempt);
+  if (!Number.isSafeInteger(attempt) || attempt !== expectedAttemptId) {
+    return "unknown";
+  }
+  return { pid: row.pid, start_time: row.start_time };
 }
 
 export function terminalSessionClaimIsReleaseable(
@@ -1532,17 +1566,26 @@ export function terminalSessionClaimIsReleaseable(
   // recorded identity and releases ONLY on positive death evidence (`gone`); a
   // `matching` (live) or `inconclusive` (uncertain) identity HOLDS the claim
   // (fail-closed, mirroring {@link decideDispatchClearLiveness}). The witness pair
-  // comes from the latest SessionStart EVENT (one atomic generation) — never the
-  // independently-coalesced jobs columns, which can synthesize a live-pid /
-  // stale-start cross-generation pair that classifies a LIVE resume as gone. The
-  // fallback is narrowed to a TRULY pidless witness (no pid — terminal by
-  // construction, the seed sweep's own pidless reap already proved it unwatchable):
-  // only THAT falls back to terminal-state trust. A pid with a missing/empty
+  // comes from the latest FOLDED, attempt-correlated SessionStart EVENT (one atomic
+  // generation) — never the independently-coalesced jobs columns, which can
+  // synthesize a live-pid / stale-start cross-generation pair that classifies a LIVE
+  // resume as gone. A newest generation on another/invalid attempt is UNKNOWN → HOLD.
+  const witnessResult = latestSessionStartWitness(
+    db,
+    row.session_id,
+    row.attempt_id,
+  );
+  if (witnessResult === "unknown") return false;
+  const witness = witnessResult ?? gated;
+  // Dual-pidless: terminal-state trust holds ONLY when the current terminal
+  // projection AND the atomic generation are BOTH pidless (a truly-pidless terminal
+  // row the seed sweep's pidless reap already proved unwatchable). A NULL-pid resume
+  // generation coalesced OVER a non-null jobs pid is an unknown resume, not a pidless
+  // row — its stale jobs pid could still be live, so HOLD. A pid with a missing/empty
   // start_time (a live process whose scrape failed) is never released on trust —
-  // `recordedOrBarePidIdentity` degrades it to a bare-pid probe that releases only
-  // on ESRCH.
-  const witness = latestSessionStartWitness(db, row.session_id) ?? gated;
-  if (witness.pid == null) return true;
+  // `recordedOrBarePidIdentity` degrades it to a bare-pid probe that releases only on
+  // ESRCH.
+  if (witness.pid == null) return gated.pid == null;
   return probeIdentity(witness.pid, witness.start_time) === "gone";
 }
 
@@ -8371,15 +8414,20 @@ function providerLegProbeVerdict(
  *
  * A MISSING current wrapper row is UNKNOWN, not positive gone — and, unlike a
  * pidless terminal row, not even a terminal projection — so it HOLDS. The witness
- * pair is read from the latest SessionStart EVENT (one atomic generation), never the
- * independently-coalesced jobs pid/start columns, which can synthesize a live-pid /
- * stale-start cross-generation pair that classifies a LIVE resume as gone; the jobs
- * columns are only a fallback for a wrapper with no SessionStart event (which then
- * carries a single coherent generation).
+ * pair is read from the latest FOLDED, attempt-correlated SessionStart EVENT (one
+ * atomic generation), never the independently-coalesced jobs pid/start columns, which
+ * can synthesize a live-pid / stale-start cross-generation pair that classifies a LIVE
+ * resume as gone. A newest generation on another/invalid attempt is UNKNOWN → HOLD;
+ * the jobs columns are only a fallback for a wrapper with no folded SessionStart event
+ * (which then carries a single coherent generation). Terminal-state trust holds ONLY
+ * when the terminal projection AND the atomic generation are BOTH pidless.
  */
 export function wrapperWitnessGoneNow(
   db: Database,
-  row: Pick<ProviderLegCascadeRow, "wrapper_job_id">,
+  row: Pick<
+    ProviderLegCascadeRow,
+    "wrapper_job_id" | "wrapper_dispatch_attempt_id"
+  >,
   probeRecordedIdentity: (
     pid: number,
     startTime: string | null,
@@ -8394,8 +8442,14 @@ export function wrapperWitnessGoneNow(
   } | null;
   if (w == null) return false; // missing row — UNKNOWN, not gone → HOLD
   if (w.state !== "ended" && w.state !== "killed") return false; // revived → HOLD
-  const witness = latestSessionStartWitness(db, row.wrapper_job_id) ?? w;
-  if (witness.pid == null) return true; // terminal + truly pidless → terminal-state trust
+  const witnessResult = latestSessionStartWitness(
+    db,
+    row.wrapper_job_id,
+    row.wrapper_dispatch_attempt_id,
+  );
+  if (witnessResult === "unknown") return false; // another/invalid attempt → HOLD
+  const witness = witnessResult ?? w;
+  if (witness.pid == null) return w.pid == null; // BOTH pidless → terminal-state trust; else HOLD
   return probeRecordedIdentity(witness.pid, witness.start_time) === "gone";
 }
 
