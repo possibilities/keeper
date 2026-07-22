@@ -371,6 +371,36 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
       expect(lensIndex).toBeGreaterThan(0);
       expect(deepLensIndex).toBeGreaterThan(lensIndex);
       expect(auditor).toContain("lenses 1–8, one pass");
+
+      // The justification rule is closed in BOTH directions. An
+      // equivalent-or-stronger replacement test is a valid justification…
+      expect(auditor).toContain(
+        "equivalent-or-stronger replacement coverage present in this same diff",
+      );
+      // …while deleting the guarded implementation alongside its test is NOT —
+      // that self-justifying deletion is the exact attack the lens catches, so
+      // same-diff code removal must be explicitly insufficient.
+      expect(auditor).toContain("NEVER justifies the test's removal");
+
+      // Severity matches the un-guarded invariant's impact; Critical is
+      // conditional on the template's own Critical bar, never automatic. The
+      // superseded unconditional-Critical wording must be gone.
+      expect(auditor).toContain(
+        "severity MATCHES the un-guarded invariant's impact",
+      );
+      expect(auditor).toContain(
+        "ONLY when losing that guard meets the Critical bar",
+      );
+      expect(auditor).toContain("task-mode `severe`");
+      expect(auditor).not.toContain(
+        "un-guarding an invariant-encoding test is `Critical`",
+      );
+
+      // The removed-test detector is convention-driven across target repos, not
+      // a fixed JS-only registry (`*.test.*`/`it`/`describe`).
+      expect(auditor).toContain("the TARGET repo's own convention");
+      expect(auditor).toContain("`*.spec.*`");
+      expect(auditor).toContain("`_test.go`");
     } finally {
       rmSync(work, { recursive: true, force: true });
     }

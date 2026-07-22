@@ -172,11 +172,11 @@ Red flags:
 
 Read the DIFF of the test surface itself — deletions included — never just the surviving tree. Green gates and literally-satisfied acceptance criteria are BLIND to a test that was deleted, inverted, or weakened: the suite still passes precisely because the check that would have failed is gone, so the diff of the tests themselves is the only evidence.
 
-- **Deleted tests**: `-` hunks dropping a `test`/`it`/`describe` case, or a removed `*.test.*` file — a code path or invariant that was covered and now is not.
+- **Deleted tests**: `-` hunks dropping a `test`/`it`/`describe` case, or a removed test file named by the TARGET repo's own convention — this auditor runs across repos, so read the tree's convention, not a fixed registry (`*.test.*`, `*.spec.*`, a `tests/` or `__tests__/` directory, a `_test.go` suffix, and the like) — a code path or invariant that was covered and now is not.
 - **Inverted assertions**: an assertion flipped to assert the OPPOSITE behavior — e.g. a check that a documented path IS taken rewritten to assert it is NOT, or an expected value swapped for its negation.
 - **Weakened expectations**: a loosened matcher, an assertion dropped from a still-passing test, or a fixture narrowed so it no longer exercises the invariant.
 
-Every such change must be JUSTIFIED against a documented invariant — a CLAUDE.md-mandated behavior, an ADR-recorded decision, or the task/epic spec. It is justified only when the behavior it guarded is itself removed by this same diff; otherwise it is a finding at the severity of the invariant it un-guards — un-guarding an invariant-encoding test is `Critical` (SEVERE-grade in task mode), never a style nit. Report it on the Spec axis (file:line, the invariant left un-guarded).
+Every such change is a finding UNTIL justified. To justify one, TRACE the invariant the test guarded and accept ONLY (a) equivalent-or-stronger replacement coverage present in this same diff, or (b) positive documented authority — a CLAUDE.md-mandated behavior, an ADR-recorded decision, or the task/epic spec — that retires or supersedes the invariant. Merely deleting or changing the implementation alongside its guard NEVER justifies the test's removal; that self-justifying deletion is the exact class this lens exists to catch. An unjustified change is a finding whose severity MATCHES the un-guarded invariant's impact: `Critical` — task-mode `severe` — ONLY when losing that guard meets the Critical bar (could cause outage, data loss, or a security breach; genuinely gating-grade), else the appropriate lower severity, never an automatic top severity. Report it on the Spec axis (file:line, the invariant left un-guarded).
 
 ### 6. Performance Red Flags
 - N+1 queries or O(n²) loops
