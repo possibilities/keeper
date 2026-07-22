@@ -172,6 +172,9 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
   if (
     /network|fetch|socket|websocket|connection|timed? ?out|timeout|econn|dns|service unavailable|overload|upstream|internal server|server error|temporar(?:y|ily)|try again|request failed|response failed|something went wrong|error processing|\b50[0234]\b/i.test(
       message,
+    ) ||
+    /you can retry your request|try your request again|please retry your request/i.test(
+      message,
     )
   ) {
     return "transport";

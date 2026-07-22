@@ -60,6 +60,8 @@ const CONTEXT = {
   systemPrompt: "system",
   messages: [{ role: "user", content: "hello", timestamp: 1 }],
 };
+const RETRYABLE_CODEX_PROVIDER_ERROR =
+  "Codex error: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists.";
 
 function message(
   stopReason: "stop" | "error" | "aborted" = "stop",
@@ -2746,7 +2748,7 @@ describe("pooled Codex stream", () => {
                   reason: "error",
                   error: message(
                     "error",
-                    "Codex error: internal server error Bearer private-value",
+                    `${RETRYABLE_CODEX_PROVIDER_ERROR} Bearer private-value`,
                   ),
                 },
               ]) as any)
@@ -2769,6 +2771,7 @@ describe("pooled Codex stream", () => {
       "Codex response failed",
       "server overloaded; try again",
       "upstream connect error",
+      RETRYABLE_CODEX_PROVIDER_ERROR,
     ]) {
       expect(classifyPoolFailure(message)).toBe("transport");
     }
@@ -2820,7 +2823,7 @@ describe("pooled Codex stream", () => {
                 {
                   type: "error",
                   reason: "error",
-                  error: message("error", "server overloaded; please retry"),
+                  error: message("error", RETRYABLE_CODEX_PROVIDER_ERROR),
                 },
               ]) as any)
             : (stream([
