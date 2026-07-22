@@ -92,7 +92,15 @@ function makeEpic(
     if (status === "done") {
       const tid = taskIds[i] as string;
       const r = runCli(
-        ["done", tid, "--summary", `summary for ${tid}`, "--force"],
+        [
+          "done",
+          tid,
+          "--summary",
+          `summary for ${tid}`,
+          "--no-op-reason",
+          "fixture: no code",
+          "--force",
+        ],
         {
           cwd: proj.root,
           home: proj.home,

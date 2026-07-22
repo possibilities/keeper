@@ -316,7 +316,12 @@ function emptySetHash(): string {
 
 function markAllDone(root: string, taskIds: string[]): void {
   for (const tid of taskIds) {
-    seedRuntime(root, tid, { status: "done" });
+    // No source commits in this fixture → each task carries a typed no-op
+    // receipt (the close ancestry gate's (b) branch).
+    seedRuntime(root, tid, {
+      status: "done",
+      no_op_reason: "fixture: no code",
+    });
   }
 }
 

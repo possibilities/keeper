@@ -192,7 +192,10 @@ function claimFirst(
 function preflightReady(proj: Proj, title: string): string {
   const { epicId, taskIds } = scaffold(proj, title, 1);
   for (const tid of taskIds) {
-    seedRuntime(proj.root, tid, { status: "done" });
+    seedRuntime(proj.root, tid, {
+      status: "done",
+      no_op_reason: "fixture: no code",
+    });
   }
   const pf = cli(["close-preflight", epicId, "--project", proj.root], proj);
   expect(pf.code).toBe(0);
@@ -327,7 +330,17 @@ describe("work-marker clear-if-matches", () => {
     const proj = getProj();
     const { taskIds } = claimFirst(proj);
     expect(markerPresent(proj.home)).toBe(true);
-    const r = cli(["done", taskIds[0] as string, "--summary", "shipped"], proj);
+    const r = cli(
+      [
+        "done",
+        taskIds[0] as string,
+        "--summary",
+        "shipped",
+        "--no-op-reason",
+        "no code",
+      ],
+      proj,
+    );
     expect(r.code).toBe(0);
     expect(markerPresent(proj.home)).toBe(false);
   });
@@ -346,7 +359,17 @@ describe("work-marker clear-if-matches", () => {
     expect(readMarker(proj.home).task_id).toBe(taskIds[1]);
     // done on .1 must NOT clear the .2 marker (the .1 sidecar is in_progress
     // from its own claim, so done succeeds).
-    const r = cli(["done", taskIds[0] as string, "--summary", "x"], proj);
+    const r = cli(
+      [
+        "done",
+        taskIds[0] as string,
+        "--summary",
+        "x",
+        "--no-op-reason",
+        "no code",
+      ],
+      proj,
+    );
     expect(r.code).toBe(0);
     expect(markerPresent(proj.home)).toBe(true);
     expect(readMarker(proj.home).task_id).toBe(taskIds[1]);
@@ -376,7 +399,10 @@ describe("work-marker clear-if-matches", () => {
       status: "in_progress",
       assignee: "test@example.com",
     });
-    const r = cli(["done", taskId, "--summary", "x"], proj);
+    const r = cli(
+      ["done", taskId, "--summary", "x", "--no-op-reason", "no code"],
+      proj,
+    );
     expect(r.code).toBe(0);
     expect(markerPresent(proj.home)).toBe(true);
     expect(readMarker(proj.home).kind).toBe("close");
@@ -535,7 +561,10 @@ describe("close-claim exclusivity (fail-loud loser)", () => {
       { title, nTasks: 1, env: { CLAUDE_CODE_SESSION_ID: SID_A } },
     );
     for (const tid of taskIds) {
-      seedRuntime(proj.root, tid, { status: "done" });
+      seedRuntime(proj.root, tid, {
+        status: "done",
+        no_op_reason: "fixture: no code",
+      });
     }
     return epicId;
   }

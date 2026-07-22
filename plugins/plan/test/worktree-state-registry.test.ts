@@ -177,11 +177,21 @@ for (const inRoots of [true, false]) {
         { inRoots, seedStatus: "in_progress" },
       );
 
-      const r = runCli(["done", taskId, "--summary", "shipped from the lane"], {
-        cwd: lane,
-        home,
-        env: laneEnv(lane),
-      });
+      const r = runCli(
+        [
+          "done",
+          taskId,
+          "--summary",
+          "shipped from the lane",
+          "--no-op-reason",
+          "no code",
+        ],
+        {
+          cwd: lane,
+          home,
+          env: laneEnv(lane),
+        },
+      );
       // Success proves done READ primary's in_progress overlay — a lane-resolved
       // read would see no overlay (todo) and fail the non-force gate.
       expect(r.code).toBe(0);

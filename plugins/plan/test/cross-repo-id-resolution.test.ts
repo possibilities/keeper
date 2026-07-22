@@ -126,7 +126,14 @@ describe("cross-repo id-addressed verb resolution (fn-882)", () => {
 
     // done from B's cwd: today this hit B's board ("Task not found"). Now it
     // resolves A's board globally and stamps there.
-    const r = invoke(mr, b as string, ["done", taskId, "--summary", "shipped"]);
+    const r = invoke(mr, b as string, [
+      "done",
+      taskId,
+      "--summary",
+      "shipped",
+      "--no-op-reason",
+      "no code",
+    ]);
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).status).toBe("done");
 
@@ -249,7 +256,14 @@ describe("cross-repo id-addressed verb resolution (fn-882)", () => {
 
     // A claim+done from A's own cwd stamps A — the unchanged single-repo flow.
     expect(invoke(mr, a as string, ["claim", taskId]).code).toBe(0);
-    const doneR = invoke(mr, a as string, ["done", taskId, "--summary", "ok"]);
+    const doneR = invoke(mr, a as string, [
+      "done",
+      taskId,
+      "--summary",
+      "ok",
+      "--no-op-reason",
+      "no code",
+    ]);
     expect(doneR.code).toBe(0);
     expect(taskJson(a as string, taskId).worker_done_at).toBeTruthy();
   });

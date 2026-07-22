@@ -92,7 +92,12 @@ function makeLaneScenario(prefix: string, statuses: string[]): LaneScenario {
   });
   statuses.forEach((status, i) => {
     if (status === "done") {
-      seedRuntime(primary, taskIds[i] as string, { status: "done" });
+      // No source commits in this fixture → a typed no-op receipt satisfies the
+      // close ancestry gate's (b) branch.
+      seedRuntime(primary, taskIds[i] as string, {
+        status: "done",
+        no_op_reason: "fixture: no code",
+      });
     }
   });
 

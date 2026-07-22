@@ -64,10 +64,21 @@ function writeSidecar(
 }
 
 function doneTask(proj: ProjectHandle, taskId: string): void {
-  const r = runCli(["done", taskId, "--summary", `did ${taskId}`, "--force"], {
-    cwd: proj.root,
-    home: proj.home,
-  });
+  const r = runCli(
+    [
+      "done",
+      taskId,
+      "--summary",
+      `did ${taskId}`,
+      "--no-op-reason",
+      "fixture: no code",
+      "--force",
+    ],
+    {
+      cwd: proj.root,
+      home: proj.home,
+    },
+  );
   if (r.code !== 0) {
     throw new Error(`done failed for ${taskId}:\n${r.output}`);
   }

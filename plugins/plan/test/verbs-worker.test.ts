@@ -351,10 +351,13 @@ describe("done", () => {
 
     const before = gitLogCount(root);
     // Frozen clock rides the subprocess env so worker_done_at == FROZEN.
-    const r = runCli(["done", taskId, "--summary", "shipped it"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
+    const r = runCli(
+      ["done", taskId, "--summary", "shipped it", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      },
+    );
     expect(r.code).toBe(0);
 
     expect((runtime(root, taskId) as Record<string, unknown>).status).toBe(
@@ -381,10 +384,13 @@ describe("done", () => {
       assignee: "test@example.com",
     });
 
-    const r = runCli(["done", taskId, "--summary", "x"], {
-      cwd: root,
-      env: { CLAUDE_CODE_SESSION_ID: "" },
-    });
+    const r = runCli(
+      ["done", taskId, "--summary", "x", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { CLAUDE_CODE_SESSION_ID: "" },
+      },
+    );
     expect(r.code).not.toBe(0);
   });
 });

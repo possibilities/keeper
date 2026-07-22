@@ -72,10 +72,13 @@ describe("done — commit failure unwinds the half-stamp", () => {
     // Arm the mid-merge commit failure (armed AFTER gitBaseline, which resets it).
     failNextCommit(root, MERGE_STDERR);
 
-    const r = runCli(["done", taskId, "--summary", "shipped it"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
+    const r = runCli(
+      ["done", taskId, "--summary", "shipped it", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      },
+    );
     expect(r.code).not.toBe(0);
     const payload = firstJsonPayload(r.output);
     expect(payload.success).toBe(false);
@@ -107,18 +110,24 @@ describe("done — commit failure unwinds the half-stamp", () => {
     gitBaseline(root);
     failNextCommit(root, MERGE_STDERR);
 
-    const failed = runCli(["done", taskId, "--summary", "shipped it"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
+    const failed = runCli(
+      ["done", taskId, "--summary", "shipped it", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      },
+    );
     expect(failed.code).not.toBe(0);
 
     // The merge completed; a plain `done` re-run (no failure armed) commits.
     const before = gitLogCount(root);
-    const r = runCli(["done", taskId, "--summary", "shipped it"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
+    const r = runCli(
+      ["done", taskId, "--summary", "shipped it", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      },
+    );
     expect(r.code).toBe(0);
     expect(firstJsonPayload(r.output).success).toBe(true);
     expect(taskDef(root, taskId).worker_done_at).toBe(FROZEN);
@@ -141,6 +150,7 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     seedRuntime(root, taskId, {
       status: "done",
       assignee: "test@example.com",
+      no_op_reason: "prior no-op done",
     });
 
     const before = gitLogCount(root);
@@ -173,6 +183,7 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     seedRuntime(root, taskId, {
       status: "done",
       assignee: "test@example.com",
+      no_op_reason: "prior no-op done",
     });
 
     const r = runCli(["done", taskId], {
@@ -265,6 +276,33 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     expect(readFileSync(taskJsonPath, "utf-8")).toBe(taskJsonBefore);
   });
 
+  test("a heal re-run cannot silently restore an empty-evidence, receiptless done", () => {
+    // A wedge whose prior done carried neither landing commits NOR a typed no-op
+    // receipt (the reset-after-fatal re-mark shape). A heal re-run has nothing to
+    // carry forward, so the empty-evidence gate refuses rather than re-stamping a
+    // silent empty success.
+    const [, taskIds] = seedState(root, { epicId: "fn-8-atomic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    gitBaseline(root);
+    seedRuntime(root, taskId, {
+      status: "done",
+      assignee: "test@example.com",
+    });
+
+    const before = gitLogCount(root);
+    const r = runCli(["done", taskId], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+    });
+    expect(r.code).not.toBe(0);
+    expect(String(parseCliOutput(r.output).error ?? r.output)).toContain(
+      "no evidence commits",
+    );
+    // No re-commit, no durable backing minted — the wedge is unchanged.
+    expect(gitLogCount(root)).toBe(before);
+    expect(taskDef(root, taskId).worker_done_at).toBeNull();
+  });
+
   test("a durably-committed done still refuses (idempotency guard preserved)", () => {
     const [, taskIds] = seedState(root, { epicId: "fn-5-atomic", nTasks: 1 });
     const taskId = taskIds[0] as string;
@@ -275,10 +313,13 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     gitBaseline(root);
 
     // First done commits worker_done_at into HEAD.
-    const r1 = runCli(["done", taskId, "--summary", "shipped"], {
-      cwd: root,
-      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
-    });
+    const r1 = runCli(
+      ["done", taskId, "--summary", "shipped", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+      },
+    );
     expect(r1.code).toBe(0);
     const afterFirst = gitLogCount(root);
 
@@ -291,5 +332,76 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     expect(r2.code).not.toBe(0);
     expect(String(parseCliOutput(r2.output).error)).toContain("already done");
     expect(gitLogCount(root)).toBe(afterFirst);
+  });
+});
+
+describe("done — empty-evidence integrity gate", () => {
+  function seedInProgress(epicId: string): string {
+    const [, taskIds] = seedState(root, { epicId, nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    seedRuntime(root, taskId, {
+      status: "in_progress",
+      assignee: "test@example.com",
+    });
+    gitBaseline(root);
+    return taskId;
+  }
+
+  test("an empty-evidence code task without a no-op reason is refused", () => {
+    const taskId = seedInProgress("fn-9-atomic");
+    const r = runCli(["done", taskId, "--summary", "shipped"], {
+      cwd: root,
+      env: { ...SID, KEEPER_PLAN_NOW: FROZEN },
+    });
+    expect(r.code).not.toBe(0);
+    expect(String(parseCliOutput(r.output).error ?? r.output)).toContain(
+      "no evidence commits",
+    );
+    // Refused before any durable write — the overlay stays in_progress, no commit.
+    expect((runtime(root, taskId) as Record<string, unknown>).status).toBe(
+      "in_progress",
+    );
+    expect(gitLogCount(root)).toBe(0);
+  });
+
+  test("--no-op-reason records the receipt and lets an empty-evidence done land", () => {
+    const taskId = seedInProgress("fn-10-atomic");
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "no code needed",
+        "--no-op-reason",
+        "doc-only follow-up",
+      ],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).toBe(0);
+    const rt = runtime(root, taskId) as Record<string, unknown>;
+    expect(rt.status).toBe("done");
+    expect(rt.no_op_reason).toBe("doc-only follow-up");
+  });
+
+  test("evidence commits satisfy done with no no-op reason (receipt stays null)", () => {
+    const taskId = seedInProgress("fn-11-atomic");
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "shipped",
+        "--evidence",
+        JSON.stringify({ commits: ["abc1234"] }),
+      ],
+      { cwd: root, env: { ...SID, KEEPER_PLAN_NOW: FROZEN } },
+    );
+    expect(r.code).toBe(0);
+    const rt = runtime(root, taskId) as Record<string, unknown>;
+    expect(rt.status).toBe("done");
+    expect(rt.no_op_reason).toBeNull();
+    expect((rt.evidence as Record<string, unknown>).commits).toEqual([
+      "abc1234",
+    ]);
   });
 });

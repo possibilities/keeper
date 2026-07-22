@@ -55,6 +55,10 @@ interface DoneArgs {
   taskId: string;
   summary: string | null;
   evidence: string | null;
+  /** An explicit "this task landed no code" receipt. Required to mark a code
+   * task done with an empty evidence commit set — the recorded reason close's
+   * per-task ancestry gate accepts as its typed no-op branch. */
+  noOpReason: string | null;
   force: boolean;
   project: string | null;
   format: OutputFormat | null;
@@ -89,6 +93,7 @@ export function runDone(args: DoneArgs): void {
     taskId,
     summary,
     evidence: evidenceInline,
+    noOpReason,
     force,
     project,
     format,
@@ -218,6 +223,34 @@ export function runDone(args: DoneArgs): void {
         emitError("Evidence must be a JSON object", format);
       }
 
+      // Empty-evidence integrity gate. A done code task with no recorded landing
+      // commits must carry an explicit typed no-op receipt — never a silent empty
+      // success. The reason comes from --no-op-reason, or (heal re-run with none
+      // supplied) is carried forward from the prior done's stored receipt, mirroring
+      // the evidence carry-forward above; a heal that would re-carry an
+      // empty-evidence, receipt-less prior done stays refused (covers the reset-
+      // after-fatal re-mark). close-finalize's per-task ancestry gate accepts this
+      // receipt as its typed no-op branch.
+      const suppliedReason = (noOpReason ?? "").trim();
+      const carriedReason =
+        typeof merged.no_op_reason === "string"
+          ? merged.no_op_reason.trim()
+          : "";
+      const noOpReasonText =
+        suppliedReason !== ""
+          ? suppliedReason
+          : healUncommittedDone
+            ? carriedReason
+            : "";
+      if (evidence.commits.length === 0 && noOpReasonText === "") {
+        emitError(
+          `Task ${taskId} has no evidence commits — supply --evidence with the ` +
+            'landing commits, or --no-op-reason "<why no code landed>" to record ' +
+            "an explicit no-op receipt. Empty evidence never silently closes.",
+          format,
+        );
+      }
+
       // Patch the spec — `## Done summary` then `## Evidence`, validating before
       // and after. A malformed spec is a hard error (the four-H2 contract).
       if (!existsSync(specPath)) {
@@ -292,6 +325,10 @@ export function runDone(args: DoneArgs): void {
         claimed_at: "claimed_at" in merged ? merged.claimed_at : null,
         claim_note: "claim_note" in merged ? merged.claim_note : "",
         evidence,
+        // The durable no-op receipt (null when the task carries real commits) —
+        // close reads it as the typed no-op branch of its per-task ancestry gate,
+        // and a heal re-run carries it forward rather than blanking it.
+        no_op_reason: noOpReasonText !== "" ? noOpReasonText : null,
         blocked_reason: null,
       };
       stateStore.saveRuntime(taskId, newState);

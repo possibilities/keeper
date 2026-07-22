@@ -57,6 +57,7 @@ import {
 } from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
+  fakeSourceCommit,
   firstJsonPayload,
   gitBaseline,
   gitInit,
@@ -84,11 +85,17 @@ function emptySetHash(): string {
 }
 
 // Mark every task done via the runtime sidecar (epic close honors it). Port of
-// _mark_all_done.
+// _mark_all_done. These fixtures model an epic with NO source commits, so each
+// task carries a typed no-op receipt — the close ancestry gate's (b) branch —
+// exactly as a real no-code done would record via `--no-op-reason`.
 function markAllDone(root: string, taskIds: string[]): void {
   for (const tid of taskIds) {
     const p = join(root, ".keeper", "state", "tasks", `${tid}.state.json`);
-    writeFileSync(p, `${JSON.stringify({ status: "done" })}\n`, "utf-8");
+    writeFileSync(
+      p,
+      `${JSON.stringify({ status: "done", no_op_reason: "fixture: no code" })}\n`,
+      "utf-8",
+    );
   }
 }
 
@@ -1782,6 +1789,181 @@ describe("close-finalize gates + exhaustiveness + retired verb", () => {
     });
     expect(r.code).not.toBe(0);
     expect(r.output.toLowerCase().includes("no such command")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-task ancestry gate — every done code task's own code must be provably in
+// the composed base close is about to publish, OR carry a typed no-op receipt.
+// The fake VCS models reachability via each seeded commit's `refs`, so a
+// lane-only rib and an off-base evidence commit are driven deterministically.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize per-task ancestry gate", () => {
+  const getProj = withProject("planctl-cf-ancestry-");
+
+  // Mark a task done via the runtime overlay, bypassing the `done` verb's own
+  // empty-evidence refusal — exactly a heal / direct overlay write, the shape the
+  // close gate is the backstop for.
+  function markDone(
+    root: string,
+    taskId: string,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const p = join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
+    writeFileSync(
+      p,
+      `${JSON.stringify({ status: "done", ...extra })}\n`,
+      "utf-8",
+    );
+  }
+
+  test("an un-fanned-in rib branch aborts the close naming the task", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Unreachable rib", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    markDone(proj.root, taskId); // empty evidence, no receipt
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    // Worktree geometry: the epic base resolves (a base commit carrying NO task
+    // trailer, so the empty-set hash still matches), but the task's rib tip is
+    // rib-only — never fanned into the base.
+    const laneRef = `keeper/epic/${epicId}`;
+    const ribRef = `${laneRef}--${taskId}`;
+    fakeSourceCommit(proj.root, "chore: epic base\n", { refs: [laneRef] });
+    fakeSourceCommit(proj.root, "wip: lane work\n", { refs: [ribRef] });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("TASK_ANCESTRY_UNVERIFIED");
+    const offenders = (err.details as Record<string, unknown>)
+      .offending_tasks as Array<Record<string, unknown>>;
+    expect(offenders).toHaveLength(1);
+    expect(offenders[0]).toMatchObject({
+      task_id: taskId,
+      reason: "unreachable-branch",
+      branch: ribRef,
+    });
+    // The irreversible close never ran.
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("an evidence commit off the composed base aborts the close", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Off-base evidence", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    // The recorded evidence commit lives on an unrelated ref, never reachable
+    // from HEAD (the composed base here — no lane).
+    const orphan = fakeSourceCommit(proj.root, "orphan work\n", {
+      refs: ["refs/heads/orphan"],
+    });
+    markDone(proj.root, taskId, {
+      evidence: { commits: [orphan], tests: [], prs: [] },
+    });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("TASK_ANCESTRY_UNVERIFIED");
+    const offenders = (err.details as Record<string, unknown>)
+      .offending_tasks as Array<Record<string, unknown>>;
+    expect(offenders[0]).toMatchObject({
+      task_id: taskId,
+      reason: "unreachable-commits",
+      commits: [orphan],
+    });
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("a done task with no evidence, no branch, and no receipt aborts", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Silent empty", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    markDone(proj.root, taskId); // empty evidence, no receipt, no commits at all
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).not.toBe(0);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("TASK_ANCESTRY_UNVERIFIED");
+    const offenders = (err.details as Record<string, unknown>)
+      .offending_tasks as Array<Record<string, unknown>>;
+    expect(offenders[0]).toMatchObject({
+      task_id: taskId,
+      reason: "no-evidence",
+    });
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("a typed no-op receipt closes clean via (b)", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "No-op receipt", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    markDone(proj.root, taskId, { no_op_reason: "doc-only, no code" });
+    seedBrief(proj.root, epicId, emptySetHash());
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_clean");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("the evidenced normal path (commits on the base) closes clean via (a)", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Evidenced normal", nTasks: 1 },
+    );
+    const taskId = taskIds[0] as string;
+    // A real landing commit on HEAD carrying the task's Task: trailer — found by
+    // both the commit-set scan (so the stamped hash includes it) and the gate.
+    const landed = fakeSourceCommit(
+      proj.root,
+      `feat: real work\n\nTask: ${taskId}\n`,
+      { refs: ["HEAD"] },
+    );
+    const hash = computeCommitSetHash([
+      { repo: realpathSync(proj.root), shas: [landed] },
+    ]);
+    markDone(proj.root, taskId, {
+      evidence: { commits: [landed], tests: [], prs: [] },
+    });
+    seedBrief(proj.root, epicId, hash);
+    seedVerdict(proj.root, epicId, { commitSetHash: hash, decisions: [] });
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_clean");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
   });
 });
 

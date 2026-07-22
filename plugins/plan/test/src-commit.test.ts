@@ -505,10 +505,13 @@ describe("mutating verbs roll back on a commit failure", () => {
     gitBaseline(root);
     failNextCommit(root);
 
-    const r = runCli(["done", taskId, "--summary", "shipped"], {
-      cwd: root,
-      env: { CLAUDE_CODE_SESSION_ID: "rb-done" },
-    });
+    const r = runCli(
+      ["done", taskId, "--summary", "shipped", "--no-op-reason", "no code"],
+      {
+        cwd: root,
+        env: { CLAUDE_CODE_SESSION_ID: "rb-done" },
+      },
+    );
     expect(r.code).not.toBe(0);
     commitFailedDetails(r.output);
     expect(fakeDirtyPaths(root)).toEqual([]);

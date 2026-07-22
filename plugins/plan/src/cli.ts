@@ -808,11 +808,12 @@ function dispatchCommand(
       break;
     }
     case "done":
-      // readPositional already skips --project / --summary / --evidence values.
+      // readPositional skips --project / --summary / --evidence / --no-op-reason values.
       runDone({
         taskId: readPositional(rest),
         summary: readOption(rest, "--summary"),
         evidence: readOption(rest, "--evidence"),
+        noOpReason: readOption(rest, "--no-op-reason"),
         force: readFlag(rest, "--force"),
         project: readOption(rest, "--project"),
         format,
@@ -1124,6 +1125,7 @@ function readPositional(rest: string[]): string {
       "--reason-file",
       "--summary",
       "--evidence",
+      "--no-op-reason",
     ]),
   );
 }

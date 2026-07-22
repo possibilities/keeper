@@ -121,11 +121,21 @@ describe("done resolves the runtime flip to primary from a lane", () => {
   test("done-from-lane flips primary's overlay, never the lane's", () => {
     const { primary, lane, home, taskId } = makeScenario("planctl-wds-ok-");
 
-    const r = runCli(["done", taskId, "--summary", "shipped from the lane"], {
-      cwd: lane,
-      home,
-      env: ENV,
-    });
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "shipped from the lane",
+        "--no-op-reason",
+        "fixture: no code",
+      ],
+      {
+        cwd: lane,
+        home,
+        env: ENV,
+      },
+    );
     // Success proves done read PRIMARY's in_progress overlay — a lane-resolved
     // read would see no overlay (status todo) and fail "not in_progress".
     expect(r.code).toBe(0);
@@ -146,6 +156,8 @@ describe("done resolves the runtime flip to primary from a lane", () => {
         taskId,
         "--summary",
         "via project override",
+        "--no-op-reason",
+        "fixture: no code",
         "--project",
         primary,
       ],
@@ -162,11 +174,21 @@ describe("done resolves the runtime flip to primary from a lane", () => {
     const { primary, taskId } = makeScenario("planctl-wds-single-");
     const homeNoRoots = freshDir("planctl-wds-noroots-home-");
 
-    const r = runCli(["done", taskId, "--summary", "single project"], {
-      cwd: primary,
-      home: homeNoRoots,
-      env: ENV,
-    });
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "single project",
+        "--no-op-reason",
+        "fixture: no code",
+      ],
+      {
+        cwd: primary,
+        home: homeNoRoots,
+        env: ENV,
+      },
+    );
     expect(r.code).toBe(0);
     expect(runtimeStatus(primary, taskId)).toBe("done");
   });

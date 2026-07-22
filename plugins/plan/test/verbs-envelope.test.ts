@@ -160,11 +160,22 @@ describe("mutating verb plan_invocation", () => {
       home: project.home,
       env: SID,
     });
-    const r = runCli(["done", taskId, "--summary", "done", "--force"], {
-      cwd: project.root,
-      home: project.home,
-      env: SID,
-    });
+    const r = runCli(
+      [
+        "done",
+        taskId,
+        "--summary",
+        "done",
+        "--no-op-reason",
+        "no code",
+        "--force",
+      ],
+      {
+        cwd: project.root,
+        home: project.home,
+        env: SID,
+      },
+    );
     expect(r.code).toBe(0);
     const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,

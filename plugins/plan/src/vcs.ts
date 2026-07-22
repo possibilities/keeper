@@ -150,6 +150,14 @@ export interface PlanVcs {
    * repo without a lane, or a missing-ref error, is never dropped). */
   resolveRef(ref: string, repo: string): string | null;
 
+  /** True when `commit` is reachable from `base` (`git merge-base --is-ancestor
+   * <commit> <base>`, exit 0). FAILS CLOSED: a not-an-ancestor result (exit 1),
+   * an unresolvable commit / base, or any git error all read FALSE — the close
+   * ancestry gate treats anything it cannot PROVE reachable as unreachable, so an
+   * un-fanned-in branch or a rewritten evidence sha is never silently published.
+   * `commit` and `base` may be shas or ref names (HEAD, a lane branch). */
+  isAncestor(commit: string, base: string, repo: string): boolean;
+
   /** Full %H shas in `repo` carrying a confirmed `Task: <taskId>` trailer via the
    * commit_lookup technique (`git log --grep` prefilter +
    * `git interpret-trailers --parse` confirmation), newest-first. A clean miss is
@@ -394,6 +402,19 @@ export const realGitVcs: PlanVcs = {
     }
     const sha = result.stdout.trim();
     return sha.length > 0 ? sha : null;
+  },
+
+  isAncestor(commit, base, repo): boolean {
+    // `--end-of-options` guards our derived commit/base values (evidence shas,
+    // lane/rib refs, HEAD) against a leading-dash parse. Only exit 0 (proven
+    // ancestor) reads true; exit 1 (not an ancestor), 128 (bad object), or a
+    // missing binary all fold to false — fail-closed for the close gate.
+    return (
+      runReadGit(
+        ["merge-base", "--is-ancestor", "--end-of-options", commit, base],
+        repo,
+      ).exitCode === 0
+    );
   },
 
   trailerCommitShas(taskId, repo, ref): string[] {

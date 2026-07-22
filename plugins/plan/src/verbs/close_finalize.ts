@@ -89,6 +89,7 @@ import {
   AllReposBrokenError,
   type CommitGroupResult,
   findCommitGroups,
+  laneBranchFor,
 } from "../commit_lookup.ts";
 import { resolveEpicGlobally } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
@@ -115,6 +116,7 @@ import { resolvePlanSessionId } from "../session_id.ts";
 import { clearCloseMarker } from "../session_markers.ts";
 import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
+import { getVcs } from "../vcs.ts";
 import { parseYamlInput } from "../yaml_input.ts";
 import { runEpicClose } from "./epic_close.ts";
 import { runScaffold } from "./scaffold.ts";
@@ -1676,6 +1678,150 @@ export function integrateEpicBases(
   }
 }
 
+/** A done task whose landed code close cannot prove reachable from the composed
+ * base it is about to publish — the bounded receipt the abort names. */
+interface UnreachableTask {
+  task_id: string;
+  reason: "unreachable-branch" | "unreachable-commits" | "no-evidence";
+  /** The un-fanned-in `keeper/epic/<epic>--<task>` rib (unreachable-branch). */
+  branch?: string;
+  /** The recorded evidence commits not contained in the composed base
+   * (unreachable-commits). */
+  commits?: string[];
+}
+
+const MAX_UNREACHABLE_NAMED = 20;
+
+/** The evidence commit shas on a merged task's runtime `evidence` overlay —
+ * non-empty strings only (done stores `{commits, tests, prs}`; only commits
+ * attribute landed code). */
+function evidenceCommitsOf(task: Record<string, unknown>): string[] {
+  const ev = task.evidence;
+  if (ev === null || typeof ev !== "object" || Array.isArray(ev)) {
+    return [];
+  }
+  const commits = (ev as Record<string, unknown>).commits;
+  if (!Array.isArray(commits)) {
+    return [];
+  }
+  return commits.filter(
+    (c): c is string => typeof c === "string" && c.trim() !== "",
+  );
+}
+
+/** Verify every DONE code task's own code is reachable from the composed base
+ * about to be published, and ABORT the close (before publish) when any is not.
+ *
+ * For each done task, in its repo (`target_repo` ?? primary), the composed base
+ * is the epic lane branch `keeper/epic/<epic>` when it resolves there, else HEAD
+ * — IDENTICAL to the commit-set scan ref, so a trailer-scan commit is reachable
+ * by construction. A task passes when EITHER (a) it has at least one attributable
+ * commit (recorded evidence ∪ `Task:`-trailer scan ∪ an existing rib tip) AND
+ * every attributable commit is an ancestor of that base, OR (b) it carries an
+ * explicit typed no-op receipt (`no_op_reason`). An existing
+ * `keeper/epic/<epic>--<task>` rib whose tip is NOT an ancestor is positive proof
+ * the lane was never fanned in — offending even with empty evidence/trailers; an
+ * empty attributable set with no receipt is the silent-empty-success this gate
+ * refuses to publish. Fail-closed throughout: `isAncestor` treats anything it
+ * cannot prove reachable as unreachable. */
+function assertDoneTaskAncestry(
+  epicId: string,
+  stateCtx: ProjectContext,
+  primaryRepo: string,
+  format: OutputFormat | null,
+): void {
+  const vcs = getVcs();
+  const laneRef = laneBranchFor(epicId);
+  const offenders: UnreachableTask[] = [];
+  for (const task of loadTasksForEpic(stateCtx, epicId)) {
+    const taskId = task.id;
+    if (typeof taskId !== "string" || !isTaskId(taskId)) {
+      continue;
+    }
+    if (task.status !== "done") {
+      continue;
+    }
+    // (b) typed no-op receipt — a recorded reason, never an empty commits array.
+    const noOp = task.no_op_reason;
+    if (typeof noOp === "string" && noOp.trim() !== "") {
+      continue;
+    }
+    const repo = realpathOr(
+      (task.target_repo as string | null | undefined) || primaryRepo,
+    );
+    if (!vcs.isGitRepo(repo)) {
+      // A repo the scan cannot read cannot prove reachability. The fresh-hash /
+      // AllReposBroken guards already fail a wholly-broken scan set; a single
+      // unreadable repo here fails the tasks it owns closed rather than silently
+      // publishing them.
+      offenders.push({ task_id: taskId, reason: "no-evidence" });
+      continue;
+    }
+    const laneResolves = vcs.resolveRef(laneRef, repo) !== null;
+    const base = laneResolves ? laneRef : "HEAD";
+    const scanRef = laneResolves ? laneRef : undefined;
+    const trailerCommits = vcs.trailerCommitShas(taskId, repo, scanRef);
+    const evidenceCommits = evidenceCommitsOf(task);
+    const ribBranch = `${laneRef}--${taskId}`;
+    const ribTip = vcs.resolveRef(ribBranch, repo);
+
+    if (ribTip !== null && !vcs.isAncestor(ribTip, base, repo)) {
+      offenders.push({
+        task_id: taskId,
+        reason: "unreachable-branch",
+        branch: ribBranch,
+      });
+      continue;
+    }
+    const unreachableCommits = evidenceCommits.filter(
+      (sha) => !vcs.isAncestor(sha, base, repo),
+    );
+    if (unreachableCommits.length > 0) {
+      offenders.push({
+        task_id: taskId,
+        reason: "unreachable-commits",
+        commits: unreachableCommits,
+      });
+      continue;
+    }
+    if (
+      evidenceCommits.length === 0 &&
+      trailerCommits.length === 0 &&
+      ribTip === null
+    ) {
+      offenders.push({ task_id: taskId, reason: "no-evidence" });
+    }
+  }
+  if (offenders.length === 0) {
+    return;
+  }
+  const named = offenders.slice(0, MAX_UNREACHABLE_NAMED);
+  const summary = named
+    .map((o) => {
+      if (o.reason === "unreachable-branch") {
+        return `${o.task_id} (branch ${o.branch} not fanned in)`;
+      }
+      if (o.reason === "unreachable-commits") {
+        return `${o.task_id} (commits ${o.commits?.join(", ")} unreachable)`;
+      }
+      return `${o.task_id} (no landing evidence and no typed no-op receipt)`;
+    })
+    .join("; ");
+  const more =
+    offenders.length > named.length
+      ? ` (+${offenders.length - named.length} more)`
+      : "";
+  emitFinalizeError(
+    "TASK_ANCESTRY_UNVERIFIED",
+    `refusing to publish ${epicId}: ${offenders.length} done task(s) whose code ` +
+      `is not provably in the composed base — ${summary}${more}. Fan in the ` +
+      "missing branch/commits, or mark the task done with --no-op-reason " +
+      '"<why no code landed>", then re-run /plan:close.',
+    format,
+    { offending_tasks: offenders },
+  );
+}
+
 export interface CloseFinalizeArgs {
   epicId: string;
   project: string | null;
@@ -1760,7 +1906,9 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   if (gatedFollowup !== null) {
     if (gatedFollowup.status === "done") {
       // The follow-up landed — adopt it and close the source (the ordinary
-      // closed_with_followup terminal).
+      // closed_with_followup terminal). This publish path re-enters BEFORE the
+      // step-5 machinery, so it runs the per-task ancestry gate itself.
+      assertDoneTaskAncestry(epicId, stateCtx, primaryRepo, format);
       integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
       closeEpic(stateCtx, epicId);
       emitOutcome(
@@ -1871,6 +2019,14 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
       { stamped_hash: stampedHash, fresh_hash: freshHash },
     );
   }
+
+  // 5.5 Per-task ancestry gate — BEFORE any publish/scaffold. Every done task's
+  //     own code must be provably in the composed base (its lane branch or HEAD),
+  //     or carry a typed no-op receipt; an un-fanned-in rib or empty-evidence,
+  //     receiptless task aborts the close here, never publishing a tree missing a
+  //     task's code. Runs ahead of the fatal/follow-up branches so a verdict
+  //     authored over an incomplete tree cannot drive an irreversible close.
+  assertDoneTaskAncestry(epicId, stateCtx, primaryRepo, format);
 
   // 6. fatal verdict → halt. No close, no scaffold; the epic stays open.
   if (verdict.fatal === true) {

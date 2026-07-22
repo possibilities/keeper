@@ -650,7 +650,14 @@ describe("done leaves the marker", () => {
     expect(claim.code).toBe(0);
     stampMarker(epicId);
 
-    const r = run(["done", taskId, "--summary", "Test done"]);
+    const r = run([
+      "done",
+      taskId,
+      "--summary",
+      "Test done",
+      "--no-op-reason",
+      "no code",
+    ]);
     expect(r.code).toBe(0);
     expect(readEpic(epicId).last_validated_at).toBe(PRE_STAMP);
   });

@@ -565,6 +565,25 @@ export const fakeVcs: PlanVcs = {
     return null;
   },
 
+  isAncestor(commit, base, repo): boolean {
+    // Reachability in the fake IS a seeded commit's `refs` membership: the commit
+    // whose sha is `commit` is an ancestor of `base` iff it carries `base` among
+    // the refs that reach it (a lane-only commit lacking HEAD is NOT an ancestor of
+    // HEAD; a rib-only commit lacking the epic base is NOT an ancestor of it). An
+    // unseeded sha reads false — the same fail-closed default realGitVcs gives a
+    // bad object.
+    const state = repos.get(normRoot(repo));
+    if (!state) {
+      return false;
+    }
+    for (const c of state.sourceCommits) {
+      if (c.sha === commit) {
+        return c.refs.includes(base);
+      }
+    }
+    return false;
+  },
+
   trailerCommitShas(taskId, repo, ref): string[] {
     return matchingSourceShas(repoFor(repo), taskId, ref);
   },
