@@ -1423,6 +1423,35 @@ export function planTerminalSessionClaimReleases(
     .all(Math.max(0, Math.floor(limit))) as TerminalSessionDispatchClaimRow[];
 }
 
+/**
+ * The recycle-safe identity verdict for a RECORDED process witness whose
+ * start-time component may be missing. With a start-time it is the full
+ * {@link recordedProcessIdentity} witness. With a bare pid — SessionStart's
+ * start-time scrape can fail, leaving a LIVE pid with a NULL/empty `start_time`
+ * (the seed sweep's Q7 rule holds exactly that shape as inconclusive) — it
+ * degrades to a bare existence probe that reports `gone` ONLY on positive ESRCH
+ * evidence. A live, EPERM-blocked, or reused pid stays `inconclusive` (never
+ * `matching`: a bare pid cannot confirm identity), so a reap gate over-holds
+ * rather than reaping a live-but-unwitnessed process — the safe side.
+ */
+export function recordedOrBarePidIdentity(
+  pid: number,
+  startTime: string | null,
+  deps: { signalZero?: (pid: number) => void } = {},
+): RecordedProcessIdentityVerdict {
+  if (startTime != null && startTime.length > 0) {
+    return recordedProcessIdentity(pid, startTime, deps);
+  }
+  const signalZero =
+    deps.signalZero ?? ((target: number) => process.kill(target, 0));
+  try {
+    signalZero(pid);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return "gone";
+  }
+  return "inconclusive";
+}
+
 export function terminalSessionClaimIsReleaseable(
   db: Database,
   row: Pick<
@@ -1431,8 +1460,8 @@ export function terminalSessionClaimIsReleaseable(
   >,
   probeIdentity: (
     pid: number,
-    startTime: string,
-  ) => RecordedProcessIdentityVerdict = recordedProcessIdentity,
+    startTime: string | null,
+  ) => RecordedProcessIdentityVerdict = recordedOrBarePidIdentity,
 ): boolean {
   const gated = db
     .query(
@@ -1469,18 +1498,15 @@ export function terminalSessionClaimIsReleaseable(
   // releases ONLY on positive death evidence (`gone` — ESRCH or a start-time
   // recycle); a `matching` (live) or `inconclusive` (uncertain) identity HOLDS the
   // claim, so a live-or-inconclusive worker is never reaped-then-redispatched
-  // (fail-closed, mirroring {@link decideDispatchClearLiveness}). A row with no
-  // process witness (NULL pid / start_time — terminal by construction, and the
-  // seed sweep's own pidless reap already proved it unwatchable) has nothing to
-  // hold a live process against, so it falls back to the terminal-state trust.
-  if (
-    gated.pid != null &&
-    gated.start_time != null &&
-    gated.start_time.length > 0
-  ) {
-    return probeIdentity(gated.pid, gated.start_time) === "gone";
-  }
-  return true;
+  // (fail-closed, mirroring {@link decideDispatchClearLiveness}). The fallback is
+  // narrowed to a TRULY pidless row (no pid at all — terminal by construction, the
+  // seed sweep's own pidless reap already proved it unwatchable): only THAT falls
+  // back to the terminal-state trust. A row that carries a pid but a missing/empty
+  // start_time (a live process whose start-time scrape failed) is NEVER released on
+  // trust — `recordedOrBarePidIdentity` degrades it to a bare-pid probe that
+  // releases only on ESRCH, holding a live-or-reused pid.
+  if (gated.pid == null) return true;
+  return probeIdentity(gated.pid, gated.start_time) === "gone";
 }
 
 /**
@@ -8077,6 +8103,14 @@ export const PROVIDER_LEG_CASCADE_POLL_MS = 250;
 export interface ProviderLegCascadeDeps {
   nowSec(): number;
   probe(pid: number, startTime: string): HarnessProcessObservation;
+  /** Recycle-safe recorded-identity witness for the WRAPPER process (pid +
+   *  possibly-missing start_time). `gone` is positive death; `matching` /
+   *  `inconclusive` HOLD the cascade. Distinct from `probe` (which is the
+   *  harness-command-aware LEG classifier). */
+  probeRecordedIdentity(
+    pid: number,
+    startTime: string | null,
+  ): RecordedProcessIdentityVerdict;
   signal(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
   listPanes: TmuxPaneOps["listPanes"];
   killWindow: TmuxPaneOps["killWindow"];
@@ -8109,6 +8143,8 @@ type ProviderLegCascadeRow = {
   leg_state: string | null;
   current_pane_generation: string | null;
   wrapper_state: string;
+  wrapper_pid: number | null;
+  wrapper_start_time: string | null;
   plan_verb: string | null;
   plan_ref: string | null;
   claim_attempt_id: number | null;
@@ -8284,6 +8320,37 @@ function providerLegProbeVerdict(
   });
 }
 
+/**
+ * Recycle-safe wrapper witness, re-read from the CURRENT `jobs` projection (never
+ * the selection snapshot — an earlier row's mint/pump this sweep may have folded a
+ * resume SessionStart for this wrapper). Returns true only when the wrapper is
+ * PROVABLY gone; a revived (non-terminal) wrapper, or one whose recorded
+ * (pid, start_time) still probes live/inconclusive, returns false so the caller
+ * HOLDS. A terminal but truly-pidless wrapper (no pid to witness) falls back to the
+ * terminal-state trust — the seed sweep's own pidless reap already proved it
+ * unwatchable. This is the wrapper-side analogue of the terminal-session claim
+ * gate: a falsely-terminal swap-routed wrapper (its jobs row reaped to `killed` by
+ * a watchdog recycle while its process lives) must never cascade its leg down or
+ * release its own claim.
+ */
+function wrapperWitnessGoneNow(
+  db: Database,
+  row: Pick<ProviderLegCascadeRow, "wrapper_job_id">,
+  deps: ProviderLegCascadeDeps,
+): boolean {
+  const w = db
+    .query("SELECT state, pid, start_time FROM jobs WHERE job_id = ?")
+    .get(row.wrapper_job_id) as {
+    state: string;
+    pid: number | null;
+    start_time: string | null;
+  } | null;
+  if (w == null) return true; // no wrapper row — nothing live to protect
+  if (w.state !== "ended" && w.state !== "killed") return false; // revived → HOLD
+  if (w.pid == null) return true; // terminal + truly pidless → terminal-state trust
+  return deps.probeRecordedIdentity(w.pid, w.start_time) === "gone";
+}
+
 async function teardownProviderLegWindow(
   deps: ProviderLegCascadeDeps,
   row: ProviderLegCascadeRow,
@@ -8380,7 +8447,8 @@ function selectProviderLegCascadeRows(
               o.backend_exec_session_id, o.state AS ownership_state,
               lj.harness, lj.state AS leg_state,
               lj.backend_exec_generation_id AS current_pane_generation,
-              w.state AS wrapper_state, w.plan_verb, w.plan_ref,
+              w.state AS wrapper_state, w.pid AS wrapper_pid,
+              w.start_time AS wrapper_start_time, w.plan_verb, w.plan_ref,
               dc.attempt_id AS claim_attempt_id, dc.state AS claim_state,
               dc.session_id AS claim_session_id,
               pc.state AS cascade_state, pc.term_sent_at, pc.kill_not_before,
@@ -8481,6 +8549,16 @@ function releaseSettledProviderLegAttempts(
     ) {
       continue;
     }
+    // Recycle-safe wrapper witness on the RELEASE. The claim tuple check above
+    // proves this is the wrapper's OWN terminal-attempt claim (a supersede can't
+    // pass it), so releasing it is terminal-wrapper authority — but a terminal jobs
+    // state is not proof the OS wrapper is gone. Re-probe (current projection) and
+    // HOLD the release when the wrapper is revived or still probes live/inconclusive,
+    // so a falsely-terminal swap-routed wrapper never has its claim dropped out from
+    // under it (the double-mint).
+    if (!wrapperWitnessGoneNow(db, row, deps)) {
+      continue;
+    }
     mintProviderLegCascadeEvent(
       db,
       deps,
@@ -8491,6 +8569,15 @@ function releaseSettledProviderLegAttempts(
         id: row.plan_ref,
         expected_attempt_id: row.wrapper_dispatch_attempt_id,
         session_id: row.wrapper_job_id,
+        // Fold-time terminal fence: stamp `terminal_session_only` so
+        // foldDispatchClaimReleased re-verifies the wrapper's jobs row is STILL
+        // terminal at fold time. An already-persisted lower-id resume SessionStart
+        // that folds before this release makes the fold inert (the claim stays
+        // bound), so an action-time-gone wrapper that revives mid-flight keeps its
+        // claim. Composes with the producer probe above; liveness never enters the
+        // fold. The settled release is terminal-wrapper authority (the superseded
+        // path already fails the current-claim tuple check), so the fence is exact.
+        terminal_session_only: true,
       },
     );
     if (row.wrapper_state === "ended" || row.wrapper_state === "killed") {
@@ -8526,11 +8613,27 @@ export async function runProviderLegCascadeSweep(
     return paneSweep;
   };
   for (const row of rows) {
-    const ownerTerminalOrSuperseded =
-      row.wrapper_state === "ended" ||
-      row.wrapper_state === "killed" ||
-      (row.claim_attempt_id != null &&
-        row.claim_attempt_id > row.wrapper_dispatch_attempt_id);
+    const wrapperTerminal =
+      row.wrapper_state === "ended" || row.wrapper_state === "killed";
+    const superseded =
+      row.claim_attempt_id != null &&
+      row.claim_attempt_id > row.wrapper_dispatch_attempt_id;
+    const ownerTerminalOrSuperseded = wrapperTerminal || superseded;
+    // Recycle-safe wrapper witness gate. When the cascade is driven SOLELY by the
+    // wrapper's terminal jobs projection (not a supersede — a newer attempt
+    // legitimately orphans the leg regardless of the old wrapper's liveness),
+    // re-probe the wrapper's recorded identity and HOLD the ENTIRE row this sweep —
+    // no arm, no leg TERM/KILL, no settle, no claim release — unless the wrapper is
+    // provably gone. A falsely-terminal swap-routed wrapper (jobs reaped to `killed`
+    // by a watchdog recycle while its process lives) must not tear down its leg or
+    // drop its claim; the next sweep re-evaluates once it is truly gone.
+    if (
+      wrapperTerminal &&
+      !superseded &&
+      !wrapperWitnessGoneNow(db, row, deps)
+    ) {
+      continue;
+    }
     if (
       !ownerTerminalOrSuperseded &&
       row.ownership_state === "live" &&
@@ -8659,6 +8762,20 @@ export async function runProviderLegCascadeSweep(
     }
     if (adjacent !== "target") {
       await blockProviderLegCascade(db, deps, row, adjacent);
+      continue;
+    }
+    // Syscall-adjacent WRAPPER recheck. The write-ahead mint's pump may have folded
+    // a lower-id resume SessionStart that revived the wrapper (or re-stamped its
+    // generation) between selection and here, so the leg we are about to signal may
+    // now belong to the resumed wrapper. The adjacent LEG probe above only witnesses
+    // the leg — so re-read the CURRENT wrapper state too, and on a revived or
+    // live/inconclusive wrapper deliver NO TERM/KILL. A supersede is exempt: a newer
+    // attempt orphans this leg regardless of the old wrapper's liveness.
+    if (
+      wrapperTerminal &&
+      !superseded &&
+      !wrapperWitnessGoneNow(db, row, deps)
+    ) {
       continue;
     }
     try {
@@ -10284,6 +10401,8 @@ function startDaemonWithExitAttribution(
       const result = await runProviderLegCascadeSweep(db, {
         nowSec: () => Date.now() / 1000,
         probe: (pid, startTime) => probeHarnessProcess(pid, startTime),
+        probeRecordedIdentity: (pid, startTime) =>
+          recordedOrBarePidIdentity(pid, startTime),
         signal: (pid, signal) => process.kill(pid, signal),
         listPanes: () => providerLegPaneOps.listPanes(),
         killWindow: (paneId) => providerLegPaneOps.killWindow(paneId),

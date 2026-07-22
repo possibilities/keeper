@@ -190,6 +190,7 @@ import {
   readTaskBlockedReason,
   readWorkerProviderPin,
   reclassifyPoisonDeadLetter,
+  recordedOrBarePidIdentity,
   recoverOneDeadLetter,
   repairCheckoutDirty,
   repairReasonFor,
@@ -6652,6 +6653,68 @@ test("double-mint structurally prevented: the planner surfaces a reaped-but-live
     true,
   );
   db.close();
+});
+
+test("terminalSessionClaimIsReleaseable: a pid-bearing owner with a MISSING start_time is NOT released on trust — only a bare-pid probe may release it", () => {
+  const { db } = freshMemDb();
+  // SessionStart's start-time scrape can fail on a genuinely-live process,
+  // leaving pid present + start_time NULL. The old fallback released this on
+  // trust (any missing witness component => release); the narrowed fallback
+  // holds it unless the injected bare-pid probe proves it gone.
+  seedTerminalSessionClaim(db, {
+    id: "livepid-nostart.1",
+    attemptId: 304,
+    sessionId: "sess-livepid-nostart",
+    jobState: "killed",
+    pid: 6000,
+    startTime: null,
+  });
+  const row = {
+    verb: "work",
+    id: "livepid-nostart.1",
+    attempt_id: 304,
+    session_id: "sess-livepid-nostart",
+  };
+  // A live (or uncertain) bare-pid probe HOLDS — no trust release.
+  expect(terminalSessionClaimIsReleaseable(db, row, () => "inconclusive")).toBe(
+    false,
+  );
+  // Only positive ESRCH evidence (a `gone` verdict) releases.
+  expect(terminalSessionClaimIsReleaseable(db, row, () => "gone")).toBe(true);
+  db.close();
+});
+
+test("recordedOrBarePidIdentity: a start-time witness delegates; a bare pid reports gone ONLY on ESRCH and never matching", () => {
+  const esrch = (): never => {
+    const err = new Error("no such process") as NodeJS.ErrnoException;
+    err.code = "ESRCH";
+    throw err;
+  };
+  const eperm = (): never => {
+    const err = new Error("operation not permitted") as NodeJS.ErrnoException;
+    err.code = "EPERM";
+    throw err;
+  };
+  // Bare pid (missing / empty start_time): existence probe only.
+  expect(recordedOrBarePidIdentity(6000, null, { signalZero: esrch })).toBe(
+    "gone",
+  );
+  expect(recordedOrBarePidIdentity(6000, "", { signalZero: esrch })).toBe(
+    "gone",
+  );
+  // Alive (signal succeeds) or EPERM-blocked or reused → inconclusive, never
+  // matching: a bare pid cannot confirm identity, so a reap gate over-holds.
+  expect(recordedOrBarePidIdentity(6000, null, { signalZero: () => {} })).toBe(
+    "inconclusive",
+  );
+  expect(recordedOrBarePidIdentity(6000, null, { signalZero: eperm })).toBe(
+    "inconclusive",
+  );
+  // A present start-time witness delegates to the full recorded-identity witness
+  // (deps forwarded): an ESRCH pid there is gone without any bare-pid fallback.
+  expect(
+    recordedOrBarePidIdentity(1234, "linux:999", { signalZero: esrch }),
+  ).toBe("gone");
 });
 
 test("buildRetryDispatchResultMessage: refused_live, refused_identity, and cleared replies are explicit", () => {

@@ -127,6 +127,7 @@ function deps(killed: string[], panes: PaneInfo[]): ProviderLegCascadeDeps {
       observedStartTime: "linux:500",
       command: "/opt/bin/pi\0--resume\0leg",
     }),
+    probeRecordedIdentity: () => "gone",
     signal: () => {},
     listPanes: async () => panes,
     killWindow: async (paneId) => {

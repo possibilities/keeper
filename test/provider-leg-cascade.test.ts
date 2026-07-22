@@ -172,6 +172,10 @@ function deps(overrides: Partial<ProviderLegCascadeDeps> = {}) {
   } = {
     nowSec: () => now,
     probe: () => matching,
+    // Default: the wrapper is provably gone (the terminal-wrapper cascades these
+    // tests exercise assume a genuinely-dead wrapper). A test that models a
+    // falsely-terminal or revived wrapper overrides this.
+    probeRecordedIdentity: () => "gone",
     signal: (pid, signal) => signals.push({ pid, signal }),
     listPanes: async () => [
       {
@@ -716,4 +720,135 @@ test("closing posture orders terminal proof before cascade and release", async (
   expect(id("ProviderLegExitConfirmed")).toBeLessThan(
     id("DispatchClaimReleased"),
   );
+});
+
+test("wrapper witness gates the cascade: a live/inconclusive wrapper HOLDS arm+signal+release; a gone wrapper proceeds", async () => {
+  seedAttempt({
+    task: "fn-1385-falsely-terminal.1",
+    attempt: 20,
+    wrapper: "wrapper-20",
+    wrapperState: "killed",
+    legs: [{ id: "leg-20", session: "leg-session-20", pid: 600 }],
+  });
+  const claimState = () =>
+    db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 20").get();
+
+  // Falsely-terminal wrapper: jobs reads killed, but its recorded identity still
+  // probes live. Zero arm, zero signal, zero release across arm+grace+kill windows.
+  const held = deps({ probeRecordedIdentity: () => "matching" });
+  await runProviderLegCascadeSweep(db, held);
+  await runProviderLegCascadeSweep(db, held);
+  held.advance(PROVIDER_LEG_TERM_GRACE_SEC + 1);
+  await runProviderLegCascadeSweep(db, held);
+  expect(cascade("leg-20")).toBeNull();
+  expect(held.signals).toEqual([]);
+  expect(claimState()).toEqual({ state: "bound" });
+
+  // An inconclusive (uncertain) wrapper witness holds too — over-holding is safe.
+  const uncertain = deps({ probeRecordedIdentity: () => "inconclusive" });
+  await runProviderLegCascadeSweep(db, uncertain);
+  expect(cascade("leg-20")).toBeNull();
+  expect(uncertain.signals).toEqual([]);
+  expect(claimState()).toEqual({ state: "bound" });
+
+  // Provably gone: the cascade proceeds (arm, then TERM the leg).
+  const proceed = deps({ probeRecordedIdentity: () => "gone" });
+  await runProviderLegCascadeSweep(db, proceed);
+  expect(cascade("leg-20")).toMatchObject({ state: "armed" });
+  await runProviderLegCascadeSweep(db, proceed);
+  expect(proceed.signals).toEqual([{ pid: 600, signal: "SIGTERM" }]);
+});
+
+test("cascade release stamps terminal_session_only; its fold is inert when a lower-id wrapper resume folds first", async () => {
+  seedAttempt({
+    task: "fn-1385-fence.1",
+    attempt: 30,
+    wrapper: "wrapper-30",
+    wrapperState: "killed",
+    legs: [{ id: "leg-30", session: "leg-session-30", pid: 700 }],
+  });
+  const claimState = () =>
+    db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 30").get();
+  // Settle the leg fast: a gone leg probe confirms it; a gone wrapper witness lets
+  // the release proceed at the producer. The moment the leg confirms — the same
+  // sweep in which the release is minted — persist a LOWER-id wrapper resume
+  // SessionStart, UNFOLDED (the wrapper actually revived on a new OS process even
+  // though its projection still reads killed). It stays unfolded until the release
+  // mint's own drain, which then folds it FIRST (jobs → stopped), so the
+  // terminal_session_only release fold re-checks terminality and no-ops.
+  let injected = false;
+  const d = deps({
+    probeRecordedIdentity: () => "gone",
+    probe: () => ({
+      identity: "gone",
+      identityReason: "esrch",
+      observedStartTime: null,
+      command: null,
+    }),
+  });
+  d.afterMint = () => {
+    drainAll();
+    if (!injected && cascade("leg-30")?.state === "confirmed") {
+      injected = true;
+      event({
+        hook: "SessionStart",
+        session: "wrapper-30",
+        pid: 9999,
+        startTime: "linux:99990",
+        spawnName: "work::fn-1385-fence.1",
+        harness: "claude",
+        data: { dispatch_attempt_id: 30 },
+      });
+      // Deliberately NOT drained here — the release mint's afterMint drains it
+      // (lower id) ahead of the release event (higher id).
+    }
+  };
+  await runProviderLegCascadeSweep(db, d); // arm
+  await runProviderLegCascadeSweep(db, d); // leg gone → settle → confirmed → (release minted, then inert on fold)
+  const release = db
+    .query(
+      `SELECT data FROM events WHERE hook_event = 'DispatchClaimReleased'
+         AND session_id = 'wrapper-30' ORDER BY id DESC LIMIT 1`,
+    )
+    .get() as { data: string } | null;
+  expect(release).not.toBeNull();
+  expect(
+    JSON.parse((release as { data: string }).data).terminal_session_only,
+  ).toBe(true);
+  expect(claimState()).toEqual({ state: "bound" });
+});
+
+test("cascade syscall-adjacent wrapper recheck: a resume folded inside the write-ahead pump cancels the leg signal", async () => {
+  seedAttempt({
+    task: "fn-1385-adjacent.1",
+    attempt: 40,
+    wrapper: "wrapper-40",
+    wrapperState: "killed",
+    legs: [{ id: "leg-40", session: "leg-session-40", pid: 800 }],
+  });
+  let revived = false;
+  const d = deps({ probeRecordedIdentity: () => "gone" });
+  d.afterMint = () => {
+    drainAll();
+    if (!revived && cascade("leg-40")?.term_sent_at != null) {
+      revived = true;
+      // A lower-id wrapper resume folds inside the write-ahead pump — the wrapper
+      // is alive again before the syscall-adjacent recheck runs.
+      event({
+        hook: "SessionStart",
+        session: "wrapper-40",
+        pid: 9999,
+        startTime: "linux:99990",
+        spawnName: "work::fn-1385-adjacent.1",
+        harness: "claude",
+        data: { dispatch_attempt_id: 40 },
+      });
+      drainAll();
+    }
+  };
+  await runProviderLegCascadeSweep(db, d); // arm
+  await runProviderLegCascadeSweep(db, d); // write-ahead term_sent → resume folds → recheck cancels signal
+  expect(d.signals).toEqual([]);
+  // The write-ahead progressed term_sent durably, but zero TERM/KILL was delivered.
+  expect(cascade("leg-40")?.term_sent_at).not.toBeNull();
 });
