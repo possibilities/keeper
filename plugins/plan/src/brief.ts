@@ -14,6 +14,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
+import { sourceStalenessWarning } from "./project.ts";
 import { atomicWriteRaw, nowIso, serializeStateJson } from "./store.ts";
 
 /** Brief schema version. Integer, starts at 1; additive-only within a version. */
@@ -80,10 +81,13 @@ export interface BriefInputs {
   dataDir: string;
 }
 
-/** Build the brief dict from already-resolved inputs. Pure: does no discovery
- * or project resolution (callers pass resolved inputs). `snippet_context` is
- * always "" (present, not omitted) so the key set is stable. Mirrors
- * assemble_brief. */
+/** Build the brief dict from already-resolved inputs. Does no project
+ * resolution (callers pass resolved inputs), but is target-aware: it derives the
+ * `source_staleness_warning` from the target/state pair (the ONE seam claim and
+ * worker-resume share, so the persisted brief and both envelopes carry an
+ * identical warning). `snippet_context` is always "" (present, not omitted) so
+ * the key set is stable. `source_staleness_warning` is likewise a stable key —
+ * null on a non-lane target. Mirrors assemble_brief. */
 export function assembleBrief(inputs: BriefInputs): Record<string, unknown> {
   return {
     schema_version: BRIEF_SCHEMA_VERSION,
@@ -98,6 +102,10 @@ export function assembleBrief(inputs: BriefInputs): Record<string, unknown> {
     task_spec_md: readSpecMd(inputs.dataDir, inputs.taskId),
     epic_spec_md: readSpecMd(inputs.dataDir, inputs.epicId),
     glossary_md: readGlossaryMd(inputs.targetRepo),
+    source_staleness_warning: sourceStalenessWarning(
+      inputs.targetRepo,
+      inputs.stateRepo,
+    ),
     snippet_context: "",
   };
 }

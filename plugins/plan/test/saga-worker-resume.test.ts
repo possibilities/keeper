@@ -29,6 +29,7 @@ import {
   gitHeadSha,
   gitInit,
   gitLogCount,
+  parseCliOutput,
   runCli,
   scaffoldEpic,
   seedRuntime,
@@ -157,6 +158,64 @@ describe("worker resume", () => {
     expect(brief.state_repo).toBe(mainRepo);
     expect(brief.primary_repo).toBe(mainRepo);
     expect(brief.target_repo).toBe(lane);
+  });
+
+  test("Gap 3: claim → worker resume carries a byte-equivalent source-staleness warning (envelope + brief)", () => {
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+    const lane = getLane();
+    const mainRepo = realpathSync(proj.root);
+
+    // Canonical worktree shape: claim from main with --project + the lane env.
+    const claimed = runCli(["claim", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(claimed.code).toBe(0);
+    const claimWarning = parseCliOutput(claimed.stdout)
+      .source_staleness_warning as string;
+    expect(claimWarning).toContain(lane);
+    expect(claimWarning).toContain(mainRepo);
+
+    // Resume regenerates the brief; the warning must survive byte-equivalent in
+    // BOTH the re-persisted brief AND the resume envelope, naming the same two
+    // authorities (the lane and the state repo).
+    const resumed = runCli(["worker", "resume", taskId], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { KEEPER_PLAN_WORKTREE: lane },
+    });
+    expect(resumed.code).toBe(0);
+    const resumeWarning = envelope(resumed.stdout)
+      .source_staleness_warning as string;
+    expect(resumeWarning).toBe(claimWarning);
+    expect(resumeWarning).toContain(lane);
+    expect(resumeWarning).toContain(mainRepo);
+    const brief = JSON.parse(
+      readFileSync(briefPath(proj.root, taskId), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(brief.source_staleness_warning).toBe(claimWarning);
+    expect(resumed.stderr).toContain("may predate");
+  });
+
+  test("Gap 1: worker resume honors --project, routing state to the named repo", () => {
+    // An explicit --project resolves state to that repo (the ISSUE-25 belt) and
+    // still emits a well-formed single-JSON envelope.
+    const proj = getProj();
+    const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
+    const taskId = taskIds[0] as string;
+
+    const r = runCli(["worker", "resume", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const payload = envelope(r.stdout);
+    expect(payload.success).toBe(true);
+    expect(payload.task_id).toBe(taskId);
+    expect(payload.primary_repo).toBe(realpathSync(proj.root));
   });
 
   test("read-only: regenerating the brief lands no commit", () => {

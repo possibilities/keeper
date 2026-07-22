@@ -177,6 +177,34 @@ describe("Claude worker cohort compiler", () => {
     expect(verify(fx).ok).toBe(true);
   });
 
+  test("renders the state-repo pin on every post-claim plan op and the reworded lane rule", () => {
+    const fx = fixture();
+    const result = compile(fx);
+    const rendered = readFileSync(
+      join(fx.targetDir, result.outputs[0]?.output ?? ""),
+      "utf8",
+    );
+    // Gap 1: the ISSUE-25 belt — the state repo is pinned explicitly on the
+    // worker's block / done / show / find-task-commit invocations.
+    expect(rendered).toContain(
+      'block $TASK_ID --project "$PRIMARY_REPO" --reason',
+    );
+    expect(rendered).toContain(
+      'done $TASK_ID --project "$PRIMARY_REPO" --summary',
+    );
+    expect(rendered).toContain('show $TASK_ID --project "$PRIMARY_REPO"');
+    expect(rendered).toContain(
+      'find-task-commit $TASK_ID --project "$PRIMARY_REPO"',
+    );
+    // Gap 3 / Gap 4: the reworded rule reads the brief's staleness field,
+    // verifies against the TARGET repo (state repo is NOT source authority), and
+    // defers a base refresh to the producer.
+    expect(rendered).toContain("source_staleness_warning");
+    expect(rendered).toContain("TARGET repo's own local default/main checkout");
+    expect(rendered).toContain("base freshness is producer-owned");
+    expect(rendered).toContain("state repo, which is STATE authority only");
+  });
+
   test("rejects rendered launch frontmatter that disagrees with computed cells", () => {
     const cases: Array<[string, string, RegExp]> = [
       [

@@ -21,7 +21,10 @@ import { emitMutating, emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import { tryResolveOwningProjectForId } from "../project.ts";
+import {
+  annotateIdReadVantage,
+  tryResolveOwningProjectForId,
+} from "../project.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
 
 /** Emit a typed refine-context error envelope and exit 1. No invocation. */
@@ -62,6 +65,11 @@ export function runRefineContext(opts: {
   if (!isEpicId(epicId)) {
     emitRefineError("BAD_EPIC_ID", `Invalid epic ID: ${epicId}`, format);
   }
+
+  // Surface the weaker-vantage note the id-bearing resolution would drop (a lane
+  // cwd keeps cwd resolution for a lane_no_state / inconclusive vantage but never
+  // annotates). No-op under --project or a non-lane cwd.
+  annotateIdReadVantage(project);
 
   // Cwd-then-global owning-project resolution via the non-emitting resolver, so
   // not-found / ambiguous map to refine-context's OWN typed EPIC_NOT_FOUND

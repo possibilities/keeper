@@ -150,7 +150,9 @@ for (const inRoots of [true, false]) {
         env: laneEnv(lane),
       });
       expect(r.code).toBe(0);
-      const payload = parseCliOutput(r.output);
+      // A lane-target claim now writes a source-staleness warning to stderr, so
+      // parse the JSON envelope off stdout alone.
+      const payload = parseCliOutput(r.stdout);
       expect(payload.success).toBe(true);
 
       // STATE landed in primary; the lane never gained an overlay.

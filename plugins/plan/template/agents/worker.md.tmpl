@@ -89,17 +89,17 @@ Then load runtime state:
 keeper session state
 ```
 
-From `keeper session state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID` only if you need the runtime status — usually you don't.
+From `keeper session state` note `status_porcelain` (uncommitted files), `head_sha`, and `branch`. Use `$PLAN_CLI show $TASK_ID --project "$PRIMARY_REPO"` only if you need the runtime status — usually you don't.
 
 **Never create or switch branches, and never mutate `git stash`.** Work in place on the branch that was current when you launched; never run `git checkout -b` / `git switch -c` / `git branch <name>` / `git worktree add`, and never switch to another branch. Never run mutating `git stash` — refs/stash is one repo-global stack shared by every sibling worktree and the human's checkout (only list/show/create are allowed); for file-level undo use `git restore <path>`, to park work make a temp commit. Branch and stash management are out of scope — the keeper branch-guard hook hard-blocks both. To answer "is this test failure pre-existing at my base commit, or did I cause it?" the sanctioned move is `keeper baseline <base sha> --wait` — key it on the `head_sha` your Phase 1 `keeper session state` reported at launch — never a stash-and-rerun.
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the plan envelope; you do not need to chdir for them.
 
-**Lane source may lag the state repo.** When you work inside a worktree lane (your `TARGET_REPO` is a `keeper/epic/*` lane distinct from `PRIMARY_REPO`), that lane's committed SOURCE may predate main — a file or symbol you can't find may simply not be in the lane yet. Before you conclude that cited source is absent, verify or refresh it against the state repo; never trust an absence-of-code finding off an unrefreshed lane. Plan STATE is already authoritative from a lane: every plan verb resolves state to `PRIMARY_REPO` for you, and passing `--project "$PRIMARY_REPO"` just makes that explicit. `KEEPER_PLAN_WORKTREE` keeps governing source-commit derivation either way — do not unset or override it. Prefer the `--file <path>` form over a heredoc whenever a plan verb (e.g. an audit submission) takes long content, so nothing truncates.
+**Lane source may lag; the state repo is NOT source authority.** When you work inside a worktree lane (your `TARGET_REPO` is a `keeper/epic/*` lane distinct from `PRIMARY_REPO`), that lane's committed SOURCE may predate its base — a file or symbol you can't find may simply not be in the lane yet. Your brief's `source_staleness_warning` field is non-null exactly when this risk applies: READ it and act on it. Before you conclude that cited source is absent, verify it against the TARGET repo's own local default/main checkout — NOT the state repo, which is STATE authority only (in multi-repo work it is often a DIFFERENT git repository than your source). On confirmed staleness, STOP and defer for a producer base refresh — you NEVER merge, pull, rebase, or otherwise refresh the lane yourself (base freshness is producer-owned). `KEEPER_PLAN_WORKTREE` keeps governing source-commit derivation — do not unset or override it. Every post-claim plan op MUST carry `--project "$PRIMARY_REPO"` explicitly: plan STATE resolves to `PRIMARY_REPO` for you, but the pin is the required belt for when lane proof is inconclusive — pass it on every `show` / `find-task-commit` / `block` / `done` (and any other plan verb) you run. Prefer the `--file <path>` form over a heredoc whenever a plan verb (e.g. an audit submission) takes long content, so nothing truncates.
 
 Parse the task spec for what matters: **Acceptance** (the bar you must clear), **Approach** (hints), **Investigation targets** (files to look at), **Files** (expected paths). The epic's `## Quick commands` are smoke tests you'll run later.
 
-**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper plan find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
+**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper plan find-task-commit $TASK_ID --project "$PRIMARY_REPO"` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
 
 - **Source commit already shipped** → skip Phases 2–4. Verify cheaply: read the predecessor commit's diff (`git show <sha>`) and run the task-targeted tests only (scope from the task `Files:` list — see Phase 3). The predecessor's commit is your confidence anchor; do not re-read every file and do not open with a fresh full-suite pass (one full pass stays available under the Phase 3 cap if the targeted run raises doubt). If the diff and targeted tests cover the acceptance, jump to Phase 5. Partial coverage → continue from Phase 3 against the existing tree for the uncovered acceptance items. If the targeted tests fail in code you did not write, treat it as your task's code and fix it within budget only when the failure sits on this task's acceptance surface; otherwise consult `keeper baseline <base sha> --wait` before you classify it — the baseline answers "red at this sha in a healthy environment", so a failure green there but red in your worktree is your environment, not the base, while a baseline-confirmed pre-existing red is `BLOCKED: SHARED_BASE_BROKEN` naming the repo, base sha, failing command/test, and suspected commit when known (genuine upstream-task dependencies still emit `BLOCKED: DEPENDENCY_BLOCKED`).
 - **Uncommitted work in `status_porcelain`** → continue from Phase 3 against the existing tree. When BOTH a predecessor commit and uncommitted work exist, this branch wins — work against the tree.
@@ -126,7 +126,7 @@ If the spec has neither block, skip Phase 1.5.
 An audit-flagged task's done-latch parks for a per-task audit between your commit and the done-stamp, so dependents never build on unreviewed drift. After Phase 3 (tests green) and Phase 4 (source commit landed), do NOT run Phase 5. Instead block yourself with an `AUDIT_READY` reason naming your commit's short sha, then end your turn:
 
 ```bash
-$PLAN_CLI block $TASK_ID --reason "AUDIT_READY: <short-sha> committed; holding for per-task audit"
+$PLAN_CLI block $TASK_ID --project "$PRIMARY_REPO" --reason "AUDIT_READY: <short-sha> committed; holding for per-task audit"
 ```
 
 `<short-sha>` is your `Task: $TASK_ID`-trailered source commit (from the `keeper commit-work` result, or `git log -1 --format=%h --grep "Task: $TASK_ID"`). The reason MUST begin with the literal `AUDIT_READY:` category token — the orchestrator and the stop-guard key on it. `keeper plan block` writes runtime state only (no commit) and clears your session marker; both are expected.
@@ -140,7 +140,7 @@ Then END THE TURN. Do not stamp done, do not keep working. The orchestrator obse
 The stamp that closes the task (Phase 6 verifies, then yields). `keeper plan done` patches the spec, emits a `plan_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.keeper/` state commit (commit #2 of the pair) lands the moment the verb returns success.
 
 ```bash
-$PLAN_CLI done $TASK_ID --summary "<1-2 sentence summary>"
+$PLAN_CLI done $TASK_ID --project "$PRIMARY_REPO" --summary "<1-2 sentence summary>"
 ```
 
 The invocation above is complete — substitute the literal `PLAN_CLI` and task id from your launch header (they are notation, not shell environment references), then run it as-is. Running `keeper plan done --help` first is a wasted call. `done` server-derives your `Task: $TASK_ID` landing commit and records it as evidence, so a bare `--summary` is all a normal close-out needs.
@@ -148,7 +148,7 @@ The invocation above is complete — substitute the literal `PLAN_CLI` and task 
 **No-code close-out.** When Phase 4 committed nothing because the task LEGITIMATELY produced no source change (a predecessor already shipped the commit, or the acceptance was met with no diff), `done` finds no landing commit and refuses a bare stamp. Record an explicit typed no-op receipt instead:
 
 ```bash
-$PLAN_CLI done $TASK_ID --summary "<1-2 sentence summary>" --no-op-reason "<why no code landed>"
+$PLAN_CLI done $TASK_ID --project "$PRIMARY_REPO" --summary "<1-2 sentence summary>" --no-op-reason "<why no code landed>"
 ```
 
 `--no-op-reason` is ONLY for a genuine no-code outcome, never an escape hatch. If you could not complete the task, or its acceptance needs a human-only proof you cannot legitimately run, do NOT fabricate a receipt, output, or evidence to force the stamp — return `BLOCKED: EXTERNAL_BLOCKED` (Typed escalation below) naming the exact human-only proof and what it needs. A no-op receipt never masks an un-fanned-in task branch: close re-derives reachability and refuses it regardless.

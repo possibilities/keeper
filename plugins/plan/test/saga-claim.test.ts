@@ -197,7 +197,8 @@ describe("claim happy path + brief schema", () => {
       env: { ...ALICE, KEEPER_PLAN_WORKTREE: lane },
     });
     expect(r.code).toBe(0);
-    const payload = parseCliOutput(r.output);
+    // The warning now rides stderr, so parse the JSON off stdout alone.
+    const payload = parseCliOutput(r.stdout);
     // target_repo follows the lane...
     expect(payload.target_repo).toBe(lane);
     // ...primary_repo (and the brief's state_repo) stay in the primary repo.
@@ -211,6 +212,17 @@ describe("claim happy path + brief schema", () => {
     expect(brief.target_repo).toBe(lane);
     expect(brief.primary_repo).toBe(mainRepo);
     expect(brief.state_repo).toBe(mainRepo);
+
+    // Gap 2 regression (i) — the canonical production shape: explicit --project
+    // from the shared main WITH a KEEPER_PLAN_WORKTREE lane keys the warning on
+    // the TARGET (the lane), and --project never suppresses it. The persisted
+    // brief and stderr carry the same value.
+    const warning = payload.source_staleness_warning as string;
+    expect(warning).toContain(lane);
+    expect(warning).toContain(mainRepo);
+    expect(warning).toContain("may predate");
+    expect(brief.source_staleness_warning).toBe(warning);
+    expect(r.stderr).toContain("may predate");
   });
 
   test("null persisted tier -> worker_agent null (claimability is the contract)", () => {

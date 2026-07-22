@@ -16,7 +16,10 @@ import { join } from "node:path";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveOwningProjectForId } from "../project.ts";
+import {
+  annotateIdReadVantage,
+  resolveOwningProjectForId,
+} from "../project.ts";
 import { LocalFileStateStore, loadJson, loadJsonSafe } from "../store.ts";
 
 interface ShowResult {
@@ -100,6 +103,12 @@ export function runShow(
   project: string | null,
   format: OutputFormat | null,
 ): ShowResult {
+  // Surface the weaker-vantage note the id-bearing resolution would drop (a lane
+  // cwd keeps cwd resolution for a lane_no_state / inconclusive vantage but never
+  // annotates). No-op under --project or a non-lane cwd.
+  if (isTaskId(idStr) || isEpicId(idStr)) {
+    annotateIdReadVantage(project);
+  }
   if (isTaskId(idStr)) {
     const ctx = resolveOwningProjectForId(idStr, project, format);
     const store = new LocalFileStateStore(ctx.stateDir);

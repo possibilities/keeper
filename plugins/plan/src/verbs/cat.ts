@@ -13,7 +13,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { isEpicId, isTaskId } from "../ids.ts";
-import { tryResolveOwningProjectForId } from "../project.ts";
+import {
+  annotateIdReadVantage,
+  tryResolveOwningProjectForId,
+} from "../project.ts";
 
 /** Run cat. Returns the process exit code (0 on success, 1 on error). The
  * dispatcher must NOT fire the generic trailer for this verb. */
@@ -22,6 +25,11 @@ export function runCat(idStr: string, project: string | null): number {
     process.stderr.write(`Error: Invalid ID format: ${idStr}\n`);
     return 1;
   }
+
+  // Surface the weaker-vantage note the id-bearing resolution would drop (a lane
+  // cwd keeps cwd resolution for a lane_no_state / inconclusive vantage but never
+  // annotates). No-op under --project or a non-lane cwd.
+  annotateIdReadVantage(project);
 
   // requireLeaf=false: resolve only to the owning EPIC, deferring the leaf
   // existence to cat's own SPEC check below (so a missing task spec still

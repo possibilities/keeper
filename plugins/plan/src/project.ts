@@ -128,6 +128,17 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
     emitError("No plan project found. Run 'keeper plan init' first.", format);
   }
 
+  annotateWeakVantage(vantage);
+
+  return contextForRoot(projectRoot);
+}
+
+/** Emit the stderr note for a WEAKER lane vantage (lane_no_state / inconclusive)
+ * — the one wording both the id-less `resolveProject` and the id-bearing verb
+ * layer (`annotateIdReadVantage`) share, so "weaker vantage annotates, never
+ * silently serves" is worded once. A `redirect` (a positively-derived state
+ * repo) is announced by its own caller; `not_lane` emits nothing. */
+function annotateWeakVantage(vantage: LaneVantage): void {
   if (vantage.kind === "lane_no_state") {
     annotateLane(
       "plan: cwd is a lane worktree; its committed .keeper snapshot may lag " +
@@ -141,8 +152,22 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
         "--project <state repo> if unexpected",
     );
   }
+}
 
-  return contextForRoot(projectRoot);
+/** Surface the weaker-vantage note the id-BEARING verbs (show / cat /
+ * refine-context / claim) would otherwise drop: they resolve cwd-then-global
+ * through `resolveEpicGlobally`, which consumes only `classifyCwdVantage()
+ * .effectiveRoot` (silently redirecting a proven lane, keeping cwd resolution
+ * for a weaker one) and never annotates. Called at the verb entrypoint so a
+ * lane_no_state / inconclusive cwd annotates on stderr just like `resolveProject`
+ * — including when the subsequent resolution fails (e.g. TASK_NOT_FOUND), so the
+ * operator sees WHY the id might be missing. Skipped under an explicit `--project`
+ * (operator intent targets a concrete project) and for a non-lane cwd. */
+export function annotateIdReadVantage(project: string | null): void {
+  if (project !== null) {
+    return;
+  }
+  annotateWeakVantage(classifyCwdVantage().vantage);
 }
 
 /** The lane-vantage outcome for a cwd-discovered project root. `not_lane` is an
@@ -174,6 +199,49 @@ export function classifyCwdVantage(): {
   const vantage = detectLaneVantage(root);
   const effectiveRoot = vantage.kind === "redirect" ? vantage.mainRoot : root;
   return { root, vantage, effectiveRoot };
+}
+
+/** Classify an ARBITRARY repo path's git vantage (not just the cwd), through the
+ * same positive-evidence `detectLaneVantage` seam. The source-staleness check
+ * routes a worker's resolved TARGET repo through this so a lane target is
+ * detected from the filesystem alone, independent of where the verb ran. */
+export function classifyRepoVantage(repoPath: string): LaneVantage {
+  return detectLaneVantage(realpathOr(repoPath));
+}
+
+/** The source-staleness warning for a worker whose TARGET source tree may lag
+ * the state repo — persisted into the brief and echoed on both the claim and
+ * worker-resume envelopes + stderr, so every entrypoint carries it identically.
+ *
+ * The target is a lane when `KEEPER_PLAN_WORKTREE` is set (the producer-proven
+ * lane path the worker cds into) OR the resolved `targetRepo` classifies as a
+ * positively-derived worktree lane (`redirect` / `lane_no_state`). A target that
+ * IS the state repo is never stale against itself, so it yields null. The advice
+ * verifies suspected-absent source against the TARGET repo's own local
+ * default/main checkout — the state repo is STATE authority, never source
+ * authority (in multi-repo work it can be a different git repository) — and
+ * defers a base refresh to the producer; the worker never merges/pulls/rebases
+ * the lane (base freshness is producer-owned). Conservative "may predate"
+ * wording, no fabricated behind-count. */
+export function sourceStalenessWarning(
+  targetRepo: string,
+  stateRepo: string,
+): string | null {
+  const producerLane = (process.env.KEEPER_PLAN_WORKTREE ?? "") !== "";
+  const kind = producerLane ? null : classifyRepoVantage(targetRepo).kind;
+  const targetIsLane =
+    producerLane || kind === "redirect" || kind === "lane_no_state";
+  if (!targetIsLane || realpathOr(targetRepo) === realpathOr(stateRepo)) {
+    return null;
+  }
+  return (
+    `the worker's target source tree ${targetRepo} is a worktree lane whose ` +
+    `committed source may predate the state authority ${stateRepo}; before ` +
+    "concluding cited source is absent, verify it against the target repo's " +
+    "own local default/main checkout, and on confirmed staleness STOP and " +
+    "defer for a producer base refresh — never merge, pull, or rebase the " +
+    "lane yourself (base freshness is producer-owned)"
+  );
 }
 
 /** Classify `projectRoot`'s git vantage from the filesystem alone (no `git`

@@ -44,19 +44,26 @@ function findSourceCommitSha(taskId: string): string | null {
 
 export function runWorkerResume(opts: {
   taskId: string;
+  project: string | null;
   format: OutputFormat | null;
 }): void {
-  const { taskId, format } = opts;
+  const { taskId, project, format } = opts;
 
   if (!isTaskId(taskId)) {
     emitError(`Invalid task id: '${taskId}'`, format);
   }
 
-  // Committed DEFS (specs / tasks / epics) read from the locate ctx (cwd, so a
-  // lane reads its byte-identical checked-out defs). Plan STATE — the runtime
-  // overlay read + the regenerated brief write — routes through the central seam
-  // to the epic's PRIMARY repo, never the lane's gitignored (absent) state/.
-  const ctx = resolveProject(format);
+  // Committed DEFS (specs / tasks / epics) read from the locate ctx. With no
+  // --project this is the cwd locate (a lane reads its byte-identical checked-out
+  // defs; a weaker vantage annotates via resolveProject). An explicit --project
+  // is the ISSUE-25 belt: defs AND state route to the named state repo outright,
+  // never an inconclusive lane. Plan STATE — the runtime overlay read + the
+  // regenerated brief write — routes through the central seam to the epic's
+  // PRIMARY repo, never the lane's gitignored (absent) state/.
+  const ctx =
+    project !== null
+      ? resolvePlanStateContext(taskId, project, format)
+      : resolveProject(format);
   const dataDir = ctx.dataDir;
 
   // The spec markdown is the existence gate (Python: TASK_NOT_FOUND when absent).
@@ -65,7 +72,7 @@ export function runWorkerResume(opts: {
     emitError(`Task spec not found: ${taskId}`, format);
   }
 
-  const stateCtx = resolvePlanStateContext(taskId, null, format);
+  const stateCtx = resolvePlanStateContext(taskId, project, format);
 
   // Read task status + tier. Under the commit-then-done contract, observing
   // `done` here means the source commit already landed.
@@ -167,6 +174,12 @@ export function runWorkerResume(opts: {
     `dirty_session_files=${dirtySessionFileCount}. ` +
     "Read BRIEF_REF, finish commit-then-done.";
 
+  // The target-keyed source-staleness warning assembleBrief computed — echoed
+  // byte-identically on the envelope + stderr so a warm/cold resume carries the
+  // SAME warning the claim envelope did.
+  const sourceStalenessWarning =
+    (briefDict.source_staleness_warning as string | null) ?? null;
+
   // Stderr notes always emit (independent of format) to inform the human without
   // cluttering the JSON/YAML stdout envelope.
   if (status !== "in_progress" && status !== "unknown") {
@@ -177,6 +190,9 @@ export function runWorkerResume(opts: {
   process.stderr.write(
     `Note: task ${taskId} tier is ${tier === null ? "None" : `'${tier}'`}\n`,
   );
+  if (sourceStalenessWarning !== null) {
+    process.stderr.write(`plan: ${sourceStalenessWarning}\n`);
+  }
 
   // Re-mark this session as working the task (guard contract). Success-path
   // only — typed-error paths above exit before reaching here. Fail-open.
@@ -201,6 +217,7 @@ export function runWorkerResume(opts: {
       primary_repo: primaryRepo,
       source_commit_sha: sourceCommitSha,
       dirty_session_file_count: dirtySessionFileCount,
+      source_staleness_warning: sourceStalenessWarning,
     },
     format,
   );

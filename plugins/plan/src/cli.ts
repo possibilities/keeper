@@ -402,7 +402,11 @@ const WORKER_GROUP: GroupSpec = {
       shortHelp:
         "Emit a ready-to-paste respawn prompt for a dropped in-progress task.",
       run: (rest, format) => {
-        runWorkerResume({ taskId: readPositional(rest), format });
+        runWorkerResume({
+          taskId: readPositional(rest),
+          project: readOption(rest, "--project"),
+          format,
+        });
       },
     },
   ],

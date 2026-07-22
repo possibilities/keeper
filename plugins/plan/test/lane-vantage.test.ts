@@ -11,7 +11,14 @@
 // carrying a `commondir`.
 
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 
 import {
@@ -241,6 +248,47 @@ function armEpic(root: string, epicId: string): void {
   writeFileSync(p, JSON.stringify(def, null, 2), "utf-8");
 }
 
+/** A recursive digest over EVERY byte under `<root>/.keeper` — the sorted file
+ * list AND each file's content — so a "lane untouched" proof covers the whole
+ * tree, not a single epic JSON. */
+function digestKeeperTree(root: string): string {
+  const h = createHash("sha256");
+  const walk = (dir: string, rel: string): void => {
+    for (const name of readdirSync(dir).sort()) {
+      const abs = join(dir, name);
+      const relPath = rel ? `${rel}/${name}` : name;
+      if (lstatSync(abs).isDirectory()) {
+        h.update(`D:${relPath}\n`);
+        walk(abs, relPath);
+      } else {
+        h.update(`F:${relPath}\n`);
+        h.update(readFileSync(abs));
+      }
+    }
+  };
+  walk(join(root, ".keeper"), "");
+  return h.digest("hex");
+}
+
+/** The typed error code off a claim error envelope on stdout. */
+function claimErrCode(stdout: string): unknown {
+  return (parseCliOutput(stdout).error as Record<string, unknown>).code;
+}
+
+/** Point a task's `target_repo` at `laneDir` so `resolveWorkerRepos` resolves
+ * the worker's TARGET to that lane WITHOUT a KEEPER_PLAN_WORKTREE env — the
+ * filesystem-classification branch of the source-staleness check. */
+function setTaskTargetRepo(
+  stateRoot: string,
+  taskId: string,
+  laneDir: string,
+): void {
+  const p = join(stateRoot, ".keeper", "tasks", `${taskId}.json`);
+  const def = JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
+  def.target_repo = laneDir;
+  writeFileSync(p, JSON.stringify(def), "utf-8");
+}
+
 describe("lane-vantage id-bearing resolution", () => {
   test("(h) claim of a task the lane's stale epic lacks resolves against main (not 'Task not found')", () => {
     const tmp = getTmp();
@@ -334,34 +382,124 @@ describe("lane-vantage id-bearing resolution", () => {
     expect(catLane.stdout).toContain("LANE SPEC");
   });
 
-  test("(k) a claim from a lane cwd carries a source-staleness warning naming BOTH the lane and the state repo", () => {
+  test("(k) Gap 2 (ii): a clustered target lane whose source-main lacks .keeper (lane_no_state) carries the warning", () => {
     const tmp = getTmp();
-    const main = join(tmp, "main");
-    const lane = join(tmp, "lane");
-    mkdirSync(main, { recursive: true });
-    mkdirSync(lane, { recursive: true });
-    seedState(main, { epicId: "fn-1-cafe", nTasks: 1 });
-    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
-    linkLaneToMain(lane, main);
+    const state = join(tmp, "state"); // the plan state repo (.keeper lives here)
+    const laneB = join(tmp, "laneB"); // the worker's TARGET lane (a second repo)
+    const mainB = join(tmp, "mainB"); // laneB's own main checkout — NO .keeper
+    mkdirSync(state, { recursive: true });
+    mkdirSync(laneB, { recursive: true });
+    mkdirSync(mainB, { recursive: true });
+    seedState(state, { epicId: "fn-1-cafe", nTasks: 1 });
+    // laneB is a linked worktree of mainB; mainB carries no .keeper → lane_no_state.
+    linkLaneToMain(laneB, mainB);
+    // No KEEPER_PLAN_WORKTREE — target_repo points at laneB, so the warning must
+    // fire off the filesystem-classification branch, not the producer env.
+    setTaskTargetRepo(state, "fn-1-cafe.1", laneB);
 
-    const r = runCli(["claim", "fn-1-cafe.1"], { cwd: lane });
+    const r = runCli(["claim", "fn-1-cafe.1", "--project", state], {
+      cwd: state,
+    });
 
     expect(r.code).toBe(0);
-    // The single JSON value is on stdout; the same warning also rides stderr.
     const env = parseCliOutput(r.stdout);
-    expect(r.stderr).toContain("may predate");
+    expect(env.target_repo).toBe(laneB);
     const warning = env.source_staleness_warning as string;
-    // Names BOTH paths, conservative "may predate" wording — never a fabricated
-    // behind-count.
-    expect(warning).toContain(lane);
-    expect(warning).toContain(main);
+    // Names BOTH the target lane and the state repo, conservative "may predate"
+    // wording — never a fabricated behind-count.
+    expect(warning).not.toBeNull();
+    expect(warning).toContain(laneB);
+    expect(warning).toContain(state);
     expect(warning).toContain("may predate");
+    expect(r.stderr).toContain("may predate");
 
     // The persisted brief carries the same warning (what the worker reads first).
     const brief = JSON.parse(
       readFileSync(env.brief_ref as string, "utf-8"),
     ) as Record<string, unknown>;
     expect(brief.source_staleness_warning).toBe(warning);
+  });
+
+  test("(n) Gap 2 (iii): a plain non-lane target emits no source-staleness warning", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main");
+    mkdirSync(main, { recursive: true });
+    seedState(main, { epicId: "fn-1-cafe", nTasks: 1 });
+    // No KEEPER_PLAN_WORKTREE; the target resolves to main itself (a plain
+    // checkout, not a worktree lane).
+    const r = runCli(["claim", "fn-1-cafe.1", "--project", main], {
+      cwd: main,
+    });
+
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.stdout);
+    expect(env.source_staleness_warning).toBeNull();
+    expect(r.stderr).not.toContain("may predate");
+  });
+
+  // -------------------------------------------------------------------------
+  // Gap 5: the id-bearing verbs surface the weaker-vantage annotation the
+  // id-less resolveProject emits — lane_no_state / inconclusive keep cwd
+  // resolution but must not silently serve a possibly-lagging snapshot.
+  // -------------------------------------------------------------------------
+
+  test("(o) Gap 5: a malformed-.git-file lane (inconclusive) annotates show AND cat on stderr", () => {
+    const tmp = getTmp();
+    const lane = join(tmp, "lane");
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    // A `.git` file with no parseable gitdir pointer → inconclusive vantage.
+    writeFileSync(join(lane, ".git"), "not a gitdir pointer\n", "utf-8");
+
+    const show = runCli(["show", "fn-1-cafe.1"], { cwd: lane });
+    expect(show.code).toBe(0);
+    // The annotation rides stderr; the single JSON value is on stdout.
+    expect(parseCliOutput(show.stdout).success).toBe(true);
+    expect(show.stderr).toContain("could not be resolved");
+    expect(show.stderr).toContain("--project");
+
+    const cat = runCli(["cat", "fn-1-cafe"], { cwd: lane });
+    expect(cat.code).toBe(0);
+    expect(cat.stderr).toContain("could not be resolved");
+    expect(cat.stderr).toContain("--project");
+  });
+
+  test("(p) Gap 5: a lane_no_state lane annotates show AND cat on stderr", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main"); // NO .keeper → lane_no_state
+    const lane = join(tmp, "lane");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    linkLaneToMain(lane, main);
+
+    const show = runCli(["show", "fn-1-cafe.1"], { cwd: lane });
+    expect(show.code).toBe(0);
+    // The annotation rides stderr; the single JSON value is on stdout.
+    expect(parseCliOutput(show.stdout).success).toBe(true);
+    expect(show.stderr).toContain("carries no .keeper");
+    expect(show.stderr).toContain("--project");
+
+    const cat = runCli(["cat", "fn-1-cafe"], { cwd: lane });
+    expect(cat.code).toBe(0);
+    expect(cat.stderr).toContain("carries no .keeper");
+  });
+
+  test("(q) Gap 5: a claim that fails TASK_NOT_FOUND from a weaker-vantage lane still carries the annotation", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main"); // NO .keeper → lane_no_state
+    const lane = join(tmp, "lane");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    linkLaneToMain(lane, main);
+
+    // Claim a task the lane does not carry → TASK_NOT_FOUND; the annotation fires
+    // first so the operator sees WHY the id might be missing.
+    const r = runCli(["claim", "fn-9-absent.1"], { cwd: lane });
+    expect(r.code).not.toBe(0);
+    expect(claimErrCode(r.stdout)).toBe("TASK_NOT_FOUND");
+    expect(r.stderr).toContain("carries no .keeper");
   });
 
   test("(l) a MUTATOR from a lane cwd writes + commits ONLY main; the lane tree and HEAD are untouched", () => {
@@ -375,11 +513,9 @@ describe("lane-vantage id-bearing resolution", () => {
     gitBaseline(main); // main is the committable state repo
     linkLaneToMain(lane, main);
 
-    // Capture the lane's pre-mutation state — bytes AND HEAD.
-    const laneEpicBytesBefore = readFileSync(
-      join(lane, ".keeper", "epics", "fn-1-cafe.json"),
-      "utf-8",
-    );
+    // Capture the lane's pre-mutation state — the WHOLE .keeper tree (every file
+    // + content), not just one epic JSON, plus HEAD.
+    const laneKeeperDigestBefore = digestKeeperTree(lane);
     const laneHeadBefore = gitHeadSha(lane);
     const laneLogBefore = gitLogCount(lane);
     const mainLogBefore = gitLogCount(main);
@@ -397,11 +533,10 @@ describe("lane-vantage id-bearing resolution", () => {
       "chore(plan): set-branch fn-1-cafe",
     );
 
-    // The lane's own .keeper is byte-untouched and its HEAD did not move: the
-    // lane's epic keeps its seeded branch_name (never the mutation's value).
-    expect(
-      readFileSync(join(lane, ".keeper", "epics", "fn-1-cafe.json"), "utf-8"),
-    ).toBe(laneEpicBytesBefore);
+    // The lane's ENTIRE .keeper tree is byte-untouched and its HEAD did not move:
+    // the full-tree digest matches, the lane's epic keeps its seeded branch_name
+    // (never the mutation's value), and the fake commit log is unchanged.
+    expect(digestKeeperTree(lane)).toBe(laneKeeperDigestBefore);
     expect(readEpicJson(lane, "fn-1-cafe").branch_name).not.toBe(
       "feat/from-lane",
     );

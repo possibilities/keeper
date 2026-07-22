@@ -25,7 +25,7 @@ import { resolveIncident } from "../incident.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentFor } from "../models.ts";
 import {
-  classifyCwdVantage,
+  annotateIdReadVantage,
   contextForRoot,
   type ProjectContext,
   resolvePlanStateContext,
@@ -182,6 +182,12 @@ export function runClaim(args: ClaimArgs): void {
     emitClaimError("BAD_TASK_ID", `Invalid task ID: ${taskId}`, format);
   }
 
+  // Surface the weaker-vantage note the id-bearing resolution would drop, BEFORE
+  // resolving — so a lane_no_state / inconclusive cwd annotates even when the
+  // resolution then fails TASK_NOT_FOUND (the operator sees why the id is
+  // missing). No-op under --project or a non-lane cwd.
+  annotateIdReadVantage(project);
+
   // 2. resolve owning project (subsumes task-exists)
   const ctx = resolveProjectForTask(taskId, project, format);
   const dataDir = ctx.dataDir;
@@ -205,26 +211,6 @@ export function runClaim(args: ClaimArgs): void {
   const projPath = ctx.projectPath;
   const primaryRepo = projPath;
   const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, projPath);
-
-  // Source-staleness policy. A claim resolved from a worktree-lane cwd (no
-  // explicit --project) reads/serves the authoritative state repo, but the
-  // worker's SOURCE tree is the lane, whose committed source MAY PREDATE the
-  // state repo. Surface a conservative warning — on the claim envelope AND the
-  // persisted brief (both worker-consumed) plus stderr — naming BOTH the lane
-  // path and the state repo, so a worker never concludes cited source is absent
-  // off a lagging lane without refreshing first. `KEEPER_PLAN_WORKTREE` keeps
-  // governing source-commit derivation; this only warns, it moves nothing.
-  const cwdVantage = classifyCwdVantage();
-  const sourceStalenessWarning =
-    project === null && cwdVantage.vantage.kind === "redirect"
-      ? `the source tree at ${cwdVantage.root} is a worktree lane whose ` +
-        "committed source may predate the authoritative state repo " +
-        `${primaryRepo}; refresh or verify it before concluding that cited ` +
-        "source is absent"
-      : null;
-  if (sourceStalenessWarning !== null) {
-    process.stderr.write(`plan: ${sourceStalenessWarning}\n`);
-  }
 
   // 5. status / deps gate (pre-check, no lock — the CAS re-reads under the lock)
   const runtimePre = stateStore.loadRuntime(taskId);
@@ -290,8 +276,18 @@ export function runClaim(args: ClaimArgs): void {
     auditRequired,
     dataDir,
   });
-  // Persist the source-staleness warning into the brief the worker reads first.
-  briefDict.source_staleness_warning = sourceStalenessWarning;
+  // Source-staleness policy. assembleBrief keys the warning on the worker's
+  // resolved TARGET repo (the lane it cds into), not the verb's cwd: an explicit
+  // `--project` from the shared main WITH a `KEEPER_PLAN_WORKTREE` lane still
+  // targets the lane, and its committed source MAY PREDATE the state repo. The
+  // brief the worker reads first carries the warning; echo the SAME value on the
+  // envelope + stderr. `KEEPER_PLAN_WORKTREE` keeps governing source-commit
+  // derivation; this only warns, it moves nothing.
+  const sourceStalenessWarning =
+    (briefDict.source_staleness_warning as string | null) ?? null;
+  if (sourceStalenessWarning !== null) {
+    process.stderr.write(`plan: ${sourceStalenessWarning}\n`);
+  }
 
   const dispatch = readDispatchConstraint();
 
