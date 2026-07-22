@@ -6638,6 +6638,18 @@ export async function runReconcileCycle(
   > | null = null,
   dispatchFailureFences?: DispatchFailureFenceMap,
   laneMaintenanceProbe?: LaneMaintenanceProbe,
+  // The withhold-rail publication seam. When present, the frame is replace-merged
+  // from the fully-classified `decision.withholds` at the classification-completion
+  // point below (after the launch pass, BEFORE the finalize tail) — NEVER from the
+  // caller's `finally`. A pre-completion abort/throw thus PRESERVES the prior frame
+  // unchanged (no partial map ever replace-merges a standing producer hold to a
+  // phantom clear); a finalize-tail throw AFTER completion keeps the published frame.
+  // `state` is the persistent per-worker frame memory; `emit` overrides the default
+  // console.error sink (tests capture the transition lines).
+  withholdFramePublish?: {
+    state: WithholdFrameState;
+    emit?: (line: string) => void;
+  },
 ): Promise<void> {
   // Realpath-normalize the worktree lane before it rides the launch as the
   // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
@@ -6868,6 +6880,12 @@ export async function runReconcileCycle(
         stderr: string;
       };
       hasFailure?: boolean;
+      /** The FIRST structural assembly reason across this epic's groups (deterministic
+       *  first-group-wins) — carried so the launch withhold names the POSITIVELY-known
+       *  blocker rather than a placeholder. */
+      failureReason?: string;
+      /** The per-(epic, repo) fence id of that first structural failure. */
+      failureFenceId?: string;
       deferred?: boolean;
       /** The most recent transient/inconclusive defer reason across this epic's
        *  groups — carried so the launch withhold names the fan-in blocker. */
@@ -6947,6 +6965,12 @@ export async function runReconcileCycle(
           break;
         case "failed":
           o.hasFailure = true;
+          // Carry the FIRST structural reason + its fence (first group wins) so the
+          // launch withhold names the POSITIVELY-known blocker, not a placeholder.
+          if (o.failureReason === undefined) {
+            o.failureReason = assembled.reason;
+            o.failureFenceId = fenceId;
+          }
           // Mint/re-mint the DURABLE per-(epic, repo) fence (routes close-plain).
           deps.emitDispatchFailed({
             verb: "close",
@@ -6985,9 +7009,12 @@ export async function runReconcileCycle(
       // (fenced) outranks a transient defer, which outranks a non-owner waiting on the
       // routed merge conflict.
       if (o.hasFailure === true) {
+        const fenceRef =
+          o.failureFenceId ?? worktreePrecloseDispatchId(epicId, "");
         preCloseProvisionBlocked.set(
           epicId,
-          "pre-close base assembly failed (fenced on close::<epic>-<repo>)",
+          `pre-close base assembly failed (fenced on ${fenceRef}): ` +
+            `${o.failureReason ?? "structural preflight failure"}`,
         );
       } else if (o.deferred === true) {
         preCloseProvisionBlocked.set(
@@ -6997,7 +7024,9 @@ export async function runReconcileCycle(
       } else if (o.conflict !== undefined && !isIncidentOwner) {
         preCloseProvisionBlocked.set(
           epicId,
-          "pre-close merge conflict awaiting owner resolution",
+          "pre-close merge conflict awaiting owner resolution: " +
+            `merging ${o.conflict.sourceBranch} into ${o.conflict.baseBranch} ` +
+            `(lane ${o.conflict.laneDir})`,
         );
       }
     }
@@ -7268,9 +7297,14 @@ export async function runReconcileCycle(
           // A transient not-ready base lane the fan-in pre-merge would blind-conflict
           // on — retry-skip: mint NO sticky, and because this `continue` PRECEDES the
           // inFlight / cooldown / pending-dispatch mint below, consume NO slot,
-          // cooldown, or pending row. Log so the silent skip stays diagnosable.
-          console.error(
-            `[autopilot-worker] provision ${plan.verb}::${plan.id}: ${wt.reason}`,
+          // cooldown, or pending row. Route the skip through the SAME ephemeral
+          // `lane-provision` rail every other producer ready-launch hold rides, so it
+          // is explainable from the withhold surface rather than a lone stderr line.
+          // The rail's transition-only emission is the spam bound, so NO parallel
+          // per-cycle console.error remains; `withhold()` bounds the reason detail.
+          decision.withholds.set(
+            plan.id,
+            withhold("lane-provision", wt.reason),
           );
           continue;
         }
@@ -7477,6 +7511,25 @@ export async function runReconcileCycle(
     } finally {
       state.inFlight.delete(plan.key);
     }
+  }
+
+  // CLASSIFICATION-COMPLETION point: the launch pass has now populated every
+  // producer-side ready-launch hold (lane provisioning) into `decision.withholds`,
+  // joining the pure core's holds. PUBLISH the withhold rail HERE — never the
+  // caller's `finally` — so the replace-merge only ever runs against a fully
+  // classified frame. A pre-completion abort (`signal.aborted` early return) or a
+  // throw from refresh/assemble/provision never reaches this line, so the prior
+  // frame is PRESERVED intact: a partial map's absent producer keys can no longer be
+  // mistaken for authoritative clears (which would drop a standing hold silently and
+  // re-emit it as a phantom transition next complete cycle). Placed BEFORE the
+  // finalize tail so a finalize-tail throw cannot discard this completed frame.
+  if (withholdFramePublish !== undefined) {
+    updateWithholdFrameState(
+      withholdFramePublish.state,
+      decision.withholds,
+      deps.now(),
+      withholdFramePublish.emit,
+    );
   }
 
   // Worktree-finalize pass. For each epic whose closer reached done this
@@ -15213,36 +15266,32 @@ function main(): void {
             );
           }
         }
-        // Emit the withhold rail AFTER the launch pass so producer-side ready-launch
-        // holds (lane provisioning it added to `decision.withholds`) ride the SAME rail
-        // and precedence as the pure core's holds. The `finally` preserves the prior
-        // always-emit guarantee: a pre-launch abort or a throw still reports this cycle's
-        // frame (the core holds are already present), and a hold that vanished this cycle
-        // is pruned to a clear by the replace-merge — never left standing as if current.
-        try {
-          await runReconcileCycle(
-            decision,
-            state,
-            liveDispatches,
-            shell,
-            // The pause-scoped signal — captured per-cycle so a mid-cycle
-            // pause-abort + fresh controller doesn't retroactively un-abort this run.
-            cycleController.signal,
-            deps,
-            // The producer live-job dirty attribution (worktree mode only) — threaded
-            // into every `provision` so the fan-in pre-merge clean never discards dirt a
-            // running worker owns; `null` (a failed read) → do-not-discard.
-            snapshot.liveAttributedDirtyByWorktree ?? null,
-            snapshot.dispatchFailureFences,
-            laneMaintenanceProbe,
-          );
-        } finally {
-          updateWithholdFrameState(
-            withholdFrameState,
-            decision.withholds,
-            deps.now(),
-          );
-        }
+        // The withhold rail publishes INSIDE `runReconcileCycle`, at the
+        // classification-completion point (after the launch pass populated the
+        // producer-side ready-launch holds into `decision.withholds`, joining the pure
+        // core's holds), NOT here. That placement is load-bearing: a cycle that aborts
+        // or throws BEFORE completing classification leaves a PARTIAL `decision.withholds`
+        // whose absent producer keys must NOT be replace-merged as authoritative clears
+        // — publishing only on positive completion preserves the prior frame unchanged,
+        // so a standing lane-provision hold never silently drops and re-emits as a
+        // phantom transition next cycle.
+        await runReconcileCycle(
+          decision,
+          state,
+          liveDispatches,
+          shell,
+          // The pause-scoped signal — captured per-cycle so a mid-cycle
+          // pause-abort + fresh controller doesn't retroactively un-abort this run.
+          cycleController.signal,
+          deps,
+          // The producer live-job dirty attribution (worktree mode only) — threaded
+          // into every `provision` so the fan-in pre-merge clean never discards dirt a
+          // running worker owns; `null` (a failed read) → do-not-discard.
+          snapshot.liveAttributedDirtyByWorktree ?? null,
+          snapshot.dispatchFailureFences,
+          laneMaintenanceProbe,
+          { state: withholdFrameState },
+        );
         // PERIODIC ORIGIN-CONTAINMENT reconcile — runs LAST, AFTER recover + finalize have
         // pushed for their epics this cycle (owner-priority: their pushes stamped the
         // per-cycle guard, so a repo an owner already pushed is skipped here — exactly ONE

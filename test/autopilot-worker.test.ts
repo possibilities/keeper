@@ -12223,8 +12223,9 @@ test("fn-16f runReconcileCycle: an incident-owner close with a STRUCTURAL failur
         : null,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const decision = reconcile(incidentOwnerCloseSnap(), makeState(), 0);
   await runReconcileCycle(
-    reconcile(incidentOwnerCloseSnap(), makeState(), 0),
+    decision,
     makeState(),
     new Map<string, LiveDispatch>(),
     "/bin/zsh",
@@ -12246,6 +12247,14 @@ test("fn-16f runReconcileCycle: an incident-owner close with a STRUCTURAL failur
   expect(
     depsLog.emissions.some((e) => e.verb === "close" && e.id === "fn-1-anchor"),
   ).toBe(false);
+  // ...and the withheld close names the POSITIVELY-known structural reason + its
+  // actual fence, never a `close::<epic>-<repo>` placeholder.
+  const wh = decision.withholds.get("fn-1-anchor");
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.detail).toContain("worktree-head-mismatch");
+  expect(wh?.detail).toContain(
+    worktreePrecloseDispatchId("fn-1-anchor", "/repo-a"),
+  );
 });
 
 test("fn-16f runReconcileCycle: a conflict in one worktree group does NOT stop assembling a LATER clean group — every group is fanned in, exactly one incident routed", async () => {
@@ -12262,12 +12271,13 @@ test("fn-16f runReconcileCycle: a conflict in one worktree group does NOT stop a
         : null,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const decision = reconcile(
+    multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve),
+    makeState(),
+    0,
+  );
   await runReconcileCycle(
-    reconcile(
-      multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve),
-      makeState(),
-      0,
-    ),
+    decision,
     makeState(),
     new Map<string, LiveDispatch>(),
     "/bin/zsh",
@@ -12291,6 +12301,16 @@ test("fn-16f runReconcileCycle: a conflict in one worktree group does NOT stop a
   expect(
     depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
   ).toBeUndefined();
+  // ...and the withheld non-owner close names the POSITIVELY-known conflict lane +
+  // source, never a bare "awaiting owner resolution" placeholder.
+  const wh = decision.withholds.get("fn-1-anchor");
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.detail).toContain(
+    "keeper/epic/fn-1-anchor--fn-1-anchor.1", // the conflicting source branch
+  );
+  expect(wh?.detail).toContain(
+    "/repo-a.worktrees/keeper-epic-fn-1-anchor", // the conflict lane
+  );
 });
 
 /** A close-ready primaryless epic carrying an OPEN pre-close structural fence for
@@ -14100,7 +14120,7 @@ test("fn-959 runReconcileCycle: worktree ON provision failure → sticky Dispatc
   expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
 });
 
-test("fn-1123 runReconcileCycle: a provision RETRY (transient dirty base) mints NO sticky and consumes no slot / cooldown", async () => {
+test("fn-09b runReconcileCycle: a provision RETRY (transient dirty base) mints NO sticky / slot / cooldown BUT is explainable on the lane-provision withhold rail", async () => {
   const { driver, log } = makeFakeWorktreeDriver({
     provisionRetry: () =>
       "worktree-premerge-dirty-base: deferring the fan-in merge — base not losslessly cleanable",
@@ -14113,9 +14133,10 @@ test("fn-1123 runReconcileCycle: a provision RETRY (transient dirty base) mints 
   });
   const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
   const state = makeState();
+  const decision = reconcile(snap, makeState(), 0);
 
   await runReconcileCycle(
-    reconcile(snap, makeState(), 0),
+    decision,
     state,
     new Map<string, LiveDispatch>(),
     "/bin/zsh",
@@ -14125,10 +14146,273 @@ test("fn-1123 runReconcileCycle: a provision RETRY (transient dirty base) mints 
 
   expect(log.calls).toEqual(["provision:fn-1-foo.1"]);
   expect(depsLog.launches).toEqual([]); // never launched
-  expect(depsLog.emissions).toEqual([]); // NO sticky — the retry-skip is invisible
+  expect(depsLog.emissions).toEqual([]); // NO sticky DispatchFailed
   // No slot, cooldown, or pending consumed → re-dispatchable next cycle.
   expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
   expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+  // ...yet the transient retry-skip is NO LONGER invisible: it routes through the SAME
+  // ephemeral lane-provision rail every other producer ready-launch hold rides, naming
+  // the bounded transient reason (the rail's transition gate is the spam bound — no
+  // parallel per-cycle console.error).
+  const wh = decision.withholds.get("fn-1-foo.1");
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.severity).toBe("normal");
+  expect(wh?.detail).toContain("worktree-premerge-dirty-base");
+});
+
+// ---------------------------------------------------------------------------
+// fn-09b withhold-frame publication is COMPLETION-GATED (Finding 2). The frame
+// publishes INSIDE runReconcileCycle at the classification-completion point (after
+// the launch pass populated the producer holds, BEFORE the finalize tail), never the
+// caller's `finally`. A pre-completion abort/throw thus PRESERVES the prior frame —
+// a partial `decision.withholds` never replace-merges a standing producer hold to a
+// phantom clear. Driven through the REAL cycle (runReconcileCycle), not the
+// updateWithholdFrameState helper in isolation.
+// ---------------------------------------------------------------------------
+
+/** A worktree-mode epic whose ready WORK task's base lane is held by a live worker,
+ *  so the producer withholds its launch with a `lane-provision` frame. */
+function heldLaneWorkFixture(): {
+  taskId: string;
+  probe: LaneMaintenanceProbe;
+  snap: ReconcileSnapshot;
+} {
+  const taskId = "fn-1-foo.1";
+  const baseLane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const liveWorker = makeJob({
+    job_id: "live-lane-worker",
+    plan_verb: "work",
+    plan_ref: taskId,
+    cwd: baseLane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[liveWorker.job_id, liveWorker]]),
+    new Map(),
+    new Set(),
+  );
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: taskId })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  return { taskId, probe, snap };
+}
+
+test("fn-09b runReconcileCycle: a pre-completion ABORT preserves the prior withhold frame — no false clear, no phantom re-emission next complete cycle", async () => {
+  const { taskId, probe, snap } = heldLaneWorkFixture();
+  const frameState = createWithholdFrameState();
+  const lines: string[] = [];
+  const publish = { state: frameState, emit: (l: string) => lines.push(l) };
+
+  const runOnce = async (signal: AbortSignal): Promise<void> => {
+    const { driver } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      signal,
+      deps,
+      new Map(),
+      undefined,
+      probe,
+      publish,
+    );
+  };
+
+  // Cycle 1 (COMPLETE): the held lane publishes a lane-provision hold — one transition.
+  await runOnce(new AbortController().signal);
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision");
+  expect(lines).toHaveLength(1);
+
+  // Cycle 2 (ABORTED before classification completes): the launch loop returns at its
+  // signal check BEFORE re-adding the producer hold, so decision.withholds is partial.
+  // The completion-point publish never runs → the prior frame is untouched.
+  const aborted = new AbortController();
+  aborted.abort();
+  await runOnce(aborted.signal);
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision"); // preserved
+  expect(frameState.lastReasonByTarget.get(taskId)).toBe("lane-provision");
+  expect(lines).toHaveLength(1); // nothing re-emitted this cycle
+
+  // Cycle 3 (COMPLETE, hold STILL present): because cycle 2 never pruned the frame, the
+  // persistent hold is not a fresh transition → NO phantom re-emission.
+  await runOnce(new AbortController().signal);
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision");
+  expect(lines).toHaveLength(1);
+});
+
+test("fn-09b runReconcileCycle: a THROW before classification (the case the old caller-`finally` mis-published) preserves the prior withhold frame — no false clear", async () => {
+  const { taskId, probe, snap } = heldLaneWorkFixture();
+  const frameState = createWithholdFrameState();
+  const lines: string[] = [];
+  const publish = { state: frameState, emit: (l: string) => lines.push(l) };
+
+  // Cycle 1 (COMPLETE): establish the lane-provision hold.
+  {
+    const { driver } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map(),
+      undefined,
+      probe,
+      publish,
+    );
+  }
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision");
+  expect(lines).toHaveLength(1);
+
+  // Cycle 2 (THROWS mid-classification): with NO deferring probe the task reaches the
+  // producer step, whose provision throws before the launch pass completes — exactly
+  // the case the OLD caller-`finally` would have published (a partial map clearing the
+  // standing hold). The completion-point publish never runs.
+  const { driver } = makeFakeWorktreeDriver();
+  const throwingDriver: WorktreeDriver = {
+    ...driver,
+    async provision() {
+      throw new Error("provision boom");
+    },
+  };
+  const { deps } = makeFakeDeps({ worktree: throwingDriver });
+  await expect(
+    runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map(),
+      undefined,
+      undefined, // no probe → the task reaches provision, which throws
+      publish,
+    ),
+  ).rejects.toThrow("provision boom");
+
+  // The prior frame survives the throw untouched (no false clear).
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision");
+  expect(frameState.lastReasonByTarget.get(taskId)).toBe("lane-provision");
+  expect(lines).toHaveLength(1);
+});
+
+test("fn-09b runReconcileCycle: a COMPLETE pass with the hold genuinely GONE clears the frame (prunes the target)", async () => {
+  const { taskId, probe, snap } = heldLaneWorkFixture();
+  const frameState = createWithholdFrameState();
+  const publish = { state: frameState };
+
+  // Cycle 1 (COMPLETE): the held lane publishes a lane-provision hold.
+  {
+    const { driver } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map(),
+      undefined,
+      probe,
+      publish,
+    );
+  }
+  expect(frameState.current.get(taskId)?.code).toBe("lane-provision");
+
+  // Cycle 2 (COMPLETE, hold GONE): no live holder → the probe no longer defers, the
+  // task provisions + launches, decision.withholds carries no entry for it. The
+  // completion-point publish runs and PRUNES the vanished hold — a genuine clear, never
+  // a phantom left standing.
+  {
+    const { driver } = makeFakeWorktreeDriver();
+    const { deps } = makeFakeDeps({ worktree: driver });
+    await runReconcileCycle(
+      reconcile(snap, makeState(), 0),
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map(),
+      undefined,
+      undefined, // no probe → the lane is no longer held
+      publish,
+    );
+  }
+  expect(frameState.current.has(taskId)).toBe(false); // genuine clear (pruned)
+  expect(frameState.lastReasonByTarget.has(taskId)).toBe(false);
+});
+
+test("fn-09b runReconcileCycle: a COMPLETE pass publishes the JOINED core + producer frame (a core-withheld task AND a producer lane-provision hold)", async () => {
+  // Two independent epics so the two holds never cross-serialize: epic A's task is
+  // producer lane-provision-held (its base lane has a live worker); epic B's task is
+  // pure-core-withheld (failed-key).
+  const baseLane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const liveWorker = makeJob({
+    job_id: "live-lane-worker",
+    plan_verb: "work",
+    plan_ref: "fn-1-foo.1",
+    cwd: baseLane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[liveWorker.job_id, liveWorker]]),
+    new Map(),
+    new Set(),
+  );
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    // A DIFFERENT root so the per-root concurrency mutex never demotes this task —
+    // its only suppression is the pure-core failed-key.
+    project_dir: "/other",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epicA, epicB],
+    worktreeMode: true,
+    failedKeys: new Set<DispatchKey>(["work::fn-2-bar.1"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  // Precondition: the core already withheld epic B's task, and epic A's task is a ready
+  // launch (the producer will hold it below).
+  expect(decision.withholds.get("fn-2-bar.1")?.code).toBe("failed-key");
+  expect(decision.launches.some((l) => l.id === "fn-1-foo.1")).toBe(true);
+
+  const frameState = createWithholdFrameState();
+  const { driver } = makeFakeWorktreeDriver();
+  const { deps } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+    new Map(),
+    undefined,
+    probe,
+    { state: frameState },
+  );
+
+  // The published frame joins BOTH the pure core hold and the producer's ready-launch
+  // hold, exactly as before this fix.
+  expect(frameState.current.get("fn-2-bar.1")?.code).toBe("failed-key"); // core
+  expect(frameState.current.get("fn-1-foo.1")?.code).toBe("lane-provision"); // producer
 });
 
 test("fn-1123 runReconcileCycle: the live-attributed dirty set threads to provision (present map → set, omitted → null do-not-discard)", async () => {
