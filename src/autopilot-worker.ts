@@ -175,6 +175,7 @@ import {
 } from "./readiness-inputs";
 import {
   type BaseDriftEntry,
+  boundedFields,
   boundFatalAuditExcerpt,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
@@ -7013,8 +7014,12 @@ export async function runReconcileCycle(
           o.failureFenceId ?? worktreePrecloseDispatchId(epicId, "");
         preCloseProvisionBlocked.set(
           epicId,
-          `pre-close base assembly failed (fenced on ${fenceRef}): ` +
-            `${o.failureReason ?? "structural preflight failure"}`,
+          boundedFields([
+            "pre-close base assembly failed (fenced on ",
+            { bounded: fenceRef },
+            "): ",
+            { bounded: o.failureReason ?? "structural preflight failure" },
+          ]),
         );
       } else if (o.deferred === true) {
         preCloseProvisionBlocked.set(
@@ -7024,9 +7029,15 @@ export async function runReconcileCycle(
       } else if (o.conflict !== undefined && !isIncidentOwner) {
         preCloseProvisionBlocked.set(
           epicId,
-          "pre-close merge conflict awaiting owner resolution: " +
-            `merging ${o.conflict.sourceBranch} into ${o.conflict.baseBranch} ` +
-            `(lane ${o.conflict.laneDir})`,
+          boundedFields([
+            "pre-close merge conflict awaiting owner resolution: merging ",
+            { bounded: o.conflict.sourceBranch },
+            " into ",
+            { bounded: o.conflict.baseBranch },
+            " (lane ",
+            { bounded: o.conflict.laneDir },
+            ")",
+          ]),
         );
       }
     }

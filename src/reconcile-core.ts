@@ -242,6 +242,91 @@ export interface WithholdReason {
 
 const OCCUPANCY_PROBE_DEGRADED_DETAIL = "tmux pane probe unavailable";
 
+/** The withhold-detail char budget — the final backstop slice in {@link withhold}. */
+export const WITHHOLD_DETAIL_MAX = 512;
+
+/**
+ * One piece of a composed withhold detail: a bare `string` is a FIXED label /
+ * connector emitted verbatim; a `{ bounded }` is a churny value shortened to its
+ * share of the budget so every value survives (see {@link boundedFields}).
+ */
+export type DetailPart = string | { readonly bounded: string };
+
+/**
+ * Compose labeled facts into a detail that fits {@link WITHHOLD_DETAIL_MAX} with every
+ * value surviving. A plain overall-string slice — withhold's final backstop — can only
+ * SHORTEN the LAST value by position: with two long values it drops the second
+ * entirely once the first fills the budget. This renderer instead splits the budget
+ * left after the fixed labels across the bounded values, eliding an over-share value in
+ * the MIDDLE (prefix + "…" + suffix) so a ref or path stays identifiable at BOTH ends,
+ * where its distinguishing bytes live. A value already within its share renders
+ * verbatim, so a detail whose values all fit equals a plain concatenation of the parts;
+ * the result never exceeds the cap, so the backstop slice stays inert.
+ */
+export function boundedFields(parts: readonly DetailPart[]): string {
+  const fixedLen = parts.reduce(
+    (n, p) => (typeof p === "string" ? n + p.length : n),
+    0,
+  );
+  const lengths = parts.flatMap((p) =>
+    typeof p === "string" ? [] : [p.bounded.length],
+  );
+  const caps = allocateBoundedCaps(
+    lengths,
+    Math.max(0, WITHHOLD_DETAIL_MAX - fixedLen),
+  );
+  let i = 0;
+  return parts
+    .map((p) => (typeof p === "string" ? p : elideMiddle(p.bounded, caps[i++])))
+    .join("");
+}
+
+/**
+ * Water-fill `budget` chars across values of the given `lengths`: a value shorter than
+ * its equal share keeps its whole length and donates the surplus; once every remaining
+ * value exceeds the share they split it evenly. The caps sum to at most `budget`.
+ */
+function allocateBoundedCaps(
+  lengths: readonly number[],
+  budget: number,
+): number[] {
+  const caps = lengths.map(() => 0);
+  const unsettled = new Set(lengths.map((_, i) => i));
+  let remaining = budget;
+  while (unsettled.size > 0) {
+    const share = Math.floor(remaining / unsettled.size);
+    let settledAny = false;
+    for (const i of [...unsettled]) {
+      if (lengths[i] <= share) {
+        caps[i] = lengths[i];
+        remaining -= lengths[i];
+        unsettled.delete(i);
+        settledAny = true;
+      }
+    }
+    if (!settledAny) {
+      for (const i of unsettled) caps[i] = share;
+      break;
+    }
+  }
+  return caps;
+}
+
+/**
+ * Shorten `value` to `cap` chars, keeping a head and tail around a middle "…" so both
+ * ends survive; a value already within `cap` is returned unchanged.
+ */
+function elideMiddle(value: string, cap: number): string {
+  if (value.length <= cap) return value;
+  if (cap <= 1) return value.slice(0, Math.max(0, cap));
+  const keep = cap - 1; // one char reserved for the "…" marker
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return tail === 0
+    ? `${value.slice(0, head)}…`
+    : `${value.slice(0, head)}…${value.slice(value.length - tail)}`;
+}
+
 export function withhold(
   code: WithholdReasonCode,
   detail: string | null = null,
@@ -250,7 +335,9 @@ export function withhold(
     code,
     severity: code === "data-bug-missing-cwd" ? "error" : "normal",
     detail:
-      detail === null ? null : detail.replace(/[\r\n]+/g, " ").slice(0, 512),
+      detail === null
+        ? null
+        : detail.replace(/[\r\n]+/g, " ").slice(0, WITHHOLD_DETAIL_MAX),
   };
 }
 /**

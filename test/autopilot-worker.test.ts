@@ -322,8 +322,10 @@ import {
   type ReadinessQuery,
 } from "../src/readiness-inputs";
 import {
+  boundedFields,
   dispatchClaimBlocksReplacement,
   dispatchTargetHasActivityCollision,
+  WITHHOLD_DETAIL_MAX,
 } from "../src/reconcile-core";
 import { drain } from "../src/reducer";
 import { readBootStatus, runQuery } from "../src/server-worker";
@@ -3116,6 +3118,109 @@ test("fn-09b withhold rail: a persistent lane-provision degrade emits once (deta
   expect(state.lastReasonByTarget.size).toBe(0);
   updateWithholdFrameState(state, new Map(), 104, emit);
   expect(lines).toHaveLength(2);
+});
+
+// ---------------------------------------------------------------------------
+// ISSUE-09 — `boundedFields` budgets each positive fact so bounding can SHORTEN
+// a value but never DELETE a later one. The pre-close composites (conflict:
+// source/base/lane; structural: fence/reason) render through it; the whole-string
+// slice in `withhold` remains only as an inert backstop.
+// ---------------------------------------------------------------------------
+
+// The EXACT part shapes the two `runReconcileCycle` composition sites feed
+// `boundedFields`, mirrored here so the budget contract is exercised on the real
+// layouts (labels + field order).
+const conflictParts = (src: string, base: string, lane: string) => [
+  "pre-close merge conflict awaiting owner resolution: merging ",
+  { bounded: src },
+  " into ",
+  { bounded: base },
+  " (lane ",
+  { bounded: lane },
+  ")",
+];
+const structuralParts = (fence: string, reason: string) => [
+  "pre-close base assembly failed (fenced on ",
+  { bounded: fence },
+  "): ",
+  { bounded: reason },
+];
+
+test("ISSUE-09 boundedFields: short conflict + structural inputs render byte-identical to a plain template concatenation", () => {
+  // (c) Where every value fits, the renderer is a pure concatenation — the existing
+  // short-case site expectations stay byte-stable.
+  const src = "keeper/epic/fn-1-anchor--fn-1-anchor.1";
+  const base = "keeper/epic/fn-1-anchor";
+  const lane = "/repo-a.worktrees/keeper-epic-fn-1-anchor";
+  expect(boundedFields(conflictParts(src, base, lane))).toBe(
+    "pre-close merge conflict awaiting owner resolution: " +
+      `merging ${src} into ${base} ` +
+      `(lane ${lane})`,
+  );
+
+  const fence = "worktree-preclose:fn-1-anchor-abc123";
+  const reason = "structural preflight failure";
+  expect(boundedFields(structuralParts(fence, reason))).toBe(
+    `pre-close base assembly failed (fenced on ${fence}): ${reason}`,
+  );
+});
+
+test("ISSUE-09 boundedFields: the reviewer's 240+240+180 conflict repro fits 512 with source, base, and lane ALL identifiable (never deleted by position)", () => {
+  // (a) Long git-ref components + a long lane raw-concatenate past 512. The
+  // whole-string slice would keep the source, cut the base mid-value, and DELETE the
+  // lane entirely; the budgeted render keeps a head+tail of each so all survive.
+  const src = `SRCHEAD${"s".repeat(240 - 14)}SRCTAIL`; // 240
+  const base = `BASEHEAD${"b".repeat(240 - 16)}BASETAIL`; // 240
+  const lane = `LANEHEAD${"l".repeat(180 - 16)}LANETAIL`; // 180
+  const plain =
+    "pre-close merge conflict awaiting owner resolution: " +
+    `merging ${src} into ${base} ` +
+    `(lane ${lane})`;
+  expect(plain.length).toBeGreaterThan(WITHHOLD_DETAIL_MAX); // the raw repro overruns
+
+  const detail = boundedFields(conflictParts(src, base, lane));
+  expect(detail.length).toBeLessThanOrEqual(WITHHOLD_DETAIL_MAX);
+  // Every field survives, identifiable at BOTH ends...
+  for (const marker of [
+    "SRCHEAD",
+    "SRCTAIL",
+    "BASEHEAD",
+    "BASETAIL",
+    "LANEHEAD",
+    "LANETAIL",
+  ]) {
+    expect(detail).toContain(marker);
+  }
+  // ...through a middle elision, and the stable labels are intact.
+  expect(detail).toContain("…");
+  expect(detail).toContain("merging ");
+  expect(detail).toContain(" into ");
+  expect(detail).toContain(" (lane ");
+
+  // Contrast: the naive whole-string slice these facts move off of deletes the later
+  // facts by position — the base tail and the whole lane vanish.
+  const naive = plain.slice(0, WITHHOLD_DETAIL_MAX);
+  expect(naive).toContain("SRCHEAD");
+  expect(naive).not.toContain("BASETAIL");
+  expect(naive).not.toContain("LANEHEAD");
+});
+
+test("ISSUE-09 boundedFields: a structural detail with a long fence AND a long reason keeps both identifiable under 512", () => {
+  // (b) The same treatment for the structural composite — fence + reason both survive.
+  const fence = `FENCEHEAD${"f".repeat(320 - 18)}FENCETAIL`; // 320
+  const reason = `REASONHEAD${"r".repeat(320 - 20)}REASONTAIL`; // 320
+  const detail = boundedFields(structuralParts(fence, reason));
+  expect(detail.length).toBeLessThanOrEqual(WITHHOLD_DETAIL_MAX);
+  for (const marker of [
+    "FENCEHEAD",
+    "FENCETAIL",
+    "REASONHEAD",
+    "REASONTAIL",
+  ]) {
+    expect(detail).toContain(marker);
+  }
+  expect(detail).toContain("(fenced on ");
+  expect(detail).toContain("…");
 });
 
 test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
@@ -12313,6 +12418,57 @@ test("fn-16f runReconcileCycle: a conflict in one worktree group does NOT stop a
   );
 });
 
+test("ISSUE-09 runReconcileCycle: the non-owner conflict withhold budgets long source/base/lane so ALL survive under 512 (site wiring for the reviewer's repro)", async () => {
+  // The production repro at the composition site: 240-char git refs + a 180-char lane
+  // raw-concatenate past 512. The budgeted render keeps a head+tail of each field so
+  // the base is never cut mid-value and the lane is never deleted by position.
+  const src = `SRCHEAD${"s".repeat(240 - 14)}SRCTAIL`; // 240
+  const base = `BASEHEAD${"b".repeat(240 - 16)}BASETAIL`; // 240
+  const lane = `LANEHEAD${"l".repeat(180 - 16)}LANETAIL`; // 180
+  const { driver } = makeFakeWorktreeDriver({
+    assembleConflict: (info) =>
+      info.repoDir === "/repo-a"
+        ? {
+            sourceBranch: src,
+            baseBranch: base,
+            laneDir: lane,
+            conflictedFiles: ["src/x.ts"],
+            stderr: "CONFLICT (content): Merge conflict in src/x.ts",
+          }
+        : null,
+  });
+  const { deps } = makeFakeDeps({ worktree: driver });
+  const decision = reconcile(
+    multiRepoSnap([closeReadyPrimarylessEpic()], abcResolve),
+    makeState(),
+    0,
+  );
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  const wh = decision.withholds.get("fn-1-anchor");
+  expect(wh?.code).toBe("lane-provision");
+  expect(wh?.detail).not.toBeNull();
+  expect(wh?.detail?.length ?? 0).toBeLessThanOrEqual(WITHHOLD_DETAIL_MAX);
+  // Source, base, AND lane are each identifiable at both ends — the whole-string slice
+  // would have deleted the base tail and the entire lane.
+  for (const marker of [
+    "SRCHEAD",
+    "SRCTAIL",
+    "BASEHEAD",
+    "BASETAIL",
+    "LANEHEAD",
+    "LANETAIL",
+  ]) {
+    expect(wh?.detail).toContain(marker);
+  }
+});
+
 /** A close-ready primaryless epic carrying an OPEN pre-close structural fence for
  * /repo-a from a prior cycle. */
 function preCloseFenceSnap(): {
@@ -13407,6 +13563,81 @@ test("fn-1034 runReconcileCycle: a clustered finalize provisions the non-primary
   ]);
   // Provision ran BEFORE the finalizes (the base must be assembled first).
   expect(log.calls[0]).toBe("provision:__close__");
+});
+
+test("ISSUE-09 runReconcileCycle: a COMPLETED withhold frame publishes BEFORE the finalize tail — a throwing finalize step still leaves the new frame emitted AND propagates the throw", async () => {
+  // Two-sided placement pin: classification COMPLETES (a frame with content), then the
+  // finalize tail (the `finalizeEpic` step) throws. The publish sits BETWEEN — so the
+  // completed frame is already visible/emitted, yet the throw still reaches the caller.
+  // Moving the publish BELOW finalize would drop the emitted frame; keeping it above
+  // the launch pass would publish a partial map — this test fails either way.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
+  // The finalize tail has real work (a done clustered epic → sink provision + finalize).
+  expect(decision.worktreeFinalize.length).toBeGreaterThan(0);
+  // Classification COMPLETED with a frame to publish (a held sibling target).
+  decision.withholds.set("fn-2-held.1", {
+    code: "cooldown",
+    severity: "normal",
+    detail: null,
+  });
+
+  // The finalize step THROWS (a tail failure strictly AFTER the publish point).
+  const { driver } = makeFakeWorktreeDriver();
+  const throwingDriver: WorktreeDriver = {
+    ...driver,
+    async finalizeEpic() {
+      throw new Error("finalize-tail boom");
+    },
+  };
+  const { deps } = makeFakeDeps({ worktree: throwingDriver });
+  const frameState = createWithholdFrameState();
+  const lines: string[] = [];
+
+  // The throw propagates to the caller (no in-cycle swallow)...
+  await expect(
+    runReconcileCycle(
+      decision,
+      makeState(),
+      new Map<string, LiveDispatch>(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      null,
+      undefined,
+      undefined,
+      { state: frameState, emit: (l) => lines.push(l) },
+    ),
+  ).rejects.toThrow("finalize-tail boom");
+
+  // ...and the completed frame was ALREADY published before that throw: the new state
+  // is visible in the frame memory AND its transition line was emitted.
+  expect(frameState.current.has("fn-2-held.1")).toBe(true);
+  expect(
+    lines.some(
+      (l) => l.includes("target=fn-2-held.1") && l.includes("reason=cooldown"),
+    ),
+  ).toBe(true);
 });
 
 test("fn-1034 runReconcileCycle: a non-primary sink fan-in FAILURE mints a sticky close row and SKIPS that group's finalize (never merges an unassembled base)", async () => {
