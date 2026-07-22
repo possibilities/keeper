@@ -995,13 +995,21 @@ export const TMUX_CLIENT_FOCUS_DESCRIPTOR: CollectionDescriptor = {
 
 /**
  * The `worktree_repo_status` descriptor (fn-1013) — the LIVE-ONLY operator
- * surface for the per-epic worktree-eligibility verdict. One row per epic the
- * autopilot reconciler marked `disabled` (a not-worktree-friendly repo → serial
- * shared-checkout dispatch), folded from a synthetic `WorktreeRepoStatus` event.
- * `keeper autopilot` subscribes over the socket and renders a neutral
- * `--- worktree ---` section DISTINCT from the red failed / dispatch-failures
- * block; an empty / pre-first-cycle table returns `rows: []` so the section
- * renders nothing. `version: 'last_event_id'` so the diff fires on every fold.
+ * surface for the per-(epic, repo) worktree-eligibility verdict. One row per repo
+ * GROUP the autopilot reconciler marked `disabled` / reopened-serial (a
+ * not-worktree-friendly repo → serial shared-checkout dispatch), folded from a
+ * synthetic `WorktreeRepoStatus` event. `keeper autopilot` subscribes over the
+ * socket and renders a neutral `--- worktree ---` section DISTINCT from the red
+ * failed / dispatch-failures block; an empty / pre-first-cycle table returns
+ * `rows: []` so the section renders nothing. `version: 'last_event_id'` so the
+ * diff fires on every fold.
+ *
+ * Composite identity `(epic_id, repo_dir)`, but `pk` expects a single column, so
+ * `epic_id` keeps the wire/filter/detail identity while the DIFF path keys by the
+ * composite `liveKeyColumns` — otherwise a CLUSTERED epic's two downgraded sibling
+ * groups (same `epic_id`, different `repo_dir`) would collapse to one
+ * watched/version/patch slot and only one live row would surface. Both columns are
+ * NON-NULL (the composite PK), so the concatenated key never yields NULL.
  */
 export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
   name: "worktree_repo_status",
@@ -1015,6 +1023,7 @@ export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
     "updated_at",
   ],
   pk: "epic_id",
+  liveKeyColumns: ["epic_id", "repo_dir"],
   version: "last_event_id",
   sortable: new Set([
     "epic_id",

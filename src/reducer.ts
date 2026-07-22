@@ -3861,9 +3861,11 @@ function extractWorktreeRepoStatus(event: Event): WorktreeRepoStatusEntry[] {
  * its own — the wipe + re-INSERT runs unconditionally and a re-fold's last
  * `WorktreeRepoStatus` event wins; the table is LIVE-ONLY (in
  * `LIVE_ONLY_PROJECTIONS`) so it is excluded from the byte-identical re-fold
- * charter regardless. `ON CONFLICT DO UPDATE` keeps the fold total even if the
- * producer ever posts a duplicate epic_id. Pure: reads ONLY the event payload +
- * `event.id` / `event.ts` — NEVER throws (a malformed payload clears the table).
+ * charter regardless. The PK is the composite `(epic_id, repo_dir)`, so a
+ * CLUSTERED epic's sibling groups (same epic, different repo) both survive; `ON
+ * CONFLICT(epic_id, repo_dir) DO UPDATE` keeps the fold total even if the producer
+ * ever posts a duplicate group. Pure: reads ONLY the event payload + `event.id` /
+ * `event.ts` — NEVER throws (a malformed payload clears the table).
  */
 function foldWorktreeRepoStatus(db: Database, event: Event): void {
   const entries = extractWorktreeRepoStatus(event);
@@ -3873,8 +3875,7 @@ function foldWorktreeRepoStatus(db: Database, event: Event): void {
       `INSERT INTO worktree_repo_status (
          epic_id, repo_dir, mode, reason, last_event_id, updated_at
        ) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(epic_id) DO UPDATE SET
-         repo_dir = excluded.repo_dir,
+       ON CONFLICT(epic_id, repo_dir) DO UPDATE SET
          mode = excluded.mode,
          reason = excluded.reason,
          last_event_id = excluded.last_event_id,

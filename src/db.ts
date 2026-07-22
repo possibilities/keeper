@@ -4660,6 +4660,48 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       ctx.db.run("DROP TABLE IF EXISTS block_escalations");
     },
   },
+  {
+    // fn-28 part 4(a) — widen `worktree_repo_status` from a per-epic PRIMARY KEY
+    // to the composite `(epic_id, repo_dir)`, so a CLUSTERED epic can surface MORE
+    // than one downgraded repo group (one row per degraded group, not just the
+    // first). A LIVE-ONLY projection (excluded from the re-fold charter — the
+    // reconciler re-emits the full set each cycle), so the recreate PRESERVES the
+    // current rows verbatim (no data transform beyond the PK change); the next
+    // cycle's full-set replace re-derives them regardless. The shape guard (fewer
+    // than two PK columns) is the sole gate, so an already-current DB — including a
+    // reopen of a migrated one — no-ops. No cursor rewind (a live-only table). Re-
+    // pin SCHEMA_FINGERPRINT. Provisional tail version; fan-in renumbers this
+    // singleton ladder entry.
+    version: 143,
+    kind: "drop",
+    apply: (ctx) => {
+      const { db } = ctx;
+      const pkColumnCount = (
+        db.prepare("PRAGMA table_info(worktree_repo_status)").all() as {
+          pk: number;
+        }[]
+      ).filter((c) => c.pk > 0).length;
+      if (pkColumnCount >= 2) return;
+      db.run("DROP TABLE IF EXISTS worktree_repo_status_v143_tmp");
+      db.run(
+        CREATE_WORKTREE_REPO_STATUS.replace(
+          "CREATE TABLE IF NOT EXISTS worktree_repo_status",
+          "CREATE TABLE worktree_repo_status_v143_tmp",
+        ),
+      );
+      db.run(
+        `INSERT INTO worktree_repo_status_v143_tmp
+           (epic_id, repo_dir, mode, reason, last_event_id, updated_at)
+         SELECT epic_id, repo_dir, mode, reason, last_event_id, updated_at
+           FROM worktree_repo_status
+          ORDER BY rowid`,
+      );
+      db.run("DROP TABLE worktree_repo_status");
+      db.run(
+        "ALTER TABLE worktree_repo_status_v143_tmp RENAME TO worktree_repo_status",
+      );
+    },
+  },
 ];
 
 /**
@@ -4680,7 +4722,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v142:2b5a836efa13d94de2c5d008700cf50f6c99e3eb46a9514a3f3ce658e20db615";
+  "v143:1b70d47896a74480da8a71c2498ebde8131422f8968b220aff51738b923aa94d";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5706,11 +5748,18 @@ CREATE TABLE IF NOT EXISTS epics (
 
 /**
  * `worktree_repo_status` projection table — the LIVE-ONLY operator surface for
- * the per-epic worktree-eligibility verdict (fn-1013). One row per epic the
- * autopilot reconciler marked `disabled` (a worktree-friendliness heuristic
- * downgrade → sequential shared-checkout dispatch), folded from a synthetic
- * `WorktreeRepoStatus` event the autopilot worker posts when the disabled set
- * changes.
+ * the per-(epic, repo) worktree-eligibility verdict (fn-1013). One row per repo
+ * GROUP the autopilot reconciler marked `disabled` / reopened-serial (a
+ * worktree-friendliness heuristic downgrade → sequential shared-checkout
+ * dispatch), folded from a synthetic `WorktreeRepoStatus` event the autopilot
+ * worker posts when the set changes.
+ *
+ * COMPOSITE PK `(epic_id, repo_dir)` — a CLUSTERED epic may downgrade MORE than
+ * one of its repo groups, so the identity is per-group, not per-epic. The
+ * descriptor keeps `pk: "epic_id"` for epic-id filter/detail semantics and rides
+ * the composite live-diff identity through `liveKeyColumns` `(epic_id, repo_dir)`
+ * so two same-epic sibling rows track independently on the watch path (see
+ * {@link WORKTREE_REPO_STATUS_DESCRIPTOR}).
  *
  * LIVE-ONLY by construction (in {@link LIVE_ONLY_PROJECTIONS}): the verdict is
  * fs-derived (a per-cycle filesystem probe), so it is DELIBERATELY excluded from
@@ -5720,17 +5769,19 @@ CREATE TABLE IF NOT EXISTS epics (
  * fold is a cheap full-set replace bounded by board size, never O(history)).
  *
  * `mode` is the dispatch shape (`serial` for a disabled repo); `reason` names the
- * disabling signal (a `worktree-disabled:*` string). The row carries NO
- * `dispatch_failures` involvement — `disabled` is a neutral, NON-error fallback.
+ * disabling signal (a `worktree-disabled:*` / `worktree-reopen-serial:*` string).
+ * The row carries NO `dispatch_failures` involvement — a neutral, NON-error
+ * fallback.
  */
 const CREATE_WORKTREE_REPO_STATUS = `
 CREATE TABLE IF NOT EXISTS worktree_repo_status (
-    epic_id TEXT PRIMARY KEY,
+    epic_id TEXT NOT NULL,
     repo_dir TEXT NOT NULL DEFAULT '',
     mode TEXT NOT NULL DEFAULT 'serial',
     reason TEXT NOT NULL DEFAULT '',
     last_event_id INTEGER,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (epic_id, repo_dir)
 )
 `;
 

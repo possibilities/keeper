@@ -408,6 +408,41 @@ test("projectWorktreeStatusRows — empty wire array yields empty output", () =>
   expect(projectWorktreeStatusRows([])).toEqual([]);
 });
 
+test("projectWorktreeStatusRows — renders BOTH same-epic sibling groups, tie-broken by repo_dir (fn-28 part 4a)", () => {
+  // A clustered epic downgrading two repo groups arrives as two same-epic wire rows
+  // (composite `(epic_id, repo_dir)` key). Both must render, ordered `(epic_id,
+  // repo_dir)` to match the composite-live-key server ordering — even when the wire
+  // rows arrive out of order.
+  const wire = [
+    {
+      epic_id: "fn-1-clust",
+      repo_dir: "/code/repo-b",
+      mode: "serial",
+      reason: "worktree-reopen-serial: /code/repo-b …",
+    },
+    {
+      epic_id: "fn-1-clust",
+      repo_dir: "/code/repo-a",
+      mode: "serial",
+      reason: "worktree-disabled:submodules",
+    },
+  ];
+  expect(projectWorktreeStatusRows(wire)).toEqual([
+    {
+      epicId: "fn-1-clust",
+      dir: "repo-a",
+      mode: "serial",
+      reason: "worktree-disabled:submodules",
+    },
+    {
+      epicId: "fn-1-clust",
+      dir: "repo-b",
+      mode: "serial",
+      reason: "worktree-reopen-serial: /code/repo-b …",
+    },
+  ]);
+});
+
 // ---------------------------------------------------------------------------
 // renderBody — five sections, each only emitted when non-empty, in priority
 // order: current → stopped → failed → armed → worktree → dependencies.

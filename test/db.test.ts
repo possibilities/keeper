@@ -666,6 +666,73 @@ test("v142 collapse migration: carries block_escalations + merge once-markers in
   db.close();
 });
 
+test("v143 worktree_repo_status widen: an existing single-PK row migrates to the composite (epic_id, repo_dir) PK, preserved verbatim + idempotent (fn-28 part 4a)", () => {
+  const { db } = freshMemDb();
+  // Re-materialize the PRE-widen shape on the migrated DB — the old per-epic
+  // PRIMARY KEY table + a live row — so the v143 apply runs as a genuine in-place
+  // upgrade over live state.
+  db.run("DROP TABLE worktree_repo_status");
+  db.run(`CREATE TABLE worktree_repo_status (
+    epic_id TEXT PRIMARY KEY,
+    repo_dir TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'serial',
+    reason TEXT NOT NULL DEFAULT '',
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0)`);
+  db.run(
+    `INSERT INTO worktree_repo_status VALUES
+       ('fn-1', '/repo-a', 'serial', 'worktree-disabled:no-manifest', 42, 7.5)`,
+  );
+
+  const pkOf = (): [string, number][] =>
+    (
+      db.query("PRAGMA table_info(worktree_repo_status)").all() as {
+        name: string;
+        pk: number;
+      }[]
+    )
+      .filter((c) => c.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((c) => [c.name, c.pk]);
+  expect(pkOf()).toEqual([["epic_id", 1]]);
+
+  const step = SCHEMA_STEPS.find((s) => s.version === 143);
+  expect(step).toBeDefined();
+  // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
+  step!.apply({ db, preMigrateStoredVersion: 142, needsEventsRebuild: false });
+
+  // The PK widened to the composite, and the existing row is preserved VERBATIM
+  // (a live-only projection recreate — no data transform beyond the PK change).
+  expect(pkOf()).toEqual([
+    ["epic_id", 1],
+    ["repo_dir", 2],
+  ]);
+  expect(db.query("SELECT * FROM worktree_repo_status").all()).toEqual([
+    {
+      epic_id: "fn-1",
+      repo_dir: "/repo-a",
+      mode: "serial",
+      reason: "worktree-disabled:no-manifest",
+      last_event_id: 42,
+      updated_at: 7.5,
+    },
+  ]);
+
+  // Idempotent: a re-run over the already-current (>=2 PK cols) shape no-ops — the
+  // row is untouched and the temp table never lingers.
+  // biome-ignore lint/style/noNonNullAssertion: asserted defined above.
+  step!.apply({ db, preMigrateStoredVersion: 143, needsEventsRebuild: false });
+  expect(db.query("SELECT * FROM worktree_repo_status").all()).toHaveLength(1);
+  expect(
+    db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'worktree_repo_status_v143_tmp'",
+      )
+      .all(),
+  ).toEqual([]);
+  db.close();
+});
+
 test("SCHEMA_STEPS versions are unique — a duplicate version is a structural error", () => {
   const versions = SCHEMA_STEPS.map((s) => s.version);
   const uniq = new Set(versions);

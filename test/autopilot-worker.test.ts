@@ -164,6 +164,7 @@ import {
   type ReconcileSnapshot,
   type ReconcileState,
   readClaimAcquireObservation,
+  readPriorWorktreeLaneProof,
   reconcile,
   recordPushTimeout,
   recoverFailureDispatchId,
@@ -256,7 +257,7 @@ import {
   runSharedCheckoutPageSweep,
   terminalSessionClaimIsReleaseable,
 } from "../src/daemon";
-import { DEFAULT_MAX_CONCURRENT_JOBS } from "../src/db";
+import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
 import {
   isRetryableDispatchKey,
   parseDispatchKey,
@@ -296,7 +297,11 @@ import type {
   Task,
 } from "../src/types";
 import { parseWorktreeList } from "../src/worktree-git";
-import { worktreePathFor } from "../src/worktree-plan";
+import {
+  baseBranchFor,
+  ribBranchFor,
+  worktreePathFor,
+} from "../src/worktree-plan";
 import {
   argvHas,
   argvStartsWith,
@@ -304,7 +309,7 @@ import {
   fakeAsyncGit,
 } from "./helpers/fake-git";
 import { drainMicrotasks } from "./helpers/retry-until";
-import { freshDbFile } from "./helpers/template-db";
+import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 // A clean shared checkout has NO in-progress pseudo-ref present. mergeReadiness
 // now probes these via `rev-parse --verify --quiet <REF>`; real git exits 1 on
@@ -8811,6 +8816,74 @@ test("28b buildWorktreeStatusEntries: a no-manifest group WITH proof re-cuts to 
   ).toEqual([]);
 });
 
+test("fn-28 part 4a buildWorktreeStatusEntries: a CLUSTERED epic with TWO degraded groups surfaces BOTH rows (no first-group dedup), sorted by (epic_id, repo_dir)", () => {
+  // /repo-b AND /repo-c are BOTH unsafe reopened-serial degrades; the composite
+  // `(epic_id, repo_dir)` PK keys each independently, so both surface (the prior
+  // per-epic dedup dropped the second).
+  const resolve = (r: string): string | null =>
+    r.startsWith("/repo-a")
+      ? "/repo-a"
+      : r.startsWith("/repo-b")
+        ? "/repo-b"
+        : r.startsWith("/repo-c")
+          ? "/repo-c"
+          : null;
+  const epic = makeEpic({
+    epic_id: "fn-1-two",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-two.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-two.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-two.3",
+        task_number: 3,
+        target_repo: "/repo-b",
+      }),
+      makeTask({
+        task_id: "fn-1-two.4",
+        task_number: 4,
+        target_repo: "/repo-c",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-two.5",
+        task_number: 5,
+        target_repo: "/repo-c",
+      }),
+    ],
+  });
+  const assess = (top: string) =>
+    top === "/repo-a"
+      ? { eligible: true, reason: "worktree-eligible" }
+      : { eligible: false, reason: "worktree-disabled:submodules" };
+  const laneProbe = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-a"
+      ? { epoch: "present", priorLane: false }
+      : { epoch: "absent", priorLane: true }; // both b + c ran a lane before
+  const entries = buildWorktreeStatusEntries(
+    classifyWorktreeRepos([epic], resolve, assess, laneProbe, true),
+  );
+  expect(entries.map((e) => [e.epic_id, e.repo_dir])).toEqual([
+    ["fn-1-two", "/repo-b"],
+    ["fn-1-two", "/repo-c"],
+  ]);
+  for (const e of entries) {
+    expect(e.mode).toBe("serial");
+    expect(e.reason).toContain("worktree-reopen-serial");
+  }
+});
+
 test("fn-978 classifyWorktreeRepos: an empty root → unresolved WITHOUT calling the resolver", () => {
   const epic = makeEpic({
     epic_id: "fn-1-foo",
@@ -10287,6 +10360,327 @@ test("fn-28b runReconcileCycle: the eligible re-opened group PROVISIONS the new 
       (p) => p.assignment.branch === "keeper/epic/fn-1-reopen",
     ),
   ).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// fn-28 part 4(c) — the FRESH-EPOCH GUARD. A fresh epoch is a TRUE reopen ONLY: a
+// done task (the finalized epoch) AND a non-done task (the newly added work). An
+// ALL-DONE positively-absent group must NOT mint an empty fresh plan.
+// ---------------------------------------------------------------------------
+
+/** A single-repo epic whose EVERY task is done (a finalized-but-not-torn epoch). */
+function allDoneEpic(): Epic {
+  return makeEpic({
+    epic_id: "fn-1-alldone",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-alldone.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-alldone.2",
+        task_number: 2,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+}
+
+test("fn-28 part 4c classifyEpicRepo: an ALL-DONE positively-absent single-repo epic gets NO fresh epoch (no empty base) — the done tasks keep the full graph, never an empty fresh plan", () => {
+  const epic = allDoneEpic();
+  const repoMap = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    absentEpoch,
+    true,
+  );
+  // No fresh-epoch marker: an all-done absent epic must NOT re-cut.
+  expect(repoMap.get("fn-1-alldone")).toEqual({
+    kind: "ok",
+    repoDir: "/repo-a",
+  });
+  // The full graph is derived (no non-done filter), so the done tasks KEEP their
+  // lanes — a fresh-epoch re-cut would have EXCLUDED them, leaving an empty base.
+  const prepared = prepareWorktreeGeometry([epic], repoMap);
+  expect(prepared.laneKeyById.has("fn-1-alldone.1")).toBe(true);
+  expect(prepared.laneKeyById.has("fn-1-alldone.2")).toBe(true);
+});
+
+test("fn-28 part 4c clusterEpicRepos: an ALL-DONE absent GROUP gets NO fresh-epoch marker (a true reopen needs a done AND a non-done task)", () => {
+  // /repo-b's tasks are ALL done and its epoch is absent — no gained work, so no
+  // fresh epoch; a live-present sibling keeps the whole epic clustered.
+  const epic = makeEpic({
+    epic_id: "fn-1-mixed",
+    project_dir: "/repo-a",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-mixed.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-mixed.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const laneProbe = (_e: string, repo: string): LaneProbeResult =>
+    repo === "/repo-b"
+      ? { epoch: "absent", priorLane: true }
+      : { epoch: "present", priorLane: false };
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    laneProbe,
+    true,
+  ).get("fn-1-mixed");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  const repoB = res.groups.find((g) => g.repoDir === "/repo-b");
+  expect(repoB?.freshEpoch).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// fn-28 part 4(b) + 4(d) — the epic-bound, bounded prior-lane PROOF query. Exercised
+// as the REAL query against a migrated DB (no injected priorLane), through the
+// selective `idx_jobs_plan_ref` seam.
+// ---------------------------------------------------------------------------
+
+/** Insert a TERMINAL lane job (durable `worktree` marker). */
+function seedLaneJob(
+  db: ReturnType<typeof freshMemDb>["db"],
+  jobId: string,
+  planRef: string,
+  worktree: string,
+  cwd: string,
+  state: "ended" | "killed" = "ended",
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, state, updated_at, plan_verb, plan_ref, worktree)
+     VALUES (?, 1, ?, ?, 1, 'work', ?, ?)`,
+    [jobId, cwd, state, planRef, worktree],
+  );
+}
+
+const PROOF_REPO_A = "/code/repo-a";
+const PROOF_REPO_B = "/code/repo-b";
+
+test("fn-28 part 4b readPriorWorktreeLaneProof: prefix-NEIGHBOR epics never cross-match (fn-1 vs fn-10 / fn-100 / fn-1-other); the exact base + rib cwd positives DO match", () => {
+  const { db } = freshMemDb();
+  const refs = (epic: string, tasks: string[]): string[] => [epic, ...tasks];
+  // fn-1's OWN base + rib lane jobs (positives).
+  seedLaneJob(
+    db,
+    "j-base",
+    "fn-1",
+    baseBranchFor("fn-1"),
+    worktreePathFor(PROOF_REPO_A, baseBranchFor("fn-1")),
+  );
+  // Prefix-neighbor epics whose lane paths share the `keeper-epic-fn-1` PREFIX but
+  // not the `--`/exact boundary — they must NEVER count for fn-1.
+  for (const neighbor of ["fn-10", "fn-100", "fn-1-other"]) {
+    seedLaneJob(
+      db,
+      `j-${neighbor}`,
+      neighbor,
+      baseBranchFor(neighbor),
+      worktreePathFor(PROOF_REPO_A, baseBranchFor(neighbor)),
+    );
+  }
+  // fn-1 has an exact-base positive.
+  expect(
+    readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, refs("fn-1", [])),
+  ).toBe(true);
+  // Each neighbor proves only from its OWN job — never fn-1's, never a sibling's.
+  expect(
+    readPriorWorktreeLaneProof(db, "fn-10", PROOF_REPO_A, refs("fn-10", [])),
+  ).toBe(true);
+  // Remove fn-1's own job: the neighbors remain, but fn-1 no longer proves (no
+  // cross-match on the shared `keeper-epic-fn-1` prefix).
+  db.run("DELETE FROM jobs WHERE job_id = 'j-base'");
+  expect(
+    readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, refs("fn-1", [])),
+  ).toBe(false);
+  // A RIB cwd positive also matches the exact-or-rib boundary.
+  seedLaneJob(
+    db,
+    "j-rib",
+    "fn-1.2",
+    ribBranchFor("fn-1", "fn-1.2"),
+    worktreePathFor(PROOF_REPO_A, ribBranchFor("fn-1", "fn-1.2")),
+    "killed",
+  );
+  expect(
+    readPriorWorktreeLaneProof(
+      db,
+      "fn-1",
+      PROOF_REPO_A,
+      refs("fn-1", ["fn-1.2"]),
+    ),
+  ).toBe(true);
+  db.close();
+});
+
+test("fn-28 part 4b readPriorWorktreeLaneProof: a MOVED repo (different repo-dir hash in the lane path) is a NEGATIVE; and a SERIAL job (NULL worktree, shared-checkout cwd) never counts", () => {
+  const { db } = freshMemDb();
+  const refs = ["fn-1", "fn-1.2"];
+  // fn-1 ran a lane in PROOF_REPO_A only.
+  seedLaneJob(
+    db,
+    "j-a",
+    "fn-1",
+    baseBranchFor("fn-1"),
+    worktreePathFor(PROOF_REPO_A, baseBranchFor("fn-1")),
+  );
+  // Probing PROOF_REPO_B (a moved target → a different repoToken hash → a different lane
+  // path) never inherits PROOF_REPO_A's history.
+  expect(readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, refs)).toBe(true);
+  expect(readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_B, refs)).toBe(
+    false,
+  );
+  // A SERIAL job for the SAME epic (worktree NULL, cwd = shared checkout) is not a
+  // worktree lane — it must never count even though its plan_ref matches.
+  db.run("DELETE FROM jobs");
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, state, updated_at, plan_verb, plan_ref, worktree)
+     VALUES ('j-serial', 1, ?, 'ended', 1, 'work', 'fn-1.2', NULL)`,
+    [PROOF_REPO_A],
+  );
+  expect(readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, refs)).toBe(
+    false,
+  );
+  db.close();
+});
+
+test("fn-28 part 4d readPriorWorktreeLaneProof: the SELECTIVE seam is plan_ref — a lane job whose cwd/worktree match the prefix but whose plan_ref is OUTSIDE the candidate set is NOT counted (idx_jobs_plan_ref-bounded)", () => {
+  const { db } = freshMemDb();
+  // A job that ran in fn-1's exact base lane path + branch, but carries an
+  // off-candidate plan_ref (e.g. a stale/foreign ref). The plan_ref IN gate excludes
+  // it, so the read never widens beyond the epic's own candidate refs.
+  seedLaneJob(
+    db,
+    "j-offref",
+    "fn-999-foreign",
+    baseBranchFor("fn-1"),
+    worktreePathFor(PROOF_REPO_A, baseBranchFor("fn-1")),
+  );
+  expect(
+    readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, ["fn-1", "fn-1.2"]),
+  ).toBe(false);
+  // With the matching ref in the candidate set, it counts — confirming plan_ref is
+  // the load-bearing selector.
+  expect(
+    readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, [
+      "fn-1",
+      "fn-999-foreign",
+    ]),
+  ).toBe(true);
+  // An empty candidate set is a bounded no-op (never a full scan).
+  expect(readPriorWorktreeLaneProof(db, "fn-1", PROOF_REPO_A, [])).toBe(false);
+  db.close();
+});
+
+test("fn-28 part 4b readPriorWorktreeLaneProof: the proof survives a simulated RESTART — a FRESH connection reads the same durable jobs rows", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wrs-proof-restart-"));
+  const path = join(dir, "keeper.db");
+  const first = freshDbFile(path);
+  seedLaneJob(
+    first.db,
+    "j-durable",
+    "fn-1",
+    baseBranchFor("fn-1"),
+    worktreePathFor(PROOF_REPO_A, baseBranchFor("fn-1")),
+  );
+  first.db.close();
+  // A brand-new connection (the "restart") sees the durable marker — it is a jobs
+  // row, never an in-memory latch.
+  const { db: reopened } = openDb(path, { readonly: true, migrate: false });
+  expect(
+    readPriorWorktreeLaneProof(reopened, "fn-1", PROOF_REPO_A, ["fn-1"]),
+  ).toBe(true);
+  reopened.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// fn-28 part 4(d) — the LAZY proof read: only the disabled arm touches `.priorLane`.
+// fn-28 part 4(e) — per-(epic, repo) probe MEMOIZATION within one classify pass.
+// ---------------------------------------------------------------------------
+
+test("fn-28 part 4d classify: an ELIGIBLE-absent reopen candidate reads ONLY .epoch, NEVER .priorLane (an eligible group re-cuts regardless — the proof read never fires for it)", () => {
+  let priorLaneReads = 0;
+  // A probe whose `.priorLane` is a getter that COUNTS reads (mirrors the real
+  // probe's lazy getter). An eligible-absent group must never trip it.
+  const countingProbe = (): LaneProbeResult => ({
+    epoch: "absent",
+    get priorLane(): boolean {
+      priorLaneReads++;
+      return true;
+    },
+  });
+  // reopenedEpic() is ELIGIBLE (default assessRepo) + a true reopen (done + non-done).
+  classifyWorktreeRepos(
+    [reopenedEpic()],
+    abResolve,
+    undefined,
+    countingProbe,
+    true,
+  );
+  expect(priorLaneReads).toBe(0);
+
+  // Contrast: a DISABLED no-manifest absent reopen candidate DOES read .priorLane.
+  priorLaneReads = 0;
+  classifyWorktreeRepos(
+    [reopenedEpic()],
+    abResolve,
+    () => ({ eligible: false, reason: "worktree-disabled:no-manifest" }),
+    countingProbe,
+    true,
+  );
+  expect(priorLaneReads).toBeGreaterThan(0);
+});
+
+test("fn-28 part 4e classifyWorktreeRepos: the lane probe is MEMOIZED per (epic, repo) — a foreign-primary eligible epic probes its repo ONCE, not twice", () => {
+  // Tasks resolve to /repo-b, but primary_repo (/repo-a) is FOREIGN → the eligible
+  // arm probes /repo-b once for the fresh-epoch decision, then clusterEpicRepos would
+  // probe it AGAIN; the per-pass memo collapses that to a single probe.
+  const epic = makeEpic({
+    epic_id: "fn-1-foreign",
+    project_dir: "/repo-a", // foreign primary
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foreign.1",
+        task_number: 1,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foreign.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+  const probeCounts = new Map<string, number>();
+  const countingProbe = (epicId: string, repoDir: string): LaneProbeResult => {
+    const key = `${epicId}::${repoDir}`;
+    probeCounts.set(key, (probeCounts.get(key) ?? 0) + 1);
+    return { epoch: "absent", priorLane: false };
+  };
+  classifyWorktreeRepos([epic], abResolve, undefined, countingProbe, true);
+  expect(probeCounts.get("fn-1-foreign::/repo-b")).toBe(1);
 });
 
 test("fn-1034 classifyWorktreeRepos: a single-repo epic NEVER clusters (stays `ok`, byte-identical) even with the flag ON", () => {

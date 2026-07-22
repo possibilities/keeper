@@ -46,6 +46,7 @@ import {
   selectByIdsChunked,
   selectVersionsByIds,
   selectVersionsByIdsChunked,
+  WORKTREE_REPO_STATUS_DESCRIPTOR,
 } from "../src/collections";
 import { MAX_IN_PARAMS, openDb } from "../src/db";
 import {
@@ -1960,6 +1961,36 @@ test("dispatch_claims: same-verb rows retain distinct live identities", () => {
     (db) => {
       seedDispatchClaim(db, "work", "task-a", 101, 5);
       seedDispatchClaim(db, "work", "task-b", 102, 7);
+    },
+  );
+});
+
+function seedWorktreeRepoStatus(
+  db: Database,
+  epicId: string,
+  repoDir: string,
+  lastEventId: number,
+): void {
+  db.query(
+    `INSERT INTO worktree_repo_status
+       (epic_id, repo_dir, mode, reason, last_event_id, updated_at)
+     VALUES (?, ?, 'serial', 'r', ?, 1.0)`,
+  ).run(epicId, repoDir, lastEventId);
+}
+
+test("worktree_repo_status: same-epic sibling groups retain distinct live identities (fn-28 part 4a)", () => {
+  // A CLUSTERED epic may downgrade MORE than one repo group; the composite
+  // `(epic_id, repo_dir)` live key must keep the two same-epic rows independent on
+  // the diff path (seed + version-map + membership token all preserve BOTH), or one
+  // sibling would collapse into the other and only a single row would surface live.
+  expectCompositeLiveIdentity(
+    WORKTREE_REPO_STATUS_DESCRIPTOR,
+    "epic_id || char(31) || repo_dir",
+    { epic_id: "fn-1", repo_dir: "/repo-a" },
+    { epic_id: "fn-1", repo_dir: "/repo-b" },
+    (db) => {
+      seedWorktreeRepoStatus(db, "fn-1", "/repo-a", 5);
+      seedWorktreeRepoStatus(db, "fn-1", "/repo-b", 7);
     },
   );
 });

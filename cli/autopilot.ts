@@ -338,15 +338,23 @@ export interface WorktreeStatusRow {
 
 /**
  * Project `worktree_repo_status` wire rows to typed {@link WorktreeStatusRow}s,
- * sorted by `epic_id` ASC for a stable render. Each row is a worktree-disabled
- * epic (serial shared-checkout dispatch); the `repo_dir` renders as its basename.
- * Pure transform — exported for tests.
+ * sorted by `(epic_id, repo_dir)` ASC for a stable render that matches the
+ * composite-live-key server ordering. A CLUSTERED epic may carry MORE than one
+ * downgraded group row (same `epic_id`, different `repo_dir`), so the tie-break on
+ * `repo_dir` keeps siblings deterministically ordered. Each row is a
+ * worktree-disabled group (serial shared-checkout dispatch); the `repo_dir` renders
+ * as its basename. Pure transform — exported for tests.
  */
 export function projectWorktreeStatusRows(
   rows: Record<string, unknown>[],
 ): WorktreeStatusRow[] {
+  const sorted = [...rows].sort(
+    (a, b) =>
+      seg(a.epic_id).localeCompare(seg(b.epic_id)) ||
+      seg(a.repo_dir).localeCompare(seg(b.repo_dir)),
+  );
   const out: WorktreeStatusRow[] = [];
-  for (const r of rows) {
+  for (const r of sorted) {
     const epicId = seg(r.epic_id);
     if (epicId === "") {
       continue;
@@ -359,7 +367,6 @@ export function projectWorktreeStatusRows(
       reason: seg(r.reason),
     });
   }
-  out.sort((a, b) => a.epicId.localeCompare(b.epicId));
   return out;
 }
 

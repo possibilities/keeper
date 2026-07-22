@@ -33,6 +33,13 @@ const DISABLED_PREFIX = "worktree-disabled";
 /** The verdict string for an eligible repo. */
 export const ELIGIBLE_REASON = "worktree-eligible";
 
+/** The EXACT `disabled` reason for a repo with no language manifest — the SINGLE
+ *  disable class a torn-down worktree group may re-cut a fresh lane for on a
+ *  restart-safe prior-lane proof (a workspace-marker / submodule / probe-error repo
+ *  never re-cuts). Exported so the autopilot lane-probe gate keys on exact equality,
+ *  never a fragile substring `.includes`. */
+export const NO_MANIFEST_REASON = `${DISABLED_PREFIX}:no-manifest`;
+
 /** A workspace-orchestration marker name — the `<which>` in a
  *  `worktree-disabled:workspace-marker:<which>` reason. */
 export type WorkspaceMarker =
@@ -133,7 +140,7 @@ export function classifyWorktreeEligibility(
     return { eligible: false, reason: `${DISABLED_PREFIX}:submodules` };
   }
   if (!signals.hasLanguageManifest) {
-    return { eligible: false, reason: `${DISABLED_PREFIX}:no-manifest` };
+    return { eligible: false, reason: NO_MANIFEST_REASON };
   }
   return { eligible: true, reason: ELIGIBLE_REASON };
 }

@@ -107,6 +107,21 @@ test("worktree_repo_status is a registered LIVE_ONLY projection (NOT determinist
   ]);
 });
 
+test("the migrated schema keys worktree_repo_status on the composite (epic_id, repo_dir) PK (fn-28 part 4a)", () => {
+  // A CLUSTERED epic may downgrade more than one repo group, so the identity is
+  // per-(epic, repo), not per-epic. `pk` (ordinal) 1 = epic_id, 2 = repo_dir.
+  const pk = (
+    db.query("PRAGMA table_info(worktree_repo_status)").all() as {
+      name: string;
+      pk: number;
+    }[]
+  )
+    .filter((c) => c.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((c) => c.name);
+  expect(pk).toEqual(["epic_id", "repo_dir"]);
+});
+
 // ---------------------------------------------------------------------------
 // Fold
 // ---------------------------------------------------------------------------
@@ -144,6 +159,37 @@ test("a WorktreeRepoStatus event folds one row per disabled epic", () => {
   );
   expect(rows[0]?.mode).toBe("serial");
   expect(rows[0]?.last_event_id).toBe(id);
+});
+
+test("two SAME-epic / different-repo entries BOTH survive under the composite PK (fn-28 part 4a)", () => {
+  // A clustered epic downgrading two of its repo groups posts two entries with the
+  // SAME epic_id — the composite `(epic_id, repo_dir)` PK keeps them independent
+  // (the old per-epic PK would UPSERT the second over the first, losing a sibling).
+  insertEvent(
+    "WorktreeRepoStatus",
+    statusData([
+      {
+        epic_id: "fn-1-clust",
+        repo_dir: "/repo-a",
+        reason: "worktree-disabled:submodules",
+      },
+      {
+        epic_id: "fn-1-clust",
+        repo_dir: "/repo-b",
+        reason: "worktree-reopen-serial: /repo-b …",
+      },
+    ]),
+  );
+  drainAll();
+  const rows = db
+    .query(
+      "SELECT epic_id, repo_dir, reason FROM worktree_repo_status ORDER BY epic_id, repo_dir",
+    )
+    .all() as { epic_id: string; repo_dir: string; reason: string }[];
+  expect(rows).toHaveLength(2);
+  expect(rows.map((r) => r.repo_dir)).toEqual(["/repo-a", "/repo-b"]);
+  expect(rows[0]?.reason).toBe("worktree-disabled:submodules");
+  expect(rows[1]?.reason).toBe("worktree-reopen-serial: /repo-b …");
 });
 
 test("full-set REPLACE: a later event wholly replaces the prior set (stale epics drop)", () => {

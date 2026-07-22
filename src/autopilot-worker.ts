@@ -233,6 +233,7 @@ import {
 import {
   ELIGIBLE_REASON,
   memoizedAssessRepo,
+  NO_MANIFEST_REASON,
   type WorktreeEligibility,
 } from "./worktree-eligibility";
 import {
@@ -4109,11 +4110,33 @@ export function classifyWorktreeRepos(
   }),
   multiRepoEnabled = false,
 ): Map<string, WorktreeRepoResolution> {
+  // MEMOIZE the lane probe per (epic, repoDir) for THIS classification pass — a
+  // foreign-primary epic's eligible arm probes its repo once in `classifyEpicRepo`
+  // and again per group in `clusterEpicRepos`, so a bare probe fires the same
+  // (epic, repo) git/db read twice. The memo is FRESH per call (GC'd when the pass
+  // returns), so it never outlives one snapshot/derivation cycle and a later cycle
+  // re-probes. Keyed on the NUL-joined pair (neither component can contain NUL).
+  const probeMemo = new Map<string, LaneProbeResult>();
+  const memoizedProbe = (epicId: string, repoDir: string): LaneProbeResult => {
+    const key = `${epicId}\u0000${repoDir}`;
+    let cached = probeMemo.get(key);
+    if (cached === undefined) {
+      cached = laneProbe(epicId, repoDir);
+      probeMemo.set(key, cached);
+    }
+    return cached;
+  };
   const out = new Map<string, WorktreeRepoResolution>();
   for (const epic of epics) {
     out.set(
       epic.epic_id,
-      classifyEpicRepo(epic, resolve, assessRepo, laneProbe, multiRepoEnabled),
+      classifyEpicRepo(
+        epic,
+        resolve,
+        assessRepo,
+        memoizedProbe,
+        multiRepoEnabled,
+      ),
     );
   }
   return out;
@@ -4123,13 +4146,15 @@ export function classifyWorktreeRepos(
  * PURE projection of the per-cycle {@link WorktreeRepoResolution} map to the
  * operator-surface entry set (fn-1013) — one entry per epic the heuristic marked
  * `disabled` (a not-worktree-friendly repo → serial shared-checkout dispatch), PLUS
- * each CLUSTERED epic's intentional reopened-serial degrade (a group that ran a
- * worktree lane before but re-cuts serial on an unsafe repo — the `reopenDegrade`
- * groups). `ok` epics get worktree lanes (the normal path), and the `multi-repo` /
- * `unresolved` / `no-primary-repo` rejects already show in the red `dispatch_failures`
- * block — the neutral worktree surface is DISTINCT from that. Sorted by `epic_id` for
- * a stable serialization so the change-gate (semantic dedupe) never fires on
- * map-iteration-order churn. Exported for tests.
+ * EVERY CLUSTERED epic's intentional reopened-serial degrade group (a group that ran
+ * a worktree lane before but re-cuts serial on an unsafe repo — the `reopenDegrade`
+ * groups). The `worktree_repo_status` PK is the composite `(epic_id, repo_dir)`, so a
+ * clustered epic with MORE than one degraded group surfaces one row PER group (no
+ * per-epic dedup). `ok` epics get worktree lanes (the normal path), and the
+ * `multi-repo` / `unresolved` / `no-primary-repo` rejects already show in the red
+ * `dispatch_failures` block — the neutral worktree surface is DISTINCT from that.
+ * Sorted by `(epic_id, repo_dir)` for a stable serialization so the change-gate
+ * (semantic dedupe) never fires on map-iteration-order churn. Exported for tests.
  */
 export function buildWorktreeStatusEntries(
   byEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
@@ -4145,25 +4170,28 @@ export function buildWorktreeStatusEntries(
       });
       continue;
     }
-    // A CLUSTERED epic surfaces its intentional reopened-serial degrade(s) — a group
-    // that ran a worktree lane before but re-cuts serial on an unsafe repo. Keyed on
-    // `epic_id` (the projection PK), so the FIRST degraded group per epic represents
-    // it (a >1-degraded-group epic is rare — the wide-key surface is a follow-up).
+    // A CLUSTERED epic surfaces EVERY intentional reopened-serial degrade group — a
+    // group that ran a worktree lane before but re-cuts serial on an unsafe repo. The
+    // composite `(epic_id, repo_dir)` PK keys each independently, so all siblings
+    // surface (no first-group dedup).
     if (resolution.kind === "clustered") {
-      const degraded = resolution.groups.find(
-        (g) => g.reopenDegrade !== undefined,
-      );
-      if (degraded !== undefined) {
-        out.push({
-          epic_id: epicId,
-          repo_dir: degraded.repoDir,
-          mode: "serial",
-          reason: degraded.reopenDegrade ?? "",
-        });
+      for (const g of resolution.groups) {
+        if (g.reopenDegrade !== undefined) {
+          out.push({
+            epic_id: epicId,
+            repo_dir: g.repoDir,
+            mode: "serial",
+            reason: g.reopenDegrade,
+          });
+        }
       }
     }
   }
-  out.sort((a, b) => a.epic_id.localeCompare(b.epic_id));
+  out.sort(
+    (a, b) =>
+      a.epic_id.localeCompare(b.epic_id) ||
+      a.repo_dir.localeCompare(b.repo_dir),
+  );
   return out;
 }
 
@@ -5319,15 +5347,21 @@ function classifyEpicRepo(
   // NON-error sequential-on-shared-checkout fallback, never a sticky reject. Only
   // ever downgrades `ok`; the loud rejects above already returned.
   const eligibility = assessRepo(repoDir);
-  // A fresh-epoch re-cut only matters when there IS an already-done task to EXCLUDE:
-  // a brand-new epic (all tasks todo) derives IDENTICALLY under the fresh or the full
-  // graph, so an ELIGIBLE such epic skips the lane probe entirely (no git/db read for
-  // every pending epic every cycle). A `disabled` epic still probes unconditionally —
-  // the grandfather decides its very mode.
+  // A fresh-epoch re-cut is a TRUE reopen ONLY: at least one DONE task (the epoch
+  // that finalized + tore its base down) AND at least one NON-DONE task (the newly
+  // added work the fresh plan is cut for). An ALL-DONE positively-absent epic must
+  // NOT mint an empty fresh plan (which would re-provision an empty base merely to
+  // finalize + tear it down again), and a brand-new ALL-TODO epic derives identically
+  // fresh or full — so an ELIGIBLE non-reopen epic skips the lane probe entirely (no
+  // git/db read for every pending epic every cycle). A `disabled` epic still probes
+  // unconditionally — the grandfather decides its very mode.
   const hasDoneTask = epic.tasks.some((t) => t.worker_phase === "done");
+  const hasNonDoneTask = epic.tasks.some((t) => t.worker_phase !== "done");
   if (eligibility.eligible) {
     const freshEpoch =
-      hasDoneTask && laneProbe(epic.epic_id, repoDir).epoch === "absent";
+      hasDoneTask &&
+      hasNonDoneTask &&
+      laneProbe(epic.epic_id, repoDir).epoch === "absent";
     return okOrForeignAnchor(freshEpoch);
   }
   const lane = laneProbe(epic.epic_id, repoDir);
@@ -5341,12 +5375,15 @@ function classifyEpicRepo(
   }
   // NO-MANIFEST RE-CUT: a torn-down (positively-absent) epoch with a restart-safe,
   // repo-bound prior-lane proof bootstraps a FRESH worktree epoch — but ONLY for the
-  // `no-manifest` disable. A workspace-marker / submodule / probe-error repo STAYS
-  // serial: a fresh worktree checkout there would carry the wrong dependency tree.
+  // EXACT `no-manifest` disable (equality, never a fragile `.includes` that a future
+  // reason substring could trip). A workspace-marker / submodule / probe-error repo
+  // STAYS serial: a fresh worktree checkout there would carry the wrong dependency
+  // tree. The reason check gates BEFORE `.priorLane` so the lazy proof db read fires
+  // only for a no-manifest absent epoch, never an unsafe one on the re-cut path.
   if (
     lane.epoch === "absent" &&
-    lane.priorLane &&
-    eligibility.reason.includes("no-manifest")
+    eligibility.reason === NO_MANIFEST_REASON &&
+    lane.priorLane
   ) {
     return okOrForeignAnchor(true);
   }
@@ -5404,31 +5441,42 @@ function clusterEpicRepos(
     // dir/ref already makes it `present`).
     const eligibility = assessRepo(repoDir);
     const groupTaskIds = taskIdsByRepo.get(repoDir) ?? [];
-    // An ELIGIBLE group with NO done task derives identically fresh or full, so it
-    // skips the lane probe (no git/db read per pending group per cycle); a `disabled`
-    // group probes unconditionally — the grandfather decides its very mode.
     const groupHasDone = groupTaskIds.some(
       (id) => donePhaseById.get(id) === true,
     );
+    const groupHasNonDone = groupTaskIds.some(
+      (id) => donePhaseById.get(id) === false,
+    );
+    // A TRUE reopen candidate has BOTH a done task (the finalized epoch) and a
+    // non-done task (the newly added work) — the only case a fresh epoch re-cut can
+    // matter. An ELIGIBLE non-candidate group derives identically fresh or full, so
+    // it skips the lane probe (no git/db read per pending group per cycle); a
+    // `disabled` group probes unconditionally — the grandfather decides its very mode.
+    const groupReopenCandidate = groupHasDone && groupHasNonDone;
     const lane =
-      eligibility.eligible && !groupHasDone
+      eligibility.eligible && !groupReopenCandidate
         ? ({ epoch: "inconclusive", priorLane: false } as LaneProbeResult)
         : laneProbe(epic.epic_id, repoDir);
+    // The no-manifest re-cut keys on EXACT reason equality (never `.includes`), and
+    // the reason check gates BEFORE `.priorLane` so the lazy proof db read fires only
+    // for a no-manifest absent group, never an unsafe one on the re-cut path.
     const worktree =
       eligibility.eligible ||
       lane.epoch === "present" ||
       (lane.epoch === "absent" &&
-        lane.priorLane &&
-        eligibility.reason.includes("no-manifest"));
+        eligibility.reason === NO_MANIFEST_REASON &&
+        lane.priorLane);
     const group: WorktreeRepoGroup = {
       repoDir,
       taskIds: groupTaskIds,
       mode: worktree ? "worktree" : "serial",
     };
     // A worktree group whose base epoch is positively ABSENT (torn down) re-cuts a
-    // FRESH epoch over its NON-DONE tasks only — deps on already-done tasks collapse
-    // to a base cut from current default. `present` / `inconclusive` → full graph.
-    if (worktree && lane.epoch === "absent") {
+    // FRESH epoch over its NON-DONE tasks only — but ONLY a TRUE reopen (a done AND a
+    // non-done task). An all-done absent group must NOT mint an empty fresh plan (it
+    // would re-provision an empty base merely to finalize + tear it down again);
+    // `present` / `inconclusive` → full graph.
+    if (worktree && lane.epoch === "absent" && groupReopenCandidate) {
       group.freshEpoch = true;
     }
     // A SERIAL group that positively RAN a worktree lane here before (absent epoch +
@@ -5441,8 +5489,8 @@ function clusterEpicRepos(
     if (
       !worktree &&
       lane.epoch === "absent" &&
-      lane.priorLane &&
-      groupTaskIds.some((id) => donePhaseById.get(id) === false)
+      groupHasNonDone &&
+      lane.priorLane
     ) {
       group.reopenDegrade = `worktree-reopen-serial: ${repoDir} ran a worktree lane before but re-cuts serial on the shared checkout — ${eligibility.reason}`;
     }
@@ -5509,6 +5557,7 @@ function worktreeEpicLaneProbe(
   db: Parameters<typeof runQuery>[0],
   epicId: string,
   repoDir: string,
+  candidatePlanRefs: readonly string[],
 ): LaneProbeResult {
   const baseBranch = baseBranchFor(epicId);
   if (existsSync(worktreePathFor(repoDir, baseBranch))) {
@@ -5521,44 +5570,79 @@ function worktreeEpicLaneProbe(
   if (refState === "inconclusive") {
     return { epoch: "inconclusive", priorLane: false };
   }
-  // Positively absent (dir absent + ref exit-1): read the prior-lane proof so a
-  // no-manifest group may bootstrap a fresh worktree epoch. Every other group ignores
-  // `priorLane` (an eligible group re-cuts regardless; an unsafe group stays serial).
+  // Positively absent (dir absent + ref exit-1). The prior-lane proof is read LAZILY
+  // through a memoized getter: ONLY the disabled `no-manifest` re-cut arm and the
+  // reopened-serial degrade actually read `.priorLane`, so an eligible-absent group
+  // (which re-cuts regardless) and a present/inconclusive epoch NEVER fire the bounded
+  // db read. Memoized so the clustered arm's up-to-two reads hit the db at most once.
+  let proofCache: boolean | undefined;
   return {
     epoch: "absent",
-    priorLane: readPriorWorktreeLaneProof(db, epicId, repoDir),
+    get priorLane(): boolean {
+      if (proofCache === undefined) {
+        proofCache = readPriorWorktreeLaneProof(
+          db,
+          epicId,
+          repoDir,
+          candidatePlanRefs,
+        );
+      }
+      return proofCache;
+    },
   };
 }
 
 /**
- * PRODUCER read: a RESTART-SAFE, repo-bound proof that a prior worktree lane ran for
- * `epicId` in `repoDir`. A bounded INDEXED read of TERMINAL (ended / killed) jobs'
- * durable `worktree` lane marker — the default `jobs` collection hides terminal rows,
+ * PRODUCER read: a RESTART-SAFE, repo-bound, epic-bound proof that a prior worktree
+ * lane ran for `epicId` in `repoDir`. Reads the durable `worktree` lane marker of
+ * TERMINAL (ended / killed) jobs — the default `jobs` collection hides terminal rows,
  * so a direct query is required, and the marker survives a daemon restart (unlike an
- * in-memory latch). Bound to the repo AND the epic via the deterministic lane `cwd`
- * prefix ({@link worktreePathFor} folds the repo-dir hash + the `keeper/epic/<id>`
- * slug), so a MOVED target repo (a different dir → a different hash → a different lane
- * path) can never inherit another repo's history. `created_at DESC` + `LIMIT 1` off
- * `idx_jobs_created_state` keeps the read bounded. A PRODUCER read; never a fold.
+ * in-memory latch).
+ *
+ * SELECTIVE SEAM: `plan_ref IN (candidatePlanRefs)` (the epic's own id + task ids)
+ * routes through the partial `idx_jobs_plan_ref`, so the read seeks the epic's OWN
+ * jobs (a board-bounded handful) — never the unbounded `created_at DESC` walk-to-EOF
+ * the old `idx_jobs_created_state` scan suffered on a no-match.
+ *
+ * EPIC-OR-RIB BOUNDARY (the `cwd` / `worktree` predicates bind the repo AND re-confirm
+ * the epic, so a MOVED repo — a different dir → a different {@link repoToken} hash →
+ * a different lane path — can never inherit another repo's history, and a prefix
+ * NEIGHBOR epic can never cross-match):
+ *  - `cwd = <laneBase>` OR `cwd LIKE <laneBase>--% ` — the exact base lane OR any rib
+ *    lane (`<laneBase>--<task>`), the `--` boundary keeping `fn-1` off `fn-10`.
+ *  - `worktree = keeper/epic/<id>` OR `worktree LIKE keeper/epic/<id>--% ` —
+ *    corroborates the durable branch marker (a SERIAL job carries a NULL worktree +
+ *    a shared-checkout cwd, so it never counts).
+ * A PRODUCER read; never a fold. Exported for the query-shape tests.
  */
-function readPriorWorktreeLaneProof(
+export function readPriorWorktreeLaneProof(
   db: Parameters<typeof runQuery>[0],
   epicId: string,
   repoDir: string,
+  candidatePlanRefs: readonly string[],
 ): boolean {
-  const laneBase = worktreePathFor(repoDir, baseBranchFor(epicId));
-  // Match the base + every rib lane under the repo+epic prefix; escape LIKE metachars.
-  const prefix = `${laneBase.replace(/[\\%_]/g, "\\$&")}%`;
+  if (candidatePlanRefs.length === 0) return false;
+  const baseBranch = baseBranchFor(epicId);
+  const laneBase = worktreePathFor(repoDir, baseBranch);
+  const escapeLike = (s: string): string => s.replace(/[\\%_]/g, "\\$&");
+  // The rib lane path / rib branch both extend the base with a literal `--` boundary
+  // ({@link ribBranchFor} / {@link worktreePathFor}), so the boundary-anchored LIKE
+  // excludes a prefix-neighbor epic (`fn-10`'s `...keeper-epic-fn-10` never matches
+  // `...keeper-epic-fn-1--%`).
+  const cwdRib = `${escapeLike(laneBase)}--%`;
+  const worktreeRib = `${escapeLike(baseBranch)}--%`;
+  const placeholders = candidatePlanRefs.map(() => "?").join(", ");
   const row = db
     .query(
       `SELECT 1 FROM jobs
-         WHERE state IN ('ended', 'killed')
+         WHERE plan_ref IN (${placeholders})
+           AND state IN ('ended', 'killed')
            AND worktree IS NOT NULL
-           AND cwd LIKE ? ESCAPE '\\'
-         ORDER BY created_at DESC
+           AND (worktree = ? OR worktree LIKE ? ESCAPE '\\')
+           AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')
          LIMIT 1`,
     )
-    .get(prefix);
+    .get(...candidatePlanRefs, baseBranch, worktreeRib, laneBase, cwdRib);
   return row != null;
 }
 
@@ -11928,12 +12012,23 @@ export async function loadReconcileSnapshot(
   // an OFF cycle adds ZERO probes.
   const toplevelResolver = memoizedNullableGitToplevel();
   const assessResolver = memoizedAssessRepo();
+  // The exact candidate `plan_ref` values the lane-probe proof seeks per epic — the
+  // epic's own id (its close job's ref) plus every task id (each work job's ref) — so
+  // `readPriorWorktreeLaneProof` routes through `idx_jobs_plan_ref` (a bounded seek of
+  // the epic's own jobs) instead of a `created_at DESC` walk-to-EOF on a no-match.
+  const epicForProbe = new Map(epics.map((e) => [e.epic_id, e]));
   const worktreeRepoByEpicId = worktreeMode
     ? classifyWorktreeRepos(
         epics,
         toplevelResolver,
         assessResolver,
-        (epicId, repoDir) => worktreeEpicLaneProbe(db, epicId, repoDir),
+        (epicId, repoDir) => {
+          const ep = epicForProbe.get(epicId);
+          const candidatePlanRefs = ep
+            ? [epicId, ...ep.tasks.map((t) => t.task_id)]
+            : [epicId];
+          return worktreeEpicLaneProbe(db, epicId, repoDir, candidatePlanRefs);
+        },
         worktreeMultiRepo,
       )
     : new Map<string, WorktreeRepoResolution>();
