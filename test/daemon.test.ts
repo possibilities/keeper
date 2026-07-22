@@ -158,6 +158,7 @@ import {
   parseRestartLedger,
   parseRestartLedgerLine,
   planNativeCrashEnrichLines,
+  planTerminalSessionClaimReleases,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
   probeBlockOwner,
@@ -239,6 +240,7 @@ import {
   shouldEnrichPriorExitAttribution,
   shouldEscalateBlockedCategory,
   type TrunkLeaseSweepDeps,
+  terminalSessionClaimIsReleaseable,
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
   writeRestartLedger,
@@ -6479,6 +6481,145 @@ test("probeDispatchClearClaimLiveness: missing claimant evidence refuses live an
       { kind: testCase.decision },
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// terminalSessionClaimIsReleaseable — the recycle-safe liveness fence on the
+// orphan/GC claim-release sweep. A terminal jobs state alone must not release a
+// claim: a serve-liveness watchdog recycle's seed sweep can fold a still-live
+// worker to `killed`, and releasing here would let the reconciler dispatch a
+// second live worker (the double-mint). The release re-probes the owning
+// session's recorded (pid, start_time) and holds a live-or-inconclusive owner.
+// ---------------------------------------------------------------------------
+
+function seedTerminalSessionClaim(
+  db: ReturnType<typeof freshMemDb>["db"],
+  opts: {
+    id: string;
+    attemptId: number;
+    sessionId: string;
+    jobState: "killed" | "ended" | "stopped";
+    pid: number | null;
+    startTime: string | null;
+    claimState?: "bound" | "resume_requested";
+  },
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, title, title_source, transcript_path,
+                       plan_verb, plan_ref, start_time)
+       VALUES (?, 1, NULL, ?, ?, ?, 2, NULL, NULL, NULL, 'work', ?, ?)`,
+    [
+      opts.sessionId,
+      opts.pid,
+      opts.jobState,
+      opts.attemptId,
+      opts.id,
+      opts.startTime,
+    ],
+  );
+  db.run(
+    `INSERT INTO dispatch_claims (verb, id, attempt_id, state, session_id, dir,
+                                  legacy_unfenced, acquired_at, bound_at,
+                                  last_event_id, updated_at)
+       VALUES ('work', ?, ?, ?, ?, '/repo', 0, 1, 1, ?, 2)`,
+    [
+      opts.id,
+      opts.attemptId,
+      opts.claimState ?? "bound",
+      opts.sessionId,
+      opts.attemptId,
+    ],
+  );
+}
+
+test("terminalSessionClaimIsReleaseable: a pid-bearing terminal owner releases ONLY when it probes provably gone", () => {
+  const { db } = freshMemDb();
+  seedTerminalSessionClaim(db, {
+    id: "live.1",
+    attemptId: 301,
+    sessionId: "sess-live",
+    jobState: "killed",
+    pid: 4242,
+    startTime: "linux:100",
+  });
+  const row = {
+    verb: "work",
+    id: "live.1",
+    attempt_id: 301,
+    session_id: "sess-live",
+  };
+  // A live worker whose row was wrongly reaped to `killed` (the recycle
+  // collateral) HOLDS its claim — releasing it would redispatch a second worker.
+  expect(terminalSessionClaimIsReleaseable(db, row, () => "matching")).toBe(
+    false,
+  );
+  // An uncertain identity (reused pid, unreadable witness) also holds — fail-closed.
+  expect(terminalSessionClaimIsReleaseable(db, row, () => "inconclusive")).toBe(
+    false,
+  );
+  // Only positive death evidence releases (the sanctioned reap).
+  expect(terminalSessionClaimIsReleaseable(db, row, () => "gone")).toBe(true);
+  db.close();
+});
+
+test("terminalSessionClaimIsReleaseable: a witnessless (NULL pid) terminal owner falls back to terminal-state trust without probing", () => {
+  const { db } = freshMemDb();
+  seedTerminalSessionClaim(db, {
+    id: "nowitness.1",
+    attemptId: 302,
+    sessionId: "sess-nowitness",
+    jobState: "killed",
+    pid: null,
+    startTime: null,
+  });
+  // No (pid, start_time) witness: the seed sweep already proved this row
+  // unwatchable/terminal by construction, so the release proceeds and the
+  // process probe is NEVER consulted.
+  expect(
+    terminalSessionClaimIsReleaseable(
+      db,
+      {
+        verb: "work",
+        id: "nowitness.1",
+        attempt_id: 302,
+        session_id: "sess-nowitness",
+      },
+      PROBE_NEVER,
+    ),
+  ).toBe(true);
+  db.close();
+});
+
+test("double-mint structurally prevented: the planner surfaces a reaped-but-live owner, the release re-check HOLDS its claim", () => {
+  const { db } = freshMemDb();
+  // A live swap-routed worker (fresh start-time witness) whose jobs row a
+  // watchdog recycle folded to `killed`. The terminal-state SQL predicate makes
+  // it a release CANDIDATE, but the liveness re-check must hold the claim so the
+  // redispatch path still sees the surviving claim/session — no double-mint.
+  seedTerminalSessionClaim(db, {
+    id: "reaped-live.1",
+    attemptId: 303,
+    sessionId: "sess-reaped-live",
+    jobState: "killed",
+    pid: 5150,
+    startTime: "linux:200",
+  });
+  const planned = planTerminalSessionClaimReleases(db);
+  expect(planned.map((row) => row.id)).toEqual(["reaped-live.1"]);
+  const candidate = planned[0];
+  if (candidate === undefined) throw new Error("expected a planned candidate");
+  // Live owner → HELD (the claim is never released, so the reconciler cannot
+  // dispatch a second worker onto the lane).
+  expect(
+    terminalSessionClaimIsReleaseable(db, candidate, () => "matching"),
+  ).toBe(false);
+  // The same candidate, once its owner is provably gone, releases (the genuine
+  // reap the sweep is for).
+  expect(terminalSessionClaimIsReleaseable(db, candidate, () => "gone")).toBe(
+    true,
+  );
+  db.close();
 });
 
 test("buildRetryDispatchResultMessage: refused_live, refused_identity, and cleared replies are explicit", () => {

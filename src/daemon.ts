@@ -1386,7 +1386,9 @@ export function orphanedClaimIsReleaseable(
 /**
  * Plan a bounded heartbeat batch of exact claims whose bound owner has durable
  * terminal evidence. Provider legs and cascade intents must already be settled;
- * the release fold repeats every predicate before changing the claim.
+ * the release re-check ({@link terminalSessionClaimIsReleaseable}) repeats every
+ * predicate — and the recycle-safe liveness probe — before changing the claim, so
+ * a candidate surfaced here whose owner still probes live is HELD, never released.
  */
 export function planTerminalSessionClaimReleases(
   db: Database,
@@ -1425,11 +1427,14 @@ export function terminalSessionClaimIsReleaseable(
     TerminalSessionDispatchClaimRow,
     "verb" | "id" | "attempt_id" | "session_id"
   >,
+  probeIdentity: (
+    pid: number,
+    startTime: string,
+  ) => RecordedProcessIdentityVerdict = recordedProcessIdentity,
 ): boolean {
-  return (
-    db
-      .query(
-        `SELECT 1
+  const gated = db
+    .query(
+      `SELECT j.pid AS pid, j.start_time AS start_time
            FROM dispatch_claims c
            JOIN jobs j ON j.job_id = c.session_id
           WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
@@ -1447,9 +1452,33 @@ export function terminalSessionClaimIsReleaseable(
                WHERE pc.wrapper_dispatch_attempt_id = c.attempt_id
                  AND pc.state != 'confirmed'
             )`,
-      )
-      .get(row.verb, row.id, row.attempt_id, row.session_id) != null
-  );
+    )
+    .get(row.verb, row.id, row.attempt_id, row.session_id) as {
+    pid: number | null;
+    start_time: string | null;
+  } | null;
+  if (gated == null) return false;
+  // Recycle-safe liveness fence. A terminal `jobs` state is NOT proof the OS
+  // process is gone: a serve-liveness watchdog recycle's boot seed sweep folds a
+  // still-live worker's row to `killed` on any misclassification, and releasing
+  // its claim here re-opens the lane for the reconciler to dispatch a SECOND live
+  // worker (the double-mint). So the release re-probes the owning session's
+  // RECORDED (pid, start_time) with the same witness every claim gate uses and
+  // releases ONLY on positive death evidence (`gone` — ESRCH or a start-time
+  // recycle); a `matching` (live) or `inconclusive` (uncertain) identity HOLDS the
+  // claim, so a live-or-inconclusive worker is never reaped-then-redispatched
+  // (fail-closed, mirroring {@link decideDispatchClearLiveness}). A row with no
+  // process witness (NULL pid / start_time — terminal by construction, and the
+  // seed sweep's own pidless reap already proved it unwatchable) has nothing to
+  // hold a live process against, so it falls back to the terminal-state trust.
+  if (
+    gated.pid != null &&
+    gated.start_time != null &&
+    gated.start_time.length > 0
+  ) {
+    return probeIdentity(gated.pid, gated.start_time) === "gone";
+  }
+  return true;
 }
 
 /**
