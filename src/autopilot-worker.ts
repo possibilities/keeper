@@ -192,6 +192,7 @@ import {
   recoverFailureDispatchId,
   SLOT_RECLAIM_GRACE_SEC,
   SLOT_RECLAIM_MAX_PER_SWEEP,
+  SLOT_RECLAIM_UNCONTENDED_GRACE_SEC,
   type StaleBaseLaneEntry,
   type Verb,
   type WithholdReason,
@@ -402,6 +403,7 @@ export {
   recoverFailureDispatchId,
   SLOT_RECLAIM_GRACE_SEC,
   SLOT_RECLAIM_MAX_PER_SWEEP,
+  SLOT_RECLAIM_UNCONTENDED_GRACE_SEC,
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -889,6 +891,7 @@ export function createLaneMaintenanceProbe(
   dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> | undefined,
   livePaneIds: ReadonlySet<string> | null,
   claimedIncidentKeys: ReadonlySet<DispatchKey> = new Set(),
+  now?: number,
 ): LaneMaintenanceProbe {
   return (target) => {
     const lanePath = normalizeLanePath(target.path);
@@ -955,6 +958,20 @@ export function createLaneMaintenanceProbe(
         // rather than forked here. `null` panes stay a DISTINCT reason: the hold
         // is fail-closed on an unavailable probe, not a witnessed live owner.
         if (!isStoppedJobLive(job, livePaneIds)) continue;
+        // A stopped-but-live sibling whose turn ended past the uncontended reap
+        // grace is a dead claim the occupancy sweep will reap; its lane hold has
+        // EXPIRED and must not block the epic's lane provision. Gated on a GENUINE
+        // liveness picture (`livePaneIds !== null`) and the SAME `updated_at`
+        // stop-age anchor + grace the reap uses, so reap and lane release stay in
+        // lockstep. A probe with no clock (`now` absent), an inconclusive probe
+        // (`null` panes), and a within-grace stop all stay fail-closed held.
+        if (
+          now !== undefined &&
+          livePaneIds !== null &&
+          now - job.updated_at >= SLOT_RECLAIM_UNCONTENDED_GRACE_SEC
+        ) {
+          continue;
+        }
         return {
           kind: "defer",
           reason: boundedLaneMaintenanceReason(
@@ -13133,6 +13150,7 @@ function main(): void {
           snapshot.dispatchClaims,
           snapshot.livePaneIds,
           snapshot.claimedIncidentKeys,
+          deps.now(),
         );
         dispatchFailedGate.observeProjection(snapshot.dispatchFailureFences);
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY

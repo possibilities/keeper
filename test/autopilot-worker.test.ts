@@ -199,6 +199,7 @@ import {
   SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
   SLOT_RECLAIM_MAX_PER_SWEEP,
+  SLOT_RECLAIM_UNCONTENDED_GRACE_SEC,
   type SlotOccupancySignal,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
@@ -2217,6 +2218,97 @@ test("computeSlotOccupancy: SLOT_RECLAIM_GRACE_SEC is the default grace, overrid
   const occ = oneOccupant({ command: "zsh", updated_at: 999 }); // idle 1s
   const out = computeSlotOccupancy(slotInput({ ...occ, graceSec: 1 }));
   expect(out.failures[0].reapTarget?.paneId).toBe("%7");
+});
+
+// ---------------------------------------------------------------------------
+// computeSlotOccupancy — time-driven reap of UNCONTENDED stopped sessions
+// ---------------------------------------------------------------------------
+
+test("computeSlotOccupancy: an uncontended stopped session past the uncontended grace is reaped (time-driven, no contention)", () => {
+  // now=1000, updated_at=600 → idle 400 ≥ SLOT_RECLAIM_UNCONTENDED_GRACE_SEC (300),
+  // and readiness maps this key to NO dispatch verb. The reap fires on stop-age
+  // alone — the squatting slot is reclaimed with zero contention.
+  const occ = oneOccupant({ command: "claude", updated_at: 600 });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: an uncontended stopped session within the uncontended grace stays silent", () => {
+  // idle 200 — PAST the contended grace (120) yet readiness wants no dispatch, so the
+  // longer uncontended grace protects it: no reap and no visibility row, the
+  // recently-ended turn keeps its inspection window.
+  const occ = oneOccupant({ command: "claude", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false }),
+  );
+  expect(out.failures).toEqual([]);
+});
+
+test("computeSlotOccupancy: uncontended grace boundary — idle === grace reaps, idle < grace stays silent", () => {
+  const atBoundary = computeSlotOccupancy(
+    slotInput({
+      ...oneOccupant({ command: "claude", updated_at: 700 }), // idle 300 === grace
+      wantsDispatch: () => false,
+      now: 1000,
+    }),
+  );
+  expect(atBoundary.failures[0].reapTarget?.jobId).toBe("j"); // 300 ≥ 300
+  const justUnder = computeSlotOccupancy(
+    slotInput({
+      ...oneOccupant({ command: "claude", updated_at: 701 }), // idle 299 < grace
+      wantsDispatch: () => false,
+      now: 1000,
+    }),
+  );
+  expect(justUnder.failures).toEqual([]); // 299 < 300 → silent
+});
+
+test("computeSlotOccupancy: an uncontended fatal_halt closer is reaped immediately (bypasses the uncontended grace)", () => {
+  // A stopped close session readiness does not want, but its fatal_halt receipt at
+  // session start proves it dead — reap now, no grace wait for a known-dead closer.
+  const occ = oneOccupant({ created_at: 900, updated_at: 999 }); // idle 1s
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      wantsDispatch: () => false,
+      latestCloseReceiptByEpicId: new Map([
+        ["fn-1-foo", { outcome: "fatal_halt", ts: 900 }],
+      ]),
+    }),
+  );
+  expect(out.failures[0].reapTarget).toEqual({
+    jobId: "j",
+    paneId: "%7",
+    immediate: true,
+  });
+});
+
+test("computeSlotOccupancy: a CONTENDED session past the short grace reaps even below the uncontended grace", () => {
+  // idle 200: past SLOT_RECLAIM_GRACE_SEC (120), under the uncontended grace (300).
+  // Contention keeps the SHORT grace — the contention-driven path is unchanged.
+  const occ = oneOccupant({ command: "claude", updated_at: 800 });
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => true }),
+  );
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: SLOT_RECLAIM_UNCONTENDED_GRACE_SEC gates the time-driven reap, overridable per call", () => {
+  expect(SLOT_RECLAIM_UNCONTENDED_GRACE_SEC).toBe(300);
+  expect(SLOT_RECLAIM_UNCONTENDED_GRACE_SEC).toBeGreaterThan(
+    SLOT_RECLAIM_GRACE_SEC,
+  );
+  // A tiny injected uncontended grace reaps an uncontended just-stopped session now.
+  const occ = oneOccupant({ command: "claude", updated_at: 999 }); // idle 1s
+  const out = computeSlotOccupancy(
+    slotInput({ ...occ, wantsDispatch: () => false, uncontendedGraceSec: 1 }),
+  );
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
 });
 
 // ---------------------------------------------------------------------------
@@ -15937,6 +16029,69 @@ test("lane maintenance probe holds live claims and fails closed on inconclusive 
       taskId: null,
     }),
   ).toMatchObject({ kind: "defer" });
+});
+
+test("lane maintenance probe expires a past-grace stopped sibling's hold, keeping within-grace / inconclusive / no-clock holds", () => {
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const target = { path: lane, epicId: "fn-1-foo", taskId: "fn-1-foo.2" };
+  // A stopped-but-live sibling squatting the lane with no live claim of its own — the
+  // exact dead-claim shape the occupancy sweep reaps.
+  const stopped = makeJob({
+    job_id: "sib",
+    plan_verb: "work",
+    plan_ref: "fn-1-foo.2",
+    cwd: lane,
+    state: "stopped",
+    backend_exec_pane_id: "%7",
+    updated_at: 100,
+  });
+  const jobs = new Map([[stopped.job_id, stopped]]);
+  const live = new Set(["%7"]);
+  const pastGrace = 100 + SLOT_RECLAIM_UNCONTENDED_GRACE_SEC; // idle === grace
+
+  // Genuine liveness picture, clock present, stop-age past grace → hold EXPIRES so the
+  // epic's lane provision proceeds.
+  const expired = createLaneMaintenanceProbe(
+    jobs,
+    new Map(),
+    live,
+    new Set(),
+    pastGrace,
+  );
+  expect(expired(target)).toEqual({ kind: "clear" });
+
+  // Within grace → still held (fail-closed; provision stays blocked).
+  const withinGrace = createLaneMaintenanceProbe(
+    jobs,
+    new Map(),
+    live,
+    new Set(),
+    pastGrace - 1,
+  );
+  expect(withinGrace(target)).toMatchObject({
+    kind: "defer",
+    reason: expect.stringContaining("live claimed session"),
+  });
+
+  // Inconclusive liveness (null panes) → still held even past grace (fail-closed).
+  const inconclusive = createLaneMaintenanceProbe(
+    jobs,
+    new Map(),
+    null,
+    new Set(),
+    pastGrace,
+  );
+  expect(inconclusive(target)).toMatchObject({
+    kind: "defer",
+    reason: expect.stringContaining("liveness probe inconclusive"),
+  });
+
+  // No clock supplied → the expiry is off entirely, the hold stays (fail-closed).
+  const noClock = createLaneMaintenanceProbe(jobs, new Map(), live, new Set());
+  expect(noClock(target)).toMatchObject({
+    kind: "defer",
+    reason: expect.stringContaining("live claimed session"),
+  });
 });
 
 test("recoverWorktrees: a task-scoped live claim plus MERGE_HEAD protects the lane from every recovery mutation", async () => {

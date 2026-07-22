@@ -2074,6 +2074,30 @@ export function isStoppedJobLive(
 export const SLOT_RECLAIM_GRACE_SEC = 120;
 
 /**
+ * Producer-`ts` seconds an UNCONTENDED positively-stopped occupant must remain
+ * stopped before the reconciler reaps its process — a stopped session readiness does
+ * NOT map to a dispatch verb this cycle (a sibling merely holding a worktree lane, a
+ * task blocked elsewhere, a fatal-halt closer). The occupancy reap is otherwise
+ * CONTENTION-driven — only a slot readiness wants right now is ever reaped — so a dead
+ * session nothing currently contends can squat its slot (and, in worktree mode, its
+ * epic's lane) indefinitely. This time-driven grace closes that hole: past it an
+ * uncontended stopped session is reap-eligible regardless of contention.
+ *
+ * DELIBERATELY longer than the contention-driven {@link SLOT_RECLAIM_GRACE_SEC}: a
+ * contended slot has ready work blocked on THIS exact target right now (relieve it
+ * fast), while an uncontended one has nothing waiting on its slot this cycle, so we
+ * wait longer to be confident the session is genuinely abandoned rather than briefly
+ * idle before reaping. Sits in the 5-minute worktree/lane grace family
+ * (`LANE_WEDGE_GRACE_SEC` / `LANE_OWNER_STALL_GRACE_SEC` / `SHARED_CHECKOUT_*_GRACE_SEC`),
+ * the apt family since the corrosive harm is a dead session squatting a worktree lane
+ * or concurrency slot from ready siblings. The SAME window the lane-maintenance probe
+ * treats a stopped sibling's hold as expired, so the reap and the lane-provision
+ * release stay in lockstep. Anchored on `job.updated_at`, exactly like the contended
+ * grace; a `fatal_halt` receipt still bypasses BOTH graces.
+ */
+export const SLOT_RECLAIM_UNCONTENDED_GRACE_SEC = 5 * 60;
+
+/**
  * Blast-radius bound on process-reap ladders a single occupancy sweep may issue.
  * One bad projection frame cannot cascade into a mass session close. Over-cap
  * eligible candidates DOWNGRADE to
@@ -2154,6 +2178,10 @@ export interface SlotOccupancyInput {
   paused: boolean;
   now: number;
   graceSec?: number;
+  /** Grace before an UNCONTENDED stopped session (readiness maps it to no verb this
+   *  cycle) becomes reap-eligible on stop-age alone. Defaults to
+   *  {@link SLOT_RECLAIM_UNCONTENDED_GRACE_SEC}; injected in tests. */
+  uncontendedGraceSec?: number;
 }
 
 /** The slot-occupancy pass output: failures with optional reap targets, and clears. */
@@ -2171,6 +2199,16 @@ const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
  * The exact session is sent through the process reaper, which re-proves identity
  * immediately before TERM and again before KILL. A `fatal_halt` close receipt at
  * or after that session's start bypasses only the age grace.
+ *
+ * Reaping is BOTH contention- and time-driven. A CONTENDED slot (readiness maps
+ * `(verb, id)` to a dispatch verb this cycle) surfaces as `slot-occupied` within
+ * {@link SLOT_RECLAIM_GRACE_SEC} and reaps past it — the ready-work-is-blocked
+ * signal. An UNCONTENDED stopped session (a lane-holding sibling, a task blocked
+ * elsewhere, a fatal-halt closer readiness does not currently want) stays SILENT
+ * within the longer {@link SLOT_RECLAIM_UNCONTENDED_GRACE_SEC} — keeping a normal
+ * recently-ended turn's inspection window untouched — then becomes reap-eligible
+ * past it, so a dead session can never squat a slot indefinitely merely because
+ * nothing contends it this cycle.
  *
  * Reaps are blast-capped at {@link SLOT_RECLAIM_MAX_PER_SWEEP} per sweep, chosen
  * by lowest `(verb, id)` key. Duplicate rows for one key are ordered by positive
@@ -2191,6 +2229,8 @@ export function computeSlotOccupancy(
     return { failures, clears };
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
+  const uncontendedGraceSec =
+    input.uncontendedGraceSec ?? SLOT_RECLAIM_UNCONTENDED_GRACE_SEC;
   const activeKeys = new Set<string>();
   const allCandidates: {
     key: string;
@@ -2217,16 +2257,24 @@ export function computeSlotOccupancy(
     if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
       continue;
     }
-    if (!input.wantsDispatch(verb, id)) continue;
-
-    const key = slotKey(verb, id);
-    activeKeys.add(key);
     const command = paneCommandById.get(paneId);
     const receipt =
       verb === "close" ? input.latestCloseReceiptByEpicId?.get(id) : undefined;
     const immediate =
       receipt?.outcome === "fatal_halt" && receipt.ts >= job.created_at;
-    const graceElapsed = input.now - job.updated_at >= graceSec;
+    const idleSec = input.now - job.updated_at;
+    const contended = input.wantsDispatch(verb, id);
+    // Contended: keep the shorter contention grace exactly — occupied within it,
+    // reaped past it (or immediately on fatal_halt). Uncontended: the added
+    // time-driven arm — reap-eligible only past the longer uncontended grace (or on
+    // fatal_halt), and SILENT (no candidate, no occupied signal) within it so a
+    // normal recently-ended turn's inspection window is left alone.
+    const reapEligible =
+      immediate || idleSec >= (contended ? graceSec : uncontendedGraceSec);
+    if (!contended && !reapEligible) continue;
+
+    const key = slotKey(verb, id);
+    activeKeys.add(key);
     allCandidates.push({
       key,
       verb,
@@ -2239,7 +2287,7 @@ export function computeSlotOccupancy(
       immediate,
       provenDead: input.provenDeadJobIds?.has(job.job_id) ?? false,
       bareShell: isBareShellCommand(command),
-      reapEligible: immediate || graceElapsed,
+      reapEligible,
     });
   }
 
