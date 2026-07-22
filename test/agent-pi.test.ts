@@ -498,7 +498,7 @@ describe("Pi command assembly", () => {
         degraded: null,
         scoped: {
           proof_scope: CODEX_SPARK_QUOTA_SCOPE,
-          authorized_aliases: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+          authorized_aliases: aliasPolicy(CODEX_ALIASES, ["keeper-codex-b"]),
         },
         updated_at_ms: now,
       });
@@ -546,7 +546,8 @@ describe("Pi command assembly", () => {
       expect(sparkContext).toMatchObject({
         mode: "active",
         activation_mode: "active-scoped",
-        alias_policy: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+        alias_policy: aliasPolicy(CODEX_ALIASES, ["keeper-codex-b"]),
+        capability_policy: aliasPolicy(CODEX_ALIASES, []),
         initial_alias: null,
         problem_code: "pool-unavailable",
       });
@@ -568,7 +569,8 @@ describe("Pi command assembly", () => {
       expect(genericContext).toMatchObject({
         mode: "active",
         activation_mode: "active-scoped",
-        alias_policy: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
+        alias_policy: aliasPolicy(CODEX_ALIASES, ["keeper-codex-b"]),
+        capability_policy: aliasPolicy(CODEX_ALIASES, CODEX_ALIASES),
         initial_alias: null,
         problem_code: "pool-unavailable",
       });

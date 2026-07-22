@@ -292,6 +292,7 @@ export interface CodexPoolLaunchContext {
   degraded?: boolean;
   aliases: string[];
   alias_policy: CodexPoolAliasPolicy;
+  capability_policy?: CodexPoolAliasPolicy;
   requested_quota_scope: CodexQuotaScope;
   initial_scope: CodexQuotaScope;
   config_binding: string;
@@ -567,11 +568,11 @@ function emptyCodexPoolAliasPolicy(): CodexPoolAliasPolicy {
 }
 
 function codexPoolProofAliasPolicy(
-  aliases: readonly string[],
+  capabilityPolicy: CodexPoolAliasPolicy,
   scope: CodexQuotaScope,
 ): CodexPoolAliasPolicy {
   const policy = emptyCodexPoolAliasPolicy();
-  policy[scope] = [...aliases];
+  policy[scope] = [...capabilityPolicy[scope]];
   return policy;
 }
 
@@ -621,20 +622,23 @@ function productionCodexPoolActivationDeps(
   const verifies = (
     candidate: Parameters<CodexPoolActivationDeps["verify"]>[0],
   ) => {
-    const quotaScope = codexPoolVerificationScopeForActivation(candidate);
-    if (
-      quotaScope === null ||
-      resolvePiCodexPoolExtension().health !== "ready"
-    ) {
-      return false;
-    }
+    if (resolvePiCodexPoolExtension().health !== "ready") return false;
     const policy = codexPoolAliasPolicyForActivation(candidate);
-    return codexPoolObservationVerifies(
-      candidate,
-      inspectCodexRouting({
-        quotaScope,
-        authorizedAliases: policy[quotaScope],
-      }),
+    const scopes = CODEX_QUOTA_SCOPES.filter(
+      (scope) => policy[scope].length > 0,
+    );
+    return (
+      scopes.length > 0 &&
+      scopes.every((scope) =>
+        codexPoolObservationVerifies(
+          candidate,
+          inspectCodexRouting({
+            quotaScope: scope,
+            authorizedAliases: policy[scope],
+          }),
+          scope,
+        ),
+      )
     );
   };
   return {
@@ -691,6 +695,29 @@ function productionCodexPoolWorkflow(
   }
 }
 
+function codexPoolCapabilityPolicy(
+  aliases: readonly string[],
+  configBinding: string,
+): CodexPoolAliasPolicy {
+  const policy = emptyCodexPoolAliasPolicy();
+  policy[CODEX_GENERIC_QUOTA_SCOPE] = [...aliases];
+  const spark = inspectCodexRouting({
+    quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+    authorizedAliases: aliases,
+  });
+  if (spark.fresh && spark.config_binding === configBinding) {
+    const supported = new Set(
+      spark.candidates
+        .filter((candidate) => candidate.supported)
+        .map((candidate) => candidate.alias),
+    );
+    policy[CODEX_SPARK_QUOTA_SCOPE] = aliases.filter((alias) =>
+      supported.has(alias),
+    );
+  }
+  return policy;
+}
+
 function problemFromCodexInspection(
   inspection: CodexRoutingInspection,
 ): CodexPoolProblemCode {
@@ -712,8 +739,13 @@ export function productionCodexPoolLaunchContext(
     const deps = productionCodexPoolActivationDeps(env);
     const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
     const aliases = [...deps.bindings.aliases];
+    const capabilityPolicy = codexPoolCapabilityPolicy(
+      aliases,
+      deps.bindings.config_binding,
+    );
     const base = {
       aliases,
+      capability_policy: capabilityPolicy,
       requested_quota_scope: requestedScope,
       initial_scope: requestedScope,
       config_binding: deps.bindings.config_binding,
@@ -795,6 +827,10 @@ export function productionCodexPoolLaunchContext(
       activation_mode: "native",
       aliases: ["keeper-codex-a", "keeper-codex-b"],
       alias_policy: emptyCodexPoolAliasPolicy(),
+      capability_policy: {
+        [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+        [CODEX_SPARK_QUOTA_SCOPE]: [],
+      },
       requested_quota_scope: requestedScope,
       initial_scope: requestedScope,
       config_binding: "0".repeat(64),
@@ -3645,6 +3681,13 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
         "(pinned to one healthy alias, NOT balanced)\n",
     );
   }
+  for (const candidate of codex.capacity.candidates) {
+    deps.write(
+      `  ${candidate.alias} scope=${candidate.quota_scope} ` +
+        `supported=${candidate.supported} authorized=${candidate.authorized} ` +
+        `eligible=${candidate.eligible} used=${candidate.used_percent}\n`,
+    );
+  }
   if (codex.capacity.verdict.kind === "pooled") {
     deps.write(
       `session route candidate: ${codex.capacity.verdict.alias} ` +
@@ -4541,10 +4584,22 @@ export async function main(deps: MainDeps): Promise<never> {
       codexQuotaScopeForModelId(startupModel);
     const aliasPolicy =
       codexMode === "proof"
-        ? codexPoolProofAliasPolicy(codexContext.aliases, requestedScope)
+        ? codexPoolProofAliasPolicy(
+            codexContext.capability_policy ?? {
+              [CODEX_GENERIC_QUOTA_SCOPE]: [...codexContext.aliases],
+              [CODEX_SPARK_QUOTA_SCOPE]: [],
+            },
+            requestedScope,
+          )
         : codexMode === "active"
           ? codexContext.alias_policy
           : emptyCodexPoolAliasPolicy();
+    if (codexMode === "proof" && aliasPolicy[requestedScope].length === 0) {
+      deps.writeErr(
+        `Error: [pool-unavailable] no enrolled Codex account supports ${requestedScope}.\n`,
+      );
+      return deps.exit(1);
+    }
     const initialScope =
       codexMode === "proof"
         ? requestedScope

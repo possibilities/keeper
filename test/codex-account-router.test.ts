@@ -304,6 +304,19 @@ describe("Codex route selection", () => {
       reason: "pool-unavailable",
       warning: CODEX_NATIVE_FALLBACK_WARNING,
     });
+    expect(
+      inspectCodexRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+      }).candidates,
+    ).toEqual([
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        supported: false,
+        eligible: false,
+      }),
+    ]);
   });
 
   test("explicit authorization restricts candidates and empty disables pooling", () => {
@@ -651,10 +664,44 @@ describe("Codex routing inspection", () => {
       shared_cooldown_until_ms: 0,
       quota_cooldown_until_ms: 0,
       capacity_cooldown_until_ms: 0,
+      supported: true,
       authorized: true,
       eligible: true,
     });
     expect(existsSync(codexPressureLedgerPath(dir))).toBe(false);
+  });
+
+  test("does not treat an expired per-alias Spark window as capability", () => {
+    const dir = root();
+    const expired = alias("keeper-codex-a", 10, { sparkUsedPercent: 0 });
+    expired.observed_at_ms = NOW - 60_000;
+    expired.expires_at_ms = NOW - 1;
+    publish(dir, [
+      expired,
+      alias("keeper-codex-b", 20, { sparkUsedPercent: 0 }),
+    ]);
+    const result = inspectCodexRouting({
+      stateDir: dir,
+      nowMs: NOW,
+      quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+      authorizedAliases: ["keeper-codex-a", "keeper-codex-b"],
+    });
+    expect(result).toMatchObject({
+      health: "ready",
+      verdict: { kind: "pooled", alias: "keeper-codex-b" },
+    });
+    expect(result.candidates).toEqual([
+      expect.objectContaining({
+        alias: "keeper-codex-a",
+        supported: false,
+        eligible: false,
+      }),
+      expect.objectContaining({
+        alias: "keeper-codex-b",
+        supported: true,
+        eligible: true,
+      }),
+    ]);
   });
 
   test("reports scoped authorization and cooldown facts", () => {
@@ -709,6 +756,7 @@ describe("Codex routing inspection", () => {
         used_percent: 5,
         shared_cooldown_until_ms: 0,
         quota_cooldown_until_ms: NOW + CODEX_FAILURE_COOLDOWN_MS,
+        supported: true,
         authorized: false,
         eligible: false,
       }),
@@ -716,6 +764,7 @@ describe("Codex routing inspection", () => {
         alias: "keeper-codex-b",
         quota_scope: CODEX_SPARK_QUOTA_SCOPE,
         used_percent: 1,
+        supported: true,
         authorized: true,
         eligible: true,
       }),

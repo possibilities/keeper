@@ -70,14 +70,17 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
     clause: "pressure_cooldown",
     evidence: [
       "concurrent-routes-observed",
-      "classified-retry-observed",
+      "classified-failure-observed",
       "cooldown-observed",
     ],
   },
   {
     sequence: 6,
     clause: "single_retry",
-    evidence: ["two-attempt-route-observed", "all-routes-at-most-two-attempts"],
+    evidence: [
+      "retry-capability-bound-observed",
+      "all-routes-at-most-two-attempts",
+    ],
   },
   {
     sequence: 7,
@@ -97,7 +100,7 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
   {
     sequence: 10,
     clause: "native_fallback",
-    evidence: ["native-fallback-completed"],
+    evidence: ["scope-fallback-policy-observed"],
   },
   {
     sequence: 11,
@@ -112,13 +115,13 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
   {
     sequence: 13,
     clause: "transport_isolation",
-    evidence: ["root-child-distinct-aliases"],
+    evidence: ["scope-supported-routing-observed"],
   },
 ];
 
 function passingReport(): LiveProofReport {
   return {
-    schema_version: 2,
+    schema_version: 3,
     revision: REVISION,
     config_binding: CONFIG_BINDING,
     alias_binding: ALIAS_BINDING,
@@ -159,7 +162,7 @@ function passingReport(): LiveProofReport {
       {
         session_role: "child",
         quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
-        aliases: ["keeper-codex-b"],
+        aliases: ["keeper-codex-a"],
         attempts: 1,
         failure_class: "none",
         substantive_output: true,
@@ -167,8 +170,16 @@ function passingReport(): LiveProofReport {
       },
     ],
     alias_health: [
-      { alias: "keeper-codex-a", status: "exhausted" },
-      { alias: "keeper-codex-b", status: "healthy" },
+      {
+        alias: "keeper-codex-a",
+        scope_supported: true,
+        status: "exhausted",
+      },
+      {
+        alias: "keeper-codex-b",
+        scope_supported: true,
+        status: "healthy",
+      },
     ],
     restoration: { required: true, completed: true },
     artifact_scan: {
@@ -184,6 +195,9 @@ function passingReport(): LiveProofReport {
 
 function degradedReport(): LiveProofReport {
   const report = clone(passingReport());
+  const child = report.routes.find((route) => route.session_role === "child");
+  if (child === undefined) throw new Error("missing-child-fixture");
+  child.aliases = ["keeper-codex-b"];
   for (const clause of ["native_fallback", "transport_isolation"] as const) {
     report.clauses[clause] = false;
     const entry = report.transcript.find((e) => e.clause === clause);
@@ -207,6 +221,43 @@ function reportForScope(
   scoped.quota_scope = quotaScope;
   for (const route of scoped.routes) route.quota_scope = quotaScope;
   return scoped;
+}
+
+function capabilityScopedSparkReport(): LiveProofReport {
+  const report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+  report.alias_health = [
+    {
+      alias: "keeper-codex-a",
+      scope_supported: false,
+      status: "unavailable",
+    },
+    {
+      alias: "keeper-codex-b",
+      scope_supported: true,
+      status: "healthy",
+    },
+  ];
+  report.routes = [
+    {
+      session_role: "root",
+      quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+      aliases: ["keeper-codex-b", "keeper-codex-b"],
+      attempts: 2,
+      failure_class: "transport",
+      substantive_output: true,
+      restored: true,
+    },
+    {
+      session_role: "child",
+      quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+      aliases: ["keeper-codex-b"],
+      attempts: 1,
+      failure_class: "none",
+      substantive_output: true,
+      restored: true,
+    },
+  ];
+  return report;
 }
 
 function scopedState(
@@ -323,6 +374,7 @@ function inspectionFor(
   quotaScope: CodexQuotaScope,
   authorizedAliases: readonly string[],
   selectedAlias = authorizedAliases[0] ?? "keeper-codex-a",
+  supportedAliases: readonly string[] = BINDINGS.aliases,
 ): CodexRoutingInspection {
   return {
     provider: "openai-codex",
@@ -347,6 +399,7 @@ function inspectionFor(
       shared_cooldown_until_ms: 0,
       quota_cooldown_until_ms: 0,
       capacity_cooldown_until_ms: 0,
+      supported: supportedAliases.includes(alias),
       authorized: authorizedAliases.includes(alias),
       eligible: authorizedAliases.includes(alias),
     })),
@@ -713,9 +766,9 @@ describe("Codex pool scoped activation", () => {
     }
   });
 
-  test("Spark full proof activates scoped Spark aliases only", () => {
+  test("Spark proof activates only the attested capability subset", () => {
     const store = new MemoryStore();
-    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    store.report = capabilityScopedSparkReport();
     const outcome = activateCodexPool(deps(store));
     expect(outcome).toMatchObject({
       ok: true,
@@ -728,12 +781,12 @@ describe("Codex pool scoped activation", () => {
       proof_scope: CODEX_SPARK_QUOTA_SCOPE,
       authorized_aliases: {
         [CODEX_GENERIC_QUOTA_SCOPE]: [],
-        [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+        [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
       },
     });
     expect(codexPoolAliasPolicyForActivation(must(written))).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: [],
-      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
     });
     expect(codexPoolStatus(deps(store))).toMatchObject({
       ok: true,
@@ -776,7 +829,7 @@ describe("Codex pool scoped activation", () => {
       aliases: ["keeper-codex-a", "keeper-codex-b"],
       updated_at_ms: NOW,
     };
-    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    store.report = capabilityScopedSparkReport();
     expect(activateCodexPool(deps(store))).toMatchObject({
       ok: true,
       state: "active-scoped",
@@ -785,7 +838,7 @@ describe("Codex pool scoped activation", () => {
       codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
     ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
-      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
     });
 
     store.report = passingReport();
@@ -800,7 +853,7 @@ describe("Codex pool scoped activation", () => {
       codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
     ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
-      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
     });
 
     store.report = reportForScope(degradedReport(), CODEX_SPARK_QUOTA_SCOPE);
@@ -829,7 +882,7 @@ describe("Codex pool scoped activation", () => {
       aliases: ["keeper-codex-a", "keeper-codex-b"],
       updated_at_ms: NOW,
     };
-    store.report = reportForScope(passingReport(), CODEX_SPARK_QUOTA_SCOPE);
+    store.report = capabilityScopedSparkReport();
     expect(activateCodexPool(deps(store))).toMatchObject({
       ok: true,
       state: "active-scoped",
@@ -838,7 +891,7 @@ describe("Codex pool scoped activation", () => {
       codexPoolAliasPolicyForActivation(must(store.writes.at(-1))),
     ).toEqual({
       [CODEX_GENERIC_QUOTA_SCOPE]: [],
-      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+      [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
     });
   });
 
@@ -894,6 +947,17 @@ describe("Codex pool scoped activation", () => {
         ),
       ),
     ).toBe(true);
+    expect(
+      codexPoolObservationVerifies(
+        scoped,
+        inspectionFor(
+          CODEX_SPARK_QUOTA_SCOPE,
+          BINDINGS.aliases,
+          "keeper-codex-b",
+          ["keeper-codex-b"],
+        ),
+      ),
+    ).toBe(false);
     expect(
       codexPoolObservationVerifies(
         scoped,

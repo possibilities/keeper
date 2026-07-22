@@ -644,8 +644,19 @@ describe("Codex usage observer", () => {
       expect.objectContaining({ used_percent: 40, exhausted: true }),
     );
     expect(usageScopeView(explicitSpark, CODEX_SPARK_QUOTA_SCOPE, 100)).toEqual(
-      expect.objectContaining({ status: "exhausted", used_percent: 40 }),
+      expect.objectContaining({
+        supported: true,
+        status: "exhausted",
+        used_percent: 40,
+      }),
     );
+    expect(
+      usageScopeView(
+        explicitSpark,
+        CODEX_SPARK_QUOTA_SCOPE,
+        explicitSpark.expires_at_ms + 1,
+      ),
+    ).toMatchObject({ supported: false, status: "unavailable" });
 
     const missingSpark = parseUsageResponse(
       "keeper-codex-a",
@@ -653,8 +664,8 @@ describe("Codex usage observer", () => {
       100,
     );
     expect(
-      usageScopeView(missingSpark, CODEX_SPARK_QUOTA_SCOPE, 100).status,
-    ).toBe("unavailable");
+      usageScopeView(missingSpark, CODEX_SPARK_QUOTA_SCOPE, 100),
+    ).toMatchObject({ supported: false, status: "unavailable" });
   });
 
   test("reduces raw failures to fixed classes", async () => {

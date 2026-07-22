@@ -346,9 +346,12 @@ keeper agent accounts codex-pool verify --json
 Activation uses a host-local advisory lock and a private transaction marker. The marker makes native mode
 authoritative throughout reload and verification; the active state publishes atomically only after the
 fresh report still matches the current code revision, configuration, alias roles, proved scope, companion
-contract, scoped alias policy, and healthy Capacity observation. A full proof authorizes all enrolled
-aliases for its scope; a scoped or degraded activation preserves other-scope policy only when the stored
-activation is valid and still binding-matched. Status is `active` when generic is fully pooled,
+contract, scoped alias policy, and healthy Capacity observation. Generic proof authorizes every enrolled
+alias; Spark proof authorizes only aliases whose fresh sanitized observation exposes the exact Spark quota
+window. Account-category labels do not grant capability. A single Spark-capable alias is a normal proven
+scope, not quota degradation; unsupported aliases remain enrolled for generic routing. A scoped or degraded
+activation preserves other-scope policy only when the stored activation is valid and still binding-matched.
+Status is `active` when generic is fully pooled,
 `active-scoped` when Spark policy is in force (including a Spark single-alias authorization), and
 `active-degraded` for the compatible explicit generic single-alias pin.
 A concurrent activation is refused. Reload or immediate verification failure returns `rollback-complete`;
@@ -364,14 +367,16 @@ keeper agent accounts codex-pool verify --json
 ```
 
 Removing the companion `-e` source or leaving activation native also restores ordinary Codex behavior.
-Runtime pool failures after a successful activation remain visible native fallbacks; they do not alter the
-fail-closed proof gate.
+Runtime generic-pool failures remain visible native fallbacks. A managed Spark request never falls through
+to a native account without Spark capability: it fails visibly when its proven capability subset has no
+eligible route. Neither behavior alters the fail-closed proof gate.
 
 ### Degraded single-alias activation (human-authorized)
 
-When one enrolled account is quota-depleted, the full proof cannot pass: `transport_isolation` and
-`native_fallback` structurally require the second alias to serve, and a quota-dead account refuses those
-legs. That is precisely the state where pooling's value is routing to the healthy alias. A proof run whose
+When one Spark alias lacks the provider's Spark quota window, it is excluded as unsupported and the
+remaining capability subset can prove normally. Degradation applies instead when a scope-capable enrolled
+account is quota-depleted. `transport_isolation` requires that second capable alias to serve; generic proof
+can also lose its native-fallback leg, while Spark proves that native fallback stays blocked. A proof run whose
 **only** unmet clauses are those two — with the interruption classified as a quota fault and a route
 recording a genuine quota failure — classifies `proven-degraded-single-alias`, recording exactly which
 clauses were waived and the cause. Any other unmet clause makes the run genuinely incomplete, never

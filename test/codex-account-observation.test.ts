@@ -257,6 +257,7 @@ describe("Codex scoped capacity view", () => {
       codexScopedAliasCapacityView(alias, CODEX_GENERIC_QUOTA_SCOPE, NOW),
     ).toMatchObject({
       quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+      supported: true,
       status: "healthy",
       windows: [{ quota_scope: CODEX_GENERIC_QUOTA_SCOPE }],
       used_percent: 0,
@@ -266,11 +267,19 @@ describe("Codex scoped capacity view", () => {
       codexScopedAliasCapacityView(alias, CODEX_SPARK_QUOTA_SCOPE, NOW),
     ).toMatchObject({
       quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+      supported: true,
       status: "healthy",
       windows: [{ quota_scope: CODEX_SPARK_QUOTA_SCOPE }],
       used_percent: 0,
       cooldown_until_ms: 0,
     });
+    expect(
+      codexScopedAliasCapacityView(
+        alias,
+        CODEX_SPARK_QUOTA_SCOPE,
+        alias.expires_at_ms + 1,
+      ),
+    ).toMatchObject({ supported: false, status: "unavailable" });
   });
 
   test("Spark exhaustion does not hide generic and missing Spark is unavailable", () => {
@@ -312,6 +321,7 @@ describe("Codex scoped capacity view", () => {
         NOW,
       ),
     ).toMatchObject({
+      supported: false,
       status: "unavailable",
       used_percent: 100,
       windows: [],

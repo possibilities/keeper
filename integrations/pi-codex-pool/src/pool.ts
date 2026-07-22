@@ -79,6 +79,8 @@ export interface PoolStreamDependencies {
   delegate: CodexDelegate;
   nativeDelegate: CodexDelegate;
   warn(reason: "pool-unavailable"): void;
+  allowNativeFallback?: boolean;
+  onNativeFallbackBlocked?(): void;
   /** Stable managed identity for provider calls, such as compaction, that omit one. */
   fallbackSessionId?: string;
   retryBackoffMs?: number;
@@ -506,6 +508,12 @@ function startNativeFallback(
   context: Context,
   options: SimpleStreamOptions | undefined,
 ): void {
+  if (deps.allowNativeFallback === false) {
+    deps.onNativeFallbackBlocked?.();
+    output.push(sanitizedErrorEvent(model, "error", "other"));
+    output.end();
+    return;
+  }
   deps.warn("pool-unavailable");
   void (async () => {
     try {
@@ -528,6 +536,10 @@ function startBoundedNativeFallback(
   deadlineMs: number | undefined,
   now: () => number,
 ): void {
+  if (deps.allowNativeFallback === false) {
+    startNativeFallback(output, deps, model, context, options);
+    return;
+  }
   const fallbackOptions = boundedNativeOptions(options, deadlineMs, now);
   if (fallbackOptions === null) {
     output.push(sanitizedErrorEvent(model, "error", "deadline"));

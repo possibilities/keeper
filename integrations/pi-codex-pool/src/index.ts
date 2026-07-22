@@ -16,8 +16,10 @@ import {
   codexPoolProofWindowActive,
 } from "../../../src/codex-pool-proof-window.ts";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
   type CodexQuotaScope,
   codexQuotaScopeForModelId,
+  codexQuotaScopeSupportedByWindows,
 } from "../../../src/codex-quota-scope.ts";
 import {
   aliasesFromEnvironment,
@@ -69,6 +71,8 @@ const REVISION_ENV = "KEEPER_PI_CODEX_POOL_REVISION";
 const CONFIG_ROOT_ENV = "KEEPER_PI_CODEX_POOL_CONFIG_ROOT";
 const WARNING =
   "[keeper-codex-pool] pool-unavailable; using native openai-codex";
+const SCOPE_WARNING =
+  "[keeper-codex-pool] pool-unavailable; native Spark fallback blocked";
 
 type ReportFailureClass = "none" | "quota" | "rate" | "auth" | "transport";
 
@@ -197,6 +201,7 @@ class ProofEvidence {
   private observerArtifact: string | null = null;
   aliasHealth: Array<{
     alias: string;
+    scope_supported: boolean;
     status: "healthy" | "exhausted" | "unavailable";
   }> = [];
   private rootSessionId: string | null = null;
@@ -205,6 +210,7 @@ class ProofEvidence {
   private concurrentPressure = false;
   private nativeFallbackAttempts = 0;
   private nativeFallbackSuccesses = 0;
+  private nativeFallbackBlocks = 0;
   interrupted = false;
 
   setRootSession(sessionId: string): void {
@@ -326,24 +332,70 @@ class ProofEvidence {
     }
   }
 
-  observed(rendered: string): void {
+  observed(rendered: string, quotaScope: CodexQuotaScope): void {
     this.observerArtifact = rendered;
     try {
       const parsed = JSON.parse(rendered) as {
-        aliases?: Array<{ alias?: unknown; usage?: { status?: unknown } }>;
+        aliases?: Array<{
+          alias?: unknown;
+          usage?: {
+            status?: unknown;
+            windows?: Array<{
+              quota_scope?: unknown;
+              exhausted?: unknown;
+            }>;
+          };
+        }>;
       };
       this.aliasHealth = (parsed.aliases ?? []).flatMap((entry) => {
         const status = entry.usage?.status;
+        const windows = (entry.usage?.windows ?? []).filter(
+          (
+            window,
+          ): window is {
+            quota_scope: CodexQuotaScope;
+            exhausted?: unknown;
+          } =>
+            window.quota_scope === "generic" ||
+            window.quota_scope === "model:gpt-5.3-codex-spark",
+        );
+        const scopeSupported = codexQuotaScopeSupportedByWindows(
+          quotaScope,
+          windows,
+        );
+        const scopedWindows = windows.filter(
+          (window) => window.quota_scope === quotaScope,
+        );
+        const scopedStatus =
+          !scopeSupported || status === "unavailable"
+            ? "unavailable"
+            : scopedWindows.some((window) => window.exhausted === true) ||
+                (quotaScope === CODEX_GENERIC_QUOTA_SCOPE &&
+                  status === "exhausted")
+              ? "exhausted"
+              : "healthy";
         return typeof entry.alias === "string" &&
           (status === "healthy" ||
             status === "exhausted" ||
             status === "unavailable")
-          ? [{ alias: entry.alias, status }]
+          ? [
+              {
+                alias: entry.alias,
+                scope_supported: scopeSupported,
+                status: scopedStatus,
+              },
+            ]
           : [];
       });
     } catch {
       this.aliasHealth = [];
     }
+  }
+
+  supportedAliases(): string[] {
+    return this.aliasHealth
+      .filter((entry) => entry.scope_supported)
+      .map((entry) => entry.alias);
   }
 
   beginNativeFallback(): void {
@@ -356,6 +408,10 @@ class ProofEvidence {
     } else {
       this.interrupted = true;
     }
+  }
+
+  nativeFallbackBlocked(): void {
+    this.nativeFallbackBlocks += 1;
   }
 
   restorationRequired(routes: LiveProofReport["routes"]): boolean {
@@ -378,6 +434,7 @@ class ProofEvidence {
       role: "primary" | "alternate";
     }>,
     state: ReturnType<PoolRouteState["snapshot"]>,
+    quotaScope: CodexQuotaScope,
   ): Partial<Record<LiveProofClause, readonly string[]>> {
     const observed: Partial<Record<LiveProofClause, string[]>> = {};
     const add = (
@@ -390,13 +447,14 @@ class ProofEvidence {
       entries.push(token);
       observed[clause] = entries;
     };
+    const supportedAliases = new Set(this.supportedAliases());
     const retryRoutes = this.routes.filter((route) => route.attempts === 2);
-    const classifiedRetries = retryRoutes.filter(
+    const classifiedFailures = this.routes.filter(
       (route) =>
-        route.proofFaultPhase === "pre-output" &&
+        route.proofFaultPhase !== null &&
         route.failureClass !== "none" &&
-        route.aliases.length === 2 &&
-        route.aliases[0] !== route.aliases[1],
+        route.aliases.length >= 1 &&
+        route.aliases.every((alias) => supportedAliases.has(alias)),
     );
     const rootAliases = this.routes
       .filter((route) => route.sessionRole === "root")
@@ -450,8 +508,8 @@ class ProofEvidence {
     );
     add(
       "pressure_cooldown",
-      classifiedRetries.length > 0,
-      "classified-retry-observed",
+      classifiedFailures.length > 0,
+      "classified-failure-observed",
     );
     add(
       "pressure_cooldown",
@@ -462,7 +520,13 @@ class ProofEvidence {
       ),
       "cooldown-observed",
     );
-    add("single_retry", retryRoutes.length > 0, "two-attempt-route-observed");
+    add(
+      "single_retry",
+      supportedAliases.size === 1
+        ? classifiedFailures.length > 0
+        : retryRoutes.length > 0,
+      "retry-capability-bound-observed",
+    );
     add(
       "single_retry",
       this.routes.every((route) => route.attempts <= 2),
@@ -495,9 +559,11 @@ class ProofEvidence {
     );
     add(
       "native_fallback",
-      this.nativeFallbackAttempts > 0 &&
-        this.nativeFallbackSuccesses === this.nativeFallbackAttempts,
-      "native-fallback-completed",
+      quotaScope === CODEX_GENERIC_QUOTA_SCOPE
+        ? this.nativeFallbackAttempts > 0 &&
+            this.nativeFallbackSuccesses === this.nativeFallbackAttempts
+        : this.nativeFallbackAttempts === 0 && this.nativeFallbackBlocks > 0,
+      "scope-fallback-policy-observed",
     );
     add(
       "compat_root_delegate",
@@ -514,12 +580,21 @@ class ProofEvidence {
       this.routes.some((route) => route.sessionRole === "child"),
       "child-route-observed",
     );
+    const routesUseSupportedAliases =
+      supportedAliases.size > 0 &&
+      this.routes.every(
+        (route) =>
+          route.aliases.length > 0 &&
+          route.aliases.every((alias) => supportedAliases.has(alias)),
+      );
     add(
       "transport_isolation",
-      rootAliases.some((rootAlias) =>
-        childAliases.some((childAlias) => childAlias !== rootAlias),
-      ),
-      "root-child-distinct-aliases",
+      routesUseSupportedAliases &&
+        (supportedAliases.size === 1 ||
+          rootAliases.some((rootAlias) =>
+            childAliases.some((childAlias) => childAlias !== rootAlias),
+          )),
+      "scope-supported-routing-observed",
     );
     return observed;
   }
@@ -562,7 +637,11 @@ class ProofEvidence {
       {
         surface: "log",
         content:
-          this.nativeFallbackAttempts > 0 ? WARNING : "no-native-fallback",
+          this.nativeFallbackAttempts > 0
+            ? WARNING
+            : this.nativeFallbackBlocks > 0
+              ? "native-fallback-blocked"
+              : "no-native-fallback",
       },
       {
         surface: "error",
@@ -617,12 +696,50 @@ function warn(): void {
   console.warn(WARNING);
 }
 
+function scopeUnavailableStream(
+  model: Model<"openai-codex-responses">,
+): AssistantMessageEventStream {
+  const error = {
+    role: "assistant" as const,
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error" as const,
+    errorMessage: "pool-scope-unavailable",
+    timestamp: Date.now(),
+  };
+  const event = { type: "error" as const, reason: "error" as const, error };
+  return {
+    result: async () => error,
+    async *[Symbol.asyncIterator]() {
+      yield event;
+    },
+  } as AssistantMessageEventStream;
+}
+
+function warnScopeUnavailable(): void {
+  console.warn(SCOPE_WARNING);
+}
+
 function fallbackStream(
   nativeDelegate: CodexDelegate,
   model: Model<"openai-codex-responses">,
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  if (codexQuotaScopeForModelId(model.id) !== CODEX_GENERIC_QUOTA_SCOPE) {
+    warnScopeUnavailable();
+    return scopeUnavailableStream(model);
+  }
   warn();
   return nativeDelegate(model, context, options);
 }
@@ -869,6 +986,7 @@ export function installCodexPool(
     if (mode === "proof" && !proofWindowActive()) {
       return fallbackStream(nativeDelegate, model, context, options);
     }
+    const quotaScope = codexQuotaScopeForModelId(model.id);
     if (evidence === null) {
       return createPooledCodexStream(
         {
@@ -877,6 +995,8 @@ export function installCodexPool(
           delegate: nativeDelegate,
           nativeDelegate,
           warn: () => warn(),
+          allowNativeFallback: quotaScope === CODEX_GENERIC_QUOTA_SCOPE,
+          onNativeFallbackBlocked: () => warnScopeUnavailable(),
           failureLog,
           ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
         },
@@ -885,7 +1005,6 @@ export function installCodexPool(
         options,
       );
     }
-    const quotaScope = codexQuotaScopeForModelId(model.id);
     const route = evidence.beginRoute(options, quotaScope);
     if (controls.deliberateAbort === true) evidence.deliberateAbort(route);
     let attemptDelegate: CodexDelegate = nativeDelegate;
@@ -973,6 +1092,11 @@ export function installCodexPool(
         delegate: instrumentedDelegate,
         nativeDelegate: instrumentedNativeDelegate,
         warn: () => warn(),
+        allowNativeFallback: quotaScope === CODEX_GENERIC_QUOTA_SCOPE,
+        onNativeFallbackBlocked: () => {
+          warnScopeUnavailable();
+          evidence.nativeFallbackBlocked();
+        },
         failureLog,
         ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
       },
@@ -1020,7 +1144,7 @@ export function installCodexPool(
     const proof = await import("./proof.ts");
     const state = routes.snapshot();
     const transcript = proof.buildProofTranscript(
-      evidence?.transcriptEvidence(aliasRoles, state) ?? {},
+      evidence?.transcriptEvidence(aliasRoles, state, quotaScope) ?? {},
     );
     const clauses = proof.clausesFromProofTranscript(transcript);
     const reportRoutes = evidence?.reportRoutes() ?? [];
@@ -1086,7 +1210,7 @@ export function installCodexPool(
           signal: ctx.signal,
         });
         const rendered = renderObserverEnvelope(envelope);
-        evidence?.observed(rendered);
+        evidence?.observed(rendered, initialScope ?? CODEX_GENERIC_QUOTA_SCOPE);
         ctx.ui.notify(rendered, "info");
       } catch {
         ctx.ui.notify(
@@ -1219,6 +1343,7 @@ export function installCodexPool(
           );
         }
         assertRunnable();
+        const proofQuotaScope = codexQuotaScopeForModelId(invocation.model.id);
         evidence.observed(
           renderObserverEnvelope(
             await observePool({
@@ -1229,17 +1354,24 @@ export function installCodexPool(
               signal: controller.signal,
             }),
           ),
+          proofQuotaScope,
         );
         assertRunnable();
+        const supportedAliases = evidence.supportedAliases();
+        if (supportedAliases.length === 0) {
+          throw new Error("proof-scope-unsupported");
+        }
 
         const rootSession = invocation.options.sessionId;
         const childSession = `${rootSession}:codex-pool-proof-child`;
         await Promise.all([runRoute(rootSession), runRoute(childSession)]);
         await runRoute(rootSession);
         await runRoute(`${childSession}:abort`, { deliberateAbort: true });
-        await runRoute(`${childSession}:retry`, {
-          fault: { failure_class: "quota", phase: "pre-output" },
-        });
+        if (supportedAliases.length > 1) {
+          await runRoute(`${childSession}:retry`, {
+            fault: { failure_class: "quota", phase: "pre-output" },
+          });
+        }
         await runRoute(`${childSession}:cutoff`, {
           fault: { failure_class: "rate", phase: "mid-stream" },
         });

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+  CODEX_GENERIC_QUOTA_SCOPE,
   type CodexQuotaScope,
   isCodexQuotaScope,
 } from "../../../src/codex-quota-scope.ts";
 import { isOpaqueAlias, writePrivateJsonAtomic } from "./auth.ts";
 
-export const LIVE_PROOF_SCHEMA_VERSION = 2;
+export const LIVE_PROOF_SCHEMA_VERSION = 3;
 export const LIVE_PROOF_MAX_AGE_MS = 15 * 60 * 1000;
 const MAX_ARTIFACTS = 64;
 const MAX_ARTIFACT_BYTES = 256 * 1024;
@@ -68,20 +69,20 @@ export const LIVE_PROOF_REQUIRED_EVIDENCE = {
   session_stickiness: ["completed-session-reused-alias"],
   pressure_cooldown: [
     "concurrent-routes-observed",
-    "classified-retry-observed",
+    "classified-failure-observed",
     "cooldown-observed",
   ],
   single_retry: [
-    "two-attempt-route-observed",
+    "retry-capability-bound-observed",
     "all-routes-at-most-two-attempts",
   ],
   substantive_cutoff: ["substantive-output-fault-not-retried"],
   abort_preserved: ["deliberate-child-abort-not-retried"],
   request_contract: ["all-attempts-preserved-request-contract"],
-  native_fallback: ["native-fallback-completed"],
+  native_fallback: ["scope-fallback-policy-observed"],
   compat_root_delegate: ["compat-root-delegate-used"],
   root_child_sessions: ["root-route-observed", "child-route-observed"],
-  transport_isolation: ["root-child-distinct-aliases"],
+  transport_isolation: ["scope-supported-routing-observed"],
 } as const satisfies Record<LiveProofClause, readonly string[]>;
 
 export interface ProofTranscriptEntry {
@@ -118,7 +119,7 @@ export interface ArtifactScanResult {
 }
 
 export interface LiveProofReport {
-  schema_version: 2;
+  schema_version: 3;
   revision: string;
   config_binding: string;
   alias_binding: string;
@@ -143,6 +144,7 @@ export interface LiveProofReport {
   }>;
   alias_health: Array<{
     alias: string;
+    scope_supported: boolean;
     status: "healthy" | "exhausted" | "unavailable";
   }>;
   restoration: {
@@ -389,21 +391,49 @@ function schemaShape(input: unknown): {
     }
   }
   const aliasHealth = top.alias_health;
-  if (!Array.isArray(aliasHealth) || aliasHealth.length > 8) {
+  if (
+    !Array.isArray(aliasHealth) ||
+    aliasHealth.length !== seenAliases.size ||
+    aliasHealth.length > 8
+  ) {
     return { unknown };
   }
+  const healthAliases = new Set<string>();
+  const supportedAliases = new Set<string>();
   for (const rawEntry of aliasHealth) {
     const entry = record(rawEntry);
     if (!entry) return { unknown };
-    unknown ||= hasUnknownKeys(entry, ["alias", "status"]);
+    unknown ||= hasUnknownKeys(entry, ["alias", "scope_supported", "status"]);
     if (
-      !hasExactKeys(entry, ["alias", "status"]) ||
+      !hasExactKeys(entry, ["alias", "scope_supported", "status"]) ||
       !isOpaqueAlias(entry.alias) ||
       !seenAliases.has(String(entry.alias)) ||
-      !["healthy", "exhausted", "unavailable"].includes(String(entry.status))
+      healthAliases.has(String(entry.alias)) ||
+      typeof entry.scope_supported !== "boolean" ||
+      !["healthy", "exhausted", "unavailable"].includes(String(entry.status)) ||
+      (top.quota_scope === CODEX_GENERIC_QUOTA_SCOPE &&
+        entry.scope_supported === false) ||
+      (entry.scope_supported === false && entry.status !== "unavailable") ||
+      (top.quota_scope !== CODEX_GENERIC_QUOTA_SCOPE &&
+        entry.scope_supported === true &&
+        entry.status === "unavailable")
     ) {
       return { unknown };
     }
+    healthAliases.add(entry.alias);
+    if (entry.scope_supported) supportedAliases.add(entry.alias);
+  }
+  if (
+    routes.some((rawRoute) => {
+      const route = record(rawRoute);
+      return (
+        route === undefined ||
+        !Array.isArray(route.aliases) ||
+        route.aliases.some((alias) => !supportedAliases.has(String(alias)))
+      );
+    })
+  ) {
+    return { unknown };
   }
   unknown ||= hasUnknownKeys(restoration, ["required", "completed"]);
   if (
@@ -532,6 +562,32 @@ function degradedEligible(
   return reasons.every((reason) => DEGRADED_ALLOWED_REASONS.has(reason));
 }
 
+function scopeIsolationSatisfied(report: LiveProofReport): boolean {
+  const supported = new Set(
+    report.alias_health
+      .filter((entry) => entry.scope_supported)
+      .map((entry) => entry.alias),
+  );
+  const routedOnlyToSupported =
+    report.routes.length > 0 &&
+    report.routes.every((route) =>
+      route.aliases.every((alias) => supported.has(alias)),
+    );
+  if (!routedOnlyToSupported || supported.size === 0) return false;
+  if (supported.size === 1) return true;
+  const rootAliases = report.routes
+    .filter((route) => route.session_role === "root")
+    .map((route) => route.aliases.at(-1))
+    .filter((alias): alias is string => alias !== undefined);
+  const childAliases = report.routes
+    .filter((route) => route.session_role === "child")
+    .map((route) => route.aliases.at(-1))
+    .filter((alias): alias is string => alias !== undefined);
+  return rootAliases.some((rootAlias) =>
+    childAliases.some((childAlias) => childAlias !== rootAlias),
+  );
+}
+
 function classifyWithoutDeclaredVerdict(
   report: LiveProofReport,
   expected: ExpectedProofBindings,
@@ -561,7 +617,8 @@ function classifyWithoutDeclaredVerdict(
   if (
     LIVE_PROOF_CLAUSES.some(
       (clause) => report.clauses[clause] !== transcriptClauses[clause],
-    )
+    ) ||
+    transcriptClauses.transport_isolation !== scopeIsolationSatisfied(report)
   ) {
     addReason(reasons, "transcript-mismatch");
   }
@@ -569,6 +626,7 @@ function classifyWithoutDeclaredVerdict(
     addReason(reasons, "clause-incomplete");
   }
   if (
+    !report.alias_health.some((entry) => entry.scope_supported) ||
     !report.routes.some((route) => route.session_role === "root") ||
     !report.routes.some((route) => route.session_role === "child") ||
     report.routes.some((route) => !route.restored)
@@ -637,7 +695,7 @@ export function classifyLiveProof(
 
 /**
  * The requested quota scope attested by a fully schema-valid report. Unknown
- * keys, non-v2 schema, invalid scope vocabulary, or mixed route scopes return
+ * keys, unsupported schemas, invalid scope vocabulary, or mixed route scopes return
  * null; verdict classification remains a separate caller decision.
  */
 export function reportQuotaScope(input: unknown): CodexQuotaScope | null {
@@ -645,6 +703,20 @@ export function reportQuotaScope(input: unknown): CodexQuotaScope | null {
   return parsed.report !== undefined && !parsed.unknown
     ? parsed.report.quota_scope
     : null;
+}
+
+export function reportSupportedAliases(input: unknown): string[] | null {
+  const parsed = schemaShape(input);
+  if (parsed.report === undefined || parsed.unknown) return null;
+  const support = new Map(
+    parsed.report.alias_health.map((entry) => [
+      entry.alias,
+      entry.scope_supported,
+    ]),
+  );
+  return parsed.report.alias_roles
+    .map((entry) => entry.alias)
+    .filter((alias) => support.get(alias) === true);
 }
 
 /**
@@ -720,6 +792,30 @@ export function collectLiveProof(
   input: Omit<LiveProofReport, "schema_version" | "verdict" | "degraded">,
   expected: ExpectedProofBindings,
 ): LiveProofReport {
+  const inputHealth = new Map(
+    input.alias_health.map((entry) => [entry.alias, entry]),
+  );
+  const normalizedHealth = input.alias_roles.map(
+    ({ alias }): LiveProofReport["alias_health"][number] => {
+      const entry = inputHealth.get(alias);
+      return entry === undefined
+        ? {
+            alias,
+            scope_supported: input.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
+            status: "unavailable",
+          }
+        : {
+            alias,
+            scope_supported: entry.scope_supported,
+            status: entry.status,
+          };
+    },
+  );
+  const supportedAliases = new Set(
+    normalizedHealth
+      .filter((entry) => entry.scope_supported)
+      .map((entry) => entry.alias),
+  );
   const report = {
     schema_version: LIVE_PROOF_SCHEMA_VERSION,
     revision: input.revision,
@@ -730,7 +826,11 @@ export function collectLiveProof(
     completed_at_ms: input.completed_at_ms,
     interrupted:
       input.interrupted ||
-      input.routes.some((route) => route.quota_scope !== input.quota_scope),
+      input.routes.some(
+        (route) =>
+          route.quota_scope !== input.quota_scope ||
+          route.aliases.some((alias) => !supportedAliases.has(alias)),
+      ),
     alias_roles: input.alias_roles.map(({ alias, role }) => ({ alias, role })),
     transcript: input.transcript.map((entry) => ({
       sequence: entry.sequence,
@@ -749,10 +849,7 @@ export function collectLiveProof(
       substantive_output: route.substantive_output,
       restored: route.restored,
     })),
-    alias_health: input.alias_health.map((entry) => ({
-      alias: entry.alias,
-      status: entry.status,
-    })),
+    alias_health: normalizedHealth,
     restoration: {
       required: input.restoration.required,
       completed: input.restoration.completed,
@@ -771,15 +868,16 @@ export function collectLiveProof(
   if (report.verdict === "incomplete") {
     const transcriptClauses = clausesFromProofTranscript(report.transcript);
     const health = new Map(
-      report.alias_health.map((entry) => [entry.alias, entry.status]),
+      report.alias_health.map((entry) => [entry.alias, entry]),
     );
     const roleAliases = report.alias_roles.map((entry) => entry.alias);
-    const healthyAliases = roleAliases.filter(
-      (alias) => health.get(alias) === "healthy",
-    );
+    const healthyAliases = roleAliases.filter((alias) => {
+      const entry = health.get(alias);
+      return entry?.scope_supported === true && entry.status === "healthy";
+    });
     const unhealthyAliases = roleAliases.filter((alias) => {
-      const status = health.get(alias);
-      return status !== undefined && status !== "healthy";
+      const entry = health.get(alias);
+      return entry?.scope_supported === true && entry.status !== "healthy";
     });
     const pinnedAlias =
       healthyAliases.length === 1 && unhealthyAliases.length >= 1

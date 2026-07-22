@@ -20,6 +20,7 @@ import {
   QUOTA_WAIVABLE_CLAUSES,
   reportDegradedVerdict,
   reportQuotaScope,
+  reportSupportedAliases,
   scanProofArtifacts,
   writeLiveProofReport,
 } from "../src/proof.ts";
@@ -63,14 +64,17 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
     clause: "pressure_cooldown",
     evidence: [
       "concurrent-routes-observed",
-      "classified-retry-observed",
+      "classified-failure-observed",
       "cooldown-observed",
     ],
   },
   {
     sequence: 6,
     clause: "single_retry",
-    evidence: ["two-attempt-route-observed", "all-routes-at-most-two-attempts"],
+    evidence: [
+      "retry-capability-bound-observed",
+      "all-routes-at-most-two-attempts",
+    ],
   },
   {
     sequence: 7,
@@ -90,7 +94,7 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
   {
     sequence: 10,
     clause: "native_fallback",
-    evidence: ["native-fallback-completed"],
+    evidence: ["scope-fallback-policy-observed"],
   },
   {
     sequence: 11,
@@ -105,7 +109,7 @@ const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
   {
     sequence: 13,
     clause: "transport_isolation",
-    evidence: ["root-child-distinct-aliases"],
+    evidence: ["scope-supported-routing-observed"],
   },
 ];
 
@@ -154,10 +158,20 @@ function passingReport(
       clauses: Object.fromEntries(
         LIVE_PROOF_CLAUSES.map((clause) => [clause, true]),
       ) as LiveProofReport["clauses"],
-      routes: quotaRoutes(quotaScope),
+      routes: quotaRoutes(quotaScope).map((route, index) =>
+        index === 1 ? { ...route, aliases: ["keeper-codex-a"] } : route,
+      ),
       alias_health: [
-        { alias: "keeper-codex-a", status: "healthy" },
-        { alias: "keeper-codex-b", status: "healthy" },
+        {
+          alias: "keeper-codex-a",
+          scope_supported: true,
+          status: "healthy",
+        },
+        {
+          alias: "keeper-codex-b",
+          scope_supported: true,
+          status: "healthy",
+        },
       ],
       restoration: { required: true, completed: true },
       artifact_scan: {
@@ -204,8 +218,16 @@ function proofInput(
     ) as LiveProofReport["clauses"],
     routes,
     alias_health: [
-      { alias: "keeper-codex-a", status: "exhausted" as const },
-      { alias: "keeper-codex-b", status: "healthy" as const },
+      {
+        alias: "keeper-codex-a",
+        scope_supported: true,
+        status: "exhausted" as const,
+      },
+      {
+        alias: "keeper-codex-b",
+        scope_supported: true,
+        status: "healthy" as const,
+      },
     ],
     restoration: { required: true, completed: true },
     artifact_scan: {
@@ -232,7 +254,7 @@ describe("live proof bindings and classifier", () => {
 
   test("returns proven only for the complete fresh allowlisted report", () => {
     const report = passingReport();
-    expect(report.schema_version).toBe(2);
+    expect(report.schema_version).toBe(3);
     expect(report.quota_scope).toBe(CODEX_GENERIC_QUOTA_SCOPE);
     expect(
       report.routes.every((route) => route.quota_scope === report.quota_scope),
@@ -267,6 +289,82 @@ describe("live proof bindings and classifier", () => {
     };
     expect(classifyLiveProof(displayLabel, EXPECTED).verdict).toBe("failed");
     expect(reportQuotaScope(displayLabel)).toBeNull();
+  });
+
+  test("proves a capability-scoped singleton and rejects unsupported routes", () => {
+    const input = proofInput(
+      [],
+      [
+        {
+          session_role: "root",
+          quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          aliases: ["keeper-codex-b", "keeper-codex-b"],
+          attempts: 2,
+          failure_class: "transport",
+          substantive_output: true,
+          restored: true,
+        },
+        {
+          session_role: "child",
+          quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+          aliases: ["keeper-codex-b"],
+          attempts: 1,
+          failure_class: "none",
+          substantive_output: true,
+          restored: true,
+        },
+      ],
+      CODEX_SPARK_QUOTA_SCOPE,
+    );
+    input.alias_health = [
+      {
+        alias: "keeper-codex-a",
+        scope_supported: false,
+        status: "unavailable",
+      },
+      {
+        alias: "keeper-codex-b",
+        scope_supported: true,
+        status: "healthy",
+      },
+    ];
+    const report = collectLiveProof(input, EXPECTED);
+    expect(report.verdict).toBe("proven");
+    expect(report.degraded).toBeNull();
+    expect(reportSupportedAliases(report)).toEqual(["keeper-codex-b"]);
+    expect(classifyLiveProof(report, EXPECTED)).toEqual({
+      verdict: "proven",
+      reasons: [],
+    });
+
+    const unsupportedRoute = clone(report);
+    unsupportedRoute.routes[0]?.aliases.splice(0, 1, "keeper-codex-a");
+    expect(classifyLiveProof(unsupportedRoute, EXPECTED).verdict).toBe(
+      "failed",
+    );
+    expect(reportSupportedAliases(unsupportedRoute)).toBeNull();
+  });
+
+  test("rejects contradictory scope capability attestations", () => {
+    const genericUnsupported = clone(passingReport());
+    genericUnsupported.alias_health[0] = {
+      alias: "keeper-codex-a",
+      scope_supported: false,
+      status: "unavailable",
+    };
+    expect(classifyLiveProof(genericUnsupported, EXPECTED).verdict).toBe(
+      "failed",
+    );
+
+    const sparkUnavailable = clone(passingReport(CODEX_SPARK_QUOTA_SCOPE));
+    sparkUnavailable.alias_health[0] = {
+      alias: "keeper-codex-a",
+      scope_supported: true,
+      status: "unavailable",
+    };
+    expect(classifyLiveProof(sparkUnavailable, EXPECTED).verdict).toBe(
+      "failed",
+    );
   });
 
   test("rejects invalid, mixed-scope, unknown-field, and old-schema scope reports", () => {
@@ -311,7 +409,9 @@ describe("live proof bindings and classifier", () => {
       entry.evidence.pop();
       report.clauses[clause] = false;
       report.verdict = "incomplete";
-      expect(classifyLiveProof(report, EXPECTED).verdict).toBe("incomplete");
+      expect(classifyLiveProof(report, EXPECTED).verdict).toBe(
+        clause === "transport_isolation" ? "failed" : "incomplete",
+      );
     }
     const passing = passingReport();
     const missing = {
@@ -490,7 +590,7 @@ describe("degraded single-alias verdict", () => {
       {
         session_role: "child",
         quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
-        aliases: ["keeper-codex-b", "keeper-codex-a"],
+        aliases: ["keeper-codex-a", "keeper-codex-b"],
         attempts: 2,
         failure_class: "quota",
         substantive_output: false,
@@ -502,8 +602,16 @@ describe("degraded single-alias verdict", () => {
       routes,
     );
     input.alias_health = [
-      { alias: "keeper-codex-a", status: "healthy" },
-      { alias: "keeper-codex-b", status: "healthy" },
+      {
+        alias: "keeper-codex-a",
+        scope_supported: true,
+        status: "healthy",
+      },
+      {
+        alias: "keeper-codex-b",
+        scope_supported: true,
+        status: "healthy",
+      },
     ];
     const report = collectLiveProof(input, EXPECTED);
     expect(report.verdict).toBe("incomplete");
@@ -553,7 +661,7 @@ describe("degraded single-alias verdict", () => {
           {
             session_role: "child",
             quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
-            aliases: ["keeper-codex-b"],
+            aliases: ["keeper-codex-a"],
             attempts: 1,
             failure_class: "none",
             substantive_output: true,

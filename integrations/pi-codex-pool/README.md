@@ -17,17 +17,19 @@ OAuth credentials stay in Pi's `auth.json`. The companion resolves and refreshes
 
 The requested model chooses the Codex quota scope. `gpt-5.3-codex-spark` requests, including provider-qualified `openai-codex/gpt-5.3-codex-spark`, use `model:gpt-5.3-codex-spark`; every other Codex model uses `generic`. A session route is sticky for exactly `(session, scope)`. Scope-specific authorization, usage/headroom, and quota cooldowns never bleed into the sibling scope; routing pressure and auth/rate/transport cooldowns are account-wide.
 
-The launcher provides a scope-keyed alias policy plus its binding. A missing, malformed, or binding-mismatched policy fails closed to native fallback instead of broadening authorization. A scope-tagged initial alias candidate is consumed only by a matching scoped request.
+The launcher provides a scope-keyed alias policy plus its binding. Generic policy retains every enrolled alias. Spark policy contains only aliases whose fresh sanitized observation exposes the exact Spark quota window; account-category labels are display metadata, never capability. A missing, malformed, or binding-mismatched policy cannot broaden authorization. A scope-tagged initial alias candidate is consumed only by a matching scoped request.
 
 One logical call can make at most two attempts. The companion disables lower transport retries for pooled attempts. It moves classified quota, rate, authentication, or pre-output transport failures to a different eligible alias; when no distinct eligible alias exists, only a pre-output transport failure retries the same alias once. Context overflow and unclassified failures never replay. Text, thinking, tool-call, and unknown events are Substantive; after any such event the attempt and its terminal outcome remain ordered and are never replayed. Abort and the caller's total timeout cover selection, refresh, backoff, and both attempts.
 
 Caller headers, callbacks, transport preference, cache controls, metadata, environment, reasoning controls, context, model, and logical session identity pass through unchanged. Account stickiness prevents a healthy cached connection from crossing aliases within its scope; a route changes only after its prior account attempt fails. Pooled delegates force `maxRetries` to zero so the wrapper remains the only account-retry owner.
 
-Missing configuration, missing Spark-scope usage evidence for a Spark request, missing scoped authorization, unavailable credentials, or failed pool machinery emits this fixed warning and delegates to native `openai-codex`:
+Missing configuration, authorization, credentials, or generic-pool machinery emits this fixed warning and delegates generic traffic to native `openai-codex`:
 
 ```text
 [keeper-codex-pool] pool-unavailable; using native openai-codex
 ```
+
+Managed Spark traffic fails visibly instead of invoking a native account outside its proven capability subset. Missing Spark evidence, an empty Spark policy, exhaustion, or cooldown therefore cannot send the Spark model to an unsupported account.
 
 ## Observation and private state
 
@@ -48,7 +50,7 @@ It never contains raw provider responses, headers, errors, credentials, account 
 
 An armed managed Pi session registers `codex_pool_proof`, a sequential no-argument tool that runs the complete proof once and atomically writes its private report. Models do not assemble proof primitives: the tool drives every required route and records the observed per-clause transcript.
 
-The report carries one top-level `quota_scope`, and every recorded route must carry the same scope. Mixed scopes, display labels, old schemas, unknown fields, or unknown scope strings fail verification structurally. Verification re-derives the verdict from the recorded transcript and the exact revision, configuration, alias, and scope bindings; it also requires root and child routes, completed restoration, and a clean artifact scan. The launcher separately binds the resulting runtime alias policy.
+The report carries one top-level `quota_scope`, per-alias capability evidence for that scope, and the same scope on every recorded route. Mixed scopes, routes through unsupported aliases, display labels, old schemas, unknown fields, or unknown scope strings fail verification structurally. Verification re-derives the verdict from the recorded transcript and the exact revision, configuration, alias, capability-subset, and scope bindings; it also requires root and child routes, completed restoration, and a clean artifact scan. One Spark-capable alias can prove normally when every route stays inside that singleton subset; two or more capable aliases must additionally demonstrate distinct root/child routing. The launcher binds the attested subset as runtime policy.
 
 The forced-refresh seam in the credential layer performs a bounded normal OAuth refresh for enrolled aliases even when expiry does not require one. The fault-injection seam at the pooled-stream delegate emits an allowed classified fault before output or after Substantive output, exercising the production classification, retry, cooldown, and fallback path. Both seams are inert outside an armed managed proof window.
 

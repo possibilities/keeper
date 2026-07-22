@@ -4,6 +4,7 @@ import {
   CODEX_SPARK_QUOTA_SCOPE,
   type CodexQuotaScope,
   codexQuotaScopeForUsageMeter,
+  codexQuotaScopeSupportedByWindows,
 } from "../../../src/codex-quota-scope.ts";
 
 export const USAGE_SCHEMA_VERSION = 2;
@@ -319,6 +320,7 @@ export function unavailableUsage(
 
 export interface UsageScopeView {
   quota_scope: CodexQuotaScope;
+  supported: boolean;
   status: UsageStatus;
   observed_at_ms: number;
   expires_at_ms: number;
@@ -349,13 +351,15 @@ export function usageScopeView(
     nowMs !== undefined &&
     Number.isFinite(nowMs) &&
     Math.floor(nowMs) > snapshot.expires_at_ms;
-  if (
-    snapshot.status === "unavailable" ||
-    stale ||
-    (quotaScope === CODEX_SPARK_QUOTA_SCOPE && windows.length === 0)
-  ) {
+  const supported =
+    quotaScope === CODEX_GENERIC_QUOTA_SCOPE ||
+    (snapshot.status !== "unavailable" &&
+      !stale &&
+      codexQuotaScopeSupportedByWindows(quotaScope, snapshot.windows));
+  if (snapshot.status === "unavailable" || stale || !supported) {
     return {
       quota_scope: quotaScope,
+      supported,
       status: "unavailable",
       observed_at_ms: snapshot.observed_at_ms,
       expires_at_ms: snapshot.expires_at_ms,
@@ -377,6 +381,7 @@ export function usageScopeView(
       : Math.max(...windows.map((window) => window.used_percent));
   return {
     quota_scope: quotaScope,
+    supported,
     status,
     observed_at_ms: snapshot.observed_at_ms,
     expires_at_ms: snapshot.expires_at_ms,

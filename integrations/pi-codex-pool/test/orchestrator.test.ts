@@ -47,7 +47,7 @@ const GENERIC_ALIAS_POLICY = JSON.stringify({
 });
 const SPARK_ALIAS_POLICY = JSON.stringify({
   [CODEX_GENERIC_QUOTA_SCOPE]: [],
-  [CODEX_SPARK_QUOTA_SCOPE]: ALIASES,
+  [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
 });
 const SPARK_MODEL = {
   ...MODEL,
@@ -121,7 +121,7 @@ function credentials(now: number) {
   };
 }
 
-function scopedUsage(usedPercent = 20) {
+function scopedUsage(usedPercent = 20, includeSpark = true) {
   const resetAt = Math.floor((Date.now() + 900_000) / 1000);
   return {
     rate_limit: {
@@ -138,18 +138,20 @@ function scopedUsage(usedPercent = 20) {
         limit_window_seconds: 604_800,
       },
     },
-    additional_rate_limits: [
-      {
-        limit_name: "GPT-5.3-Codex-Spark",
-        rate_limit: {
-          primary_window: {
-            used_percent: usedPercent,
-            reset_at: resetAt,
-            limit_window_seconds: 18_000,
+    additional_rate_limits: includeSpark
+      ? [
+          {
+            limit_name: "GPT-5.3-Codex-Spark",
+            rate_limit: {
+              primary_window: {
+                used_percent: usedPercent,
+                reset_at: resetAt,
+                limit_window_seconds: 18_000,
+              },
+            },
           },
-        },
-      },
-    ],
+        ]
+      : [],
   };
 }
 
@@ -293,7 +295,10 @@ async function installProof(
       nativeDelegate: nativeStream as never,
       oauth: TEST_OAUTH as never,
       requestUsage: async ({ accountId }) =>
-        scopedUsage(accountId === "account-private-a" ? 0 : 10),
+        scopedUsage(
+          accountId === "account-private-a" ? 0 : 10,
+          accountId !== "account-private-a",
+        ),
     },
   );
   sessionStart(
@@ -347,7 +352,7 @@ describe("atomic Codex pool proof tool", () => {
         interrupted: false,
       });
       const report = JSON.parse(readFileSync(installed.reportPath, "utf8"));
-      expect(report.schema_version).toBe(2);
+      expect(report.schema_version).toBe(3);
       expect(report.quota_scope).toBe(CODEX_GENERIC_QUOTA_SCOPE);
       expect(reportQuotaScope(report)).toBe(CODEX_GENERIC_QUOTA_SCOPE);
       expect(
@@ -427,14 +432,29 @@ describe("atomic Codex pool proof tool", () => {
         interrupted: false,
       });
       const report = JSON.parse(readFileSync(installed.reportPath, "utf8"));
-      expect(report.schema_version).toBe(2);
+      expect(report.schema_version).toBe(3);
       expect(report.quota_scope).toBe(CODEX_SPARK_QUOTA_SCOPE);
       expect(reportQuotaScope(report)).toBe(CODEX_SPARK_QUOTA_SCOPE);
       expect(
         report.routes.every(
-          (route: any) => route.quota_scope === CODEX_SPARK_QUOTA_SCOPE,
+          (route: any) =>
+            route.quota_scope === CODEX_SPARK_QUOTA_SCOPE &&
+            route.aliases.every((alias: string) => alias === "keeper-codex-b"),
         ),
       ).toBe(true);
+      expect(report.alias_health).toEqual([
+        {
+          alias: "keeper-codex-a",
+          scope_supported: false,
+          status: "unavailable",
+        },
+        {
+          alias: "keeper-codex-b",
+          scope_supported: true,
+          status: "healthy",
+        },
+      ]);
+      expect(report.degraded).toBeNull();
       expect(
         classifyLiveProof(report, {
           revision: REVISION,

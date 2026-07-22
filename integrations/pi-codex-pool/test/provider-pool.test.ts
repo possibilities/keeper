@@ -401,6 +401,18 @@ describe("provider registration and compatibility", () => {
       await collect(openaiStream(MODEL, CONTEXT, { sessionId: "native" }));
       expect(providers).toEqual(["openai-codex"]);
       expect(extensionDelegateApiKeys).toEqual([undefined]);
+      extensionDelegateApiKeys.length = 0;
+      const sparkEvents = await collect(
+        openaiStream(
+          { ...MODEL, id: "openai-codex/gpt-5.3-codex-spark" },
+          CONTEXT,
+          { sessionId: "unsupported-spark" },
+        ),
+      );
+      expect(extensionDelegateApiKeys).toEqual([]);
+      expect((sparkEvents.at(-1) as any).error.errorMessage).toBe(
+        "pool-scope-unavailable",
+      );
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
@@ -481,6 +493,22 @@ describe("provider registration and compatibility", () => {
           expect(warnings).toEqual([
             "[keeper-codex-pool] pool-unavailable; using native openai-codex",
           ]);
+          extensionDelegateApiKeys.length = 0;
+          warnings.length = 0;
+          const sparkEvents = await collect(
+            openaiStream(
+              { ...MODEL, id: "openai-codex/gpt-5.3-codex-spark" },
+              CONTEXT,
+              { sessionId: "blocked-spark" },
+            ),
+          );
+          expect(extensionDelegateApiKeys).toEqual([]);
+          expect(warnings).toEqual([
+            "[keeper-codex-pool] pool-unavailable; native Spark fallback blocked",
+          ]);
+          expect((sparkEvents.at(-1) as any).error.errorMessage).toBe(
+            "pool-scope-unavailable",
+          );
         } finally {
           rmSync(sandbox, { recursive: true, force: true });
         }
@@ -588,6 +616,22 @@ describe("provider registration and compatibility", () => {
       expect(warnings).toEqual([
         "[keeper-codex-pool] pool-unavailable; using native openai-codex",
       ]);
+      extensionDelegateApiKeys.length = 0;
+      warnings.length = 0;
+      const sparkEvents = await collect(
+        openaiStream(
+          { ...MODEL, id: "openai-codex/gpt-5.3-codex-spark" },
+          CONTEXT,
+          { sessionId: "expired-spark-proof-session" },
+        ),
+      );
+      expect(extensionDelegateApiKeys).toEqual([]);
+      expect(warnings).toEqual([
+        "[keeper-codex-pool] pool-unavailable; native Spark fallback blocked",
+      ]);
+      expect((sparkEvents.at(-1) as any).error.errorMessage).toBe(
+        "pool-scope-unavailable",
+      );
       await proofCommand.handler("", { ui: { notify() {} } });
       expect(existsSync(join(sandbox, "live-proof.json"))).toBe(false);
     } finally {
@@ -740,20 +784,20 @@ describe("provider registration and compatibility", () => {
       expect(existsSync(path)).toBe(true);
       expect(statSync(path).mode & 0o777).toBe(0o600);
       const report = JSON.parse(readFileSync(path, "utf8"));
-      expect(report.schema_version).toBe(2);
+      expect(report.schema_version).toBe(3);
       expect(report.quota_scope).toBe(CODEX_GENERIC_QUOTA_SCOPE);
       expect(
         report.routes.every(
           (route: any) => route.quota_scope === CODEX_GENERIC_QUOTA_SCOPE,
         ),
       ).toBe(true);
-      expect(report.verdict).toBe("incomplete");
+      expect(report.verdict).toBe("failed");
       expect(report.artifact_scan.status).toBe("clean");
       expect(notifications.at(-1)).toEqual({
         message: JSON.stringify({
           schema_version: 1,
           status: "written",
-          verdict: "incomplete",
+          verdict: "failed",
         }),
         level: "warning",
       });
@@ -780,8 +824,8 @@ describe("provider registration and compatibility", () => {
           state: "native",
           problem_code: "proof-incomplete",
           proof: expect.objectContaining({
-            verdict: "incomplete",
-            reasons: expect.arrayContaining(["clause-incomplete"]),
+            verdict: "failed",
+            reasons: expect.arrayContaining(["transcript-mismatch"]),
           }),
         }),
       );
@@ -3633,6 +3677,49 @@ describe("pooled Codex stream", () => {
     expect(events).toEqual(nativeEvents);
     expect(nativeCalls).toBe(1);
     expect(warnings).toEqual(["pool-unavailable"]);
+  });
+
+  test("blocks native fallback when the requested scope is unsupported", async () => {
+    let nativeCalls = 0;
+    let blocked = 0;
+    const sparkModel = {
+      ...MODEL,
+      id: "openai-codex/gpt-5.3-codex-spark",
+    };
+    const events = await collect(
+      createPooledCodexStream(
+        {
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+          ),
+          routes: routeState(),
+          allowNativeFallback: false,
+          onNativeFallbackBlocked: () => {
+            blocked += 1;
+          },
+          warn: () => {
+            throw new Error("must-not-warn");
+          },
+          delegate: () => {
+            throw new Error("must-not-call");
+          },
+          nativeDelegate: () => {
+            nativeCalls += 1;
+            return stream([]) as any;
+          },
+        },
+        sparkModel as any,
+        CONTEXT as any,
+        { sessionId: "unsupported-spark-session" },
+      ),
+    );
+    expect(nativeCalls).toBe(0);
+    expect(blocked).toBe(1);
+    expect((events.at(-1) as any).type).toBe("error");
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      "pool-other-failure",
+    );
   });
 
   test("falls visibly back to native Codex when pool credentials are unavailable", async () => {

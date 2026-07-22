@@ -23,8 +23,8 @@ import {
 } from "./account-routing-config";
 import {
   CODEX_GENERIC_QUOTA_SCOPE,
-  CODEX_SPARK_QUOTA_SCOPE,
   type CodexQuotaScope,
+  codexQuotaScopeSupportedByWindows,
   parseCodexQuotaScope,
 } from "./codex-quota-scope";
 
@@ -76,6 +76,7 @@ export interface CodexCapacityObservation {
 export interface CodexScopedAliasCapacityView {
   alias: string;
   quota_scope: CodexQuotaScope;
+  supported: boolean;
   status: CodexCapacityStatus;
   observed_at_ms: number;
   expires_at_ms: number;
@@ -481,9 +482,11 @@ export function codexScopedAliasCapacityView(
   const windowExhausted = windows.some((window) =>
     effectiveExhausted(window, nowMs),
   );
-  const unavailable =
-    alias.status === "unavailable" ||
-    (quotaScope === CODEX_SPARK_QUOTA_SCOPE && windows.length === 0);
+  const fresh = isCodexAliasFresh(alias, nowMs);
+  const supported =
+    quotaScope === CODEX_GENERIC_QUOTA_SCOPE ||
+    (fresh && codexQuotaScopeSupportedByWindows(quotaScope, alias.windows));
+  const unavailable = !fresh || !supported;
   const status: CodexCapacityStatus = unavailable
     ? "unavailable"
     : windowExhausted ||
@@ -495,6 +498,7 @@ export function codexScopedAliasCapacityView(
   return {
     alias: alias.alias,
     quota_scope: quotaScope,
+    supported,
     status,
     observed_at_ms: alias.observed_at_ms,
     expires_at_ms: alias.expires_at_ms,

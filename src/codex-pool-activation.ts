@@ -18,6 +18,7 @@ import {
   QUOTA_WAIVABLE_CLAUSES,
   reportDegradedVerdict,
   reportQuotaScope,
+  reportSupportedAliases,
 } from "../integrations/pi-codex-pool/src/proof.ts";
 import {
   type PoolAliasPolicy,
@@ -856,14 +857,19 @@ export function activateCodexPool(
     if (proofScope === null) {
       return result("activate", false, "native", "proof-failed", proof);
     }
-    // A full proven report replaces authorization for its quota scope with all
-    // enrolled aliases. A degraded verdict replaces only that scope with the
-    // explicitly authorized pin. Other effective scopes are preserved only when
-    // their stored activation still matches the operational bindings.
+    // A full proven report replaces authorization for its quota scope with the
+    // capability subset attested by that report. A degraded verdict replaces
+    // only that scope with the explicitly authorized pin. Other effective scopes
+    // are preserved only when their stored activation still matches the
+    // operational bindings.
     const policy = currentlyAuthorizedAliasPolicy(deps.store, deps.bindings);
     let degraded: CodexPoolDegradedMarker | null = null;
     if (proof.verdict === "proven") {
-      policy[proofScope] = [...deps.bindings.aliases];
+      const supportedAliases = reportSupportedAliases(input);
+      if (supportedAliases === null || supportedAliases.length === 0) {
+        return result("activate", false, "native", "proof-failed", proof);
+      }
+      policy[proofScope] = supportedAliases;
     } else if (proof.verdict === CODEX_POOL_DEGRADED_VERDICT) {
       if (authorization?.degraded_verdict !== CODEX_POOL_DEGRADED_VERDICT) {
         return result(
@@ -1013,6 +1019,7 @@ function inspectionHasExactAuthorizedAliases(
     return false;
   }
   const authorized = new Set<string>();
+  const supported = new Set<string>();
   for (const entry of inspection.candidates) {
     if (
       entry.quota_scope !== inspection.quota_scope ||
@@ -1020,13 +1027,20 @@ function inspectionHasExactAuthorizedAliases(
     ) {
       return false;
     }
-    if (!entry.authorized) continue;
-    if (authorized.has(entry.alias)) return false;
-    authorized.add(entry.alias);
+    if (entry.supported) {
+      if (supported.has(entry.alias)) return false;
+      supported.add(entry.alias);
+    }
+    if (entry.authorized) {
+      if (authorized.has(entry.alias)) return false;
+      authorized.add(entry.alias);
+    }
   }
   return (
     authorized.size === expected.size &&
-    [...expected].every((alias) => authorized.has(alias))
+    [...expected].every(
+      (alias) => authorized.has(alias) && supported.has(alias),
+    )
   );
 }
 

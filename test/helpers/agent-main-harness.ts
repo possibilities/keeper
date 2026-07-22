@@ -394,6 +394,10 @@ export function makeHarness(opts: HarnessOptions): Harness {
           [CODEX_GENERIC_QUOTA_SCOPE]: [],
           [CODEX_SPARK_QUOTA_SCOPE]: [],
         },
+        capability_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: ["keeper-codex-a", "keeper-codex-b"],
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
         requested_quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
         initial_scope: CODEX_GENERIC_QUOTA_SCOPE,
         config_binding: "a".repeat(64),

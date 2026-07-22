@@ -128,6 +128,7 @@ export interface CodexRoutingCandidate {
   shared_cooldown_until_ms: number;
   quota_cooldown_until_ms: number;
   capacity_cooldown_until_ms: number;
+  supported: boolean;
   authorized: boolean;
   eligible: boolean;
 }
@@ -628,6 +629,7 @@ function inspectCandidate(
     shared_cooldown_until_ms: candidate.entry.shared_cooldown_until_ms,
     quota_cooldown_until_ms: quotaCooldown,
     capacity_cooldown_until_ms: candidate.view.cooldown_until_ms,
+    supported: candidate.view.supported,
     authorized: candidate.authorized,
     eligible: candidate.eligible,
   };

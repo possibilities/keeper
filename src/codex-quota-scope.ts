@@ -51,3 +51,13 @@ export function codexQuotaScopeForUsageMeter(
     ? CODEX_SPARK_QUOTA_SCOPE
     : CODEX_GENERIC_QUOTA_SCOPE;
 }
+
+export function codexQuotaScopeSupportedByWindows(
+  quotaScope: CodexQuotaScope,
+  windows: readonly { quota_scope: CodexQuotaScope }[],
+): boolean {
+  return (
+    quotaScope === CODEX_GENERIC_QUOTA_SCOPE ||
+    windows.some((window) => window.quota_scope === quotaScope)
+  );
+}

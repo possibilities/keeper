@@ -973,7 +973,7 @@ describe("keeper agent accounts codex-pool", () => {
     expect(launches).toEqual([[false, "openai-codex/gpt-5.4-mini"]]);
   });
 
-  test("a Spark proof window overrides generic active policy only for Spark", async () => {
+  test("a Spark proof window authorizes only capability-detected aliases", async () => {
     const launches: Array<[boolean | undefined, string | null | undefined]> =
       [];
     const h = makeHarness({
@@ -1001,6 +1001,10 @@ describe("keeper agent accounts codex-pool", () => {
             [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
             [CODEX_SPARK_QUOTA_SCOPE]: [],
           },
+          capability_policy: {
+            [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+            [CODEX_SPARK_QUOTA_SCOPE]: ["keeper-codex-b"],
+          },
           requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
           initial_scope: CODEX_SPARK_QUOTA_SCOPE,
           config_binding: "d".repeat(64),
@@ -1015,10 +1019,10 @@ describe("keeper agent accounts codex-pool", () => {
 
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIAS_POLICY).toBe(
-      aliasPolicyEnv([], CODEX_ALIASES),
+      aliasPolicyEnv([], ["keeper-codex-b"]),
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_POLICY_BINDING).toBe(
-      aliasPolicyBindingEnv([], CODEX_ALIASES),
+      aliasPolicyBindingEnv([], ["keeper-codex-b"]),
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_SCOPE).toBe(
       CODEX_SPARK_QUOTA_SCOPE,
@@ -1026,6 +1030,50 @@ describe("keeper agent accounts codex-pool", () => {
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("e".repeat(40));
     expect(launches).toEqual([[false, "openai-codex/gpt-5.3-codex-spark"]]);
+  });
+
+  test("a Spark proof refuses to launch without a capable alias", async () => {
+    const h = makeHarness({
+      argv: [
+        "pi",
+        "--x-codex-pool-proof-window=arm",
+        "--model",
+        "openai-codex/gpt-5.3-codex-spark",
+        "prove spark routing",
+      ],
+      rawArgv: true,
+      now: () => 1_000_000,
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "active",
+        activation_mode: "active",
+        aliases: CODEX_ALIASES,
+        alias_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        capability_policy: {
+          [CODEX_GENERIC_QUOTA_SCOPE]: CODEX_ALIASES,
+          [CODEX_SPARK_QUOTA_SCOPE]: [],
+        },
+        requested_quota_scope: CODEX_SPARK_QUOTA_SCOPE,
+        initial_scope: CODEX_SPARK_QUOTA_SCOPE,
+        config_binding: "d".repeat(64),
+        revision: "e".repeat(40),
+        initial_alias: null,
+        problem_code: "pool-unavailable",
+      }),
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(1);
+    expect(h.spawned).toEqual([]);
+    expect(h.err.join("")).toContain(
+      `no enrolled Codex account supports ${CODEX_SPARK_QUOTA_SCOPE}`,
+    );
   });
 
   test("an absent arm clears inherited proof state and leaves native launch behavior", async () => {
@@ -1382,6 +1430,7 @@ describe("keeper agent accounts check", () => {
             shared_cooldown_until_ms: 0,
             quota_cooldown_until_ms: 0,
             capacity_cooldown_until_ms: 0,
+            supported: true,
             authorized: true,
             eligible: true,
           },
@@ -1395,6 +1444,7 @@ describe("keeper agent accounts check", () => {
             shared_cooldown_until_ms: 0,
             quota_cooldown_until_ms: 0,
             capacity_cooldown_until_ms: 0,
+            supported: true,
             authorized: true,
             eligible: true,
           },
@@ -1463,6 +1513,7 @@ describe("keeper agent accounts check", () => {
               shared_cooldown_until_ms: 0,
               quota_cooldown_until_ms: 0,
               capacity_cooldown_until_ms: 0,
+              supported: true,
               authorized: true,
               eligible: true,
             },
