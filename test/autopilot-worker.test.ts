@@ -9372,6 +9372,173 @@ test("fn-1034 classifyWorktreeRepos: flag OFF keeps the >1 reject; flag ON parti
   expect(on.primaryRepoDir).toBe("/repo-a");
 });
 
+// fn-16 — a clustered epic whose PRIMARY hosts NO tasks (every task carries an
+// explicit non-primary target_repo) must still anchor its single plan-close to the
+// resolved primary_repo — where the epic's plan state lives — not the first task
+// group's lane (a closer booted there dies EPIC_NOT_FOUND at preflight).
+const abcResolve = (r: string): string | null =>
+  r.startsWith("/repo-a")
+    ? "/repo-a"
+    : r.startsWith("/repo-b")
+      ? "/repo-b"
+      : r.startsWith("/repo-c")
+        ? "/repo-c"
+        : null;
+
+/** A clustered epic whose PRIMARY (/repo-c) hosts NO tasks: .1 → /repo-a, .2 → /repo-b. */
+function primarylessEpic(tasks?: Task[]): Epic {
+  return makeEpic({
+    epic_id: "fn-1-anchor",
+    project_dir: "/repo-c", // primary_repo — hosts NO tasks
+    tasks: tasks ?? [
+      makeTask({
+        task_id: "fn-1-anchor.1",
+        task_number: 1,
+        epic_id: "fn-1-anchor",
+        target_repo: "/repo-a",
+      }),
+      makeTask({
+        task_id: "fn-1-anchor.2",
+        task_number: 2,
+        epic_id: "fn-1-anchor",
+        target_repo: "/repo-b",
+      }),
+    ],
+  });
+}
+
+test("fn-16 clusterEpicRepos: a clustered epic whose PRIMARY hosts no tasks appends a task-less serial close-sink anchor group + primaryRepoDir = primary (NOT groups[0])", () => {
+  const res = classifyWorktreeRepos(
+    [primarylessEpic()],
+    abcResolve,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-anchor");
+  expect(res?.kind).toBe("clustered");
+  if (res?.kind !== "clustered") throw new Error("expected clustered");
+  // The two TASK groups are byte-identical; the primary (/repo-c) is appended as a
+  // task-less SERIAL anchor (no lane — the close runs on its shared checkout).
+  expect(res.groups).toEqual([
+    { repoDir: "/repo-a", taskIds: ["fn-1-anchor.1"], mode: "worktree" },
+    { repoDir: "/repo-b", taskIds: ["fn-1-anchor.2"], mode: "worktree" },
+    { repoDir: "/repo-c", taskIds: [], mode: "serial" },
+  ]);
+  // The close anchors to the RESOLVED primary, never the arbitrary first task group.
+  expect(res.primaryRepoDir).toBe("/repo-c");
+});
+
+test("fn-16 reconcile: a done clustered epic whose PRIMARY hosts no tasks anchors the close to the primary SHARED CHECKOUT (cwd = primary, worktree-less), never a task-group lane", () => {
+  const epic = primarylessEpic([
+    makeTask({
+      task_id: "fn-1-anchor.1",
+      task_number: 1,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-a",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+    makeTask({
+      task_id: "fn-1-anchor.2",
+      task_number: 2,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-b",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+  ]);
+  const snap = multiRepoSnap([epic], abcResolve);
+  const decision = reconcile(snap, makeState(), 0);
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  expect(closeLaunch).toBeDefined();
+  // The close runs on the primary shared checkout (`project_dir` — where the plan
+  // state lives), worktree-less, NOT in a lane worktree of a task-group repo.
+  expect(closeLaunch?.cwd).toBe("/repo-c");
+  expect(closeLaunch?.worktree).toBeUndefined();
+});
+
+test("fn-16 reconcile: a done clustered epic with a task-less primary finalizes BOTH task groups and provisions BOTH sinks (no close worker dispatches into either lane now) — the primary anchor cuts no lane", () => {
+  const epic = primarylessEpic([
+    makeTask({
+      task_id: "fn-1-anchor.1",
+      task_number: 1,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-a",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+    makeTask({
+      task_id: "fn-1-anchor.2",
+      task_number: 2,
+      epic_id: "fn-1-anchor",
+      target_repo: "/repo-b",
+      worker_phase: "done",
+      runtime_status: "done",
+    }),
+  ]);
+  epic.status = "done";
+  const snap = multiRepoSnap([epic], abcResolve);
+  const decision = reconcile(snap, makeState(), 0);
+  // Both TASK groups finalize (the single close gates them all) — unaffected.
+  expect(decision.worktreeFinalize.map((f) => f.repoDir).sort()).toEqual([
+    "/repo-a",
+    "/repo-b",
+  ]);
+  // BOTH need a producer-side fan-in provision: the primary is a serial anchor, so
+  // no close worker assembles a task-group base (contrast twoRepoEpic, where the
+  // primary /repo-a hosts the close worker and skips provision).
+  expect(decision.worktreeSinkProvision.map((s) => s.repoDir).sort()).toEqual([
+    "/repo-a",
+    "/repo-b",
+  ]);
+  // The task-less primary anchor cuts NO lane → contributes no finalize/provision.
+  expect(decision.worktreeFinalize.map((f) => f.repoDir)).not.toContain(
+    "/repo-c",
+  );
+});
+
+test("fn-16 reconcile: the ORDINARY clustered case (primary hosts tasks) is UNCHANGED — the close anchors to the primary group's BASE LANE and only the non-primary sink provisions", () => {
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a", // primary HOSTS task .1
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const res = classifyWorktreeRepos(
+    [epic],
+    abResolve,
+    undefined,
+    undefined,
+    true,
+  ).get("fn-1-foo");
+  // No extra anchor group is appended — the primary is already a task group.
+  expect(res?.kind === "clustered" && res.groups).toEqual([
+    { repoDir: "/repo-a", taskIds: ["fn-1-foo.1"], mode: "worktree" },
+    { repoDir: "/repo-b", taskIds: ["fn-1-foo.2"], mode: "worktree" },
+  ]);
+  const decision = reconcile(multiRepoSnap([epic], abResolve), makeState(), 0);
+  // Only the NON-primary /repo-b provisions (the primary group's base is assembled
+  // by its own close worker) — byte-identical to before the anchor fix.
+  expect(decision.worktreeSinkProvision.map((s) => s.repoDir)).toEqual([
+    "/repo-b",
+  ]);
+});
+
 test("fn-1034 classifyWorktreeRepos: a single-repo epic NEVER clusters (stays `ok`, byte-identical) even with the flag ON", () => {
   const epic = makeEpic({
     epic_id: "fn-1-solo",

@@ -5236,10 +5236,12 @@ function classifyEpicRepo(
  * Groups are ordered by first-appearance in `epic.tasks`; each is assessed for
  * worktree-eligibility INDEPENDENTLY (its own `assessRepo` verdict, with the
  * per-(epic, repoDir) grandfather), so one group can be `worktree` while a sibling
- * is `serial`. `primaryRepoDir` is the resolved toplevel of `project_dir` when it
- * is one of the group repos (the group that hosts the single plan-close worker),
- * else the first group's repo — a deterministic fallback that keeps the close
- * anchored to a real group. Pure: no fs/git beyond the injected `resolve` /
+ * is `serial`. `primaryRepoDir` is the resolved toplevel of `project_dir` — the
+ * anchor for the single plan-close. When the primary hosts no tasks it is absent
+ * from the task groups, so it is appended as a TASK-LESS `serial` close-sink group
+ * (the close then runs on the primary shared checkout, where the plan state lives,
+ * never in a task-group lane). The first-group fallback survives ONLY for a primary
+ * that fails to resolve. Pure: no fs/git beyond the injected `resolve` /
  * `assessRepo` / grandfather probes (all memoized producer-side).
  */
 function clusterEpicRepos(
@@ -5273,15 +5275,30 @@ function clusterEpicRepos(
         : "serial";
     return { repoDir, taskIds: taskIdsByRepo.get(repoDir) ?? [], mode };
   });
-  // The PRIMARY group hosts the single plan-close. Prefer the group whose repo IS
-  // the resolved primary; fall back to the first group so the close always anchors
-  // to a real group's base.
+  // The PRIMARY group hosts the single plan-close, which reads the epic's plan
+  // state from `primary_repo` (mirrored onto `project_dir`). When the primary
+  // hosts tasks it is ALREADY one of the task groups above. When it hosts NONE —
+  // every task carries an explicit non-primary `target_repo` — it is absent from
+  // the task-derived groups, so ANCHOR it explicitly as a TASK-LESS `serial`
+  // close-sink group. A serial group runs the close worktree-less on the primary
+  // shared checkout (`project_dir`, where the live plan state lives), never in a
+  // task-group lane whose `.keeper` is stale/absent (a closer booted there dies
+  // EPIC_NOT_FOUND at preflight). The task groups' own lanes/finalize are
+  // untouched — only the close anchor moves. The primary base carries no task
+  // work, so a lane there would be an empty branch to provision + tear down for
+  // nothing; the shared-checkout close is the existing serial-primary contract.
   const primaryResolved = resolve(projectDir);
-  const primaryRepoDir =
+  if (
     primaryResolved !== null &&
-    groups.some((g) => g.repoDir === primaryResolved)
-      ? primaryResolved
-      : (groups[0]?.repoDir ?? "");
+    !groups.some((g) => g.repoDir === primaryResolved)
+  ) {
+    groups.push({ repoDir: primaryResolved, taskIds: [], mode: "serial" });
+  }
+  // Anchor on the resolved primary; fall back to the first group ONLY when the
+  // primary fails to resolve to a git toplevel (no real repo to anchor to — a
+  // degraded operator data bug, kept from prior behavior rather than widened).
+  const primaryRepoDir =
+    primaryResolved !== null ? primaryResolved : (groups[0]?.repoDir ?? "");
   return { kind: "clustered", groups, primaryRepoDir };
 }
 

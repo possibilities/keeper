@@ -1237,7 +1237,12 @@ export type WorktreeRepoResolution =
 export interface WorktreeRepoGroup {
   /** This group's RESOLVED git toplevel — the lane base every group task forks off. */
   repoDir: string;
-  /** The epic task ids resolving to `repoDir`, in `epic.tasks` order. */
+  /**
+   * The epic task ids resolving to `repoDir`, in `epic.tasks` order. EMPTY only
+   * for the task-less `serial` anchor group appended when the epic's `primary_repo`
+   * hosts no tasks — a close-sink anchor so the single plan-close runs on the
+   * primary shared checkout rather than an arbitrary task-group lane.
+   */
   taskIds: string[];
   /**
    * `worktree` — a worktree-friendly repo: provision lanes (base + ribs + sink).
