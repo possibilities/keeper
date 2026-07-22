@@ -12,7 +12,7 @@ description: >-
   question (read the repo), an episodic "what did I do / discuss" question
   (`keeper history` / `/plan:hack`), a current public-web fact (WebSearch /
   WebFetch), email (Gmail), or a one-off page fetch with no durable save
-  (Scrapectl) — route those without an Agentbrain call.
+  (Agentscrape) — route those without an Agentbrain call.
 allowed-tools: Bash(agentbrain:*)
 ---
 
@@ -46,8 +46,8 @@ whose syntax you're unsure of.
   `keeper history` / `/plan:hack`, never Agentbrain.
 - A current public-web fact with no save intent → `WebSearch` / `WebFetch`.
 - Email → Gmail.
-- Fetch-and-read one page with no durable save intent → Scrapectl
-  (`scrapectl fetch-markdown` / `agent-browser`), not `agentbrain submit`.
+- Fetch-and-read one page with no durable save intent → Agentscrape
+  (`agentscrape fetch-markdown` / `agent-browser`), not `agentbrain submit`.
 - A connector or source kind `agentbrain sources` doesn't list as an enabled
   definition is not supported — say so plainly rather than presenting it as
   implemented.

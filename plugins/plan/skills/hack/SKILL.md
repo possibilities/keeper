@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(printenv KEEPER_HANDOFF_ENVELOPE), Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(gh gist create:*), WebSearch, WebFetch, Agent, Skill, Monitor
+allowed-tools: Bash(printenv KEEPER_HANDOFF_ENVELOPE), Bash(keeper agent:*), Bash(knowctl:*), Bash(agentscrape:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(gh gist create:*), WebSearch, WebFetch, Agent, Skill, Monitor
 ---
 
 # Hack
@@ -36,17 +36,17 @@ Pick a mode from the wording, then operate in that shape. Don't pre-announce the
 - **Quick-answer** — bounded factoid, yes/no, "how does X work." Terse chat reply, optional brief `## Context` block from local sources only.
 - **Troubleshoot** — "broken," "fails," "why doesn't," "doesn't work." Reproduce, isolate, find root cause, quote evidence. No fix yet.
 - **Internal report** — "summarize," "compare," "give me a writeup." Project-internal sources only — codebase, git history, keeper history, `knowctl`. No web search, no scraping.
-- **External research** — "what does the web say," "current state of X," "what are people doing." `searchctl`, `scrapectl`, `agent-browser`, `knowctl`. Primary sources, cited URLs.
+- **External research** — "what does the web say," "current state of X," "what are people doing." `searchctl`, `agentscrape`, `agent-browser`, `knowctl`. Primary sources, cited URLs.
 - **Work-shaped** — "add X," "build Y," "implement Z," "fix this." Investigate enough to understand scope. In ordinary mode, stop and confirm with the human before touching anything; if they greenlight, execute inline, otherwise route to `/plan:plan` or `/plan:defer`. In captured Handoff mode, choose and execute the route without that stop. **Scope-confirm reflex:** on an ambiguous or still-evolving design ask, state your assumption on the unstated axis in one sentence before proceeding (*"assuming per-repo, not per-epic — say so if not"*), rather than silently picking a direction on an axis the human left open. Fires on a genuinely unstated axis only; never re-litigate a settled directive.
 
 If two modes feel equally plausible and the choice would meaningfully change the answer's shape, ask one short plain-text question first. Otherwise pick and proceed.
 
 ## How to investigate
 
-**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `scrapectl`, `agent-browser`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
+**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `agentscrape`, `agent-browser`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
 
 - `searchctl` (web search) → the harness `WebSearch` tool.
-- `scrapectl fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
+- `agentscrape fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
 - `knowctl` (internal docs) → note in one line that no local topic docs are reachable, then go straight to web search.
 - `keeper history list|show|search|files|index` → the keeper history verbs below; `keeper resume <session-reference>` continues the human foreground session; `keeper transcript` stays for explicit subagent/tool-detail or Pi branch-aware drill-down.
 - `tmuxctl` → plain `tmux` over Bash.
@@ -67,8 +67,8 @@ Mode-specific moves:
 
 - **Quick-answer** — cap local reads around three; if you need more, you guessed the mode wrong, upgrade to report or troubleshoot.
 - **Troubleshoot** — reproduce → narrow surface → quote evidence → hypothesize → test → repeat. `keeper`, `tmuxctl`, recent `git log` and `git blame` are faster than guessing. When the trail is cold, the history recipes below find who touched what, when, and in which session.
-- **Internal report** — codebase, configs, git history, keeper history, `knowctl`. Skip `searchctl` and `scrapectl`. Gather enough to be thorough — don't exhaustively research.
-- **External research** — cast a wide net with `searchctl web-search` / `reason-search` / `pro-search`; pull primary sources via `scrapectl fetch-markdown`; use `agent-browser` for pages needing interaction or JS; cross-reference; flag disagreements; cite URLs for key claims.
+- **Internal report** — codebase, configs, git history, keeper history, `knowctl`. Skip `searchctl` and `agentscrape`. Gather enough to be thorough — don't exhaustively research.
+- **External research** — cast a wide net with `searchctl web-search` / `reason-search` / `pro-search`; pull primary sources via `agentscrape fetch-markdown`; use `agent-browser` for pages needing interaction or JS; cross-reference; flag disagreements; cite URLs for key claims.
 - **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`keeper history list` / `keeper history show` for related conversations, `keeper plan epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
 
 ### Session history (native artifacts + optional Keeper metadata)

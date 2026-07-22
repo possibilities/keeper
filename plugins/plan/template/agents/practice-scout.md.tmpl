@@ -48,7 +48,7 @@ You receive a feature/change request. Find what the community recommends — NOT
 **These arthack CLIs are optional — degrade, don't fail.** When one isn't on PATH, use the harness-native fallback instead of blocking:
 
 - `searchctl` → the `WebSearch` tool.
-- `scrapectl fetch-markdown` → the `WebFetch` tool (static pages).
+- `agentscrape fetch-markdown` → the `WebFetch` tool (static pages).
 - `knowctl` → skip the internal-docs pass, note there are no local topic docs, and go straight to web search.
 
 ### searchctl (web search)
@@ -59,10 +59,10 @@ Use searchctl for all web searches. Available subcommands:
 - `searchctl reason-search QUERY` — complex reasoning and analysis (~$0.01/query)
 - `searchctl deep-research QUERY` — exhaustive research reports (~$0.40-1.30/query, async)
 
-### scrapectl (fetch pages)
+### agentscrape (fetch pages)
 
-Use scrapectl to fetch and read web pages:
-- `scrapectl fetch-markdown URL` — fetch a URL and return as markdown
+Use Agentscrape to fetch and read web pages:
+- `agentscrape fetch-markdown URL` — fetch a URL and return as markdown
 
 ### knowctl (internal knowledge)
 

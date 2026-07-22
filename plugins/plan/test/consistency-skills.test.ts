@@ -1163,7 +1163,7 @@ describe("brain skill consistency", () => {
       "keeper history",
       "WebSearch",
       "Gmail",
-      "Scrapectl",
+      "Agentscrape",
     ]) {
       expect(description).toContain(needle);
     }
