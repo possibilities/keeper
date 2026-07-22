@@ -294,6 +294,13 @@ export interface BoardSummaryCounts {
   readonly epicsOpen: number;
   readonly epicsRunning: number;
   readonly epicsClosing: number;
+  // Rendered-but-not-open epics: a plan-closed epic whose close verdict reads
+  // `completed` yet is still pinned onto the grid by a standing post-close
+  // `dispatch_failures` row (ADR 0018). It leaves `epicsOpen`, so the summary
+  // must name it separately or the grid renders more epic blocks than the line
+  // counts. `epicsOpen + epicsClosed` is exactly the number of epic blocks
+  // rendered.
+  readonly epicsClosed: number;
   readonly tasksOpen: number;
   readonly tasksRunning: number;
 }
@@ -338,6 +345,7 @@ export function computeBoardSummary(
   let tasksOpen = 0;
   let tasksRunning = 0;
   let epicsClosing = 0;
+  let epicsClosed = 0;
 
   for (const epic of input.epics) {
     const epicId = boardSummaryId(epic, "epic_id");
@@ -345,6 +353,11 @@ export function computeBoardSummary(
       epicId === "" ? undefined : input.readiness.perCloseRow.get(epicId);
     if (isOpenVerdict(closeVerdict)) {
       epicsOpen += 1;
+    } else {
+      // A `completed` close verdict — a pinned plan-closed epic. It still
+      // renders as an epic block (ADR 0018), so count it here to keep the
+      // summary reconcilable with the rendered row count.
+      epicsClosed += 1;
     }
 
     let epicRunning = isRunningVerdict(closeVerdict);
@@ -373,16 +386,23 @@ export function computeBoardSummary(
     epicsOpen,
     epicsRunning,
     epicsClosing,
+    epicsClosed,
     tasksOpen,
     tasksRunning,
   };
 }
 
 export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
+  // `epicsClosed` — pinned plan-closed epics still on the grid — rides an
+  // additive suffix so the epics line accounts for EVERY rendered epic block:
+  // `epicsOpen` open blocks + `epicsClosed` closed-but-pinned blocks. Omitted
+  // when zero so the steady-state (nothing pinned) line is byte-identical.
+  const closedSuffix =
+    counts.epicsClosed > 0 ? ` (+${counts.epicsClosed} closed)` : "";
   return [
     "summary",
     `  tasks: ${counts.tasksOpen} open / ${counts.tasksRunning} running`,
-    `  epics: ${counts.epicsOpen} open / ${counts.epicsRunning} running / ${counts.epicsClosing} closing`,
+    `  epics: ${counts.epicsOpen} open / ${counts.epicsRunning} running / ${counts.epicsClosing} closing${closedSuffix}`,
   ];
 }
 
@@ -775,6 +795,27 @@ export function homedBlockedWorkRows(args: {
     }
   }
   return out;
+}
+
+/**
+ * The inline WHY line a pinned plan-closed epic carries directly under its
+ * header. Such an epic left `epicsOpen` yet still renders a full block (ADR
+ * 0018, pinned by a standing `close::`/`work::` `dispatch_failures` row); without
+ * this line the operator sees a closed epic on the board with no reason — the
+ * defect this fixes. Names the standing post-close reason keeping it pinned (the
+ * failure's first line, capped to keep the block scannable); a pin whose reason
+ * can't be resolved still states the shown-because fact. Indented one level to
+ * sit beneath the header like the blocked-verdict line. Returns "" for an epic
+ * that is not pinned-closed (no line emitted).
+ */
+export function closedEpicWhyLine(reason: string | undefined): string {
+  const base = "  closed · still shown for standing post-close plumbing";
+  const first = (reason?.split("\n", 1)[0] ?? "").trim();
+  if (first === "") {
+    return base;
+  }
+  const capped = first.length > 120 ? `${first.slice(0, 119)}…` : first;
+  return `${base}: ${capped}`;
 }
 
 function taskNumFromId(id: string): number | null {
@@ -1288,6 +1329,8 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     const epicId = seg(row.epic_id);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
+    const closeVerdict = verdictFromMap(snap.readiness.perCloseRow, epicId);
+    const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     // The `{epic_number} {title}` label falls back to `epic_id` when both are
     // null (a pre-`EpicSnapshot` stub row), so the header is never blank.
     // `validatedPill`, `armedPill`, and `startedPill` all omit their default and
@@ -1301,14 +1344,35 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
         : [`${epicHeader} ${iconizePills(formatPill(epicVerdict))}`];
-    lines.push(...epicHeaderLines, ...renderJobLinkLines(row.job_links));
+    lines.push(...epicHeaderLines);
+    // A pinned plan-closed epic (completed close verdict) still renders a full
+    // block (ADR 0018); annotate WHY directly under the header — the standing
+    // post-close dispatch-failure that keeps it pinned — so a closed epic never
+    // sits on the board with no reason. Prefer the close-row reason; fall back
+    // to a task's work-failure reason (a `work::` pin homes on a task, not the
+    // close row).
+    if (closeVerdict.tag === "completed") {
+      let standingReason = closeFailureReasonFor(epicId, [...epicIds]);
+      if (standingReason === undefined) {
+        for (const task of tasks) {
+          const wf = workFailures.get(
+            seg((task as Record<string, unknown>).task_id),
+          );
+          if (wf !== undefined) {
+            standingReason = wf;
+            break;
+          }
+        }
+      }
+      lines.push(closedEpicWhyLine(standingReason));
+    }
+    lines.push(...renderJobLinkLines(row.job_links));
     // fn-941: the coarse "escalation in flight" set for this snapshot — task ids
     // carrying a `block_escalations` latch row. An escalated `runtime-blocked`
     // task renders `[blocked·escalated]` (planner notified) vs plain `[blocked:…]`.
     const escalatedTaskIds = new Set(
       snap.blockEscalations.map((e) => e.task_id),
     );
-    const tasks = Array.isArray(row.tasks) ? row.tasks : [];
     for (const task of tasks) {
       const t = task as Record<string, unknown>;
       const tdeps = Array.isArray(t.depends_on) ? t.depends_on : [];
@@ -1340,9 +1404,10 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
         ...renderJobLines(subagentIndex, t.jobs),
       );
     }
-    const closeVerdict = verdictFromMap(snap.readiness.perCloseRow, epicId);
     // Same rule as the task arm: a [blocked:<reason>] verdict drops to its
     // own line beneath the [id]; ready/completed/running stay inline.
+    // `closeVerdict` was resolved once at the top of the block (the pinned-closed
+    // WHY line reads it too).
     const closeIdLines =
       closeVerdict.tag === "blocked"
         ? [`    [${epicId}]`, `    ${iconizePills(formatPill(closeVerdict))}`]

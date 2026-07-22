@@ -34,6 +34,7 @@ import {
   boardHeaderDisplayWidth,
   boardHeaderWidth,
   boardSummaryLines,
+  closedEpicWhyLine,
   colorizePillsInLine,
   computeBoardSummary,
   epicNumFromIdOrBare,
@@ -316,6 +317,7 @@ const HEADER_MODEL: BoardHeaderViewModel = {
     epicsOpen: 2,
     epicsRunning: 1,
     epicsClosing: 1,
+    epicsClosed: 0,
   },
   autopilot: {
     paused: false,
@@ -2246,14 +2248,95 @@ test("computeBoardSummary: counts open/running tasks and epics, including closin
     epicsOpen: 2,
     epicsRunning: 2,
     epicsClosing: 1,
+    // The completed-close epic left `epicsOpen` yet still renders a block, so
+    // it counts here — the summary must name it, never drop it silently.
+    epicsClosed: 1,
     tasksOpen: 1,
     tasksRunning: 1,
   });
   expect(boardSummaryLines(counts)).toEqual([
     "summary",
     "  tasks: 1 open / 1 running",
-    "  epics: 2 open / 2 running / 1 closing",
+    "  epics: 2 open / 2 running / 1 closing (+1 closed)",
   ]);
+});
+
+// The counts-match-rows invariant: `renderEpicsBody` renders one block per
+// `snap.epics` entry, so the summary's open + closed epic counts must sum to
+// exactly the rendered block count — every epic lands in one bucket or the
+// other, never both, never neither.
+test("computeBoardSummary: epicsOpen + epicsClosed equals the rendered epic-block count", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-a", tasks: [] }),
+    makeEpic({ epic_id: "fn-2-b", tasks: [] }),
+    makeEpic({ epic_id: "fn-3-c", tasks: [] }),
+    // A verdict-less epic (no perCloseRow entry) still renders a block;
+    // `isOpenVerdict(undefined)` puts it in the open bucket, never uncounted.
+    makeEpic({ epic_id: "fn-4-d", tasks: [] }),
+  ];
+  const counts = computeBoardSummary({
+    epics,
+    readiness: {
+      perTask: new Map<string, Verdict>(),
+      perCloseRow: new Map<string, Verdict>([
+        ["fn-1-a", EPIC_NOT_VALIDATED],
+        ["fn-2-b", COMPLETED],
+        ["fn-3-c", JOB_RUNNING],
+      ]),
+    },
+  });
+  expect(counts.epicsOpen).toBe(3);
+  expect(counts.epicsClosed).toBe(1);
+  expect(counts.epicsOpen + counts.epicsClosed).toBe(epics.length);
+});
+
+test("boardSummaryLines: no `closed` suffix when nothing is pinned-closed (byte-identical steady state)", () => {
+  expect(
+    boardSummaryLines({
+      epicsOpen: 3,
+      epicsRunning: 1,
+      epicsClosing: 0,
+      epicsClosed: 0,
+      tasksOpen: 5,
+      tasksRunning: 2,
+    }),
+  ).toEqual([
+    "summary",
+    "  tasks: 5 open / 2 running",
+    "  epics: 3 open / 1 running / 0 closing",
+  ]);
+});
+
+// The per-block WHY line: a pinned plan-closed epic still renders a full block
+// (ADR 0018), so it must announce WHY it is still shown — the standing
+// post-close dispatch-failure keeping it pinned — never sit on the board bare.
+test("closedEpicWhyLine: names the standing post-close reason under the header", () => {
+  expect(
+    closedEpicWhyLine("worktree-finalize-non-fast-forward: origin moved ahead"),
+  ).toBe(
+    "  closed · still shown for standing post-close plumbing: worktree-finalize-non-fast-forward: origin moved ahead",
+  );
+});
+
+test("closedEpicWhyLine: a pin with no resolvable reason still states the shown-because fact", () => {
+  expect(closedEpicWhyLine(undefined)).toBe(
+    "  closed · still shown for standing post-close plumbing",
+  );
+  expect(closedEpicWhyLine("   ")).toBe(
+    "  closed · still shown for standing post-close plumbing",
+  );
+});
+
+test("closedEpicWhyLine: keeps only the reason's first line, capped with an ellipsis past 120 chars", () => {
+  expect(
+    closedEpicWhyLine("worktree-recover-dirty-checkout: blocked\nsecond line"),
+  ).toBe(
+    "  closed · still shown for standing post-close plumbing: worktree-recover-dirty-checkout: blocked",
+  );
+  const long = `worktree-recover: ${"x".repeat(200)}`;
+  expect(closedEpicWhyLine(long)).toBe(
+    `  closed · still shown for standing post-close plumbing: ${long.slice(0, 119)}…`,
+  );
 });
 
 // ADR 0018 (fn-1175.2): a pinned epic rides `snap.epics` with a REAL
@@ -2278,6 +2361,9 @@ test("computeBoardSummary: a pinned plan-closed epic (completed close verdict) n
     epicsOpen: 0,
     epicsRunning: 0,
     epicsClosing: 0,
+    // The pinned plan-closed epic renders a block, so it is counted here — the
+    // summary now names it (`(+1 closed)`) rather than dropping it silently.
+    epicsClosed: 1,
     tasksOpen: 0,
     tasksRunning: 0,
   });
