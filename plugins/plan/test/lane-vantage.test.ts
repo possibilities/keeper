@@ -437,6 +437,38 @@ describe("lane-vantage id-bearing resolution", () => {
     expect(r.stderr).not.toContain("may predate");
   });
 
+  test("(r6) explicit --project <lane> with target==state==lane still carries the warning", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main"); // carries .keeper → the lane classifies redirect
+    const lane = join(tmp, "lane");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(lane, { recursive: true });
+    seedState(main, { epicId: "fn-1-cafe", nTasks: 1 });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    linkLaneToMain(lane, main);
+    // Point the lane task's own target_repo at the lane, so with --project <lane>
+    // the resolved TARGET and STATE both equal the lane. No KEEPER_PLAN_WORKTREE —
+    // the lane classification comes from the filesystem, not the producer env.
+    setTaskTargetRepo(lane, "fn-1-cafe.1", lane);
+
+    const r = runCli(["claim", "fn-1-cafe.1", "--project", lane], {
+      cwd: lane,
+    });
+
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.stdout);
+    // target == state == lane; equality never suppresses a lane target — the
+    // lane's own SOURCE can still lag its local default, which is what the
+    // warning is about.
+    expect(env.target_repo).toBe(lane);
+    expect(env.primary_repo).toBe(lane);
+    const warning = env.source_staleness_warning as string;
+    expect(warning).not.toBeNull();
+    expect(warning).toContain(lane);
+    expect(warning).toContain("may predate");
+    expect(r.stderr).toContain("may predate");
+  });
+
   // -------------------------------------------------------------------------
   // Gap 5: the id-bearing verbs surface the weaker-vantage annotation the
   // id-less resolveProject emits — lane_no_state / inconclusive keep cwd
@@ -497,6 +529,57 @@ describe("lane-vantage id-bearing resolution", () => {
     // Claim a task the lane does not carry → TASK_NOT_FOUND; the annotation fires
     // first so the operator sees WHY the id might be missing.
     const r = runCli(["claim", "fn-9-absent.1"], { cwd: lane });
+    expect(r.code).not.toBe(0);
+    expect(claimErrCode(r.stdout)).toBe("TASK_NOT_FOUND");
+    expect(r.stderr).toContain("carries no .keeper");
+  });
+
+  test("(r) Gap 5: resolve-task on a lane_no_state lane annotates a successful stale read", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main"); // NO .keeper → lane_no_state
+    const lane = join(tmp, "lane");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    linkLaneToMain(lane, main);
+
+    const r = runCli(["resolve-task", "fn-1-cafe.1"], { cwd: lane });
+    expect(r.code).toBe(0);
+    // The single JSON value is on stdout; the lane note rides stderr.
+    const env = parseCliOutput(r.stdout);
+    expect(env.task_id).toBe("fn-1-cafe.1");
+    expect(r.stderr).toContain("carries no .keeper");
+    expect(r.stderr).toContain("--project");
+  });
+
+  test("(s) Gap 5: resolve-task on a malformed-.git lane (inconclusive) annotates a successful stale read", () => {
+    const tmp = getTmp();
+    const lane = join(tmp, "lane");
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    // A `.git` file with no parseable gitdir pointer → inconclusive vantage.
+    writeFileSync(join(lane, ".git"), "not a gitdir pointer\n", "utf-8");
+
+    const r = runCli(["resolve-task", "fn-1-cafe.1"], { cwd: lane });
+    expect(r.code).toBe(0);
+    const env = parseCliOutput(r.stdout);
+    expect(env.task_id).toBe("fn-1-cafe.1");
+    expect(r.stderr).toContain("could not be resolved");
+    expect(r.stderr).toContain("--project");
+  });
+
+  test("(t) Gap 5: resolve-task failing TASK_NOT_FOUND from a weaker-vantage lane still annotates", () => {
+    const tmp = getTmp();
+    const main = join(tmp, "main"); // NO .keeper → lane_no_state
+    const lane = join(tmp, "lane");
+    mkdirSync(main, { recursive: true });
+    mkdirSync(lane, { recursive: true });
+    seedState(lane, { epicId: "fn-1-cafe", nTasks: 1 });
+    linkLaneToMain(lane, main);
+
+    // Resolve a task the lane does not carry → TASK_NOT_FOUND; the annotation
+    // fires first so the operator sees WHY the id might be missing.
+    const r = runCli(["resolve-task", "fn-9-absent.1"], { cwd: lane });
     expect(r.code).not.toBe(0);
     expect(claimErrCode(r.stdout)).toBe("TASK_NOT_FOUND");
     expect(r.stderr).toContain("carries no .keeper");

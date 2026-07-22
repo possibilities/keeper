@@ -143,7 +143,7 @@ The stamp that closes the task (Phase 6 verifies, then yields). `keeper plan don
 $PLAN_CLI done $TASK_ID --project "$PRIMARY_REPO" --summary "<1-2 sentence summary>"
 ```
 
-The invocation above is complete — substitute the literal `PLAN_CLI` and task id from your launch header (they are notation, not shell environment references), then run it as-is. Running `keeper plan done --help` first is a wasted call. `done` server-derives your `Task: $TASK_ID` landing commit and records it as evidence, so a bare `--summary` is all a normal close-out needs.
+The invocation above is complete — substitute the literal `PLAN_CLI`, task id, AND `PRIMARY_REPO` path from your launch header (all three are notation, not shell environment references — `PRIMARY_REPO` is a prompt-config value, never an exported shell variable, so leaving `--project "$PRIMARY_REPO"` unsubstituted resolves to an empty `--project ""`), then run it as-is. Running `keeper plan done --help` first is a wasted call. `done` server-derives your `Task: $TASK_ID` landing commit and records it as evidence, so a bare `--summary` is all a normal close-out needs.
 
 **No-code close-out.** When Phase 4 committed nothing because the task LEGITIMATELY produced no source change (a predecessor already shipped the commit, or the acceptance was met with no diff), `done` finds no landing commit and refuses a bare stamp. Record an explicit typed no-op receipt instead:
 

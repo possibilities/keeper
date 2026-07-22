@@ -166,6 +166,26 @@ describe("the parser validates the command set against the descriptor", () => {
   });
 });
 
+describe("worker resume documents --project in its leaf help", () => {
+  const CWD = tmpdir();
+
+  test("the descriptor carries the --project option on worker resume", () => {
+    const resume = planCommand("worker")?.subcommands?.find(
+      (s) => s.name === "resume",
+    );
+    expect(resume?.options?.map((o) => o.name)).toContain("--project");
+  });
+
+  test("keeper plan worker resume --help lists the --project option", () => {
+    const r = runCli(["worker", "resume", "--help"], { cwd: CWD });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("Usage: keeper plan worker resume");
+    // OPT_PROJECT renders as a value option in the shared leaf-help column.
+    expect(r.stdout).toContain("--project TEXT");
+    expect(r.stdout).toContain("Target project root");
+  });
+});
+
 describe("keeper plan --agent-help serves the operator runbook purely", () => {
   const CWD = tmpdir();
 

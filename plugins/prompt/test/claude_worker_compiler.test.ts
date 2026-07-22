@@ -203,6 +203,14 @@ describe("Claude worker cohort compiler", () => {
     expect(rendered).toContain("TARGET repo's own local default/main checkout");
     expect(rendered).toContain("base freshness is producer-owned");
     expect(rendered).toContain("state repo, which is STATE authority only");
+    // The Phase-5 substitution instruction names PRIMARY_REPO alongside PLAN_CLI
+    // and the task id as a notation value to substitute — a prompt-config value,
+    // never a shell variable — so a copied command never becomes `--project ""`.
+    expect(rendered).toContain(
+      "substitute the literal `PLAN_CLI`, task id, AND `PRIMARY_REPO` path",
+    );
+    expect(rendered).toContain("never an exported shell variable");
+    expect(rendered).toContain('resolves to an empty `--project ""`');
   });
 
   test("rejects rendered launch frontmatter that disagrees with computed cells", () => {

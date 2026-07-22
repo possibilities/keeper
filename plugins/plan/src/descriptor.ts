@@ -361,6 +361,7 @@ const WORKER_SUBCOMMANDS: readonly PlanCommand[] = [
     summary:
       "Emit a ready-to-paste respawn prompt for a dropped in-progress task.",
     args: [{ name: "TASK_ID" }],
+    options: [OPT_PROJECT],
   },
 ];
 

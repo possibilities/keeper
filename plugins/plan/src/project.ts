@@ -215,9 +215,13 @@ export function classifyRepoVantage(repoPath: string): LaneVantage {
  *
  * The target is a lane when `KEEPER_PLAN_WORKTREE` is set (the producer-proven
  * lane path the worker cds into) OR the resolved `targetRepo` classifies as a
- * positively-derived worktree lane (`redirect` / `lane_no_state`). A target that
- * IS the state repo is never stale against itself, so it yields null. The advice
- * verifies suspected-absent source against the TARGET repo's own local
+ * positively-derived worktree lane (`redirect` / `lane_no_state`); a non-lane
+ * target (an ordinary checkout) classifies `not_lane` and yields null. A lane
+ * target carries the warning even when it EQUALS the state repo — an explicit
+ * `--project <lane>` makes target and state equal while the lane's SOURCE still
+ * lags its own local default, so target/state equality says nothing about source
+ * freshness and never suppresses. The advice verifies suspected-absent source
+ * against the TARGET repo's own local
  * default/main checkout — the state repo is STATE authority, never source
  * authority (in multi-repo work it can be a different git repository) — and
  * defers a base refresh to the producer; the worker never merges/pulls/rebases
@@ -231,7 +235,7 @@ export function sourceStalenessWarning(
   const kind = producerLane ? null : classifyRepoVantage(targetRepo).kind;
   const targetIsLane =
     producerLane || kind === "redirect" || kind === "lane_no_state";
-  if (!targetIsLane || realpathOr(targetRepo) === realpathOr(stateRepo)) {
+  if (!targetIsLane) {
     return null;
   }
   return (

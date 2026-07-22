@@ -18,6 +18,7 @@ import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, normalizeTask, workerAgentFor } from "../models.ts";
 import {
+  annotateIdReadVantage,
   type ProjectContext,
   resolvePlanStateContext,
   tryResolveOwningProjectForId,
@@ -93,6 +94,12 @@ export function runResolveTask(opts: {
   if (!isTaskId(taskId)) {
     emitResolveError("BAD_TASK_ID", `Invalid task ID: ${taskId}`, format);
   }
+
+  // Surface the weaker-vantage note the id-bearing resolution would drop, BEFORE
+  // resolving — so a lane_no_state / inconclusive cwd annotates even when the
+  // resolution then fails TASK_NOT_FOUND (the operator sees why the id is
+  // missing). No-op under --project or a non-lane cwd.
+  annotateIdReadVantage(project);
 
   const ctx = resolveProjectForTask(taskId, project, format);
 

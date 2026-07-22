@@ -311,6 +311,34 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
     }
   });
 
+  test("pins the state repo on every warm-resume done nudge in the rendered work skill", () => {
+    const { work, rc } = renderPlan(MULTI_PROVIDER_MATRIX);
+    try {
+      expect(rc).toBe(0);
+      const skill = readFileSync(
+        join(work, "skills", "work", "SKILL.md"),
+        "utf-8",
+      );
+      // The three warm-resume "done" nudges (in_progress_committed,
+      // in_progress_uncommitted, state_uncommitted) each pin --project on the
+      // done command. A parent resume directive supersedes the worker's pinned
+      // Phase-5 example, so an unpinned nudge would mis-route the .keeper commit.
+      expect(skill).toContain(
+        'run `keeper plan done <task_id> --project <primary_repo> --summary "..."` now.',
+      );
+      expect(skill).toContain(
+        "`keeper commit-work`, `keeper plan done <task_id> --project <primary_repo>`.",
+      );
+      expect(skill).toContain(
+        'Re-run `keeper plan done <task_id> --project <primary_repo> --summary "..."` to land',
+      );
+      // The reconcile nudge stays pinned alongside the done nudges.
+      expect(skill).toContain("reconcile <task_id> --project <primary_repo>");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
   test("renders the repairer catalog default_pin when its host pin is omitted", () => {
     const matrixYaml = matrixWithAgentPins(
       [
