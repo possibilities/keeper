@@ -245,6 +245,7 @@ import {
   terminalSessionClaimIsReleaseable,
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
+  wrapperWitnessGoneNow,
   writeRestartLedger,
   writeServeHealthHistory,
 } from "../src/daemon";
@@ -6715,6 +6716,164 @@ test("recordedOrBarePidIdentity: a start-time witness delegates; a bare pid repo
   expect(
     recordedOrBarePidIdentity(1234, "linux:999", { signalZero: esrch }),
   ).toBe("gone");
+});
+
+test("recordedOrBarePidIdentity: a group / malformed pid is inconclusive and never reaches the signal seam", () => {
+  const explode = (): never => {
+    throw new Error("the signal seam must not be invoked for a malformed pid");
+  };
+  // 0 and negative pids target a PROCESS GROUP; 1 is init; a non-safe-integer is
+  // malformed. All are rejected as inconclusive BEFORE signalZero runs, on both the
+  // bare-pid path (null start) and the delegated path (present start).
+  for (const badPid of [0, 1, -1, -100, 2 ** 53, Number.NaN]) {
+    expect(
+      recordedOrBarePidIdentity(badPid, null, { signalZero: explode }),
+    ).toBe("inconclusive");
+    expect(
+      recordedOrBarePidIdentity(badPid, "linux:1", { signalZero: explode }),
+    ).toBe("inconclusive");
+  }
+});
+
+test("wrapperWitnessGoneNow: missing row and revived state HOLD; a cross-generation event pair takes the bare-pid HOLD; a gone witness proceeds", () => {
+  const { db } = freshMemDb();
+  const insertJob = (
+    jobId: string,
+    state: string,
+    pid: number | null,
+    start: string | null,
+  ): void => {
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                         updated_at, title, title_source, transcript_path, start_time)
+         VALUES (?, 1, NULL, ?, ?, 0, 2, NULL, NULL, NULL, ?)`,
+      [jobId, pid, state, start],
+    );
+  };
+  const insertSessionStart = (
+    sessionId: string,
+    tsVal: number,
+    pid: number | null,
+    start: string | null,
+  ): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time)
+         VALUES (?, ?, ?, 'SessionStart', 'session_start', ?)`,
+      [tsVal, sessionId, pid, start],
+    );
+  };
+  // A start-aware probe: a STALE-start pair (the jobs-column trap) reads gone; a
+  // NULL-start pair (the true resume generation) reads inconclusive (bare-pid live).
+  const startAware = (
+    _pid: number,
+    startTime: string | null,
+  ): RecordedProcessIdentityVerdict =>
+    startTime == null ? "inconclusive" : "gone";
+
+  // Missing wrapper row → UNKNOWN, not positive gone → HOLD.
+  expect(
+    wrapperWitnessGoneNow(db, { wrapper_job_id: "absent" }, startAware),
+  ).toBe(false);
+
+  // Revived (non-terminal) wrapper → HOLD.
+  insertJob("w-revived", "stopped", 5000, "linux:old");
+  insertSessionStart("w-revived", 1, 5000, "linux:new");
+  expect(
+    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-revived" }, startAware),
+  ).toBe(false);
+
+  // Cross-generation trap: jobs carries (killed, new pid 5000, STALE start
+  // "linux:old") from independent COALESCE, but the latest SessionStart EVENT is
+  // (5000, NULL). A jobs-column read would probe (5000, "linux:old") → gone; the
+  // atomic event pair (5000, NULL) routes to the bare-pid HOLD.
+  insertJob("w-crossgen", "killed", 5000, "linux:old");
+  insertSessionStart("w-crossgen", 1, 1000, "linux:old"); // original generation
+  insertSessionStart("w-crossgen", 2, 5000, null); // resume: new pid, failed scrape
+  expect(
+    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-crossgen" }, startAware),
+  ).toBe(false);
+
+  // Terminal + a truly-pidless latest SessionStart → terminal-state trust.
+  insertJob("w-pidless", "killed", null, null);
+  insertSessionStart("w-pidless", 1, null, null);
+  expect(
+    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-pidless" }, startAware),
+  ).toBe(true);
+
+  // Terminal + a gone (present-start) event witness → proceed.
+  insertJob("w-gone", "killed", 1000, "linux:old");
+  insertSessionStart("w-gone", 1, 1000, "linux:old");
+  expect(
+    wrapperWitnessGoneNow(db, { wrapper_job_id: "w-gone" }, startAware),
+  ).toBe(true);
+
+  db.close();
+});
+
+test("cross-generation witness (non-provider): a resumed live bare pid yields ZERO terminal-session claim release", () => {
+  const { db } = freshMemDb();
+  // Production-shaped history (a direct jobs seed is insufficient): SessionStart(old
+  // pid+start) → Killed → resume SessionStart(new pid + NULL start) whose ts is BELOW
+  // the kill stamp, so the jobs STATE stays killed (revival blocked) while pid and
+  // start_time coalesce INDEPENDENTLY into the cross-generation trap pair.
+  const insertSessionStart = (
+    tsVal: number,
+    pid: number | null,
+    start: string | null,
+  ): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, start_time,
+                           spawn_name, data)
+         VALUES (?, 'sess-xg', ?, 'SessionStart', 'session_start', ?, 'work::fn-xg.1', ?)`,
+      [tsVal, pid, start, JSON.stringify({ dispatch_attempt_id: 60 })],
+    );
+  };
+  insertSessionStart(1000, 1000, "linux:1000"); // original generation
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+       VALUES (2000, 'sess-xg', NULL, 'Killed', 'killed', ?)`,
+    [
+      JSON.stringify({
+        pid: 1000,
+        start_time: "linux:1000",
+        close_kind: "pid_died",
+        reason: "exit_watched",
+      }),
+    ],
+  );
+  insertSessionStart(500, 5000, null); // resume BELOW the kill stamp: new pid, failed scrape
+  while (drain(db) > 0) {
+    // fold to head
+  }
+  // The trap actually formed: killed state, NEW pid, STALE start.
+  expect(
+    db
+      .query("SELECT state, pid, start_time FROM jobs WHERE job_id = 'sess-xg'")
+      .get(),
+  ).toEqual({ state: "killed", pid: 5000, start_time: "linux:1000" });
+
+  // A bound claim owned by this exact session.
+  db.run(
+    `INSERT INTO dispatch_claims (verb, id, attempt_id, state, session_id, dir,
+                                  legacy_unfenced, acquired_at, bound_at,
+                                  last_event_id, updated_at)
+       VALUES ('work', 'fn-xg.1', 60, 'bound', 'sess-xg', '/repo', 0, 1, 1, 1, 2)`,
+  );
+  const startAware = (
+    _pid: number,
+    startTime: string | null,
+  ): RecordedProcessIdentityVerdict =>
+    startTime == null ? "inconclusive" : "gone";
+  // The gate must read the atomic event pair (5000, NULL) → bare-pid HOLD, never the
+  // jobs trap pair (5000, "linux:1000") → gone. So ZERO release.
+  expect(
+    terminalSessionClaimIsReleaseable(
+      db,
+      { verb: "work", id: "fn-xg.1", attempt_id: 60, session_id: "sess-xg" },
+      startAware,
+    ),
+  ).toBe(false);
+  db.close();
 });
 
 test("buildRetryDispatchResultMessage: refused_live, refused_identity, and cleared replies are explicit", () => {

@@ -852,3 +852,99 @@ test("cascade syscall-adjacent wrapper recheck: a resume folded inside the write
   // The write-ahead progressed term_sent durably, but zero TERM/KILL was delivered.
   expect(cascade("leg-40")?.term_sent_at).not.toBeNull();
 });
+
+test("cross-generation wrapper witness: a resume with a new pid + NULL start yields ZERO provider cascade/signal/release", async () => {
+  seedAttempt({
+    task: "fn-1385-crossgen.1",
+    attempt: 50,
+    wrapper: "wrapper-50",
+    wrapperState: "killed",
+    legs: [{ id: "leg-50", session: "leg-session-50", pid: 900 }],
+  });
+  // The wrapper RESUMED on a new pid but its start-time scrape FAILED (NULL). Fold a
+  // SessionStart whose ts is BELOW the kill stamp so the jobs STATE stays killed
+  // (revival blocked) while pid and start_time coalesce INDEPENDENTLY into the
+  // cross-generation trap pair (new pid, stale start).
+  db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data,
+                         start_time, spawn_name, harness)
+       VALUES (500, 'wrapper-50', 5000, 'SessionStart', 'session_start', ?, NULL,
+               'work::fn-1385-crossgen.1', 'claude')`,
+    [JSON.stringify({ dispatch_attempt_id: 50 })],
+  );
+  drainAll();
+  // The trap actually formed: killed state, NEW pid, STALE start.
+  expect(
+    db
+      .query(
+        "SELECT state, pid, start_time FROM jobs WHERE job_id = 'wrapper-50'",
+      )
+      .get(),
+  ).toEqual({ state: "killed", pid: 5000, start_time: "linux:1050" });
+
+  // A start-aware witness: the jobs trap pair (stale start) would read gone; the
+  // atomic event pair (5000, NULL) reads inconclusive (bare-pid live). The fix must
+  // consult the event pair → HOLD the entire cascade across arm+grace+kill windows.
+  const d = deps({
+    probeRecordedIdentity: (_pid, startTime) =>
+      startTime == null ? "inconclusive" : "gone",
+  });
+  await runProviderLegCascadeSweep(db, d);
+  await runProviderLegCascadeSweep(db, d);
+  d.advance(PROVIDER_LEG_TERM_GRACE_SEC + 1);
+  await runProviderLegCascadeSweep(db, d);
+  expect(cascade("leg-50")).toBeNull();
+  expect(d.signals).toEqual([]);
+  expect(
+    db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 50").get(),
+  ).toEqual({ state: "bound" });
+});
+
+test("marker survives an inert (fence-blocked) release; the LIVE resumed wrapper keeps its guard", async () => {
+  const wrapper = "wrapper-marker-inert";
+  await withSessionMarker(wrapper, async (home) => {
+    seedAttempt({
+      task: "fn-1385-marker-inert.1",
+      attempt: 55,
+      wrapper,
+      wrapperState: "killed",
+      legs: [{ id: "leg-55", session: "leg-session-55", pid: 950 }],
+    });
+    let injected = false;
+    const d = deps({
+      probeRecordedIdentity: () => "gone",
+      probe: () => ({
+        identity: "gone",
+        identityReason: "esrch",
+        observedStartTime: null,
+        command: null,
+      }),
+    });
+    d.afterMint = () => {
+      drainAll();
+      if (!injected && cascade("leg-55")?.state === "confirmed") {
+        injected = true;
+        // A live resume folds ahead of the release (reviving the wrapper), so the
+        // terminal_session_only fold is inert and the claim stays bound. Left
+        // UNDRAINED — the release mint's own drain folds it first.
+        event({
+          hook: "SessionStart",
+          session: wrapper,
+          pid: 9999,
+          startTime: "linux:99990",
+          spawnName: "work::fn-1385-marker-inert.1",
+          harness: "claude",
+          data: { dispatch_attempt_id: 55 },
+        });
+      }
+    };
+    await runProviderLegCascadeSweep(db, d); // arm
+    await runProviderLegCascadeSweep(db, d); // settle → confirmed → release minted, then inert on fold
+    // The fence held the claim bound...
+    expect(
+      db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 55").get(),
+    ).toEqual({ state: "bound" });
+    // ...and the LIVE resumed wrapper's marker was NOT deleted off the stale state.
+    expect(existsSync(sessionMarkerPath(home, wrapper))).toBe(true);
+  });
+});

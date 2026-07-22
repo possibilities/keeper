@@ -1433,12 +1433,18 @@ export function planTerminalSessionClaimReleases(
  * evidence. A live, EPERM-blocked, or reused pid stays `inconclusive` (never
  * `matching`: a bare pid cannot confirm identity), so a reap gate over-holds
  * rather than reaping a live-but-unwitnessed process — the safe side.
+ *
+ * A non-safe-integer or `pid <= 1` is rejected as `inconclusive` BEFORE the signal
+ * seam runs (mirroring the full witness's own guard): `process.kill(0|negative, 0)`
+ * targets a PROCESS GROUP, and a group/malformed pid must never be classified gone
+ * on ESRCH and authorize a reap.
  */
 export function recordedOrBarePidIdentity(
   pid: number,
   startTime: string | null,
   deps: { signalZero?: (pid: number) => void } = {},
 ): RecordedProcessIdentityVerdict {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return "inconclusive";
   if (startTime != null && startTime.length > 0) {
     return recordedProcessIdentity(pid, startTime, deps);
   }
@@ -1450,6 +1456,35 @@ export function recordedOrBarePidIdentity(
     if ((error as NodeJS.ErrnoException).code === "ESRCH") return "gone";
   }
   return "inconclusive";
+}
+
+/**
+ * Read the latest SessionStart EVENT's `(pid, start_time)` for a session as ONE
+ * atomic generation pair. This is DELIBERATELY not `jobs.pid` / `jobs.start_time`:
+ * the SessionStart UPSERT coalesces those two columns INDEPENDENTLY
+ * (`COALESCE(excluded.pid, jobs.pid)` / `COALESCE(excluded.start_time, jobs.start_time)`),
+ * so a resume that lands a NEW pid but a FAILED (NULL) start-time scrape synthesizes
+ * a CROSS-GENERATION pair `(pid = new, start_time = old)`. A full witness on that
+ * pair sees a LIVE new pid whose observed start-time differs from the stale recorded
+ * one and falsely classifies it `gone` — authorizing a reap of a live process. The
+ * event carries the pair atomically (`pid = new, start_time = NULL`), so reading it
+ * routes a scrape-failed resume onto the bare-pid HOLD path instead. Returns null
+ * when the session has no SessionStart event at all (a synthetic/legacy row) — the
+ * caller then falls back to the jobs columns, which for such a row carry a single
+ * coherent generation (a cross-generation pair can only be produced BY a resume
+ * event, which this read would have found).
+ */
+function latestSessionStartWitness(
+  db: Database,
+  sessionId: string,
+): { pid: number | null; start_time: string | null } | null {
+  return db
+    .query(
+      `SELECT pid, start_time FROM events
+         WHERE session_id = ? AND hook_event = 'SessionStart'
+         ORDER BY id DESC LIMIT 1`,
+    )
+    .get(sessionId) as { pid: number | null; start_time: string | null } | null;
 }
 
 export function terminalSessionClaimIsReleaseable(
@@ -1494,19 +1529,21 @@ export function terminalSessionClaimIsReleaseable(
   // still-live worker's row to `killed` on any misclassification, and releasing
   // its claim here re-opens the lane for the reconciler to dispatch a SECOND live
   // worker (the double-mint). So the release re-probes the owning session's
-  // RECORDED (pid, start_time) with the same witness every claim gate uses and
-  // releases ONLY on positive death evidence (`gone` — ESRCH or a start-time
-  // recycle); a `matching` (live) or `inconclusive` (uncertain) identity HOLDS the
-  // claim, so a live-or-inconclusive worker is never reaped-then-redispatched
-  // (fail-closed, mirroring {@link decideDispatchClearLiveness}). The fallback is
-  // narrowed to a TRULY pidless row (no pid at all — terminal by construction, the
-  // seed sweep's own pidless reap already proved it unwatchable): only THAT falls
-  // back to the terminal-state trust. A row that carries a pid but a missing/empty
-  // start_time (a live process whose start-time scrape failed) is NEVER released on
-  // trust — `recordedOrBarePidIdentity` degrades it to a bare-pid probe that
-  // releases only on ESRCH, holding a live-or-reused pid.
-  if (gated.pid == null) return true;
-  return probeIdentity(gated.pid, gated.start_time) === "gone";
+  // recorded identity and releases ONLY on positive death evidence (`gone`); a
+  // `matching` (live) or `inconclusive` (uncertain) identity HOLDS the claim
+  // (fail-closed, mirroring {@link decideDispatchClearLiveness}). The witness pair
+  // comes from the latest SessionStart EVENT (one atomic generation) — never the
+  // independently-coalesced jobs columns, which can synthesize a live-pid /
+  // stale-start cross-generation pair that classifies a LIVE resume as gone. The
+  // fallback is narrowed to a TRULY pidless witness (no pid — terminal by
+  // construction, the seed sweep's own pidless reap already proved it unwatchable):
+  // only THAT falls back to terminal-state trust. A pid with a missing/empty
+  // start_time (a live process whose scrape failed) is never released on trust —
+  // `recordedOrBarePidIdentity` degrades it to a bare-pid probe that releases only
+  // on ESRCH.
+  const witness = latestSessionStartWitness(db, row.session_id) ?? gated;
+  if (witness.pid == null) return true;
+  return probeIdentity(witness.pid, witness.start_time) === "gone";
 }
 
 /**
@@ -8324,19 +8361,29 @@ function providerLegProbeVerdict(
  * Recycle-safe wrapper witness, re-read from the CURRENT `jobs` projection (never
  * the selection snapshot — an earlier row's mint/pump this sweep may have folded a
  * resume SessionStart for this wrapper). Returns true only when the wrapper is
- * PROVABLY gone; a revived (non-terminal) wrapper, or one whose recorded
- * (pid, start_time) still probes live/inconclusive, returns false so the caller
- * HOLDS. A terminal but truly-pidless wrapper (no pid to witness) falls back to the
- * terminal-state trust — the seed sweep's own pidless reap already proved it
- * unwatchable. This is the wrapper-side analogue of the terminal-session claim
- * gate: a falsely-terminal swap-routed wrapper (its jobs row reaped to `killed` by
- * a watchdog recycle while its process lives) must never cascade its leg down or
- * release its own claim.
+ * PROVABLY gone; a revived (non-terminal) wrapper, or one whose recorded identity
+ * still probes live/inconclusive, returns false so the caller HOLDS. A terminal but
+ * truly-pidless wrapper (no pid to witness) falls back to terminal-state trust — the
+ * seed sweep's own pidless reap already proved it unwatchable. This is the
+ * wrapper-side analogue of the terminal-session claim gate: a falsely-terminal
+ * swap-routed wrapper (its jobs row reaped to `killed` by a watchdog recycle while
+ * its process lives) must never cascade its leg down or release its own claim.
+ *
+ * A MISSING current wrapper row is UNKNOWN, not positive gone — and, unlike a
+ * pidless terminal row, not even a terminal projection — so it HOLDS. The witness
+ * pair is read from the latest SessionStart EVENT (one atomic generation), never the
+ * independently-coalesced jobs pid/start columns, which can synthesize a live-pid /
+ * stale-start cross-generation pair that classifies a LIVE resume as gone; the jobs
+ * columns are only a fallback for a wrapper with no SessionStart event (which then
+ * carries a single coherent generation).
  */
-function wrapperWitnessGoneNow(
+export function wrapperWitnessGoneNow(
   db: Database,
   row: Pick<ProviderLegCascadeRow, "wrapper_job_id">,
-  deps: ProviderLegCascadeDeps,
+  probeRecordedIdentity: (
+    pid: number,
+    startTime: string | null,
+  ) => RecordedProcessIdentityVerdict,
 ): boolean {
   const w = db
     .query("SELECT state, pid, start_time FROM jobs WHERE job_id = ?")
@@ -8345,10 +8392,11 @@ function wrapperWitnessGoneNow(
     pid: number | null;
     start_time: string | null;
   } | null;
-  if (w == null) return true; // no wrapper row — nothing live to protect
+  if (w == null) return false; // missing row — UNKNOWN, not gone → HOLD
   if (w.state !== "ended" && w.state !== "killed") return false; // revived → HOLD
-  if (w.pid == null) return true; // terminal + truly pidless → terminal-state trust
-  return deps.probeRecordedIdentity(w.pid, w.start_time) === "gone";
+  const witness = latestSessionStartWitness(db, row.wrapper_job_id) ?? w;
+  if (witness.pid == null) return true; // terminal + truly pidless → terminal-state trust
+  return probeRecordedIdentity(witness.pid, witness.start_time) === "gone";
 }
 
 async function teardownProviderLegWindow(
@@ -8556,7 +8604,7 @@ function releaseSettledProviderLegAttempts(
     // HOLD the release when the wrapper is revived or still probes live/inconclusive,
     // so a falsely-terminal swap-routed wrapper never has its claim dropped out from
     // under it (the double-mint).
-    if (!wrapperWitnessGoneNow(db, row, deps)) {
+    if (!wrapperWitnessGoneNow(db, row, deps.probeRecordedIdentity)) {
       continue;
     }
     mintProviderLegCascadeEvent(
@@ -8580,7 +8628,26 @@ function releaseSettledProviderLegAttempts(
         terminal_session_only: true,
       },
     );
-    if (row.wrapper_state === "ended" || row.wrapper_state === "killed") {
+    // Clear the wrapper's dead-session marker ONLY on POSITIVE post-pump evidence
+    // that THIS release actually folded — the current claim tuple now reads
+    // `released` for this exact attempt — AND the current wrapper still passes gone
+    // authority. Never off the stale selected `wrapper_state`: when the fold-time
+    // fence makes the release inert (a live lower-id resume folded first, so the
+    // claim stays bound), the LIVE resumed wrapper's marker is its active guard and
+    // must survive. A genuine gone/released keeps clearing.
+    const releasedClaim = db
+      .query(
+        "SELECT state, attempt_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+      )
+      .get(row.plan_verb, row.plan_ref) as {
+      state: string;
+      attempt_id: number | null;
+    } | null;
+    if (
+      releasedClaim?.state === "released" &&
+      releasedClaim.attempt_id === row.wrapper_dispatch_attempt_id &&
+      wrapperWitnessGoneNow(db, row, deps.probeRecordedIdentity)
+    ) {
       clearDeadSessionMarker(row.wrapper_job_id);
     }
     acted = true;
@@ -8630,7 +8697,7 @@ export async function runProviderLegCascadeSweep(
     if (
       wrapperTerminal &&
       !superseded &&
-      !wrapperWitnessGoneNow(db, row, deps)
+      !wrapperWitnessGoneNow(db, row, deps.probeRecordedIdentity)
     ) {
       continue;
     }
@@ -8774,7 +8841,7 @@ export async function runProviderLegCascadeSweep(
     if (
       wrapperTerminal &&
       !superseded &&
-      !wrapperWitnessGoneNow(db, row, deps)
+      !wrapperWitnessGoneNow(db, row, deps.probeRecordedIdentity)
     ) {
       continue;
     }
