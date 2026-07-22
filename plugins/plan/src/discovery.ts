@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 import { loadRoots } from "./config.ts";
 import { parseId } from "./ids.ts";
-import { findProjectRoot } from "./project.ts";
+import { classifyCwdVantage } from "./project.ts";
 import {
   hasDataDir,
   resolveDataDir,
@@ -232,10 +232,13 @@ export function resolveEpicGlobally(
   epicId: string,
   roots?: string[],
 ): ResolveResult {
-  // 1. Cwd short-circuit.
+  // 1. Cwd short-circuit — lane-aware. A redirect-eligible worktree lane resolves
+  // to its authoritative main STATE repo (the same `classifyCwdVantage` seam the
+  // id-less resolver uses), so an id-addressed verb reads/serves the state repo's
+  // definition, never the lane's lagging committed snapshot.
   let cwdRoot: string | null;
   try {
-    cwdRoot = findProjectRoot();
+    cwdRoot = classifyCwdVantage().effectiveRoot;
   } catch {
     cwdRoot = null;
   }

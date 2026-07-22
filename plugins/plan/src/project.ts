@@ -6,15 +6,23 @@
 // where the pytest tmp tree resolves /var -> /private/var). resolveProject
 // hard-errors through emitError when no `.keeper/` data dir is present.
 //
-// resolveProject also detects a LANE VANTAGE: a cwd inside a linked git
-// worktree serves that lane's committed `.keeper` snapshot, which can lag the
-// authoritative state repo. Detection is positive-evidence — only a readable
-// `.git` FILE resolving through its gitdir/commondir to a main checkout that
-// positively carries a `.keeper/` redirects resolution there; anything weaker
-// keeps the cwd resolution and annotates on stderr, never redirecting on a
-// guess.
+// A cwd inside a linked git worktree serves that lane's committed `.keeper`
+// snapshot, which can lag the authoritative state repo. `classifyCwdVantage` is
+// the single seam both the id-less (`resolveProject`) and the id-bearing
+// (`resolveEpicGlobally`) resolvers route through, so the state repo is
+// authoritative from every verb shape. Detection is positive-evidence — only a
+// REGULAR-FILE `.git` resolving through its gitdir/commondir to a main checkout
+// whose own `.git` samefile-backlinks the derived common dir AND positively
+// carries a `.keeper/` redirects resolution there; anything weaker keeps the cwd
+// resolution and annotates on stderr, never redirecting on a guess.
 
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
 import { resolveEpicGlobally } from "./discovery.ts";
@@ -82,21 +90,31 @@ export function contextForRoot(projectRoot: string): ProjectContext {
  * `.keeper/` data dir is present. `format` selects the error envelope's
  * serialization.
  *
- * When the cwd-discovered root is a LANE VANTAGE (a linked worktree serving a
- * potentially stale committed `.keeper` snapshot), the resolution is corrected
- * or annotated per `detectLaneVantage`'s positive-evidence tri-state:
- *  - a positively derived main checkout carrying `.keeper` REDIRECTS resolution
- *    there (the lane's snapshot is bypassed), even when the lane itself has no
- *    data dir;
- *  - a lane whose main checkout is derivable but carries no `.keeper`, and a lane
- *    whose `.git` file is unreadable/malformed (main not derivable), keep the cwd
- *    resolution and emit a stderr note — never a silent redirect on a guess.
+ * STATE-AUTHORITY POLICY. The cwd-discovered root is classified for a LANE
+ * VANTAGE (a linked worktree serving a potentially stale committed `.keeper`
+ * snapshot). When the lane's main checkout is POSITIVELY derived (the
+ * regular-`.git`-file + samefile backlink proof in `detectLaneVantage`) and
+ * carries `.keeper`, the state repo — never the lane's lagging snapshot — is
+ * authoritative for BOTH reads AND writes. A MUTATOR run from a lane cwd (e.g.
+ * `set-branch`, `set-title`, `scaffold`, `refine-apply`) therefore writes and
+ * auto-commits ONLY the main repo's `.keeper`, leaving the lane's own `.keeper`
+ * byte-untouched and landing the commit in the MAIN repo's git history. This is
+ * deliberate: a board has exactly one authoritative state home, and a worktree
+ * lane is a source overlay, not a second state root. `--project <lane>` is the
+ * sole intentional way to target a lane's own `.keeper` — an explicit override
+ * never reaches here.
+ *
+ * A weaker vantage never redirects — it keeps the cwd resolution and annotates on
+ * stderr, never a silent redirect on a guess:
+ *  - a lane whose main checkout is derivable but carries no `.keeper`, and
+ *  - a `.git` file / worktree structure that fails the positive-evidence proof
+ *    (unreadable pointer, missing common dir, or a broken backlink),
+ * each keep the cwd resolution and emit a stderr note.
  *
  * The note rides stderr, never stdout, so every read/inspection verb still emits
  * exactly one top-level JSON value. Explicit `--project` never reaches here. */
 export function resolveProject(format: OutputFormat | null): ProjectContext {
-  const projectRoot = findProjectRoot();
-  const vantage = detectLaneVantage(projectRoot);
+  const { root: projectRoot, vantage } = classifyCwdVantage();
 
   if (vantage.kind === "redirect") {
     annotateLane(
@@ -128,38 +146,66 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
 }
 
 /** The lane-vantage outcome for a cwd-discovered project root. `not_lane` is an
- * ordinary checkout (a `.git` directory, or no `.git`) — byte-identical current
+ * ordinary checkout (a `.git` DIRECTORY, or no `.git`) — byte-identical current
  * behavior. `redirect` positively derived a main checkout carrying `.keeper`.
  * `lane_no_state` positively derived the main checkout but it lacks `.keeper`.
- * `inconclusive` is a `.git` FILE whose worktree structure could not be read. */
-type LaneVantage =
+ * `inconclusive` is a `.git` FILE / worktree structure that failed the
+ * positive-evidence proof (non-regular `.git`, unreadable pointer, missing common
+ * dir, or a broken backlink) — annotate, never redirect. */
+export type LaneVantage =
   | { kind: "not_lane" }
   | { kind: "redirect"; mainRoot: string }
   | { kind: "lane_no_state"; mainRoot: string }
   | { kind: "inconclusive" };
 
+/** The cwd's git vantage — the SINGLE seam both the id-less (`resolveProject`)
+ * and the id-bearing (`resolveEpicGlobally`'s cwd short-circuit) resolvers route
+ * their state-authority redirect through, so a lane cwd resolves identically no
+ * matter which verb shape reached it. `root` is the plain cwd project root
+ * (`findProjectRoot`); `effectiveRoot` is the main STATE repo when `root` is a
+ * redirect-eligible lane, else `root` itself. Pure — no stderr, no process
+ * probes; callers own any annotation. */
+export function classifyCwdVantage(): {
+  root: string;
+  vantage: LaneVantage;
+  effectiveRoot: string;
+} {
+  const root = findProjectRoot();
+  const vantage = detectLaneVantage(root);
+  const effectiveRoot = vantage.kind === "redirect" ? vantage.mainRoot : root;
+  return { root, vantage, effectiveRoot };
+}
+
 /** Classify `projectRoot`'s git vantage from the filesystem alone (no `git`
- * subprocess). A `.git` DIRECTORY (or absent `.git`) is positively not a lane. A
- * `.git` FILE marks a linked worktree: follow its `gitdir:` pointer to the
- * worktree git dir, then its `commondir` to the main checkout's git dir, whose
- * parent is the main toplevel. Only a positively derived main toplevel that
- * carries `.keeper` justifies redirecting; a self-resolving or unreadable
- * structure stays inconclusive. */
+ * subprocess), positive-evidence only. A `.git` DIRECTORY (or absent `.git`) is
+ * positively not a lane. A linked worktree is marked by a `.git` REGULAR FILE (an
+ * lstat: a symlink or any other node type is NOT positive evidence). Its
+ * `gitdir:` pointer leads to the worktree git dir, whose `commondir` leads to the
+ * main checkout's git dir — which MUST exist and be a directory. The redirect
+ * fires ONLY when the derived main toplevel's OWN `.git` resolves (samefile) to
+ * that SAME common git dir, so a forged `commondir` pointing at an unrelated
+ * directory whose parent merely carries a `.keeper/` is rejected as inconclusive.
+ * A proven main toplevel carrying `.keeper` redirects; one without is
+ * `lane_no_state`; every failed proof is `inconclusive`. */
 function detectLaneVantage(projectRoot: string): LaneVantage {
-  let st: ReturnType<typeof statSync>;
+  const gitPath = join(projectRoot, ".git");
+  let st: ReturnType<typeof lstatSync>;
   try {
-    st = statSync(join(projectRoot, ".git"));
+    st = lstatSync(gitPath);
   } catch {
     return { kind: "not_lane" };
   }
+  // A `.git` DIRECTORY is its own repo — positively not a lane.
   if (st.isDirectory()) {
     return { kind: "not_lane" };
   }
+  // A linked-worktree marker is a REGULAR FILE. A symlink (or any other node
+  // type) is forgeable indirection, not positive evidence — inconclusive.
+  if (!st.isFile()) {
+    return { kind: "inconclusive" };
+  }
 
-  const worktreeGitDir = readGitdirPointer(
-    join(projectRoot, ".git"),
-    projectRoot,
-  );
+  const worktreeGitDir = readGitdirPointer(gitPath, projectRoot);
   if (worktreeGitDir === null) {
     return { kind: "inconclusive" };
   }
@@ -167,16 +213,50 @@ function detectLaneVantage(projectRoot: string): LaneVantage {
   if (commonGitDir === null) {
     return { kind: "inconclusive" };
   }
+  // The common git dir must EXIST and be a directory (the main checkout's `.git`).
+  if (!isDirectoryPath(commonGitDir)) {
+    return { kind: "inconclusive" };
+  }
 
-  // The common git dir is the main checkout's `.git`; its parent is that
-  // toplevel. A structure resolving back onto the lane is a no-op, not a lane.
+  // The common git dir's parent is the candidate main toplevel. A structure
+  // resolving back onto the lane is a no-op, not a lane.
   const mainRoot = realpathOr(dirname(commonGitDir));
   if (mainRoot === projectRoot) {
     return { kind: "not_lane" };
   }
+  // Backlink proof (samefile): the main toplevel's OWN `.git` must resolve to the
+  // SAME node as the derived common git dir. A forged `commondir` pointing at an
+  // unrelated directory fails here — no redirect on a guess.
+  if (!sameFile(join(mainRoot, ".git"), commonGitDir)) {
+    return { kind: "inconclusive" };
+  }
   return hasDataDir(mainRoot)
     ? { kind: "redirect", mainRoot }
     : { kind: "lane_no_state", mainRoot };
+}
+
+/** True iff `p` exists and is a directory (following symlinks); false on any
+ * stat error. */
+function isDirectoryPath(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Samefile check: `a` and `b` resolve (through symlinks) to the SAME path.
+ * False when either does not exist — a non-resolvable node is never proof. */
+function sameFile(a: string, b: string): boolean {
+  let ra: string;
+  let rb: string;
+  try {
+    ra = realpathSync(a);
+    rb = realpathSync(b);
+  } catch {
+    return false;
+  }
+  return ra === rb;
 }
 
 /** Follow a linked-worktree `.git` file's `gitdir:` line to the worktree git

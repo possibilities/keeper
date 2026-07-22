@@ -25,6 +25,7 @@ import { resolveIncident } from "../incident.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentFor } from "../models.ts";
 import {
+  classifyCwdVantage,
   contextForRoot,
   type ProjectContext,
   resolvePlanStateContext,
@@ -205,6 +206,26 @@ export function runClaim(args: ClaimArgs): void {
   const primaryRepo = projPath;
   const { targetRepo } = resolveWorkerRepos(taskDef, epicDef, projPath);
 
+  // Source-staleness policy. A claim resolved from a worktree-lane cwd (no
+  // explicit --project) reads/serves the authoritative state repo, but the
+  // worker's SOURCE tree is the lane, whose committed source MAY PREDATE the
+  // state repo. Surface a conservative warning — on the claim envelope AND the
+  // persisted brief (both worker-consumed) plus stderr — naming BOTH the lane
+  // path and the state repo, so a worker never concludes cited source is absent
+  // off a lagging lane without refreshing first. `KEEPER_PLAN_WORKTREE` keeps
+  // governing source-commit derivation; this only warns, it moves nothing.
+  const cwdVantage = classifyCwdVantage();
+  const sourceStalenessWarning =
+    project === null && cwdVantage.vantage.kind === "redirect"
+      ? `the source tree at ${cwdVantage.root} is a worktree lane whose ` +
+        "committed source may predate the authoritative state repo " +
+        `${primaryRepo}; refresh or verify it before concluding that cited ` +
+        "source is absent"
+      : null;
+  if (sourceStalenessWarning !== null) {
+    process.stderr.write(`plan: ${sourceStalenessWarning}\n`);
+  }
+
   // 5. status / deps gate (pre-check, no lock — the CAS re-reads under the lock)
   const runtimePre = stateStore.loadRuntime(taskId);
   const mergedPre = mergeTaskState(taskDef, runtimePre);
@@ -269,6 +290,8 @@ export function runClaim(args: ClaimArgs): void {
     auditRequired,
     dataDir,
   });
+  // Persist the source-staleness warning into the brief the worker reads first.
+  briefDict.source_staleness_warning = sourceStalenessWarning;
 
   const dispatch = readDispatchConstraint();
 
@@ -426,6 +449,7 @@ export function runClaim(args: ClaimArgs): void {
       task_state: taskState,
       epic_state: epicState,
       brief_ref: briefRef,
+      source_staleness_warning: sourceStalenessWarning,
       incident,
     },
     pc,

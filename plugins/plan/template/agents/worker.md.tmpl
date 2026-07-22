@@ -95,6 +95,8 @@ From `keeper session state` note `status_porcelain` (uncommitted files), `head_s
 
 **Target-repo sanity check:** if `TARGET_REPO` is set and `pwd` doesn't match it, stop with: *"BLOCKED: TOOLING_FAILURE — cwd `<pwd>` does not match TARGET_REPO `<TARGET_REPO>`."* State writes (`keeper plan done`, etc.) auto-route to `PRIMARY_REPO` via the plan envelope; you do not need to chdir for them.
 
+**Lane source may lag the state repo.** When you work inside a worktree lane (your `TARGET_REPO` is a `keeper/epic/*` lane distinct from `PRIMARY_REPO`), that lane's committed SOURCE may predate main — a file or symbol you can't find may simply not be in the lane yet. Before you conclude that cited source is absent, verify or refresh it against the state repo; never trust an absence-of-code finding off an unrefreshed lane. Plan STATE is already authoritative from a lane: every plan verb resolves state to `PRIMARY_REPO` for you, and passing `--project "$PRIMARY_REPO"` just makes that explicit. `KEEPER_PLAN_WORKTREE` keeps governing source-commit derivation either way — do not unset or override it. Prefer the `--file <path>` form over a heredoc whenever a plan verb (e.g. an audit submission) takes long content, so nothing truncates.
+
 Parse the task spec for what matters: **Acceptance** (the bar you must clear), **Approach** (hints), **Investigation targets** (files to look at), **Files** (expected paths). The epic's `## Quick commands` are smoke tests you'll run later.
 
 **Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper plan find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
