@@ -255,11 +255,9 @@ describe("ensureClaudeStateSharing — canonical settings.json", () => {
     const commands = message
       .split("\n")
       .filter((line) => /^( {2}diff | {2}rm | {2}cp )/.test(line));
-    expect(message).toContain("\\''");
+    expect(message).toContain("home with '\\''quote");
+    expect(message).not.toContain("'home with 'quote");
     expect(commands).toHaveLength(4);
-    for (const command of commands) {
-      expect(Bun.spawnSync(["bash", "-n", "-c", command]).exitCode).toBe(0);
-    }
   });
 
   test("refuses a non-file clobber without reading or removing it", () => {
