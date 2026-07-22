@@ -168,6 +168,16 @@ Red flags:
 - Tests asserting internal state instead of observable behavior
 - Modified assertions in existing tests (especially weakening: removing checks, loosening matchers)
 
+### 5c. Test-Surface Integrity (Spec axis)
+
+Read the DIFF of the test surface itself — deletions included — never just the surviving tree. Green gates and literally-satisfied acceptance criteria are BLIND to a test that was deleted, inverted, or weakened: the suite still passes precisely because the check that would have failed is gone, so the diff of the tests themselves is the only evidence.
+
+- **Deleted tests**: `-` hunks dropping a `test`/`it`/`describe` case, or a removed `*.test.*` file — a code path or invariant that was covered and now is not.
+- **Inverted assertions**: an assertion flipped to assert the OPPOSITE behavior — e.g. a check that a documented path IS taken rewritten to assert it is NOT, or an expected value swapped for its negation.
+- **Weakened expectations**: a loosened matcher, an assertion dropped from a still-passing test, or a fixture narrowed so it no longer exercises the invariant.
+
+Every such change must be JUSTIFIED against a documented invariant — a CLAUDE.md-mandated behavior, an ADR-recorded decision, or the task/epic spec. It is justified only when the behavior it guarded is itself removed by this same diff; otherwise it is a finding at the severity of the invariant it un-guards — un-guarding an invariant-encoding test is `Critical` (SEVERE-grade in task mode), never a style nit. Report it on the Spec axis (file:line, the invariant left un-guarded).
+
 ### 6. Performance Red Flags
 - N+1 queries or O(n²) loops
 - Unbounded data fetching

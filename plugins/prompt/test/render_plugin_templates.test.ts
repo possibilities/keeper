@@ -339,6 +339,43 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
     }
   });
 
+  test("keeps the test-surface-integrity lens inside the lean baseline of the rendered auditor", () => {
+    const { work, rc } = renderPlan(MULTI_PROVIDER_MATRIX);
+    try {
+      expect(rc).toBe(0);
+      const auditor = readFileSync(
+        join(work, "agents", "quality-auditor.md"),
+        "utf-8",
+      );
+      // A deleted, inverted, or weakened invariant-encoding test slips past
+      // green gates and every literally-satisfied acceptance criterion, so the
+      // lens reads the DIFF of the test surface itself — deletions included.
+      expect(auditor).toContain("### 5c. Test-Surface Integrity");
+      for (const failureClass of [
+        "**Deleted tests**",
+        "**Inverted assertions**",
+        "**Weakened expectations**",
+      ]) {
+        expect(auditor).toContain(failureClass);
+      }
+      expect(auditor).toContain(
+        "the diff of the tests themselves is the only evidence",
+      );
+      // Load-bearing placement: the lens lives in the lean baseline (lenses 1–8
+      // that both epic-lean and task mode run), never among the deep-only
+      // lenses 9/10 — task-mode audits degrade to lean and must still run it.
+      const lensIndex = auditor.indexOf("### 5c. Test-Surface Integrity");
+      const deepLensIndex = auditor.indexOf(
+        "### 9. Cross-file interaction sweep",
+      );
+      expect(lensIndex).toBeGreaterThan(0);
+      expect(deepLensIndex).toBeGreaterThan(lensIndex);
+      expect(auditor).toContain("lenses 1–8, one pass");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
   test("renders the repairer catalog default_pin when its host pin is omitted", () => {
     const matrixYaml = matrixWithAgentPins(
       [
