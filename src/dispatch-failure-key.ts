@@ -903,5 +903,10 @@ export function parseMergeConflictReason(
   if (m == null) {
     return null;
   }
-  return { source: m[1], base: m[2], stderr };
+  const source = m[1];
+  const base = m[2];
+  if (source === undefined || base === undefined) {
+    return null;
+  }
+  return { source, base, stderr };
 }

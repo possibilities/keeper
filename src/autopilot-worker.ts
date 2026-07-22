@@ -282,7 +282,12 @@ import {
   shortBranchName,
   type WorktreeEntry,
 } from "./worktree-git";
-import { baseBranchFor, repoDirHash, worktreePathFor } from "./worktree-plan";
+import {
+  baseBranchFor,
+  repoDirHash,
+  worktreePathFor,
+  worktreePrecloseDispatchId,
+} from "./worktree-plan";
 
 // The dispatch-failure vocabulary + typed row router live in the dep-free
 // `./dispatch-failure-key` leaf; re-exported here so every existing
@@ -6396,7 +6401,7 @@ export async function runReconcileCycle(
       }
       const epicId = closeKeyEpicId(sink);
       const o = outcomeFor(epicId);
-      const fenceId = `${WORKTREE_PRECLOSE_ID_PREFIX}${epicId}-${repoDirHash(sink.repoDir)}`;
+      const fenceId = worktreePrecloseDispatchId(epicId, sink.repoDir);
       // Positive-evidence level-clear of a self-healed structural fence (scoped to an
       // OPEN fence for THIS (epic, repo) — never dismisses another cycle's live block).
       const clearFenceIfOpen = (): void => {
@@ -6490,6 +6495,15 @@ export async function runReconcileCycle(
       } else if (o.conflict !== undefined && !isIncidentOwner) {
         preCloseProvisionBlocked.add(epicId);
       }
+    }
+    // ABSENT-SINK fence retirement: reconcile positively proved these fences' (epic,
+    // repo) sinks are gone (landed / reaped / worktree-off / regrouped), so retire the
+    // stale rows the same-cycle level-clear could never reach (no present sink to
+    // assemble). Fenced through the SAME emitDispatchCleared path as the level-clear.
+    for (const fenceId of decision.preCloseFenceClears) {
+      deps.emitDispatchCleared(
+        dispatchClearedPayload(dispatchFailureFences, "close", fenceId),
+      );
     }
   }
 

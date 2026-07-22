@@ -40,6 +40,7 @@
  */
 
 import { homedir } from "node:os";
+import { WORKTREE_PRECLOSE_ID_PREFIX } from "./dispatch-failure-key";
 
 import type { Task } from "./types";
 
@@ -221,6 +222,20 @@ function shortHash(s: string): string {
  */
 export function repoDirHash(repoDir: string): string {
   return shortHash(stripTrailingSlash(repoDir));
+}
+
+/**
+ * The `dispatch_failures.id` of a per-(epic, repo) PRE-CLOSE structural fence row —
+ * `worktree-preclose:<epicId>-<repoDirHash(repoDir)>`. The SINGLE generator both the
+ * producer (minting + the same-cycle level-clear) and the reconciler (the absent-sink
+ * retirement KEEP set) call, so a fence is matched by regenerating its EXACT identity
+ * from `(epicId, repoDir)` — never by splitting the (hyphenated) id string.
+ */
+export function worktreePrecloseDispatchId(
+  epicId: string,
+  repoDir: string,
+): string {
+  return `${WORKTREE_PRECLOSE_ID_PREFIX}${epicId}-${repoDirHash(repoDir)}`;
 }
 
 /**

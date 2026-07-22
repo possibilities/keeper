@@ -302,6 +302,7 @@ import {
   repoDirHash,
   ribBranchFor,
   worktreePathFor,
+  worktreePrecloseDispatchId,
 } from "../src/worktree-plan";
 import {
   argvHas,
@@ -10657,6 +10658,110 @@ test("fn-16g runReconcileCycle: a still-failing pre-close structural failure RE-
   ).toBeUndefined();
 });
 
+// ABSENT-SINK fence retirement — a pre-close structural fence whose (epic, repo) sink
+// vanished (landed / reaped / worktree-off / regrouped) is cleared by reconcile, matched
+// by REGENERATING the fence identity from a present clustered epic's non-primary worktree
+// groups, never by splitting the id. UNKNOWN (paused/degraded) never clears.
+
+test("fn-16 reconcile: a fence for a DONE (landed) epic is RETIRED — no present sink can ever assemble to clear it", () => {
+  const epic = { ...closeReadyPrimarylessEpic(), status: "done" };
+  const fence = worktreePrecloseDispatchId("fn-1-anchor", "/repo-b");
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abcResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    preCloseFenceFailureIds: new Set([fence]),
+  });
+  expect(reconcile(snap, makeState(), 0).preCloseFenceClears).toEqual([fence]);
+});
+
+test("fn-16 reconcile: a fence for an ABSENT epic (reaped, not on the board) is RETIRED", () => {
+  const fence = worktreePrecloseDispatchId("fn-1-gone", "/repo-b");
+  const snap = makeSnapshot({
+    epics: [],
+    worktreeMode: true,
+    worktreeRepoByEpicId: new Map(),
+    preCloseFenceFailureIds: new Set([fence]),
+  });
+  expect(reconcile(snap, makeState(), 0).preCloseFenceClears).toEqual([fence]);
+});
+
+test("fn-16 reconcile: a present non-primary group's fence is KEPT while a stale-repo fence (grouping changed) is RETIRED — the OLD identity clears, the live one never cross-clears", () => {
+  const epic = closeReadyPrimarylessEpic();
+  const live = worktreePrecloseDispatchId("fn-1-anchor", "/repo-b"); // a live worktree group
+  const stale = worktreePrecloseDispatchId("fn-1-anchor", "/repo-z"); // NOT a current group
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abcResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    preCloseFenceFailureIds: new Set([live, stale]),
+  });
+  const clears = reconcile(snap, makeState(), 0).preCloseFenceClears;
+  expect(clears).toEqual([stale]);
+  expect(clears).not.toContain(live);
+});
+
+test("fn-16 reconcile: worktree mode OFF retires EVERY open pre-close fence (all sinks are gone)", () => {
+  const fenceA = worktreePrecloseDispatchId("fn-1-anchor", "/repo-a");
+  const fenceB = worktreePrecloseDispatchId("fn-1-anchor", "/repo-b");
+  const snap = makeSnapshot({
+    epics: [closeReadyPrimarylessEpic()],
+    worktreeMode: false,
+    preCloseFenceFailureIds: new Set([fenceA, fenceB]),
+  });
+  expect(reconcile(snap, makeState(), 0).preCloseFenceClears.sort()).toEqual(
+    [fenceA, fenceB].sort(),
+  );
+});
+
+test("fn-16 reconcile: while PAUSED no fence is retired (UNKNOWN never clears)", () => {
+  const fence = worktreePrecloseDispatchId("fn-1-gone", "/repo-b");
+  const snap = makeSnapshot({
+    epics: [],
+    worktreeMode: true,
+    worktreeRepoByEpicId: new Map(),
+    preCloseFenceFailureIds: new Set([fence]),
+  });
+  expect(
+    reconcile(snap, makeState({ paused: true }), 0).preCloseFenceClears,
+  ).toEqual([]);
+});
+
+test("fn-16 runReconcileCycle: an absent-sink fence retirement is EMITTED as a DispatchCleared on the exact custom row", async () => {
+  const fence = worktreePrecloseDispatchId("fn-1-gone", "/repo-b");
+  const snap = makeSnapshot({
+    epics: [],
+    worktreeMode: true,
+    worktreeRepoByEpicId: new Map(),
+    preCloseFenceFailureIds: new Set([fence]),
+  });
+  const { driver } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  expect(depsLog.clears.some((c) => c.verb === "close" && c.id === fence)).toBe(
+    true,
+  );
+});
+
 // 28b — the TRI-STATE lane epoch + FRESH-EPOCH re-cut. A re-opened worktree group
 // (base + `keeper/epic/<id>` ref POSITIVELY torn down) derives over its NON-DONE tasks
 // only, so a new task OWNS a fresh base (cut from current default) instead of a rib
@@ -11952,6 +12057,44 @@ test("fn-1034 loadReconcileSnapshot: recover rows and per-repo finalize rows loa
     // Both rows still gate dispatch via failedKeys (scoping is orthogonal).
     expect(snap.failedKeys.has("close::fn-1-foo")).toBe(true);
     expect(snap.failedKeys.has(`close::${bKey}`)).toBe(true);
+  });
+});
+
+test("fn-16 loadReconcileSnapshot: an OPEN worktree-preclose fence loads into preCloseFenceFailureIds; a finalize / recover / bare-incident row NEVER cross-collects (foreign keys stay out)", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (id: string, reason: string, dir: string): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ["close", id, reason, dir, 1, 1, 1, 1],
+      );
+    };
+    const fence = worktreePrecloseDispatchId("fn-1-foo", "/repo-b");
+    insert(
+      fence,
+      "worktree-preclose-merge-failed: structural failure",
+      "/repo-b",
+    );
+    // Foreign siblings that must NEVER cross-collect into the pre-close fence set.
+    const finalizeId = worktreeFinalizeDispatchId("fn-1-foo", "/repo-a");
+    insert(
+      finalizeId,
+      "worktree-finalize-non-fast-forward: origin ahead",
+      "/repo-a",
+    );
+    insert("fn-1-foo", "worktree-recover-conflict: merging …", "/repo-c");
+    insert(
+      "fn-1-bar",
+      "worktree-merge-conflict: merging X into Y — z",
+      "/repo-d",
+    );
+
+    const snap = await loadReconcileSnapshot(db);
+    expect([...(snap.preCloseFenceFailureIds ?? [])]).toEqual([fence]);
+    expect(snap.preCloseFenceFailureIds?.has(finalizeId)).toBe(false);
+    expect(snap.preCloseFenceFailureIds?.has("fn-1-foo")).toBe(false);
+    expect(snap.preCloseFenceFailureIds?.has("fn-1-bar")).toBe(false);
   });
 });
 

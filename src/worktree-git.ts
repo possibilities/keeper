@@ -105,11 +105,12 @@ export type MergeResult =
    */
   | { kind: "missing-source" }
   /**
-   * The merge hit a genuine CONTENT conflict — a merge WAS in flight (a `MERGE_HEAD`
-   * was present) and `git merge --abort` cleared it cleanly. The caller routes it to
-   * the fan-in resolver incident; `stderr` carries git's conflict output and
-   * `conflictedFiles` the unmerged paths (best-effort — a timed-out probe leaves it
-   * empty, but the merge-state is the authoritative content-conflict signal).
+   * The merge hit a genuine CONTENT conflict — BOTH signals were positive: a merge WAS
+   * in flight (`MERGE_HEAD` present) AND there were POSITIVE unmerged (U) paths — and
+   * `git merge --abort` cleared it cleanly. The caller routes it to the fan-in resolver
+   * incident; `stderr` carries git's conflict output and `conflictedFiles` the unmerged
+   * paths. Positive-U is required, so a present state with an unknown U probe is
+   * `merge-inconclusive`, not `conflict`.
    */
   | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   /**
@@ -123,13 +124,16 @@ export type MergeResult =
    */
   | { kind: "merge-failed"; stderr: string }
   /**
-   * The merge failed but its true class cannot be POSITIVELY determined: the
-   * `MERGE_HEAD` probe was inconclusive (a 124 SIGKILL or a git error — UNKNOWN, never
-   * collapsed to absent), OR the two signals DISAGREE (positive U-paths with no merge
-   * state). A visible WEDGE/DEFER that never claims a clean structural failure and
-   * never routes a normal resolver — the checkout may still be mid-merge, so it is left
-   * for the next cycle's readiness/recover pass rather than a possibly-wrong abort.
-   * `stderr` carries git's output.
+   * The merge failed but no positive class can be claimed from the two signals:
+   *  - the MERGE-STATE probe was INCONCLUSIVE (a 124 SIGKILL or a git error — UNKNOWN,
+   *    never collapsed to absent): the state is unknown, so it is NOT aborted and any
+   *    residue is left for the next cycle's readiness/recover pass;
+   *  - a PRESENT (positively-owned) merge state with an INCONCLUSIVE U probe: the clean
+   *    owned state IS aborted here, leaving NO residue, but a zero-U structural failure
+   *    is never claimed on unknown U evidence;
+   *  - an ABSENT merge state with POSITIVE U paths (the two signals disagree).
+   * A visible WEDGE/DEFER that never claims a clean structural failure and never routes
+   * a normal resolver. `stderr` carries git's output.
    */
   | { kind: "merge-inconclusive"; stderr: string }
   /**

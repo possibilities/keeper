@@ -68,6 +68,7 @@ import {
   type WorktreeAssignment,
   WorktreeCycleError,
   type WorktreePlan,
+  worktreePrecloseDispatchId,
 } from "./worktree-plan";
 
 /**
@@ -1665,6 +1666,18 @@ export interface ReconcileDecision {
    */
   preCloseFenceFailureIds: Set<string>;
   /**
+   * The OPEN pre-close fence ids to RETIRE this cycle because their `(epic, repo)` sink
+   * is POSITIVELY ABSENT — no present, non-done, clustered epic carries that fence's
+   * generated identity anymore (the epic landed / was reaped, worktree mode turned off,
+   * or its repo grouping changed). Distinct from the pre-close pass's positive-evidence
+   * level-clear (which fires for a PRESENT sink that assembled clean); this covers the
+   * sink that vanished before any clean assembly could clear it, so a retryable custom
+   * row never stands forever jamming the close's final drain. EMPTY when paused / degraded
+   * (UNKNOWN never clears). Matched by regenerating {@link worktreePrecloseDispatchId},
+   * never by splitting the id.
+   */
+  preCloseFenceClears: string[];
+  /**
    * The slot-occupancy signals this cycle: one per wanted `(verb, id)` key whose
    * mint is blocked by a stopped-but-LIVE occupant. A non-null `reapTarget` names
    * the exact stopped job the TERM→KILL process reaper may act on this sweep.
@@ -2411,6 +2424,7 @@ export function reconcile(
       preCloseIncidentOwnerEpicIds: new Set(),
       finalizeFailureIds: new Set(),
       preCloseFenceFailureIds: new Set(),
+      preCloseFenceClears: [],
       slotOccupancy: [],
       slotOccupancyClears: [],
     };
@@ -3088,6 +3102,41 @@ export function reconcile(
     }
   }
 
+  // ABSENT-SINK fence retirement: a pre-close structural fence whose `(epic, repo)` sink
+  // has vanished — the epic landed / was reaped, worktree mode turned off, or its
+  // repo grouping changed — must be cleared, else the retryable custom row stands forever
+  // jamming the close's final drain (the pre-close pass's positive-evidence clear only
+  // ever fires for a PRESENT sink). The KEEP set is every fence identity a currently
+  // PRESENT, NON-DONE, clustered epic's non-primary worktree group could carry —
+  // REGENERATED via `worktreePrecloseDispatchId`, never by splitting the id — so any OPEN
+  // fence NOT in it is positively absent. EMPTY while paused (UNKNOWN never clears; a
+  // degraded cycle already returned above with no fences).
+  const preCloseFenceClears: string[] = [];
+  const openFences = snapshot.preCloseFenceFailureIds;
+  if (!state.paused && openFences !== undefined && openFences.size > 0) {
+    const keep = new Set<string>();
+    for (const epic of snapshot.epics) {
+      if (epic.status === "done") continue; // landed → its fences are stale
+      const geom = worktreeGeometry.byEpicId.get(epic.epic_id);
+      if (geom === undefined || geom.kind !== "clustered") continue;
+      for (const group of geom.groups) {
+        if (
+          group.mode !== "worktree" ||
+          group.repoDir === geom.primaryRepoDir
+        ) {
+          continue; // serial group / close-host primary → no pre-close sink → no fence
+        }
+        keep.add(worktreePrecloseDispatchId(epic.epic_id, group.repoDir));
+      }
+    }
+    for (const openId of openFences) {
+      if (!keep.has(openId)) {
+        preCloseFenceClears.push(openId);
+      }
+    }
+    preCloseFenceClears.sort();
+  }
+
   return {
     launches,
     closeRecoveryStamps,
@@ -3100,6 +3149,7 @@ export function reconcile(
     preCloseIncidentOwnerEpicIds,
     finalizeFailureIds: snapshot.finalizeFailureIds,
     preCloseFenceFailureIds: snapshot.preCloseFenceFailureIds ?? new Set(),
+    preCloseFenceClears,
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
   };
