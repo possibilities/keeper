@@ -160,7 +160,10 @@ import {
 import { localBranchState, memoizedNullableGitToplevel } from "./git-toplevel";
 import { readTrunkLeaseLeaf } from "./grant-leaf";
 import { keeperStateDir } from "./keeper-state-dir";
-import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
+import {
+  classifyProviderPin,
+  loadProviderEquivalenceSnapshot,
+} from "./provider-equivalence";
 import {
   findLongUnknownMonitorOccupants,
   type LongUnknownMonitorOccupant,
@@ -235,6 +238,7 @@ import {
   findShadowingWorkManifest,
   inventoryLaunchCwdWorkPluginManifests,
   physicalPluginDir,
+  providerPinUnknownReason,
   providerRejectReason,
   providerUnlaunchableReason,
   resolveWorkerCell,
@@ -7087,6 +7091,9 @@ export async function runReconcileCycle(
         ...(plan.providerReject !== undefined
           ? { providerReject: plan.providerReject }
           : {}),
+        ...(plan.providerPinReject !== undefined
+          ? { providerPinReject: plan.providerPinReject }
+          : {}),
         ...(plan.providerLaunchContract !== undefined
           ? { providerLaunchContract: plan.providerLaunchContract }
           : {}),
@@ -7109,6 +7116,14 @@ export async function runReconcileCycle(
           reason =
             `worker-cell-bad-matrix: ${cell.state} — ${cell.detail} ` +
             "Then 'keeper retry-dispatch'.";
+          break;
+        // (1a) the durable `worker_provider` pin AUTHORITY read UNKNOWN (a present-
+        //      but-invalid value, ADR 0047) — refuse this cell-bearing launch
+        //      VISIBLY rather than dispatch the unpinned assigned cell. Ranks right
+        //      after bad-matrix (matrix-first), the authority parity the manual +
+        //      block-owner paths hold.
+        case "provider-pin-unknown":
+          reason = providerPinUnknownReason(cell.detail);
           break;
         // (1b) the `worker_provider` pin could not translate the assigned cell
         //      into the pinned family (ADR 0047) — fail-closed, NEVER a fallback to
@@ -12950,22 +12965,24 @@ export async function loadReconcileSnapshot(
   const worktreeMultiRepo: boolean = worktreeMultiRepoRaw === 1;
 
   // The durable work-dispatch provider pin (`worker_provider`, ADR 0047) rides the
-  // SAME singleton row — NULL/absent (unconstrained, the byte-identical default) or
-  // a family (`"claude"`/`"gpt"`) every cell-bearing `work` launch is translated
-  // into. Projection-pull only so a runtime `set_autopilot_config` lands the next
-  // cycle. Mirrors `projectWorkerProvider`'s coercion (only the two exact members
-  // pass; anything else is unconstrained). The equivalence map is loaded + reduced
-  // ONCE per cycle ONLY when a pin is active — an unconstrained cycle reads no map
-  // (zero fs) and never consults the fail-closed snapshot below. Fail-closed: a
-  // stale/broken map becomes a per-cell `map-malformed` launch reject, NEVER a
-  // thrown cycle crash.
-  const workerProviderRaw = (
-    autopilotRows[0] as { worker_provider?: unknown } | undefined
-  )?.worker_provider;
+  // SAME singleton row, TRI-STATED through the shared `classifyProviderPin` so this
+  // AUTHORITY path agrees byte-for-byte with the manual dispatch + daemon block-
+  // owner consumers: ONLY a successful null/absent read is unconstrained; a present-
+  // but-invalid value is UNKNOWN (rides `workerProviderPinUnknown`, refusing every
+  // cell-bearing launch VISIBLY — never the unpinned assigned cell). A read/query
+  // THROW aborts the whole snapshot upstream, so it never reaches here. Projection-
+  // pull only so a runtime `set_autopilot_config` lands the next cycle. The
+  // equivalence map is loaded + reduced ONCE per cycle ONLY when a pin VALUE is
+  // active — an unconstrained OR unknown cycle reads no map (zero fs). Fail-closed:
+  // a stale/broken map becomes a per-cell `map-malformed` reject, never a crash.
+  const pinRead = classifyProviderPin(
+    (autopilotRows[0] as { worker_provider?: unknown } | undefined)
+      ?.worker_provider,
+  );
   const workerProvider: "claude" | "gpt" | null =
-    workerProviderRaw === "claude" || workerProviderRaw === "gpt"
-      ? workerProviderRaw
-      : null;
+    pinRead.kind === "value" ? pinRead.provider : null;
+  const workerProviderPinUnknown =
+    pinRead.kind === "unknown" ? { detail: pinRead.detail } : undefined;
   const providerEquivalence =
     workerProvider !== null ? loadProviderEquivalenceSnapshot() : undefined;
 
@@ -13473,6 +13490,9 @@ export async function loadReconcileSnapshot(
     closeEffort,
     hostMatrix,
     workerProvider,
+    ...(workerProviderPinUnknown !== undefined
+      ? { workerProviderPinUnknown }
+      : {}),
     ...(providerEquivalence !== undefined ? { providerEquivalence } : {}),
     maxConcurrentJobs,
     maxConcurrentPerRoot,

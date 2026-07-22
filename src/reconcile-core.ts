@@ -1069,8 +1069,22 @@ export interface ReconcileSnapshot {
    * A `close` row is cell-less and untouched. Projection-pull only so a runtime
    * `set_autopilot_config` lands the next cycle; NEVER a fold input. Optional for
    * call-site back-compat — an absent field is unconstrained (no translation).
+   * ONLY a successful null/absent read is unconstrained: a present-but-invalid
+   * durable value is UNKNOWN and rides {@link workerProviderPinUnknown} instead,
+   * with this field left null (no translation; the launch refuses visibly).
    */
   workerProvider?: WorkerProvider | null;
+  /**
+   * Set IFF the durable `worker_provider` pin AUTHORITY read UNKNOWN this cycle — a
+   * present-but-invalid value the producer's `classifyProviderPin` could not coerce
+   * (a read THROW aborts the whole snapshot upstream, never reaching here). When
+   * set, {@link workerProvider} is null and EVERY cell-bearing `work` launch is
+   * refused VISIBLY (a `provider-pin-unknown` reject naming the pin), NEVER the
+   * unpinned assigned-cell fallback — the authority parity the manual dispatch and
+   * daemon block-owner paths hold. A cell-less / `close` row is untouched (no
+   * translation to refuse). NEVER a fold input.
+   */
+  workerProviderPinUnknown?: { detail: string };
   /**
    * The parsed cross-provider equivalence map (`plugins/plan/provider-equivalence.yaml`),
    * loaded + reduced PRODUCER-SIDE in {@link loadReconcileSnapshot} ONCE per cycle
@@ -1567,6 +1581,15 @@ export interface PlannedLaunch {
     target: EquivalenceCell | null;
     detail?: string;
   };
+  /**
+   * Set IFF the durable `worker_provider` pin AUTHORITY was UNKNOWN this cycle (a
+   * present-but-invalid value, ADR 0047) and this is a cell-bearing `work` row —
+   * the fail-closed refusal parallel to {@link providerReject}, carrying the pin
+   * read detail the producer composes its sticky `DispatchFailed` reason from.
+   * NEVER a fallback to the unpinned assigned cell. Ranks AFTER {@link matrixReject}
+   * (bad-matrix first), BEFORE {@link providerReject} (no translation runs).
+   */
+  providerPinReject?: { detail: string };
   /**
    * `true` IFF this is an EPIC-level finalizer (`close` at the close-row site,
    * keyed by epic id). The cycle glue stamps `state.finalizerGuard[id]` for these
@@ -3023,6 +3046,7 @@ export function reconcile(
       let dispatchConstraint: WorkerProvider | null = null;
       let providerLaunchContract: PlannedLaunch["providerLaunchContract"];
       let providerReject: PlannedLaunch["providerReject"];
+      let providerPinReject: PlannedLaunch["providerPinReject"];
       // The wrapped-cell guard marker (task .1) — computed off the EFFECTIVE cell
       // (`composeModel`/`composeTier` below, the pin-translated cell when the pin
       // fired) so a native worker is never marked and a wrapped worker never
@@ -3040,6 +3064,15 @@ export function reconcile(
             matrixReject = {
               state: snapshot.hostMatrix.state,
               detail: snapshot.hostMatrix.detail,
+            };
+          } else if (snapshot.workerProviderPinUnknown !== undefined) {
+            // The durable pin AUTHORITY read UNKNOWN (a present-but-invalid value,
+            // ADR 0047). We cannot know which family to translate into, so refuse
+            // this cell-bearing launch VISIBLY rather than dispatch the unpinned
+            // assigned cell — matrix-first (this else only runs on a good matrix);
+            // cell-less rows never reach here. No translation runs (no pin value).
+            providerPinReject = {
+              detail: snapshot.workerProviderPinUnknown.detail,
             };
           } else {
             // Apply the pin FIRST (translate assigned → effective), then compose
@@ -3146,6 +3179,7 @@ export function reconcile(
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),
         ...(matrixReject !== undefined ? { matrixReject } : {}),
         ...(providerReject !== undefined ? { providerReject } : {}),
+        ...(providerPinReject !== undefined ? { providerPinReject } : {}),
       });
       budget--;
     }

@@ -372,6 +372,13 @@ export interface WorkerCellCompose {
     target: EquivalenceCell | null;
     detail?: string;
   };
+  /** Set IFF the durable `worker_provider` pin AUTHORITY was UNKNOWN this cycle (a
+   *  present-but-invalid value the producer could not coerce, ADR 0047) — the
+   *  fail-closed refusal of a cell-bearing launch, carried so a caller composes an
+   *  operator reason naming the pin read. Ranks after {@link matrixReject}
+   *  (bad-matrix first), before {@link providerReject} (no translation runs under
+   *  an unknown pin). `detail` names the offending value/error class. */
+  providerPinReject?: { detail: string };
   /**
    * The capability `{model, tier}` this compose was built from — carried so a
    * caller can name the model/tier in its reject prose. Optional so a bare
@@ -459,6 +466,7 @@ export function composeWorkerCellDir(
 export type WorkerCellResult =
   | { ok: true; pluginDir: string | null }
   | { ok: false; kind: "bad-matrix"; state: MatrixFailureState; detail: string }
+  | { ok: false; kind: "provider-pin-unknown"; detail: string }
   | {
       ok: false;
       kind: "provider-reject";
@@ -501,11 +509,11 @@ export interface WorkerCellProbeDeps {
 
 /**
  * The shared resolution seam. Applies the producer's exact precedence over a
- * compose result: bad-matrix → provider-reject → out-of-matrix → missing →
- * stale/unverified cohort → exact-cell shadow → ok. Returns a machine-kind union;
- * each caller composes its own reason prose. Filesystem probes fire lazily in that
- * precedence order, so an earlier reject or cell-less launch never verifies or
- * inventories the worker plugin tree.
+ * compose result: bad-matrix → provider-pin-unknown → provider-reject →
+ * out-of-matrix → missing → stale/unverified cohort → exact-cell shadow → ok.
+ * Returns a machine-kind union; each caller composes its own reason prose.
+ * Filesystem probes fire lazily in that precedence order, so an earlier reject or
+ * cell-less launch never verifies or inventories the worker plugin tree.
  */
 export function resolveWorkerCell(
   compose: WorkerCellCompose,
@@ -517,6 +525,16 @@ export function resolveWorkerCell(
       kind: "bad-matrix",
       state: compose.matrixReject.state,
       detail: compose.matrixReject.detail,
+    };
+  }
+  // Provider-pin-UNKNOWN ranks right after bad-matrix (matrix-first) and ahead of
+  // every translation/compose reject — an unobservable pin authority refuses the
+  // launch before any cell composes, so no translation ran and `pluginDir` is null.
+  if (compose.providerPinReject !== undefined) {
+    return {
+      ok: false,
+      kind: "provider-pin-unknown",
+      detail: compose.providerPinReject.detail,
     };
   }
   // Provider-pin reject ranks after bad-matrix (no host matrix ⇒ no target to
@@ -623,6 +641,20 @@ export function providerUnlaunchableReason(reject: {
     `route=${reject.route ?? "none"}, wrapped_marker=${reject.wrappedCell ?? "none"}; ` +
     "refusing to dispatch before spawn; fix the provider constraint, equivalence " +
     "map, host matrix route, or compiled cell, then retry"
+  );
+}
+
+/** Compose the operator reason for a `worker_provider` pin AUTHORITY that read
+ *  UNKNOWN (ADR 0047) — a present-but-invalid durable value the producer could not
+ *  coerce, so a cell-bearing launch refuses rather than dispatching the unpinned
+ *  assigned cell. Shares the `worker-provider-pin-unknown` problem code with the
+ *  manual dispatch refusal so the two authority-refusal paths name the same fault. */
+export function providerPinUnknownReason(detail: string): string {
+  return (
+    `worker-provider-pin-unknown: the durable worker_provider pin is UNKNOWN ` +
+    `(${detail}) — refusing a cell-bearing work launch rather than dispatching the ` +
+    "unpinned assigned cell (a durable pin could translate it into the other " +
+    "family); fix the pin value, then 'keeper retry-dispatch'"
   );
 }
 

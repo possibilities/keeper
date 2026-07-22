@@ -142,10 +142,17 @@ export function projectNonFableFocus(
 /**
  * Coerce a singleton `autopilot_state` wire row's `worker_provider` column
  * (NULLABLE TEXT: `"claude"` | `"gpt"` | NULL — the durable work-dispatch
- * provider pin, docs/adr/0047) to its enum value. An empty row set, an absent
- * column, or any value outside the two recognized members ALL resolve to
- * `null` (unconstrained, the byte-identical default); only an exact
- * `"claude"`/`"gpt"` string passes through. Pure — exported for tests.
+ * provider pin, docs/adr/0047) to its enum value for DISPLAY. An empty row set, an
+ * absent column, or any value outside the two recognized members ALL resolve to
+ * `null`; only an exact `"claude"`/`"gpt"` string passes through. Pure — exported
+ * for tests.
+ *
+ * NON-AUTHORITATIVE — DISPLAY ONLY. This coercion collapses a present-but-invalid
+ * value to `null` for the `keeper autopilot` / board status render; it must NEVER
+ * gate a dispatch. The dispatch AUTHORITY is `classifyProviderPin` (which tri-
+ * states a present-but-invalid value to UNKNOWN and refuses a cell-bearing launch);
+ * the three dispatch consumers (manual, daemon block-owner, reconcile snapshot) all
+ * read THAT, never this.
  */
 export function projectWorkerProvider(
   rows: Record<string, unknown>[],

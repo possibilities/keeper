@@ -889,6 +889,8 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     switch (r.kind) {
       case "bad-matrix":
         return "bad-matrix";
+      case "provider-pin-unknown":
+        return "provider-pin-unknown";
       case "provider-reject":
         return "provider-reject";
       case "out-of-matrix":
@@ -911,6 +913,7 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     { pluginDir: null }, // → ok (cell-less)
     { pluginDir: null, reject: "x" }, // → out-of-matrix
     { pluginDir: null, matrixReject: { state, detail: "d" } }, // → bad-matrix
+    { pluginDir: null, providerPinReject: { detail: "banana" } }, // → provider-pin-unknown
     {
       pluginDir: null,
       providerReject: {
@@ -976,6 +979,7 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
       "ok",
       "out-of-matrix",
       "bad-matrix",
+      "provider-pin-unknown",
       "provider-reject",
       "provider-unlaunchable",
       "missing",

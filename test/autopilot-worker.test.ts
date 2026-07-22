@@ -3582,6 +3582,121 @@ test("reconcile: a SAME-family cell under a pin is UNCHANGED (empty carriers)", 
   );
 });
 
+test("reconcile: an UNKNOWN pin REFUSES a cell-bearing work launch VISIBLY (never the assigned cell)", () => {
+  // The producer coerced the durable pin to UNKNOWN (a present-but-invalid value).
+  // A cell-bearing work row must be withheld with a visible `providerPinReject`,
+  // never fall through to the unpinned assigned opus cell.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: PROVIDER_MATRIX,
+    workerProviderPinUnknown: {
+      detail: 'present but invalid worker_provider value "banana"',
+    },
+  });
+  const plan = reconcile(snap, makeState(), 0).launches[0];
+  expect(plan?.verb).toBe("work");
+  // Visible fail-closed reject — no cell composed, NEVER the assigned opus cell.
+  expect(plan?.providerPinReject?.detail).toContain("banana");
+  expect(plan?.pluginDir).toBeNull();
+  expect(plan?.workerCommand).not.toContain("--plugin-dir");
+  // Not translated, and not a MAP reject (a distinct authority fault).
+  expect(plan?.dispatchedCellModel).toBeNull();
+  expect(plan?.dispatchConstraint).toBeNull();
+  expect(plan?.providerReject).toBeUndefined();
+});
+
+test("reconcile: an UNKNOWN pin leaves CELL-LESS work and CLOSE launches untouched (pin-independent)", () => {
+  const workEpic = makeEpic({
+    epic_id: "fn-1-work",
+    project_dir: "/repo-work",
+    tasks: [makeTask({ task_id: "fn-1-work.1", epic_id: "fn-1-work" })], // cell-less
+  });
+  const closeEpic = makeEpic({
+    epic_id: "fn-2-close",
+    epic_number: 2,
+    project_dir: "/repo-close",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-close.1",
+        epic_id: "fn-2-close",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [workEpic, closeEpic],
+    workerProviderPinUnknown: { detail: "banana" },
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workLaunch = decision.launches.find((l) => l.verb === "work");
+  const closeLaunch = decision.launches.find((l) => l.verb === "close");
+  // A cell-less work row invents no translation, so an UNKNOWN pin never refuses it.
+  expect(workLaunch?.providerPinReject).toBeUndefined();
+  expect(workLaunch?.pluginDir).toBeNull();
+  // A close row is cell-less and pin-independent (the block is gated on verb=work).
+  expect(closeLaunch?.verb).toBe("close");
+  expect(closeLaunch?.providerPinReject).toBeUndefined();
+});
+
+test("loadReconcileSnapshot→reconcile: a DURABLE present-invalid worker_provider is UNKNOWN, refusing every cell-bearing launch (never the assigned cell)", async () => {
+  await withSeededDb(async (db) => {
+    // A durable, present-but-INVALID pin — the exact authority the old
+    // `valid ? value : null` coercion silently dropped to "no pin".
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, worker_provider)
+       VALUES (1, 0, 0, 0, 0, 'banana')`,
+    );
+    seedEpicRow(db, "fn-1-x", {
+      epic_number: 1,
+      status: "open",
+      tasks: [
+        makeTask({
+          task_id: "fn-1-x.1",
+          epic_id: "fn-1-x",
+          tier: "max",
+          model: "opus",
+        }),
+      ],
+    });
+    const snap = await loadReconcileSnapshot(db);
+    // The producer coerces present-invalid to UNKNOWN — NOT the unconstrained null.
+    expect(snap.workerProvider).toBeNull();
+    expect(snap.workerProviderPinUnknown?.detail).toContain("banana");
+    // The full sequence: reconcile mints ZERO valid cell-bearing launch — any work
+    // launch carries the visible `providerPinReject`, never a composed --plugin-dir.
+    const decision = reconcile(snap, makeState(), 0);
+    const workLaunches = decision.launches.filter((l) => l.verb === "work");
+    // Non-vacuity guard: the seeded task IS reconciled to a work launch, so the
+    // withhold assertions below actually run (a readiness regression can't hide it).
+    expect(workLaunches.some((l) => l.id === "fn-1-x.1")).toBe(true);
+    for (const l of workLaunches) {
+      expect(l.pluginDir).toBeNull(); // ZERO valid cell-bearing launch
+      expect(l.providerPinReject?.detail).toContain("banana"); // visible withhold
+    }
+  });
+});
+
+test("loadReconcileSnapshot: a DURABLE valid / absent worker_provider is byte-identical parity (value / null, never UNKNOWN)", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, worker_provider)
+       VALUES (1, 0, 0, 0, 0, 'gpt')`,
+    );
+    const valid = await loadReconcileSnapshot(db);
+    expect(valid.workerProvider).toBe("gpt");
+    expect(valid.workerProviderPinUnknown).toBeUndefined();
+    // Absent/NULL is a genuine no-pin — unconstrained, never UNKNOWN.
+    db.run("UPDATE autopilot_state SET worker_provider = NULL WHERE id = 1");
+    const absent = await loadReconcileSnapshot(db);
+    expect(absent.workerProvider).toBeNull();
+    expect(absent.workerProviderPinUnknown).toBeUndefined();
+  });
+});
+
 test("isWrappedCell: driver-keyed — wrapped for a gpt model (even with a null constraint), native for claude, wrapped for an unknown", () => {
   // The shared predicate the autopilot producer + the manual dispatch path both key
   // the marker on. A pre-assigned gpt cell is wrapped regardless of any pin.

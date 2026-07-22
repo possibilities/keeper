@@ -82,6 +82,7 @@ import {
   composeWorkerCellDir,
   defaultShadowingWorkProbe,
   defaultWorkerCellFreshnessProbe,
+  providerPinUnknownReason,
   providerRejectReason,
   providerUnlaunchableReason,
   resolveWorkerCell,
@@ -904,6 +905,15 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
             // provider. Same three-reason prose the autopilot sticky carries.
             die(
               `refusing to launch ${claudeName}: ${providerRejectReason(cell)}`,
+            );
+            break;
+          case "provider-pin-unknown":
+            // Unreachable here — manual dispatch refuses an UNKNOWN pin BEFORE
+            // composing (the tri-state check above), so it never sets
+            // `providerPinReject`. Handled for switch exhaustiveness + parity with
+            // the autopilot producer's identical fail-closed reason.
+            die(
+              `refusing to launch ${claudeName}: ${providerPinUnknownReason(cell.detail)}`,
             );
             break;
           case "out-of-matrix":
