@@ -806,6 +806,15 @@ export interface ReconcileSnapshot {
    */
   finalizeFailureIds: Set<string>;
   /**
+   * The `id`s of every OPEN per-(epic, repo) PRE-CLOSE structural fence row (its id
+   * carries the {@link WORKTREE_PRECLOSE_ID_PREFIX} marker). The pre-close pass
+   * level-clears any whose repo assembles clean (or reaches a content conflict — proof
+   * the base is structurally sound) this cycle, so a self-healed structural failure
+   * never leaves a durable row jamming the close's final drain. SCOPED to the pre-close
+   * prefix so the merge-conflict incident on the bare `close::<epic>` key is untouched.
+   */
+  preCloseFenceFailureIds?: Set<string>;
+  /**
    * The `(verb, id)` of every OPEN slot-occupancy `dispatch_failures` row (its
    * `reason` carries a {@link isSlotOccupancyReason} prefix — `slot-reclaimed` /
    * `slot-occupied`). The slot pass level-clears any whose key no longer has a
@@ -1648,6 +1657,14 @@ export interface ReconcileDecision {
    */
   finalizeFailureIds: Set<string>;
   /**
+   * The OPEN per-(epic, repo) pre-close structural fence ids (mirrored straight off
+   * `snapshot.preCloseFenceFailureIds`). The pre-close pass level-clears any whose repo
+   * assembles clean (or conflicts) this cycle — the positive-evidence auto-clear that
+   * keeps a self-healed structural failure from stranding a durable row that jams the
+   * close's final drain (the row also clears on `retry_dispatch`).
+   */
+  preCloseFenceFailureIds: Set<string>;
+  /**
    * The slot-occupancy signals this cycle: one per wanted `(verb, id)` key whose
    * mint is blocked by a stopped-but-LIVE occupant. A non-null `reapTarget` names
    * the exact stopped job the TERM→KILL process reaper may act on this sweep.
@@ -2393,6 +2410,7 @@ export function reconcile(
       worktreePreCloseProvision: [],
       preCloseIncidentOwnerEpicIds: new Set(),
       finalizeFailureIds: new Set(),
+      preCloseFenceFailureIds: new Set(),
       slotOccupancy: [],
       slotOccupancyClears: [],
     };
@@ -3081,6 +3099,7 @@ export function reconcile(
     worktreePreCloseProvision,
     preCloseIncidentOwnerEpicIds,
     finalizeFailureIds: snapshot.finalizeFailureIds,
+    preCloseFenceFailureIds: snapshot.preCloseFenceFailureIds ?? new Set(),
     slotOccupancy: slot.failures,
     slotOccupancyClears: slot.clears,
   };

@@ -68,6 +68,18 @@ export const WORKTREE_RECOVER_KEY_PREFIX = "worktree-recover:";
 export const WORKTREE_FINALIZE_ID_PREFIX = "worktree-finalize:";
 
 /**
+ * The `dispatch_failures.id` prefix every PER-REPO pre-close STRUCTURAL fence row
+ * carries (`worktree-preclose:<epicId>-<repoHash>`). A pre-close structural failure
+ * (a wrong-branch worktree, a failed `worktree add`, a non-content merge failure)
+ * mints it as a DURABLE visible close-plain row DISTINCT from the merge-conflict
+ * incident on the bare `close::<epic>` key. The pre-close level-clear scopes its OPEN
+ * fence set on this ID prefix — cleared on the SAME (epic, repo)'s clean assembly (or
+ * content conflict) this cycle, so a self-healed structural failure never strands a row
+ * jamming the close's final drain; `retry_dispatch` also clears it.
+ */
+export const WORKTREE_PRECLOSE_ID_PREFIX = "worktree-preclose:";
+
+/**
  * The origin-ahead non-fast-forward finalize reason — an operator jam (origin
  * moved ahead; a push would be rejected non-fast-forward, and the reconciler
  * never fetch/rebase/force). Its close row keys on {@link

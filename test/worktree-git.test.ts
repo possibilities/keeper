@@ -1374,6 +1374,52 @@ test("mergeBranchInto: an INCONCLUSIVE merge-state probe (124) with positive U-p
   );
 });
 
+for (const diffExit of [124, 128]) {
+  test(`mergeBranchInto: MERGE_HEAD PRESENT + an INCONCLUSIVE U probe (diff exit ${diffExit}) → aborts the KNOWN-OWNED merge state, then merge-inconclusive (never structural merge-failed, never a resolver conflict)`, async () => {
+    const { run, calls } = fakeAsyncGit([
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--quiet", "--verify") &&
+          a.some((t) => t.endsWith("^{commit}")),
+        result: { exitCode: 0 },
+      },
+      {
+        when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+        result: { exitCode: 1 },
+      },
+      {
+        when: (a) =>
+          argvStartsWith(a, "rev-parse", "--path-format=absolute", "--git-dir"),
+        result: { stdout: "/wt/.git\n" },
+      },
+      {
+        when: (a) => argvStartsWith(a, "merge", "--no-edit"),
+        result: { exitCode: 1, stdout: "CONFLICT (content): foo.ts" },
+      },
+      {
+        when: (a) =>
+          argvStartsWith(a, "diff", "--name-only", "--diff-filter=U"),
+        result: { exitCode: diffExit }, // U evidence is UNKNOWN, NOT proven-zero
+      },
+      {
+        when: (a) => argvHas(a, "MERGE_HEAD"),
+        result: { exitCode: 0, stdout: "mergehead\n" }, // state is positively ours
+      },
+    ]);
+    const res = await mergeBranchInto(
+      "/wt",
+      "src",
+      run,
+      recordingLock().acquire,
+    );
+    expect(res.kind).toBe("merge-inconclusive");
+    // The KNOWN-OWNED merge state IS aborted (safe — positively ours), leaving no residue.
+    expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
+      true,
+    );
+  });
+}
+
 // BLOCKER 3 — the four-state reads keep a TRANSIENT wedge, an UNKNOWN read, and a
 // POSITIVELY-OBSERVED structural fact apart (never a permanent sticky for UNKNOWN).
 

@@ -130,6 +130,7 @@ import {
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_LANE_PREMERGE_REASON_PREFIX,
+  WORKTREE_PRECLOSE_ID_PREFIX,
   WORKTREE_RECOVER_KEY_PREFIX,
   ZOMBIE_SESSION_DISTRESS_ID_PREFIX,
   ZOMBIE_SESSION_DISTRESS_REASON,
@@ -332,6 +333,7 @@ export {
   stuckSentinelJobId,
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
+  WORKTREE_PRECLOSE_ID_PREFIX,
   WORKTREE_RECOVER_REASON_PREFIX,
   ZOMBIE_SESSION_DISTRESS_ID_PREFIX,
   ZOMBIE_SESSION_DISTRESS_REASON,
@@ -6358,10 +6360,13 @@ export async function runReconcileCycle(
   // the resolver launch (an owner launches to resolve THIS rib, then the producer
   // re-enters for the next; a non-owner waits one cycle for the incident to route it); a
   // transient/inconclusive `defer` retries next cycle WITHOUT consuming an attachment
-  // (suppress, no row); a STRUCTURAL `failed` mints a DURABLE visible fence on a DISTINCT
-  // per-repo key (never the bare incident key it must not masquerade as) and suppresses.
-  // The `conflict` incident re-mints each cycle onto the bare `close::<epic>` key (the
-  // fold preserves its attach/paging markers). Gated not-paused like refreshBase/finalize.
+  // (suppress, no row); a STRUCTURAL `failed` mints a DURABLE per-(epic, repo) fence on a
+  // DISTINCT key (never the bare incident key it must not masquerade as) and suppresses.
+  // The fence LEVEL-CLEARS on the SAME (epic, repo)'s clean assembly (or content
+  // conflict — proof the structural preflight passed) this cycle, so a self-healed
+  // failure never leaves a durable row jamming the close's final drain. The `conflict`
+  // incident re-mints each cycle onto the bare `close::<epic>` key (the fold preserves
+  // its attach/paging markers). Gated not-paused like refreshBase/finalize.
   const preCloseProvisionBlocked = new Set<string>();
   if (deps.worktree !== undefined && !state.paused) {
     interface PreCloseOutcome {
@@ -6372,7 +6377,7 @@ export async function runReconcileCycle(
         conflictedFiles: string[];
         stderr: string;
       };
-      failure?: { reason: string; repoDir: string };
+      hasFailure?: boolean;
       deferred?: boolean;
     }
     const epicOutcomes = new Map<string, PreCloseOutcome>();
@@ -6391,6 +6396,16 @@ export async function runReconcileCycle(
       }
       const epicId = closeKeyEpicId(sink);
       const o = outcomeFor(epicId);
+      const fenceId = `${WORKTREE_PRECLOSE_ID_PREFIX}${epicId}-${repoDirHash(sink.repoDir)}`;
+      // Positive-evidence level-clear of a self-healed structural fence (scoped to an
+      // OPEN fence for THIS (epic, repo) — never dismisses another cycle's live block).
+      const clearFenceIfOpen = (): void => {
+        if (decision.preCloseFenceFailureIds.has(fenceId)) {
+          deps.emitDispatchCleared(
+            dispatchClearedPayload(dispatchFailureFences, "close", fenceId),
+          );
+        }
+      };
       const hold = probeLaneMaintenance(laneMaintenanceProbe, {
         path: sink.assignment.worktreePath,
         epicId,
@@ -6412,7 +6427,8 @@ export async function runReconcileCycle(
       );
       switch (assembled.kind) {
         case "assembled":
-          break; // this group's base is fanned in
+          clearFenceIfOpen(); // the base is structurally sound now
+          break;
         case "defer":
           o.deferred = true;
           logLaneMaintenanceDeferralOnce(
@@ -6432,17 +6448,25 @@ export async function runReconcileCycle(
               stderr: assembled.stderr,
             };
           }
+          clearFenceIfOpen(); // reaching a content conflict PROVES the preflight passed
           break;
         case "failed":
-          if (o.failure === undefined) {
-            o.failure = { reason: assembled.reason, repoDir: sink.repoDir };
-          }
+          o.hasFailure = true;
+          // Mint/re-mint the DURABLE per-(epic, repo) fence (routes close-plain).
+          deps.emitDispatchFailed({
+            verb: "close",
+            id: fenceId,
+            reason: assembled.reason,
+            dir: sink.repoDir,
+            conflictedFiles: null,
+            ts: deps.now(),
+          });
           break;
         default:
           assertNever(assembled);
       }
     }
-    // Route + suppress per epic.
+    // Route the conflict incident + decide suppression, per epic.
     for (const [epicId, o] of epicOutcomes) {
       const isIncidentOwner = decision.preCloseIncidentOwnerEpicIds.has(epicId);
       // A positively-current conflict → mint/re-point the resolver incident on the
@@ -6457,24 +6481,11 @@ export async function runReconcileCycle(
           ts: deps.now(),
         });
       }
-      // A structural failure → a DURABLE visible fence on a DISTINCT per-repo key
-      // (routes close-plain; cleared only by retry_dispatch), never clobbering the
-      // conflict incident on the bare key.
-      if (o.failure !== undefined) {
-        deps.emitDispatchFailed({
-          verb: "close",
-          id: `worktree-preclose:${epicId}-${repoDirHash(o.failure.repoDir)}`,
-          reason: o.failure.reason,
-          dir: o.failure.repoDir,
-          conflictedFiles: null,
-          ts: deps.now(),
-        });
-      }
       // Suppress the launch UNLESS the base is a clean positively-current conflict state
       // owned by an incident: a structural failure or a transient/inconclusive defer
       // suppresses regardless of owner (no attachment burned on a non-conflict); a
       // conflict alone forces the launch only for the incident owner.
-      if (o.failure !== undefined || o.deferred === true) {
+      if (o.hasFailure === true || o.deferred === true) {
         preCloseProvisionBlocked.add(epicId);
       } else if (o.conflict !== undefined && !isIncidentOwner) {
         preCloseProvisionBlocked.add(epicId);
@@ -11494,6 +11505,7 @@ export async function loadReconcileSnapshot(
   const recoverFailureIds = new Set<string>();
   const openRecoverRows: NonNullable<ReconcileSnapshot["openRecoverRows"]> = [];
   const finalizeFailureIds = new Set<string>();
+  const preCloseFenceFailureIds = new Set<string>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
   // The `repoDir`s with an OPEN shared-checkout-wedge distress row — the level-clear
   // set the recover pass's grace tracker clears against (a row whose checkout is
@@ -11725,6 +11737,13 @@ export async function loadReconcileSnapshot(
         ) {
           incidentOwnerKeys.add(key);
         }
+      }
+      // An OPEN per-(epic, repo) pre-close structural fence (id-prefixed; routes
+      // `close-plain`, so the typed switch never touches it) — fed to the pre-close
+      // positive-evidence level-clear so a self-healed structural failure never leaves
+      // a durable row jamming the close's final drain.
+      if (verb === "close" && id.startsWith(WORKTREE_PRECLOSE_ID_PREFIX)) {
+        preCloseFenceFailureIds.add(id);
       }
       switch (route.kind) {
         case "worktree-recover": {
@@ -12244,6 +12263,7 @@ export async function loadReconcileSnapshot(
     recoverFailureIds,
     openRecoverRows,
     finalizeFailureIds,
+    preCloseFenceFailureIds,
     slotOccupancyFailures,
     sharedWedgeDistressDirs,
     sharedDirtyDistressDirs,

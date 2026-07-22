@@ -299,6 +299,7 @@ import type {
 import { parseWorktreeList } from "../src/worktree-git";
 import {
   baseBranchFor,
+  repoDirHash,
   ribBranchFor,
   worktreePathFor,
 } from "../src/worktree-plan";
@@ -10263,31 +10264,30 @@ function makeThreeRibSinkInfo(): WorktreeLaunchInfo {
   };
 }
 
-test("fn-16f createWorktreeDriver: assembleBase CONTINUES past clean conflict aborts — a (conflict, conflict, clean) scan assembles the CLEAN rib, routes the FIRST conflict, and iterates to a clean close", async () => {
+test("fn-16f createWorktreeDriver: assembleBase CONTINUES past clean conflict aborts — a (conflict, conflict, clean) scan assembles the CLEAN rib EXACTLY ONCE, routes the FIRST conflict, and iterates to a clean close over PERSISTED base state", async () => {
   const resolved = new Set<string>();
-  const driver = () =>
-    createWorktreeDriver(makeThreeRibAssembleRun(resolved).run, () => ({
-      release() {},
-    }));
+  // ONE runner across all passes — its `inBase` persists, so a rib merged in an earlier
+  // pass reads as an ancestor later (proving pass-1 persistence, not a re-merge).
+  const { run, cmds } = makeThreeRibAssembleRun(resolved);
+  const driver = createWorktreeDriver(run, () => ({ release() {} }));
   // Pass 1: RIB1 + RIB2 both conflict (recorded, cleanly aborted), but RIB3 is CLEAN
   // and STILL gets merged — it is never stranded behind the conflicts. The FIRST
   // conflict (RIB1) is routed to the resolver.
-  const p1run = makeThreeRibAssembleRun(resolved);
-  const p1 = await createWorktreeDriver(p1run.run, () => ({
-    release() {},
-  })).assembleBase(makeThreeRibSinkInfo(), null);
+  const p1 = await driver.assembleBase(makeThreeRibSinkInfo(), null);
   expect(p1.kind).toBe("conflict");
   expect(p1.kind === "conflict" && p1.sourceBranch).toBe(RIB1);
-  expect(p1run.cmds).toContain(`merge --no-edit ${RIB3}`); // clean suffix assembled
+  expect(cmds).toContain(`merge --no-edit ${RIB3}`); // clean suffix assembled
   // The resolver settles RIB1 → the NEXT pass routes RIB2 (the next unresolved conflict).
   resolved.add(RIB1);
-  const p2 = await driver().assembleBase(makeThreeRibSinkInfo(), null);
+  const p2 = await driver.assembleBase(makeThreeRibSinkInfo(), null);
   expect(p2.kind).toBe("conflict");
   expect(p2.kind === "conflict" && p2.sourceBranch).toBe(RIB2);
   // The resolver settles RIB2 → every rib is an ancestor → the close may land.
   resolved.add(RIB2);
-  const p3 = await driver().assembleBase(makeThreeRibSinkInfo(), null);
+  const p3 = await driver.assembleBase(makeThreeRibSinkInfo(), null);
   expect(p3).toEqual({ kind: "assembled" });
+  // RIB3 persisted from pass 1 — it is merged EXACTLY ONCE, never re-merged in a later pass.
+  expect(cmds.filter((c) => c === `merge --no-edit ${RIB3}`)).toHaveLength(1);
 });
 
 /** A close-ready primaryless epic whose close ROUTES an open merge-escalation incident. */
@@ -10462,6 +10462,80 @@ test("fn-16f runReconcileCycle: a conflict in one worktree group does NOT stop a
   expect(incidents[0]?.reason.startsWith("worktree-merge-conflict:")).toBe(
     true,
   );
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeUndefined();
+});
+
+/** A close-ready primaryless epic carrying an OPEN pre-close structural fence for
+ * /repo-a from a prior cycle. */
+function preCloseFenceSnap(): {
+  snap: ReconcileSnapshot;
+  repoAFence: string;
+} {
+  const epic = closeReadyPrimarylessEpic();
+  const repoAFence = `worktree-preclose:fn-1-anchor-${repoDirHash("/repo-a")}`;
+  const snap = makeSnapshot({
+    epics: [epic],
+    worktreeMode: true,
+    worktreeRepoByEpicId: classifyWorktreeRepos(
+      [epic],
+      abcResolve,
+      undefined,
+      undefined,
+      true,
+    ),
+    preCloseFenceFailureIds: new Set([repoAFence]),
+  });
+  return { snap, repoAFence };
+}
+
+test("fn-16g runReconcileCycle: a self-healed pre-close fence LEVEL-CLEARS on clean assembly and the close LAUNCHES (no stale row jamming the close's final drain)", async () => {
+  const { snap, repoAFence } = preCloseFenceSnap();
+  const { driver } = makeFakeWorktreeDriver(); // assembleBase → assembled
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The stale structural fence self-clears on positive evidence (the base assembled)...
+  expect(
+    depsLog.clears.some((c) => c.verb === "close" && c.id === repoAFence),
+  ).toBe(true);
+  // ...and the close LAUNCHES (no durable row survives to jam final drain).
+  expect(
+    depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
+  ).toBeDefined();
+});
+
+test("fn-16g runReconcileCycle: a still-failing pre-close structural failure RE-MINTS its fence, SUPPRESSES the close, and never level-clears it", async () => {
+  const { snap, repoAFence } = preCloseFenceSnap();
+  const { driver } = makeFakeWorktreeDriver({
+    assembleFail: (info) =>
+      info.repoDir === "/repo-a"
+        ? "worktree-head-mismatch: /repo-a HEAD is feature, expected keeper/epic/fn-1-anchor"
+        : null,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  await runReconcileCycle(
+    reconcile(snap, makeState(), 0),
+    makeState(),
+    new Map<string, LiveDispatch>(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  // The fence is RE-MINTED (persists while the structural condition stands)...
+  expect(
+    depsLog.emissions.some((e) => e.verb === "close" && e.id === repoAFence),
+  ).toBe(true);
+  // ...never level-cleared while it still fails...
+  expect(depsLog.clears.some((c) => c.id === repoAFence)).toBe(false);
+  // ...and the close is SUPPRESSED (gated by the structural failure this cycle).
   expect(
     depsLog.launches.find((l) => l.name === "close::fn-1-anchor"),
   ).toBeUndefined();

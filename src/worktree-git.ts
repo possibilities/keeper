@@ -2204,8 +2204,9 @@ export async function mergeBranchInto(
       return { kind: "local-timeout" };
     }
     // Non-zero: a conflict (or other failure). Capture the unmerged index paths
-    // BEFORE the guarded abort destroys the stage-1/2/3 entries. Best-effort only:
-    // a failed/timed-out diff must never replace the merge's real outcome.
+    // BEFORE the guarded abort destroys the stage-1/2/3 entries. The U signal is
+    // TRI-STATE — a nonzero / timed-out `diff` is UNKNOWN, NOT proven-zero, so it must
+    // never masquerade as a zero-U structural failure.
     const unmerged = await run(["diff", "--name-only", "--diff-filter=U"], {
       cwd: worktreePath,
       timeoutMs: GIT_LOCAL_TIMEOUT_MS,
@@ -2217,23 +2218,29 @@ export async function mergeBranchInto(
             .map((path) => path.trim())
             .filter((path) => path.length > 0)
         : [];
+    const uEvidence: "positive" | "zero" | "inconclusive" =
+      unmerged.code !== 0
+        ? "inconclusive"
+        : conflictedFiles.length > 0
+          ? "positive"
+          : "zero";
     // Classify from BOTH signals — the MERGE STATE (`MERGE_HEAD`) AND the unmerged-path
-    // (U) evidence — never from state alone:
-    //  - state INCONCLUSIVE (probe timed out / errored) OR positive-U with NO state (the
-    //    two signals disagree) → `merge-inconclusive`: never claim a clean structural
-    //    failure nor route a resolver, and leave any residue for the next cycle (a
-    //    possibly-wrong abort on an unknown state is worse than a retry).
-    //  - state PRESENT → a merge IS in flight: abort it DIRECTLY (a re-probe could
-    //    collapse a timed-out MERGE_HEAD to "absent" and skip the abort, stranding
-    //    residue). Then present+U = a genuine content `conflict`; present+no-U = a
-    //    STRUCTURAL `merge-failed` (a pre-merge-commit hook that rejected AFTER git made
-    //    `MERGE_HEAD`) — the clean state is already aborted.
-    //  - state ABSENT + no U → the merge never started → STRUCTURAL `merge-failed`.
+    // (U) evidence — never from one alone, and never on an UNKNOWN either:
+    //  - state INCONCLUSIVE (probe timed out / errored) → `merge-inconclusive` (any U):
+    //    the state is unknown, so no abort, no claim, no resolver — retry next cycle.
+    //  - state PRESENT → a merge IS in flight and the state is positively OURS: abort it
+    //    DIRECTLY (a re-probe could collapse a timed-out MERGE_HEAD to "absent" and skip
+    //    the abort, stranding residue). Then classify by U: positive = a genuine content
+    //    `conflict`; zero = a STRUCTURAL `merge-failed` (a pre-merge-commit hook that
+    //    rejected AFTER git made `MERGE_HEAD`); INCONCLUSIVE = `merge-inconclusive` (the
+    //    clean owned state IS aborted, but never claim a zero-U structural failure).
+    //  - state ABSENT + zero U → the merge never started → STRUCTURAL `merge-failed`.
+    //  - state ABSENT + positive/inconclusive U → the signals disagree or U is unknown →
+    //    `merge-inconclusive` (never claim clean, never route a resolver).
     //  - abort itself failed → the checkout is left mid-merge → `abort-failed` wedge.
     const merged = (merge.stdout + merge.stderr).trim();
-    const hasU = conflictedFiles.length > 0;
     const mergeState = await probeMergeStateTri(worktreePath, run);
-    if (mergeState === "inconclusive" || (mergeState === "absent" && hasU)) {
+    if (mergeState === "inconclusive") {
       return { kind: "merge-inconclusive", stderr: merged };
     }
     if (mergeState === "present") {
@@ -2253,12 +2260,19 @@ export async function mergeBranchInto(
                 : `git merge --abort failed (exit ${abort.code})`,
         };
       }
-      return hasU
-        ? { kind: "conflict", stderr: merged, conflictedFiles }
-        : { kind: "merge-failed", stderr: merged };
+      if (uEvidence === "positive") {
+        return { kind: "conflict", stderr: merged, conflictedFiles };
+      }
+      if (uEvidence === "zero") {
+        return { kind: "merge-failed", stderr: merged };
+      }
+      return { kind: "merge-inconclusive", stderr: merged };
     }
-    // state ABSENT, no U — the merge never entered a merge state.
-    return { kind: "merge-failed", stderr: merged };
+    // state ABSENT: only a positively-zero U is a structural non-start; a positive or
+    // inconclusive U disagrees with the absent state → inconclusive.
+    return uEvidence === "zero"
+      ? { kind: "merge-failed", stderr: merged }
+      : { kind: "merge-inconclusive", stderr: merged };
   } finally {
     lock.release();
   }
