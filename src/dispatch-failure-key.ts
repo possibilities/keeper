@@ -28,27 +28,48 @@
 export const MERGE_ESCALATION_REASON_TOKEN = "worktree-merge-conflict";
 
 /**
- * The EXACT leading reason token a WITHHELD close mints when the epic's latest
- * close receipt is a still-current `fatal_halt` audit verdict (`fatal-audit: <bounded
- * finding excerpt>`). The reconciler mints it on `close::<epic>` (the natural close
- * key) so the ordinary {@link WORKTREE_FINALIZE_ID_PREFIX} / {@link
- * WORKTREE_RECOVER_REASON_PREFIX} / {@link MERGE_ESCALATION_REASON_TOKEN} arms all
- * miss it and it routes {@link routeDispatchFailure} `close-plain` — a retryable
- * sticky in `failedKeys` (so it withholds the close re-mint) that ONLY
- * `retry_dispatch` OR the reconciler's positive-evidence commit-set-drift level-clear
- * drops. Distinct leading token from every sibling above, so it never cross-classifies.
- * A PAGING operator jam (in {@link isJamReason}): a fatal audit finding is
- * operator-attention-worthy, so it surfaces through needs-human and pages once.
+ * The EXACT leading reason token a WITHHELD close mints when the epic's latest close
+ * receipt is a still-current `fatal_halt` audit verdict (`fatal-audit: <bounded finding
+ * excerpt>`). The row lands on the TYPED SYNTHETIC id `close::fatal-audit:<epic>` (see
+ * {@link FATAL_AUDIT_ID_PREFIX}) — never the bare `close::<epic>` key — so it can never
+ * alias, overwrite, or be overwritten by an ordinary close failure (merge/finalize/launch)
+ * on that PK. It routes {@link routeDispatchFailure} `close-plain` (a `fatal-audit`
+ * leading token, distinct from every close arm). A PAGING operator jam (in {@link
+ * isJamReason}): a fatal audit finding is operator-attention-worthy, so it surfaces
+ * through needs-human and pages once.
  */
 export const FATAL_AUDIT_REASON_TOKEN = "fatal-audit";
 
 /**
+ * The `dispatch_failures.id` PREFIX every fatal-audit row carries — `fatal-audit:<epic>`,
+ * verb `close`. A TYPED synthetic id (the {@link WORKTREE_PRECLOSE_ID_PREFIX} /
+ * `origin-containment-stuck:` precedent), so the family is REASON-DISJOINT by construction
+ * from the bare `close::<epic>` key: mint / clear / page all target this distinct PK, and
+ * the close WITHHOLD derives explicitly from the receipt/open-row state, never from a row's
+ * existence on the natural close key. Board mapping strips it via {@link
+ * WORKTREE_CLOSE_KEY_PREFIXES}. `retry_dispatch close::fatal-audit:<epic>` clears the row
+ * (the id-half colon is an accepted dispatch-id token).
+ */
+export const FATAL_AUDIT_ID_PREFIX = "fatal-audit:";
+
+/** Build the synthetic fatal-audit `dispatch_failures.id` for an epic. */
+export function fatalAuditDispatchId(epicId: string): string {
+  return `${FATAL_AUDIT_ID_PREFIX}${epicId}`;
+}
+
+/** The epic id behind a fatal-audit synthetic `dispatch_failures.id`, or null when the
+ *  id does not carry the prefix. Inverse of {@link fatalAuditDispatchId}. */
+export function epicIdFromFatalAuditId(id: string): string | null {
+  return id.startsWith(FATAL_AUDIT_ID_PREFIX)
+    ? id.slice(FATAL_AUDIT_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * Whether a `dispatch_failures.reason` is a withheld-close fatal-audit verdict — the
  * EXACT leading-token gate ({@link FATAL_AUDIT_REASON_TOKEN}). Scopes the reconciler's
- * positive-evidence level-clear to fatal-audit rows ONLY (a genuine close-plain
- * failure sharing the key is never auto-dismissed — the same reason-scope discipline
- * {@link isWorktreeRecoverReason} / {@link isSlotOccupancyReason} enforce), and the
- * needs-human / page surfaces. Pure; a null/colon-less/non-matching reason yields false.
+ * positive-evidence level-clear + the needs-human / page surfaces to fatal-audit rows.
+ * Pure; a null/colon-less/non-matching reason yields false.
  */
 export function isFatalAuditReason(reason: string): boolean {
   return leadingReasonToken(reason) === FATAL_AUDIT_REASON_TOKEN;
@@ -136,6 +157,7 @@ export const WORKTREE_FINALIZE_SUITE_RED_REASON = "worktree-finalize-suite-red";
 export const WORKTREE_CLOSE_KEY_PREFIXES = [
   WORKTREE_FINALIZE_ID_PREFIX,
   WORKTREE_RECOVER_KEY_PREFIX,
+  FATAL_AUDIT_ID_PREFIX,
 ] as const;
 
 /**

@@ -202,7 +202,8 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_ID,
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
-  FATAL_AUDIT_REASON_TOKEN,
+  epicIdFromFatalAuditId,
+  FATAL_AUDIT_ID_PREFIX,
   isBusDegradedDistressKey,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
@@ -15801,11 +15802,12 @@ function startDaemonWithExitAttribution(
     }
   }
 
-  // The OPEN, not-yet-paged fatal-audit rows — a `close::<epic>` `dispatch_failures` row
-  // whose reason leads with FATAL_AUDIT_REASON_TOKEN (a still-current fatal close-audit
-  // verdict holding the epic open). Carries `instance_event_id` so the page is fenced to the
-  // EXACT row instance: a clear + fresh re-mint (retry / re-halt) during the async notify
-  // must not let the stale completion stamp the replacement row and suppress ITS page.
+  // The OPEN, not-yet-paged fatal-audit rows — the TYPED synthetic id
+  // `close::fatal-audit:<epic>` (a still-current fatal close-audit verdict holding the epic
+  // open). Selected by ID PREFIX (reason-disjoint from the bare `close::<epic>` key).
+  // Carries `instance_event_id` so the page is fenced to the EXACT row instance: a clear +
+  // fresh re-mint (retry / re-halt) during the async notify must not let the stale
+  // completion stamp the replacement row and suppress ITS page.
   type FatalAuditPageRow = {
     id: string;
     reason: string;
@@ -15816,9 +15818,9 @@ function startDaemonWithExitAttribution(
       return db
         .query(
           `SELECT id, reason, instance_event_id FROM dispatch_failures
-             WHERE verb = 'close' AND reason LIKE ? AND human_notified_at IS NULL`,
+             WHERE verb = 'close' AND id LIKE ? AND human_notified_at IS NULL`,
         )
-        .all(`${FATAL_AUDIT_REASON_TOKEN}:%`) as Array<{
+        .all(`${FATAL_AUDIT_ID_PREFIX}%`) as Array<{
         id: string;
         reason: string;
         instance_event_id: number | null;
@@ -15846,11 +15848,13 @@ function startDaemonWithExitAttribution(
   async function notifyHumanOfFatalAudit(
     row: FatalAuditPageRow,
   ): Promise<SharedCheckoutNotifiedOutcome> {
+    const epic = epicIdFromFatalAuditId(row.id) ?? row.id;
     return notifyHuman(
       [
-        `🔴 keeper: close::${row.id} halted — a fatal close-audit verdict stands.`,
-        `The closer will not re-run while it holds; land a follow-up (its commits`,
-        `re-audit the tree and lift the fence) or, once addressed, clear it:`,
+        `🔴 keeper: close of ${epic} halted — a fatal close-audit verdict stands.`,
+        `The closer will not re-run while it holds. The fence lifts automatically when a`,
+        `follow-up TASK for the epic is marked done (a session-attributed \`plan done\` fact`,
+        `re-audits the fresh tree); a session-less manual done stays retry-only. Or clear it:`,
         `  keeper autopilot retry close::${row.id}`,
         ``,
         `Finding: ${row.reason.trim()}`,

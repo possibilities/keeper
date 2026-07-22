@@ -93,9 +93,10 @@ import {
   assertNever,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
+  epicIdFromFatalAuditId,
   FATAL_AUDIT_REASON_TOKEN,
+  fatalAuditDispatchId,
   isDupEpicNumberDistressKey,
-  isFatalAuditReason,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
@@ -6692,18 +6693,19 @@ export async function runReconcileCycle(
       dispatchClearedPayload(dispatchFailureFences, clr.verb, clr.id),
     );
   }
-  // Fatal-audit fence: mint one durable `close::<epic>` needs-human row per still-current
-  // fatal verdict (breaking the ~21s re-halt hot-loop — `failedKeys` then withholds every
-  // re-mint), and positive-drift-clear a row whose commit set moved so the re-dispatched
-  // closer re-audits the fresh tree. The change-gate + reducer UPSERT make a re-emit of a
-  // standing row idempotent (fold-safe: two mints, one row).
+  // Fatal-audit fence: mint one durable needs-human row per still-current fatal verdict on
+  // the TYPED synthetic id `close::fatal-audit:<epic>` — reason-disjoint from the bare
+  // `close::<epic>` key, so a standing merge/finalize/launch failure is never overwritten
+  // and the withhold derives from the receipt (not this row's existence). A commit-set
+  // drift positive-clears the row so the re-dispatched closer re-audits the fresh tree. The
+  // change-gate + reducer UPSERT make a re-emit of a standing row idempotent.
   for (const mint of decision.fatalAuditMints) {
     if (signal.aborted) {
       return;
     }
     deps.emitDispatchFailed({
       verb: "close",
-      id: mint.id,
+      id: fatalAuditDispatchId(mint.id),
       reason: `${FATAL_AUDIT_REASON_TOKEN}: ${mint.excerpt}`,
       dir: null,
       conflictedFiles: null,
@@ -6715,7 +6717,11 @@ export async function runReconcileCycle(
       return;
     }
     deps.emitDispatchCleared(
-      dispatchClearedPayload(dispatchFailureFences, "close", clr.id),
+      dispatchClearedPayload(
+        dispatchFailureFences,
+        "close",
+        fatalAuditDispatchId(clr.id),
+      ),
     );
   }
   // Refresh drifted bases before dispatching new work. This is a producer sibling
@@ -12144,17 +12150,27 @@ export function extractCloseFinalizeReceipt(
   }
 }
 
+/** A fatal-audit fence read plus its TRUST: `trusted` is false ONLY when a query THREW (a
+ *  transient read error), distinguishing it from a clean known-absence (a null row / a
+ *  malformed-but-stable receipt). An untrusted read arms a bounded producer retry so the
+ *  operator-free unjam is never stranded on a quiescent DB. */
+export interface CloseReceiptRead {
+  receipts: Map<string, CloseReceipt>;
+  trusted: boolean;
+}
+
 /**
  * Join each live close target to its newest durable close-finalize receipt. The
  * events projection is indexed by `plan_target`; one bounded point lookup runs per
- * distinct live close epic. A malformed newest receipt yields no terminal fact —
- * an older fatal outcome may not leak across a later failed attempt.
+ * distinct live close epic. A malformed newest receipt yields no terminal fact (a stable
+ * known-absence, `trusted`) — an older fatal outcome may not leak across a later failed
+ * attempt; a QUERY THROW marks the read UNTRUSTED so the caller arms a retry.
  */
 export function loadLatestCloseReceipts(
   db: Parameters<typeof runQuery>[0],
   jobs: ReadonlyMap<string, Job>,
   additionalEpicIds?: Iterable<string>,
-): Map<string, CloseReceipt> {
+): CloseReceiptRead {
   const epicIds = new Set<string>();
   for (const job of jobs.values()) {
     if (
@@ -12174,6 +12190,7 @@ export function loadLatestCloseReceipts(
     }
   }
   const receipts = new Map<string, CloseReceipt>();
+  let trusted = true;
   for (const epicId of [...epicIds].sort()) {
     try {
       const row = db
@@ -12192,10 +12209,11 @@ export function loadLatestCloseReceipts(
       const receipt = extractCloseFinalizeReceipt(row.data, row.ts, row.id);
       if (receipt != null) receipts.set(epicId, receipt);
     } catch {
-      // Missing/inconclusive receipt evidence keeps the ordinary grace.
+      // A transient read error is UNTRUSTED (not a known-absence) → arm a retry.
+      trusted = false;
     }
   }
-  return receipts;
+  return { receipts, trusted };
 }
 
 /**
@@ -12207,14 +12225,20 @@ export function loadLatestCloseReceipts(
  * `commit_trailer_facts` watermark — that channel churns on any plan-metadata commit
  * (validate/title/scaffold) and MISSES a bare `Task:`-trailer source commit, so it is
  * neither a superset nor an equivalent of the `commit_set_hash`. ONE bounded aggregate per
- * epic; a read edge degrades that epic to UNKNOWN (absent from the map → the grade holds
- * the fence). Producer-side read, NEVER a fold.
+ * epic; a null aggregate is a clean known-no-done (`trusted`), a QUERY THROW is UNTRUSTED
+ * (arms a retry). Producer-side read, NEVER a fold.
  */
+export interface TaskDoneWatermarkRead {
+  watermarks: Map<string, number>;
+  trusted: boolean;
+}
+
 export function loadEpicTaskDoneWatermarks(
   db: Parameters<typeof runQuery>[0],
   epicIds: Iterable<string>,
-): Map<string, number> {
-  const out = new Map<string, number>();
+): TaskDoneWatermarkRead {
+  const watermarks = new Map<string, number>();
+  let trusted = true;
   for (const epicId of epicIds) {
     if (epicId == null || epicId === "") continue;
     try {
@@ -12224,13 +12248,14 @@ export function loadEpicTaskDoneWatermarks(
         )
         .get(epicId) as { m: number | null } | null;
       if (row != null && typeof row.m === "number" && Number.isFinite(row.m)) {
-        out.set(epicId, row.m);
+        watermarks.set(epicId, row.m);
       }
     } catch {
-      // Read edge → UNKNOWN watermark → the staleness grade holds the fence.
+      // A transient read error is UNTRUSTED (not a known-no-done) → arm a retry.
+      trusted = false;
     }
   }
-  return out;
+  return { watermarks, trusted };
 }
 
 /**
@@ -12339,7 +12364,7 @@ export async function loadReconcileSnapshot(
   // MOVED (not copied) — the epics merge/dedup, the pending-dispatch builder, and
   // the git-seed gate all live in that ONE place now.
   const {
-    readinessDegraded,
+    readinessDegraded: readinessDegradedBase,
     epics,
     jobs,
     subagentInvocations,
@@ -12356,11 +12381,8 @@ export async function loadReconcileSnapshot(
   const openEpicIds = epics
     .filter((e) => e.status !== "done")
     .map((e) => e.epic_id);
-  const latestCloseReceiptByEpicId = loadLatestCloseReceipts(
-    db,
-    jobs,
-    openEpicIds,
-  );
+  const closeReceiptRead = loadLatestCloseReceipts(db, jobs, openEpicIds);
+  const latestCloseReceiptByEpicId = closeReceiptRead.receipts;
 
   // The shared jobs descriptor intentionally omits the live-only generation
   // column; exact Resource holds require it, so enrich the producer snapshot
@@ -12670,12 +12692,15 @@ export async function loadReconcileSnapshot(
       if (verb === "close" && id.startsWith(WORKTREE_PRECLOSE_ID_PREFIX)) {
         preCloseFenceFailureIds.add(id);
       }
-      // An OPEN `fatal-audit` `close::<epic>` row (reason leading token, id is the bare
-      // epic) — collected for the mint-idempotency + drift level-clear. Routes
-      // `close-plain` (the typed switch never touches it), so this reason-scoped
-      // collection is the only handle on it.
-      if (verb === "close" && isFatalAuditReason(reasonStr)) {
-        openFatalAuditIds.add(id);
+      // An OPEN fatal-audit row on the TYPED synthetic id `close::fatal-audit:<epic>` —
+      // collected by ID PREFIX and mapped BACK to the epic (the mint/clear/memo all key on
+      // epic). Reason-disjoint from the bare `close::<epic>` key by construction, so it
+      // never aliases an ordinary close failure. Routes `close-plain` (inert).
+      if (verb === "close") {
+        const fatalEpic = epicIdFromFatalAuditId(id);
+        if (fatalEpic !== null && fatalEpic !== "") {
+          openFatalAuditIds.add(fatalEpic);
+        }
       }
       switch (route.kind) {
         case "worktree-recover": {
@@ -13202,10 +13227,14 @@ export async function loadReconcileSnapshot(
     ...fatalHaltEpicIds,
     ...openFatalAuditIds,
   ]);
-  const fatalAuditTaskDoneWatermarks = loadEpicTaskDoneWatermarks(
-    db,
-    fatalAuditGradeEpicIds,
-  );
+  const taskDoneRead = loadEpicTaskDoneWatermarks(db, fatalAuditGradeEpicIds);
+  const fatalAuditTaskDoneWatermarks = taskDoneRead.watermarks;
+  // Fold the fatal-audit read TRUST into the cycle's degraded verdict: a transient receipt
+  // or task-done read error arms the waker's bounded retry (three-state arming), so the
+  // operator-free drift unjam re-reads even on a quiescent DB — never stranded on the one
+  // data_version edge that coincided with a read error.
+  const readinessDegraded =
+    readinessDegradedBase || !closeReceiptRead.trusted || !taskDoneRead.trusted;
   const currentFatalAuditEpicIds = new Map<string, string>();
   for (const epicId of fatalHaltEpicIds) {
     if (!openEpicIdSet.has(epicId)) continue; // scope the fence/mint to OPEN epics only
@@ -14702,7 +14731,7 @@ function main(): void {
         // gate on the positive observed-then-gone lift so the re-mint after the re-run's
         // re-halt is emitted immediately.
         for (const epicId of snapshot.fatalAuditFenceLifted) {
-          dispatchFailedGate.forget("close", epicId);
+          dispatchFailedGate.forget("close", fatalAuditDispatchId(epicId));
         }
         const decision = reconcile(snapshot, state, deps.now());
         // Map the slot evidence through the ONE tri-state seam: a trusted expiry arms the edge;

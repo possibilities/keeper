@@ -1805,6 +1805,46 @@ test("MergeHumanNotified instance fence: a STALE completion never stamps the REP
   expect(getHumanNotifiedAt("close", "fn-if-1")).toBe(1860);
 });
 
+test("fatal-audit synthetic id and a bare close conflict coexist on distinct PKs (no aliasing)", () => {
+  // A standing merge conflict on the bare close key.
+  dispatchFailedEvent(
+    "close",
+    "fn-fa-1",
+    "worktree-merge-conflict: merging X into Y",
+    "/r",
+    1700,
+  );
+  // A fatal-audit row on the TYPED synthetic id — a DIFFERENT PK.
+  dispatchFailedEvent(
+    "close",
+    "fatal-audit:fn-fa-1",
+    "fatal-audit: boom",
+    null,
+    1710,
+  );
+  drainAll();
+  // conflict-survives-fatal-mint: both rows exist, neither overwrote the other.
+  expect(getDispatchFailure("close", "fn-fa-1")?.reason).toContain(
+    "worktree-merge-conflict",
+  );
+  const fatalInstance = getDispatchFailure(
+    "close",
+    "fatal-audit:fn-fa-1",
+  )?.instance_event_id;
+  expect(typeof fatalInstance).toBe("number");
+
+  // conflict-survives-stale-fatal-clear: clearing the fatal row (its own PK + instance)
+  // deletes ONLY the fatal row; the bare-key conflict is untouched.
+  dispatchClearedEvent("close", "fatal-audit:fn-fa-1", "reconciler", {
+    expectedInstanceEventId: fatalInstance,
+  });
+  drainAll();
+  expect(getDispatchFailure("close", "fatal-audit:fn-fa-1")).toBeNull();
+  expect(getDispatchFailure("close", "fn-fa-1")?.reason).toContain(
+    "worktree-merge-conflict",
+  );
+});
+
 test("human_notified_at is INDEPENDENT of owner_redispatch_attempts (both live on the same sticky)", () => {
   dispatchFailedEvent(
     "close",

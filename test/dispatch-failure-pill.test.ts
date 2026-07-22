@@ -116,6 +116,20 @@ describe("classifyDispatchFailure", () => {
     ).toBeNull();
   });
 
+  test("a fatal-audit synthetic close row maps to its epic and its own pill kind", () => {
+    // The typed synthetic id `close::fatal-audit:<epic>` strips to the epic (board target),
+    // reason-disjoint from an ordinary `close::<epic>` failure, and reads its own pill.
+    expect(
+      resolveFailureTarget(
+        { verb: "close", id: "fatal-audit:fn-7-a", dir: "" },
+        ["fn-7-a"],
+      ),
+    ).toEqual({ kind: "epic", epicId: "fn-7-a" });
+    expect(
+      classifyDispatchFailure("fatal-audit: data loss in the migration"),
+    ).toBe("fatal-audit");
+  });
+
   test("maps the shared-checkout-wedge distress reason to its own display kind", () => {
     // The full minted reason carries a trailing recover-verdict dump; the prefix
     // rule classifies it to the shared-wedge pill, distinct from every other kind.

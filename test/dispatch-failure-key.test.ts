@@ -22,6 +22,7 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_ID,
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
+  FATAL_AUDIT_ID_PREFIX,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
   isLaneWedgeDistressKey,
@@ -665,13 +666,15 @@ describe("preserved predicate helpers", () => {
 });
 
 describe("single vocabulary source", () => {
-  test("close-key prefixes are exactly the finalize + recover key prefixes", () => {
+  test("close-key prefixes are exactly the finalize + recover + fatal-audit key prefixes", () => {
     expect([...WORKTREE_CLOSE_KEY_PREFIXES]).toEqual([
       WORKTREE_FINALIZE_ID_PREFIX,
       WORKTREE_RECOVER_KEY_PREFIX,
+      FATAL_AUDIT_ID_PREFIX,
     ]);
     expect(WORKTREE_FINALIZE_ID_PREFIX).toBe("worktree-finalize:");
     expect(WORKTREE_RECOVER_KEY_PREFIX).toBe("worktree-recover:");
+    expect(FATAL_AUDIT_ID_PREFIX).toBe("fatal-audit:");
     expect(WORKTREE_RECOVER_REASON_PREFIX).toBe("worktree-recover");
     expect(MERGE_ESCALATION_REASON_TOKEN).toBe("worktree-merge-conflict");
     expect(WORKTREE_FINALIZE_NON_FF_REASON).toBe(

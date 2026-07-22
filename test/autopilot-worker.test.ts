@@ -113,7 +113,6 @@ import {
   decideTerminalPaneTeardowns,
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
-  dispatchKey,
   dupEpicNumberDistressId,
   EXPIRY_WAKE_UNKNOWN_RETRY_SEC,
   type ExpiryWakeClock,
@@ -7704,7 +7703,8 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
         ],
       ]),
     );
-    const receipt = receipts.get("fn-1-close");
+    expect(receipts.trusted).toBe(true);
+    const receipt = receipts.receipts.get("fn-1-close");
     expect(receipt?.outcome).toBe("fatal_halt");
     expect(receipt?.ts).toBe(30);
     // The receipt now carries its own event id (the staleness watermark) + the bounded
@@ -7733,7 +7733,7 @@ test("latest close receipts join by epic and do not leak an older fatal past a n
         }),
       ],
     ]);
-    expect(loadLatestCloseReceipts(db, jobs).size).toBe(0);
+    expect(loadLatestCloseReceipts(db, jobs).receipts.size).toBe(0);
   });
 });
 
@@ -7865,16 +7865,17 @@ test("fatal-audit: a lifted fence (operator retry) lets the closer re-run once, 
   expect(decision.fatalAuditMints).toEqual([]);
 });
 
-test("fatal-audit: a standing row is not re-minted (fold-safe) but STILL withholds the close", () => {
+test("fatal-audit: a standing row is not re-minted (fold-safe) and the RECEIPT withholds the close", () => {
+  // The row lives on the synthetic key `close::fatal-audit:<epic>`, so the withhold derives
+  // from the receipt state (currentFatalAuditEpicIds), NOT the row's existence on the bare
+  // close key — proving the two are decoupled.
   const decision = reconcile(
-    fatalAuditSnapshot({
-      openFatalAuditIds: new Set(["fn-2-close"]),
-      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
-    }),
+    fatalAuditSnapshot({ openFatalAuditIds: new Set(["fn-2-close"]) }),
     makeState(),
     0,
   );
   expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
+  expect(decision.withholds.get("fn-2-close")?.code).toBe("fatal-audit");
   // Row already open → no second mint (the fold-safety property: two mints, one row).
   expect(decision.fatalAuditMints).toEqual([]);
   expect(decision.fatalAuditClears).toEqual([]);
@@ -7888,7 +7889,6 @@ test("fatal-audit: POSITIVE resolution evidence level-CLEARS an open row", () =>
       currentFatalAuditEpicIds: new Map(),
       openFatalAuditIds: new Set(["fn-2-close"]),
       fatalAuditResolvedEpicIds: new Set(["fn-2-close"]),
-      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
     }),
     makeState(),
     0,
@@ -7900,18 +7900,17 @@ test("fatal-audit: POSITIVE resolution evidence level-CLEARS an open row", () =>
 test("fatal-audit: an open row with NO resolution evidence (UNKNOWN) is RETAINED, never fail-open cleared", () => {
   const decision = reconcile(
     fatalAuditSnapshot({
-      // Absent from BOTH current and resolved (e.g. a transient receipt read failure).
+      // Absent from BOTH current and resolved (e.g. a transient receipt read failure — the
+      // producer marks the cycle degraded so dispatch bails; here we assert the row is not
+      // fail-open cleared).
       currentFatalAuditEpicIds: new Map(),
       openFatalAuditIds: new Set(["fn-2-close"]),
       fatalAuditResolvedEpicIds: new Set(),
-      failedKeys: new Set([dispatchKey("close", "fn-2-close")]),
     }),
     makeState(),
     0,
   );
-  // No positive evidence → the fence row is held (failedKeys still withholds the close).
   expect(decision.fatalAuditClears).toEqual([]);
-  expect(decision.launches.find((l) => l.verb === "close")).toBeUndefined();
 });
 
 test("fatal-audit: a non-current / non-fatal receipt does NOT withhold or mint", () => {
@@ -7939,9 +7938,28 @@ test("loadEpicTaskDoneWatermarks: max TASK-DONE fact id per epic, ignoring non-d
     // Only 'done' ops count — the set-title plan-metadata commit (id 20) is IGNORED, so a
     // validate/title churn never spuriously lifts the fence.
     const w = loadEpicTaskDoneWatermarks(db, ["fn-1-foo", "fn-2-none"]);
-    expect(w.get("fn-1-foo")).toBe(9);
-    expect(w.has("fn-2-none")).toBe(false);
+    expect(w.trusted).toBe(true);
+    expect(w.watermarks.get("fn-1-foo")).toBe(9);
+    expect(w.watermarks.has("fn-2-none")).toBe(false);
   });
+});
+
+test("fatal-audit reads report UNTRUSTED on a query THROW (arms a retry clock), TRUSTED on a clean absence", () => {
+  // A throwing DB distinguishes a transient read error (untrusted) from a known-absence.
+  const throwingDb = {
+    query: () => ({
+      get: () => {
+        throw new Error("transient sqlite error");
+      },
+      all: () => {
+        throw new Error("transient sqlite error");
+      },
+    }),
+  } as unknown as Parameters<typeof loadLatestCloseReceipts>[0];
+  expect(loadLatestCloseReceipts(throwingDb, new Map(), ["fn-1"]).trusted).toBe(
+    false,
+  );
+  expect(loadEpicTaskDoneWatermarks(throwingDb, ["fn-1"]).trusted).toBe(false);
 });
 
 const fatalHookData = (body: Record<string, unknown>): string =>
@@ -8023,10 +8041,12 @@ test("loadReconcileSnapshot fatal-audit: an open row RETAINS on an unreadable re
       status: "open",
       tasks: [makeTask({ task_id: `${unknown}.1`, epic_id: unknown })],
     });
+    // The row lands on the TYPED synthetic id `close::fatal-audit:<epic>`, mapped back to
+    // the epic by the snapshot's id-prefix collection.
     db.run(
       `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at)
        VALUES ('close', ?, 'fatal-audit: boom', 1, 1, 1, 1)`,
-      [unknown],
+      [`fatal-audit:${unknown}`],
     );
     // A positively-DONE epic with an open fatal-audit row → resolved (clear).
     const resolvedDone = "fn-41-done";
@@ -8045,7 +8065,7 @@ test("loadReconcileSnapshot fatal-audit: an open row RETAINS on an unreadable re
     db.run(
       `INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at)
        VALUES ('close', ?, 'fatal-audit: old', 1, 1, 1, 1)`,
-      [resolvedDone],
+      [`fatal-audit:${resolvedDone}`],
     );
 
     const snap = await loadReconcileSnapshot(db);
