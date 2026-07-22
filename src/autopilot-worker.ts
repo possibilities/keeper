@@ -45,7 +45,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { clearDeadSessionMarker } from "../plugins/plan/src/session_markers.ts";
-import { loadMatrixV2, MatrixConfigError } from "./agent/matrix";
+import {
+  buildRouteByModel,
+  loadMatrixV2,
+  MatrixConfigError,
+} from "./agent/matrix";
 import { computeEligibleEpics } from "./armed-closure";
 import { epicStarted } from "./await-conditions";
 import {
@@ -13201,18 +13205,7 @@ export async function loadReconcileSnapshot(
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
       driverByModel: matrix.driverByModel,
-      routeByModel: new Map(
-        matrix.subagentModels.flatMap((model) => {
-          const driver = matrix.driverByModel.get(model) ?? "wrapped";
-          const hasRoute = matrix.providers.some(
-            (entry) =>
-              (driver === "native"
-                ? entry.name === "claude"
-                : entry.name !== "claude") && entry.models.has(model),
-          );
-          return hasRoute ? ([[model, driver]] as const) : [];
-        }),
-      ),
+      routeByModel: buildRouteByModel(matrix),
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {

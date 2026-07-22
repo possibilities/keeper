@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { ConfigError } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
+  buildRouteByModel,
   capabilityOf,
   cellSet,
   driverFor,
@@ -923,6 +924,18 @@ describe("v2 loader — capability derivation + parse", () => {
       { model: "sonnet", driver: "native" },
       { model: "gpt-5.3-codex-spark", driver: "wrapped" },
     ]);
+  });
+
+  test("buildRouteByModel: each routed cell maps to its serving-provider driver", () => {
+    // The SHARED route builder the autopilot producer, the daemon block-owner
+    // redispatch, and the manual dispatch path all fill `routeByModel` from — a
+    // claude-served cell routes native, a Pi-served wrapped cell routes wrapped.
+    const m = loadMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    expect(Object.fromEntries(buildRouteByModel(m))).toEqual({
+      opus: "native",
+      sonnet: "native",
+      "gpt-5.3-codex-spark": "wrapped",
+    });
   });
 
   test("matrixV2EffortsFor: per-capability list, else the top-level axis", () => {

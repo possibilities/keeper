@@ -47,7 +47,12 @@ import {
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
-import { loadMatrixV2, MatrixConfigError, type MatrixV2 } from "./agent/matrix";
+import {
+  buildRouteByModel,
+  loadMatrixV2,
+  MatrixConfigError,
+  type MatrixV2,
+} from "./agent/matrix";
 import type {
   AutocloseWorkerData,
   AutocloseWorkerMessage,
@@ -15249,18 +15254,7 @@ function startDaemonWithExitAttribution(
         effortsByModel: matrix.effortsByModel,
         efforts: matrix.efforts,
         driverByModel: matrix.driverByModel,
-        routeByModel: new Map(
-          matrix.subagentModels.flatMap((model) => {
-            const driver = matrix.driverByModel.get(model) ?? "wrapped";
-            const hasRoute = matrix.providers.some(
-              (provider) =>
-                (driver === "native"
-                  ? provider.name === "claude"
-                  : provider.name !== "claude") && provider.models.has(model),
-            );
-            return hasRoute ? ([[model, driver]] as const) : [];
-          }),
-        ),
+        routeByModel: buildRouteByModel(matrix),
       };
       return { matrix, axes };
     } catch (err) {

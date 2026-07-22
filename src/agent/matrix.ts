@@ -1199,6 +1199,28 @@ export function matrixV2Cells(matrix: MatrixV2): MatrixCell[] {
   }));
 }
 
+/** The launchable route driver per worker-cell capability: a capability whose
+ *  declared driver has a serving provider (native → claude, wrapped → a non-claude
+ *  provider that lists it) maps to that driver; a capability with NO serving
+ *  provider is omitted, so a present-but-absent entry is positive evidence of "no
+ *  launch route". The SINGLE builder the autopilot producer, the daemon block-owner
+ *  redispatch, and the manual dispatch path share to fill `HostMatrixAxes.routeByModel`
+ *  so their launch-contract route facts never drift. Pure. */
+export function buildRouteByModel(matrix: MatrixV2): Map<string, Driver> {
+  return new Map(
+    matrix.subagentModels.flatMap((model) => {
+      const driver = matrix.driverByModel.get(model) ?? "wrapped";
+      const hasRoute = matrix.providers.some(
+        (provider) =>
+          (driver === "native"
+            ? provider.name === "claude"
+            : provider.name !== "claude") && provider.models.has(model),
+      );
+      return hasRoute ? ([[model, driver]] as const) : [];
+    }),
+  );
+}
+
 // ── v2 pure derivations (operator diagnostic verbs) ──────────────────────────
 //
 // The v2 counterparts of the v1 derivations above, feeding `presets list` /

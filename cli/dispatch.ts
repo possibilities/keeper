@@ -41,7 +41,11 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { loadMatrixV2, MatrixConfigError } from "../src/agent/matrix";
+import {
+  buildRouteByModel,
+  loadMatrixV2,
+  MatrixConfigError,
+} from "../src/agent/matrix";
 import { parseTriple } from "../src/agent/triple";
 import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
 import {
@@ -62,7 +66,10 @@ import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
-import { loadProviderEquivalenceSnapshot } from "../src/provider-equivalence";
+import {
+  loadProviderEquivalenceSnapshot,
+  type ProviderEquivalenceSnapshot,
+} from "../src/provider-equivalence";
 import type { HostMatrixAxes } from "../src/reconcile-core";
 import {
   applyProviderConstraint,
@@ -148,6 +155,12 @@ export interface MainDeps {
     pluginDir: string,
     launchCwd: string,
   ) => string | null;
+  /** Provider-equivalence map snapshot loader for the `worker_provider` pin
+   *  translation. Defaults to the real `loadProviderEquivalenceSnapshot` (reads
+   *  the committed map). Injected so a test drives the fail-closed `map-malformed`
+   *  refusal on a read/parse error without an unreadable file on disk; a clean
+   *  `{ok:true}` snapshot leaves the translation path byte-identical. */
+  readonly loadProviderEquivalence?: () => ProviderEquivalenceSnapshot;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -749,6 +762,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           effortsByModel: m.effortsByModel,
           efforts: m.efforts,
           driverByModel: m.driverByModel,
+          routeByModel: buildRouteByModel(m),
         };
       } catch (err) {
         if (!(err instanceof MatrixConfigError)) throw err;
@@ -770,7 +784,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         const result = applyProviderConstraint(
           { model: assignedModel, effort: assignedTier },
           workerProvider,
-          loadProviderEquivalenceSnapshot(),
+          (deps.loadProviderEquivalence ?? loadProviderEquivalenceSnapshot)(),
           axes,
         );
         if (result.kind === "reject") {
@@ -790,10 +804,51 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           dispatchCellConstraint = workerProvider;
         }
       }
+      // Wrapped-cell guard marker off the EFFECTIVE cell (task .1) — the SAME
+      // predicate the autopilot producer uses, so a hand-fired wrapped worker is
+      // marked (and guarded) identically. Computed BEFORE the cell resolves so it
+      // also feeds the provider launch contract below. Present only for a wrapped
+      // cell under no reject; a native / cell-less launch leaves both undefined.
+      if (
+        providerReject === undefined &&
+        axes !== null &&
+        composeModel !== null &&
+        composeTier !== null &&
+        isWrappedCell(axes, composeModel)
+      ) {
+        dispatchWrappedCell = `${composeModel}::${composeTier}`;
+        dispatchWrappedEnvelope = wrappedEnvelopePath(cwd, id);
+      }
       const compose: WorkerCellCompose =
         providerReject !== undefined
           ? { pluginDir: null, providerReject }
           : composeWorkerCellDir(composeModel, composeTier);
+      // Provider launch contract (ADR 0047) — composed on the EFFECTIVE cell when a
+      // pin is set, mirroring the reconciler + daemon block-owner paths so the
+      // driver/route/marker mismatch arm (`provider-unlaunchable`) is reachable BY
+      // HAND, not only from autopilot. Requires the host axes (a bad matrix defers
+      // to the bad-matrix reject) and a resolved cell (a cell-less work row carries
+      // none); `route` reads the axis map exactly as the reconciler does.
+      if (
+        compose.providerReject === undefined &&
+        workerProvider !== null &&
+        axes !== null &&
+        composeModel !== null &&
+        composeTier !== null
+      ) {
+        const driver = axes.driverByModel.get(composeModel) ?? "wrapped";
+        compose.providerLaunchContract = {
+          provider: workerProvider,
+          model: composeModel,
+          tier: composeTier,
+          driver,
+          route:
+            axes.routeByModel === undefined
+              ? driver
+              : (axes.routeByModel.get(composeModel) ?? null),
+          wrappedCell: dispatchWrappedCell ?? null,
+        };
+      }
       const cell = resolveWorkerCell(compose, {
         dirExists: deps.dirExists ?? existsSync,
         probeFreshness:
@@ -859,21 +914,9 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         }
       } else {
         // null pluginDir = cell-less → no `--plugin-dir` (byte-identical to a
-        // close/free-form launch); a resolved cell threads its absolute dir.
+        // close/free-form launch); a resolved cell threads its absolute dir. The
+        // wrapped-cell marker is already set above (pre-resolution).
         workerPluginDir = cell.pluginDir ?? undefined;
-        // Wrapped-cell guard marker off the EFFECTIVE cell (task .1) — the SAME
-        // predicate the autopilot producer uses, so a hand-fired wrapped worker is
-        // marked (and guarded) identically. Present only for a wrapped cell; a
-        // native / cell-less launch leaves both undefined → empty carriers.
-        if (
-          axes !== null &&
-          composeModel !== null &&
-          composeTier !== null &&
-          isWrappedCell(axes, composeModel)
-        ) {
-          dispatchWrappedCell = `${composeModel}::${composeTier}`;
-          dispatchWrappedEnvelope = wrappedEnvelopePath(cwd, id);
-        }
       }
     }
   } else {

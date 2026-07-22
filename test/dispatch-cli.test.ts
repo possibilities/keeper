@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { main as dispatchMain, type MainDeps } from "../cli/dispatch";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
+import { buildProviderEquivalenceMap } from "../src/provider-equivalence";
 
 class ExitError extends Error {
   readonly code: number;
@@ -541,6 +542,100 @@ test("plan work: a NULL worker_provider pin is byte-identical to today (assigned
   // A native opus cell carries NO wrapped-cell marker — the guard stays inert.
   expect(r.spec?.wrappedCell).toBeUndefined();
   expect(r.spec?.wrappedEnvelope).toBeUndefined();
+});
+
+// A provider-constraint READ ERROR (the equivalence map fails to load/parse at
+// dispatch) adopts the autopilot owner's fail-closed posture: refuse with the
+// typed map-malformed reason (naming the config + error class), NEVER a silent
+// fallback to the assigned cell — the impossible-manifest class the pin prevents.
+test("plan work: a provider-constraint READ ERROR refuses fail-closed (map-malformed), never a fallback", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "gpt" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+    loadProviderEquivalence: () => ({
+      ok: false,
+      detail:
+        "cannot read provider-equivalence map at /nope/provider-equivalence.yaml: ENOENT",
+    }),
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched — no fallback to opus
+  expect(r.stderr).toContain("worker-provider-map-malformed");
+  expect(r.stderr).toContain("ENOENT"); // the error class rides through
+  expect(r.stderr).toContain("provider-equivalence.yaml"); // the config to fix
+});
+
+// Absent PIN ≠ unreadable MAP (the tri-state discipline): with NO pin configured
+// the constraint block short-circuits BEFORE the map is ever read, so even a map
+// that WOULD fail to load leaves the assigned cell dispatching byte-identically.
+test("plan work: a cleanly-absent pin passes through — the map is never read (absent ≠ unreadable)", async () => {
+  writeMatrix(SOL_MATRIX);
+  let mapRead = false;
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [{ id: 1, paused: 1 } as unknown as Row], // no worker_provider
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+    loadProviderEquivalence: () => {
+      mapRead = true;
+      return { ok: false, detail: "must never be read without a pin" };
+    },
+  });
+  expect(r.code).toBeUndefined(); // launched
+  expect(mapRead).toBe(false); // the absent pin short-circuits before the map read
+  expect(r.spec?.pluginDir).toContain("plugins/plan/workers/opus-max");
+  expect(r.spec?.dispatchedModel).toBeUndefined();
+});
+
+// Manual dispatch composes the provider launch contract, so a map that
+// translates into a cell whose DRIVER contradicts the pin (a gpt pin mapped onto
+// claude-NATIVE sonnet) trips the provider-unlaunchable arm — the driver/route/
+// marker mismatch a by-hand launch cannot reach without the contract the
+// autopilot producer composes.
+test("plan work: a driver/route mismatch trips the provider-unlaunchable contract arm (reachable by hand)", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "gpt" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+    // A deliberately broken map: a gpt pin translated onto claude-native sonnet.
+    // applyProviderConstraint passes it (sonnet IS a dispatchable host cell), but
+    // the contract arm catches the effective driver (native) contradicting the pin.
+    loadProviderEquivalence: () => ({
+      ok: true,
+      map: buildProviderEquivalenceMap({
+        schema_version: 1,
+        mappings: {
+          claude_to_gpt: [
+            {
+              source: { model: "opus", effort: "max" },
+              target: { model: "sonnet", effort: "max" },
+            },
+          ],
+          gpt_to_claude: [],
+        },
+      }),
+    }),
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched
+  expect(r.stderr).toContain("worker-provider-cell-unlaunchable");
+  expect(r.stderr).toContain("constraint requires wrapped");
+  expect(r.stderr).toContain("driver=native");
 });
 
 // ---------------------------------------------------------------------------
