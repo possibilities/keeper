@@ -1231,6 +1231,12 @@ export interface BlockEscalationRequestedPayload {
   epic_id: string;
   /** Blocked task id — part of the `block_escalations` pk. */
   task_id: string;
+  /** OPTIONAL instance fence: the block latch's `instance_event_id` at selection. When
+   *  present the fold updates the row ONLY if it still carries that instance — so a stale
+   *  in-flight sweep for a cleared block instance A never mutates the REPLACEMENT instance B
+   *  (same task id, fresh `instance_event_id` after an unblock→re-block). Absent (historical
+   *  payloads) → no instance check, byte-identical to the pre-fence fold. */
+  expectedInstanceEventId?: number | null;
 }
 
 /**
@@ -1254,6 +1260,11 @@ export interface BlockEscalationAttemptedPayload {
   task_id: string;
   /** Producer-recorded attempt outcome, recorded onto the latch `outcome` column. */
   outcome: string;
+  /** OPTIONAL instance fence: the block latch's `instance_event_id` at selection. When
+   *  present the fold updates the row ONLY if it still carries that instance — so a stale
+   *  attempt for a cleared block instance A never terminalizes the REPLACEMENT instance B.
+   *  Absent (historical payloads) → no instance check, byte-identical to the pre-fence fold. */
+  expectedInstanceEventId?: number | null;
 }
 
 /**
@@ -1277,6 +1288,13 @@ export interface BlockHumanNotifiedPayload {
   task_id: string;
   /** Producer-recorded notify outcome; only the terminal `notified` stamps the marker. */
   outcome: string;
+  /** OPTIONAL instance fence: the block latch's `instance_event_id` the page was sent
+   *  about. When present the fold stamps `human_notified_at` ONLY if the current row still
+   *  carries that instance — so a page sent about block instance A that completed AFTER A
+   *  was cleared and a REPLACEMENT instance B minted (same task id) never stamps B,
+   *  suppressing B's required page. Absent (historical payloads) → no instance check,
+   *  byte-identical to the pre-fence fold. */
+  expectedInstanceEventId?: number | null;
 }
 
 /**

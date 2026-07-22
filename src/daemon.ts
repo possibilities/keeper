@@ -1661,6 +1661,11 @@ export interface PendingBlockEscalation {
   /** The latch's last-touch wall-clock (seconds) — set on block arrival, then bumped
    *  by each attachment attempt. The EXTERNAL_BLOCKED re-check cadence clocks off it. */
   updated_at: number;
+  /** The block instance token (the arming event id; equal to `blocked_since` at arm). The
+   *  producer threads it through every mint so the fold fences the exact instance — an
+   *  unblock→re-block mints a fresh row with a new token, so a stale in-flight sweep never
+   *  mutates the replacement instance. */
+  instance_event_id: number | null;
   /** Owning epic's `project_dir` — the plan state-file root for the reason read. */
   project_dir: string | null;
   /** The embedded task's live `runtime_status` — the cancellation-guard signal. */
@@ -1693,7 +1698,7 @@ export function selectPendingBlockEscalations(
   const latches = db
     .query(
       `SELECT id AS task_id, block_status AS status, block_outcome AS outcome,
-              owner_redispatch_attempts, updated_at
+              owner_redispatch_attempts, updated_at, instance_event_id
          FROM dispatch_failures
         WHERE verb = 'block'
           AND (block_status = 'pending'
@@ -1705,6 +1710,7 @@ export function selectPendingBlockEscalations(
     outcome: string | null;
     owner_redispatch_attempts: number;
     updated_at: number;
+    instance_event_id: number | null;
   }[];
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
@@ -1754,6 +1760,7 @@ export function selectPendingBlockEscalations(
       outcome: latch.outcome,
       owner_redispatch_attempts: latch.owner_redispatch_attempts,
       updated_at: latch.updated_at,
+      instance_event_id: latch.instance_event_id,
       project_dir: epicRow?.project_dir ?? null,
       runtime_status: runtimeStatus,
       target_repo: targetRepo,
@@ -1996,23 +2003,29 @@ export const EXTERNAL_BLOCK_RECHECK_INTERVAL_MS = 45 * 60_000;
 /**
  * The EXTERNAL_BLOCKED re-check gate — the time-driven sibling of {@link
  * blockOwnerEscalationDecision}. A transient external blocker (a provider quota window)
- * clears on its own clock, not on the owner session's death, so this gate ignores owner
- * liveness entirely: it re-dispatches the owning `work::<task>` verb once the re-check
+ * clears on its own clock, not on the owner session's death, so the RE-CHECK trigger
+ * ignores owner liveness: it re-dispatches the owning `work::<task>` verb once the
  * interval has elapsed since the last attempt (or the block's arrival), consuming one
- * bounded attachment attempt each time. Once the bounded budget is spent it surfaces
- * exhausted so stage-3 pages — the same convergence-then-page shape as the owner-death
- * ladder, just clocked on the external window instead of an owner death. `lastAttemptMs`
+ * bounded attachment attempt each time (`dispatchOwner`'s own `already_live` guard drops
+ * a redundant launch while an owner is live). The TERMINAL page, however, obeys the same
+ * positive-evidence discipline as the owner-death ladder: once the budget is spent it
+ * surfaces exhausted ONLY on a witnessed owner death — a live or absent/inconclusive
+ * owner HOLDS, because the final recheck's re-dispatched owner may still be actively
+ * resolving and time must never terminal-page over a positively-live owner. `lastAttemptMs`
  * is the latch's last-touch wall-clock (block arrival, then each attempt), so the
  * attempts space out by `intervalMs`. Pure.
  */
 export function externalBlockRecheckDecision(
+  liveness: BlockOwnerLiveness,
   lastAttemptMs: number,
   ownerRedispatchAttempts: number,
   nowMs: number,
   intervalMs: number = EXTERNAL_BLOCK_RECHECK_INTERVAL_MS,
   attemptLimit: number = BLOCK_OWNER_REDISPATCH_LIMIT,
 ): "defer" | "redispatch_owner" | "surface_exhausted" {
-  if (ownerRedispatchAttempts >= attemptLimit) return "surface_exhausted";
+  if (ownerRedispatchAttempts >= attemptLimit) {
+    return liveness.state === "dead" ? "surface_exhausted" : "defer";
+  }
   return nowMs - lastAttemptMs >= intervalMs ? "redispatch_owner" : "defer";
 }
 
@@ -2049,14 +2062,22 @@ export interface BlockEscalationSweepDeps {
     taskId: string,
   ) => string | null;
   /** Mint a `BlockEscalationRequested` synthetic event (advances the latch
-   *  `pending → requested`). */
-  readonly mintRequested: (epicId: string, taskId: string) => void;
-  /** Mint a `BlockEscalationAttempted{outcome}` synthetic event (advances the
-   *  latch `requested → attempted`, records `outcome`). */
+   *  `pending → requested`). `instanceEventId` fences the fold to the exact block
+   *  instance (the row's `instance_event_id`) so a stale sweep never mutates a
+   *  replacement instance after an unblock→re-block. */
+  readonly mintRequested: (
+    epicId: string,
+    taskId: string,
+    instanceEventId: number | null,
+  ) => void;
+  /** Mint a `BlockEscalationAttempted{outcome}` synthetic event (records `outcome`;
+   *  a terminal advances the latch to `attempted`). `instanceEventId` fences the fold
+   *  to the exact block instance. */
   readonly mintAttempted: (
     epicId: string,
     taskId: string,
     outcome: BlockEscalationOutcome,
+    instanceEventId: number | null,
   ) => void;
   /** Launch one `work::<task>` orchestrator. Used for ordinary owner attachment
    *  and an AUDIT_READY resume; the in-session unblocker rides that turn. A real
@@ -2140,9 +2161,10 @@ export type BlockCandidateDropClass =
  *    block handler: mints nothing, so the latch stays pending.
  *  - `owner_redispatched` / `owner_redispatch_failed` — consume one durable
  *    attachment attempt and stay pending.
- *  - `owner_exhausted` (terminal) — the bounded re-attach lease is spent. Mints
- *    Requested→Attempted so the row leaves `pending` and the stage-3 human-notify
- *    sweep pages the operator ONCE. NEVER dispatches an agent.
+ *  - `owner_exhausted` (terminal) — the bounded re-attach lease is spent AND the owner
+ *    is positively gone. Mints ONE `Attempted` (no Requested pair — a failed append stays
+ *    retryable at `pending`, never stranded at `requested`) so the row leaves `pending`
+ *    and the stage-3 human-notify sweep pages the operator ONCE. NEVER dispatches an agent.
  *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal) — the legacy
  *    fallback launch outcome. A cap/occupancy skip mints nothing.
  *
@@ -2201,8 +2223,13 @@ export async function runBlockEscalationSweep(
         "not_blocked",
         `runtime_status=${row.runtime_status ?? "null"}`,
       );
-      deps.mintRequested(row.epic_id, row.task_id);
-      deps.mintAttempted(row.epic_id, row.task_id, "skipped_unblocked");
+      deps.mintRequested(row.epic_id, row.task_id, row.instance_event_id);
+      deps.mintAttempted(
+        row.epic_id,
+        row.task_id,
+        "skipped_unblocked",
+        row.instance_event_id,
+      );
       continue;
     }
 
@@ -2266,8 +2293,13 @@ export async function runBlockEscalationSweep(
       if (reason != null) {
         drop(row.task_id, "surface_and_stop", `category=${category ?? "null"}`);
       }
-      deps.mintRequested(row.epic_id, row.task_id);
-      deps.mintAttempted(row.epic_id, row.task_id, "skipped_category");
+      deps.mintRequested(row.epic_id, row.task_id, row.instance_event_id);
+      deps.mintAttempted(
+        row.epic_id,
+        row.task_id,
+        "skipped_category",
+        row.instance_event_id,
+      );
       // Durable re-dispatch guard: a surface-and-stop block must NOT auto-requeue.
       // The `block_escalations` latch (now leaving `pending`) and the transient
       // `runtime_status='blocked'` flag are both deleted on leave-blocked, so
@@ -2298,6 +2330,7 @@ export async function runBlockEscalationSweep(
     const decideLadder = (liveness: BlockOwnerLiveness) =>
       category === EXTERNAL_BLOCKED_CATEGORY
         ? externalBlockRecheckDecision(
+            liveness,
             row.updated_at * 1000,
             row.owner_redispatch_attempts,
             (deps.now ?? Date.now)(),
@@ -2313,18 +2346,27 @@ export async function runBlockEscalationSweep(
           ? (auditLiveness ?? { state: "absent" })
           : (deps.ownerLiveness?.(row) ?? { state: "absent" });
       const decision = decideLadder(liveness);
-      // The exhausted lease is TERMINAL: mint `owner_exhausted` (Requested→Attempted)
-      // so the row leaves the block-sweep working set and enters the stage-3
-      // human-notify sweep, which pages the operator ONCE. Minted exactly once per
-      // instance — the `attempted/owner_exhausted` latch matches neither `pending` nor
-      // the `skipped_category` re-arm the block selector reads, so it never re-mints.
+      // The exhausted lease is TERMINAL: mint the terminal `owner_exhausted` so the row
+      // leaves the block-sweep working set and enters the stage-3 human-notify sweep,
+      // which pages the operator ONCE. A no-launch terminal mints ONE
+      // `BlockEscalationAttempted{owner_exhausted}` (NOT a Requested→Attempted pair) —
+      // its fold advances `pending → attempted` directly, so a failed append leaves the
+      // row `pending` and stage-2 re-selects it, never stranding it at `requested` (which
+      // BOTH selectors exclude). Minted exactly once per instance — the
+      // `attempted/owner_exhausted` latch matches neither `pending` nor the
+      // `skipped_category` re-arm the block selector reads, so it never re-mints.
       if (decision === "surface_exhausted") {
-        deps.mintRequested(row.epic_id, row.task_id);
-        deps.mintAttempted(row.epic_id, row.task_id, "owner_exhausted");
+        deps.mintAttempted(
+          row.epic_id,
+          row.task_id,
+          "owner_exhausted",
+          row.instance_event_id,
+        );
         continue;
       }
-      // `defer` (owner may recover, or the external re-check interval has not elapsed)
-      // skips without dispatching.
+      // `defer` (owner may recover, the external re-check interval has not elapsed, or an
+      // exhausted external lease is holding for a still-live owner) skips without
+      // dispatching.
       if (decision !== "redispatch_owner") continue;
     }
 
@@ -2401,13 +2443,14 @@ export async function runBlockEscalationSweep(
       );
       continue;
     }
-    deps.mintRequested(row.epic_id, row.task_id);
+    deps.mintRequested(row.epic_id, row.task_id, row.instance_event_id);
     deps.mintAttempted(
       row.epic_id,
       row.task_id,
       ownerOutcome === "dispatched"
         ? "owner_redispatched"
         : "owner_redispatch_failed",
+      row.instance_event_id,
     );
   }
 }
@@ -2437,6 +2480,10 @@ export interface PendingBlockHumanNotify {
   /** The terminal `block_outcome`: `owner_exhausted` (pages directly) or the legacy
    *  `dispatched` (sequences behind the `unblock::<task>` session's verdict). */
   outcome: string;
+  /** The block instance token (`instance_event_id`) the page is about — threaded to the
+   *  `BlockHumanNotified` mint and re-checked across the async notify so a page about a
+   *  cleared instance never stamps a replacement instance's marker. */
+  instance_event_id: number | null;
 }
 
 /**
@@ -2457,17 +2504,22 @@ export function selectPendingBlockHumanNotifications(
 ): PendingBlockHumanNotify[] {
   const rows = db
     .query(
-      `SELECT id, block_outcome FROM dispatch_failures
+      `SELECT id, block_outcome, instance_event_id FROM dispatch_failures
          WHERE verb = 'block'
            AND block_status = 'attempted'
            AND block_outcome IN ('dispatched', 'owner_exhausted')
            AND human_notified_at IS NULL`,
     )
-    .all() as { id: string; block_outcome: string }[];
+    .all() as {
+    id: string;
+    block_outcome: string;
+    instance_event_id: number | null;
+  }[];
   return rows.map((r) => ({
     task_id: r.id,
     epic_id: parsePlanRef(r.id)?.epic_id ?? "",
     outcome: r.block_outcome,
+    instance_event_id: r.instance_event_id,
   }));
 }
 
@@ -2649,11 +2701,17 @@ export interface BlockHumanNotifySweepDeps {
   /** The current-state pending working set (DELEGATES to
    *  {@link selectPendingBlockHumanNotifications} in production). */
   readonly selectPending: () => PendingBlockHumanNotify[];
-  /** Re-read that the latch for `(epicId, taskId)` is STILL a terminal-but-not-
-   *  notified stage-3 row — checked immediately before the notify to narrow the
-   *  clear-mid-sweep window (a leave-blocked DELETE between select and notify drops
-   *  the row). Reads the live projection on the writable connection in production. */
-  readonly stillPending: (epicId: string, taskId: string) => boolean;
+  /** Re-read that the EXACT block instance for `(epicId, taskId, instanceEventId)` is
+   *  STILL a terminal-but-not-notified stage-3 row — checked immediately BEFORE the notify
+   *  AND re-checked AFTER the async notify (the re-fence), so a clear + re-block during the
+   *  async send can neither page a replacement instance nor let a stale completion stamp
+   *  it. Conditions on the instance token + outcome + `human_notified_at IS NULL`. Reads
+   *  the live projection on the writable connection in production. */
+  readonly stillPending: (
+    epicId: string,
+    taskId: string,
+    instanceEventId: number | null,
+  ) => boolean;
   /** Classify the legacy `dispatched` `unblock::<task>` session's outcome for `taskId`
    *  (DELEGATES to {@link classifyEscalationOutcome} over the live `jobs` map in
    *  production). Read ONLY for a `dispatched` row; an `owner_exhausted` row is already
@@ -2669,12 +2727,14 @@ export interface BlockHumanNotifySweepDeps {
     verdict: BlockNotifyVerdict,
   ) => Promise<BlockHumanNotifiedOutcome>;
   /** Mint a `BlockHumanNotified{outcome}` synthetic event. The fold stamps
-   *  `human_notified_at` ONLY on the terminal `notified`; it NEVER clears the latch —
+   *  `human_notified_at` ONLY on the terminal `notified`, fenced to `instanceEventId` so a
+   *  stale completion never stamps a replacement instance; it NEVER clears the latch —
    *  only the leave-blocked `TaskSnapshot` DELETE does, which re-arms it at NULL. */
   readonly mintAttempted: (
     epicId: string,
     taskId: string,
     outcome: BlockHumanNotifiedOutcome,
+    instanceEventId: number | null,
   ) => void;
   /** Warn sink for non-fatal diagnostics. */
   readonly noteLine?: (line: string) => void;
@@ -2693,9 +2753,12 @@ export interface BlockHumanNotifySweepDeps {
  * does. A TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next
  * sweep's selector drops the row; a `notify_failed` (agentbot absent / failed) leaves
  * the marker NULL so the row re-sweeps and the notification is never lost (the block
- * is operator-visible the whole time). NEVER throws — every helper edge degrades to a
- * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
- * `applyEvent`.
+ * is operator-visible the whole time). INSTANCE-FENCED across the async notify: the
+ * exact block instance is re-checked both before AND after the send, and the mint carries
+ * the instance so the fold stamps only a matching row — a clear + re-block during the send
+ * can neither page nor suppress the replacement instance's own page. NEVER throws — every
+ * helper edge degrades to a recorded outcome. The spawn lives ONLY here in the producer,
+ * never reachable from `applyEvent`.
  */
 export async function runBlockHumanNotifySweep(
   deps: BlockHumanNotifySweepDeps,
@@ -2715,10 +2778,12 @@ export async function runBlockHumanNotifySweep(
   if (pending.length === 0) return;
 
   for (const row of pending) {
-    // Re-read immediately before the notify: a leave-blocked DELETE (the task got
-    // unblocked) or the notified fold between select and notify means there is
-    // nothing left to notify — skip without minting.
-    if (!deps.stillPending(row.epic_id, row.task_id)) continue;
+    // Re-read the EXACT instance immediately before the notify: a leave-blocked DELETE
+    // (the task got unblocked) — or a clear + re-block minting a fresh instance, or the
+    // notified fold — between select and notify means THIS instance is no longer the
+    // pending stage-3 row, so skip without minting (never page a replacement instance).
+    if (!deps.stillPending(row.epic_id, row.task_id, row.instance_event_id))
+      continue;
     // Resolve the page verdict. An exhausted lease is ALREADY terminal — the block
     // sweep minted `owner_exhausted` only after the bounded re-attach budget was spent,
     // so there is no session to sequence behind: page directly. A legacy `dispatched`
@@ -2748,9 +2813,16 @@ export async function runBlockHumanNotifySweep(
       );
       result = "notify_failed";
     }
+    // Re-fence AFTER the async yield: a clear + re-block during the notify means the row
+    // now carries a DIFFERENT instance, so skip the stamp — its replacement instance must
+    // still page. (Belt to the mint's own instance-fenced fold: the fold conditions on the
+    // instance too, so even a lost post-await read cannot stamp the replacement.)
+    if (!deps.stillPending(row.epic_id, row.task_id, row.instance_event_id))
+      continue;
     // Mint the attempt regardless of outcome: the fold stamps the once-marker ONLY on a
-    // terminal `notified`, so a `notify_failed` folds to a no-op and the row re-sweeps.
-    deps.mintAttempted(row.epic_id, row.task_id, result);
+    // terminal `notified` and ONLY on an instance match, so a `notify_failed` folds to a
+    // no-op and the row re-sweeps.
+    deps.mintAttempted(row.epic_id, row.task_id, result, row.instance_event_id);
   }
 }
 
@@ -14064,11 +14136,19 @@ function startDaemonWithExitAttribution(
     epicId: string,
     taskId: string,
     outcome: string | null,
+    expectedInstanceEventId?: number | null,
   ): void {
-    const data =
-      hookEvent === "BlockEscalationAttempted"
-        ? JSON.stringify({ epic_id: epicId, task_id: taskId, outcome })
-        : JSON.stringify({ epic_id: epicId, task_id: taskId });
+    // Keep historical payloads byte-identical when no instance fence is given (the field
+    // only appears once the producer threads the row's `instance_event_id`).
+    const payload: Record<string, unknown> = {
+      epic_id: epicId,
+      task_id: taskId,
+    };
+    if (hookEvent === "BlockEscalationAttempted") payload.outcome = outcome;
+    if (expectedInstanceEventId != null) {
+      payload.expectedInstanceEventId = expectedInstanceEventId;
+    }
+    const data = JSON.stringify(payload);
     try {
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
@@ -14130,7 +14210,17 @@ function startDaemonWithExitAttribution(
     epicId: string,
     taskId: string,
     outcome: BlockHumanNotifiedOutcome,
+    expectedInstanceEventId?: number | null,
   ): void {
+    // Keep historical payloads byte-identical when no instance fence is given.
+    const payload: Record<string, unknown> = {
+      epic_id: epicId,
+      task_id: taskId,
+      outcome,
+    };
+    if (expectedInstanceEventId != null) {
+      payload.expectedInstanceEventId = expectedInstanceEventId;
+    }
     try {
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
@@ -14145,7 +14235,7 @@ function startDaemonWithExitAttribution(
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+        $data: JSON.stringify(payload),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,
@@ -15358,19 +15448,21 @@ function startDaemonWithExitAttribution(
     await runBlockEscalationSweep({
       selectPending: () => selectPendingBlockEscalations(db),
       readBlockedReason: readTaskBlockedReason,
-      mintRequested: (epicId, taskId) =>
+      mintRequested: (epicId, taskId, instanceEventId) =>
         mintBlockEscalationEvent(
           "BlockEscalationRequested",
           epicId,
           taskId,
           null,
+          instanceEventId,
         ),
-      mintAttempted: (epicId, taskId, outcome) =>
+      mintAttempted: (epicId, taskId, outcome, instanceEventId) =>
         mintBlockEscalationEvent(
           "BlockEscalationAttempted",
           epicId,
           taskId,
           outcome,
+          instanceEventId,
         ),
       dispatchOwner: (row) => dispatchBlockOwner(row),
       isEpicBlockHandlingLive: (epicId) => epicBlockHandlingLive(epicId),
@@ -15480,15 +15572,22 @@ function startDaemonWithExitAttribution(
     if (autopilotPaused) return;
     await runBlockHumanNotifySweep({
       selectPending: () => selectPendingBlockHumanNotifications(db),
-      stillPending: (_epicId, taskId) => {
+      stillPending: (_epicId, taskId, instanceEventId) => {
+        // Fence to the EXACT instance: a clear + re-block replaces the row with a fresh
+        // `instance_event_id`, so a match on the OLD instance means THIS page is stale.
         try {
-          return (
-            db
-              .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome IN ('dispatched', 'owner_exhausted') AND human_notified_at IS NULL LIMIT 1",
-              )
-              .get(taskId) != null
+          const instancePredicate =
+            instanceEventId != null
+              ? "instance_event_id = ?"
+              : "instance_event_id IS NULL";
+          const query = db.query(
+            `SELECT 1 FROM dispatch_failures WHERE verb = 'block' AND id = ? AND block_status = 'attempted' AND block_outcome IN ('dispatched', 'owner_exhausted') AND human_notified_at IS NULL AND ${instancePredicate} LIMIT 1`,
           );
+          const row =
+            instanceEventId != null
+              ? query.get(taskId, instanceEventId)
+              : query.get(taskId);
+          return row != null;
         } catch {
           return false;
         }
@@ -15506,8 +15605,8 @@ function startDaemonWithExitAttribution(
           unblockIncidentOpen(taskId),
         ),
       notifyHuman: (row, verdict) => notifyHumanOfBlock(row, verdict),
-      mintAttempted: (epicId, taskId, outcome) =>
-        mintBlockHumanNotifiedEvent(epicId, taskId, outcome),
+      mintAttempted: (epicId, taskId, outcome, instanceEventId) =>
+        mintBlockHumanNotifiedEvent(epicId, taskId, outcome, instanceEventId),
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }

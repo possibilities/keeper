@@ -2302,12 +2302,17 @@ function blockRequestedEvent(
   taskId: string,
   ts: number,
   sessionId = "reconciler",
+  expectedInstanceEventId?: number,
 ): number {
   return insertEvent({
     hook_event: "BlockEscalationRequested",
     session_id: sessionId,
     ts,
-    data: JSON.stringify({ epic_id: epicId, task_id: taskId }),
+    data: JSON.stringify({
+      epic_id: epicId,
+      task_id: taskId,
+      ...(expectedInstanceEventId != null ? { expectedInstanceEventId } : {}),
+    }),
   });
 }
 
@@ -2317,12 +2322,18 @@ function blockAttemptedEvent(
   outcome: string,
   ts: number,
   sessionId = "reconciler",
+  expectedInstanceEventId?: number,
 ): number {
   return insertEvent({
     hook_event: "BlockEscalationAttempted",
     session_id: sessionId,
     ts,
-    data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+    data: JSON.stringify({
+      epic_id: epicId,
+      task_id: taskId,
+      outcome,
+      ...(expectedInstanceEventId != null ? { expectedInstanceEventId } : {}),
+    }),
   });
 }
 
@@ -2332,12 +2343,18 @@ function blockHumanNotifiedEvent(
   outcome: string,
   ts: number,
   sessionId = "reconciler",
+  expectedInstanceEventId?: number,
 ): number {
   return insertEvent({
     hook_event: "BlockHumanNotified",
     session_id: sessionId,
     ts,
-    data: JSON.stringify({ epic_id: epicId, task_id: taskId, outcome }),
+    data: JSON.stringify({
+      epic_id: epicId,
+      task_id: taskId,
+      outcome,
+      ...(expectedInstanceEventId != null ? { expectedInstanceEventId } : {}),
+    }),
   });
 }
 
@@ -2562,6 +2579,109 @@ test("BlockHumanNotified with a malformed payload is a safe no-op (cursor advanc
   expect(
     getBlockLatch("fn-be-mal", "fn-be-mal.1")?.human_notified_at,
   ).toBeNull();
+});
+
+test("BlockEscalationAttempted is INSTANCE-FENCED: a stale attempt for a cleared block instance never terminalizes the replacement instance (and re-folds identically)", () => {
+  const epicId = "fn-be-fence";
+  const taskId = "fn-be-fence.1";
+  // Block instance A (its arm event id becomes the latch `instance_event_id`).
+  const instanceA = armBlockLatch(epicId, taskId, 1700);
+  drainAll();
+  // Clear (leave blocked, DELETE) then re-block → a FRESH instance B.
+  unblockTask(epicId, taskId, "todo");
+  drainAll();
+  const instanceB = armBlockLatch(epicId, taskId, 1900);
+  drainAll();
+  expect(instanceB).not.toBe(instanceA);
+  expect(getBlockLatch(epicId, taskId)?.status).toBe("pending");
+
+  // A STALE terminal attempt fenced to instance A lands while instance B is live.
+  blockAttemptedEvent(
+    epicId,
+    taskId,
+    "owner_exhausted",
+    1950,
+    "reconciler",
+    instanceA,
+  );
+  drainAll();
+  // Instance B is UNTOUCHED — still pending, never terminalized by the stale attempt.
+  expect(getBlockLatch(epicId, taskId)).toEqual({
+    status: "pending",
+    outcome: null,
+    human_notified_at: null,
+  });
+
+  // A terminal attempt fenced to the CURRENT instance B terminalizes it.
+  blockAttemptedEvent(
+    epicId,
+    taskId,
+    "owner_exhausted",
+    1960,
+    "reconciler",
+    instanceB,
+  );
+  drainAll();
+  const terminal = {
+    status: "attempted",
+    outcome: "owner_exhausted",
+    human_notified_at: null,
+  };
+  expect(getBlockLatch(epicId, taskId)).toEqual(terminal);
+
+  // A from-scratch re-fold reproduces the fenced outcome byte-identically.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures WHERE verb = 'block'");
+  db.run("DELETE FROM epics");
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)).toEqual(terminal);
+});
+
+test("BlockHumanNotified is INSTANCE-FENCED: a stale page for a cleared block instance never stamps the replacement instance's marker, preserving ITS required page", () => {
+  const epicId = "fn-be-fence2";
+  const taskId = "fn-be-fence2.1";
+  const instanceA = armBlockLatch(epicId, taskId, 1700);
+  drainAll();
+  // Clear then re-block → instance B, terminalized so it is page-eligible.
+  unblockTask(epicId, taskId, "todo");
+  drainAll();
+  const instanceB = armBlockLatch(epicId, taskId, 1900);
+  blockAttemptedEvent(
+    epicId,
+    taskId,
+    "owner_exhausted",
+    1910,
+    "reconciler",
+    instanceB,
+  );
+  drainAll();
+  expect(instanceB).not.toBe(instanceA);
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBeNull();
+
+  // A STALE page fenced to instance A (its async notify completed after A was cleared)
+  // must NOT stamp instance B's once-marker.
+  blockHumanNotifiedEvent(
+    epicId,
+    taskId,
+    "notified",
+    1950,
+    "reconciler",
+    instanceA,
+  );
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBeNull();
+
+  // Instance B's OWN page (fenced to B) still stamps — its required page is preserved.
+  blockHumanNotifiedEvent(
+    epicId,
+    taskId,
+    "notified",
+    1960,
+    "reconciler",
+    instanceB,
+  );
+  drainAll();
+  expect(getBlockLatch(epicId, taskId)?.human_notified_at).toBe(1960);
 });
 
 test("zero-event projection: a fresh DB has zero dispatch_failures rows", () => {

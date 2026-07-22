@@ -6161,6 +6161,18 @@ function foldInstantDeathTerminal(
 }
 
 /**
+ * Parse the OPTIONAL `expectedInstanceEventId` block-instance fence off a payload — a
+ * positive safe integer, else null (absent / malformed → no fence, byte-identical to the
+ * pre-fence fold). The shared reader for all three block chain payloads (Requested /
+ * Attempted / HumanNotified), mirroring the `MergeHumanNotified` fence.
+ */
+function parseBlockInstanceFence(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null;
+}
+
+/**
  * Parse a `BlockEscalationRequested` event payload. Returns null on any
  * structural miss ({@link foldBlockEscalationRequested} folds null to a safe
  * no-op); NEVER throws. Strict: `epic_id` / `task_id` non-empty strings (the
@@ -6182,7 +6194,13 @@ function extractBlockEscalationRequestedPayload(
     if (typeof parsed.task_id !== "string" || parsed.task_id.length === 0) {
       return null;
     }
-    return { epic_id: parsed.epic_id, task_id: parsed.task_id };
+    return {
+      epic_id: parsed.epic_id,
+      task_id: parsed.task_id,
+      expectedInstanceEventId: parseBlockInstanceFence(
+        parsed.expectedInstanceEventId,
+      ),
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse BlockEscalationRequested payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -6196,12 +6214,24 @@ function extractBlockEscalationRequestedPayload(
  * `block_escalations` latch `pending → requested` for the matching
  * `(epic_id, task_id)`. Idempotent: a missing latch row (the leave-blocked
  * DELETE already cleared it, or a malformed payload) folds to a safe no-op — the
- * UPDATE matches zero rows. Pure function of the payload + the persisted row
- * (`event.id` only, no wall-clock/fs/liveness), so re-fold is byte-deterministic.
+ * UPDATE matches zero rows. Optional instance fence: when the payload names the exact
+ * block instance, the UPDATE also conditions on `instance_event_id` so a stale sweep for
+ * a cleared instance A never touches the replacement instance B (absent field → no extra
+ * predicate, byte-identical historical fold). Pure function of the payload + the persisted
+ * row (`event.id` only, no wall-clock/fs/liveness), so re-fold is byte-deterministic.
  */
 function foldBlockEscalationRequested(db: Database, event: Event): void {
   const payload = extractBlockEscalationRequestedPayload(event);
   if (payload == null) {
+    return;
+  }
+  if (payload.expectedInstanceEventId != null) {
+    db.run(
+      `UPDATE dispatch_failures
+          SET block_status = 'requested', last_event_id = ?, updated_at = ?
+        WHERE verb = 'block' AND id = ? AND instance_event_id = ?`,
+      [event.id, event.ts, payload.task_id, payload.expectedInstanceEventId],
+    );
     return;
   }
   db.run(
@@ -6241,6 +6271,9 @@ function extractBlockEscalationAttemptedPayload(
       epic_id: parsed.epic_id,
       task_id: parsed.task_id,
       outcome: parsed.outcome,
+      expectedInstanceEventId: parseBlockInstanceFence(
+        parsed.expectedInstanceEventId,
+      ),
     };
   } catch (err) {
     console.error(
@@ -6257,15 +6290,19 @@ function extractBlockEscalationAttemptedPayload(
  * and the `skipped_*` surface-and-stop terminals. Ordinary non-terminal launch failures
  * reset to pending. Owning-work re-attach outcomes (`owner_redispatched` /
  * `owner_redispatch_failed`) also reset to pending while incrementing the durable
- * attachment count, whether the launch succeeded or failed. Every branch reads only the
- * payload, event id, and persisted row, so replay is deterministic; a missing latch is a
- * safe no-op.
+ * attachment count, whether the launch succeeded or failed. Optional instance fence: when
+ * the payload names the exact block instance, every UPDATE also conditions on
+ * `instance_event_id` so a stale attempt for a cleared instance A never terminalizes /
+ * counts against the replacement instance B (absent field → no extra predicate,
+ * byte-identical historical fold). Every branch reads only the payload, event id, and
+ * persisted row, so replay is deterministic; a missing latch is a safe no-op.
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
     return;
   }
+  const fence = payload.expectedInstanceEventId;
   const ownerRedispatch =
     payload.outcome === "owner_redispatched" ||
     payload.outcome === "owner_redispatch_failed";
@@ -6276,8 +6313,10 @@ function foldBlockEscalationAttempted(db: Database, event: Event): void {
               block_outcome = ?,
               owner_redispatch_attempts = owner_redispatch_attempts + 1,
               last_event_id = ?, updated_at = ?
-        WHERE verb = 'block' AND id = ?`,
-      [payload.outcome, event.id, event.ts, payload.task_id],
+        WHERE verb = 'block' AND id = ?${fence != null ? " AND instance_event_id = ?" : ""}`,
+      fence != null
+        ? [payload.outcome, event.id, event.ts, payload.task_id, fence]
+        : [payload.outcome, event.id, event.ts, payload.task_id],
     );
     return;
   }
@@ -6287,8 +6326,10 @@ function foldBlockEscalationAttempted(db: Database, event: Event): void {
   db.run(
     `UPDATE dispatch_failures
         SET block_status = ?, block_outcome = ?, last_event_id = ?, updated_at = ?
-      WHERE verb = 'block' AND id = ?`,
-    [status, payload.outcome, event.id, event.ts, payload.task_id],
+      WHERE verb = 'block' AND id = ?${fence != null ? " AND instance_event_id = ?" : ""}`,
+    fence != null
+      ? [status, payload.outcome, event.id, event.ts, payload.task_id, fence]
+      : [status, payload.outcome, event.id, event.ts, payload.task_id],
   );
 }
 
@@ -6747,6 +6788,9 @@ function extractBlockHumanNotifiedPayload(
       epic_id: parsed.epic_id,
       task_id: parsed.task_id,
       outcome: parsed.outcome,
+      expectedInstanceEventId: parseBlockInstanceFence(
+        parsed.expectedInstanceEventId,
+      ),
     };
   } catch (err) {
     console.error(
@@ -6758,15 +6802,19 @@ function extractBlockHumanNotifiedPayload(
 
 /**
  * Fold one synthetic `BlockHumanNotified` event — the terminal "human notified"
- * once-latch of the UNBLOCK path on the collapsed `('block', task_id)` incident row,
+ * once-latch of the block path on the collapsed `('block', task_id)` incident row,
  * sibling in discipline to {@link foldMergeHumanNotified}. For the TERMINAL
- * `notified` outcome (the daemon delivered the one agentbot notification about a
- * declined/dead `unblock::<task>` session) it stamps `human_notified_at = event.ts`
+ * `notified` outcome (the daemon delivered the one agentbot notification about an
+ * exhausted / declined / dead block) it stamps `human_notified_at = event.ts`
  * on the block incident row, gated `human_notified_at IS NULL` so the page fires
  * exactly once per block instance and a re-fold reproduces it byte-identically. Every
  * other outcome (`notify_failed` / unknown) is NON-TERMINAL and folds to a no-op,
- * leaving the marker NULL so the sweep re-attempts on the next tick. The branch reads
- * ONLY the payload `outcome` + `event.ts` (no wall-clock/fs/liveness), so re-fold
+ * leaving the marker NULL so the sweep re-attempts on the next tick. Optional instance
+ * fence: when the payload names the exact block instance the page was sent about, the
+ * stamp also conditions on `instance_event_id` so a page about a cleared instance A that
+ * completes after a replacement instance B is minted never stamps B — preserving B's
+ * required page (absent field → no extra predicate, byte-identical historical fold). The
+ * branch reads ONLY the payload + `event.ts` (no wall-clock/fs/liveness), so re-fold
  * stays byte-deterministic. The UPDATE no-ops on a missing incident row (the
  * leave-blocked DELETE already cleared it) and NEVER clears the incident — only the
  * leave-blocked `TaskSnapshot` transition does, which re-arms the marker at NULL.
@@ -6778,6 +6826,16 @@ function foldBlockHumanNotified(db: Database, event: Event): void {
     return;
   }
   if (payload.outcome !== "notified") {
+    return;
+  }
+  if (payload.expectedInstanceEventId != null) {
+    db.run(
+      `UPDATE dispatch_failures
+          SET human_notified_at = ?
+        WHERE verb = 'block' AND id = ? AND human_notified_at IS NULL
+          AND instance_event_id = ?`,
+      [event.ts, payload.task_id, payload.expectedInstanceEventId],
+    );
     return;
   }
   db.run(
