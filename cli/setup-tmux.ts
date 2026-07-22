@@ -249,7 +249,7 @@ export interface DashRecoveryResult {
 export interface DashServerRecovery {
   clear(): void;
   record(identity: DashServerIdentity): void;
-  recoverTimedOutServer(): DashRecoveryResult;
+  recoverUnresponsiveServer(): DashRecoveryResult;
 }
 
 interface DashServerLease extends DashServerIdentity {
@@ -390,7 +390,7 @@ function fileDashServerRecovery(
       fs.writeFileSync(tmp, `${JSON.stringify(lease)}\n`, { mode: 0o600 });
       fs.renameSync(tmp, path);
     },
-    recoverTimedOutServer: () => {
+    recoverUnresponsiveServer: () => {
       const lease = readLease();
       if (lease === null) {
         return {
@@ -558,8 +558,8 @@ export function buildKillDashServerArgs(): string[] {
   return dashTmux("kill-server");
 }
 
-/** Read the dedicated server's pid and socket after a successful rebuild so a
- * later timed-out `kill-server` can fence that recorded process. */
+/** Read the dedicated server's pid and socket after a successful rebuild so an
+ * unresponsive `kill-server` can fence that recorded process. */
 export function buildDashServerIdentityArgs(): string[] {
   return dashTmux("display-message", "-p", "#{pid} #{socket_path}");
 }
@@ -934,8 +934,8 @@ function runChecked(
 /** Rebuild the dash session from scratch on its dedicated `-L dash` server:
  *  unconditional kill-server, sized new-session, main-pane-width, the four
  *  splits each followed by a layout pass, then re-focus the board pane by its
- *  captured id. A timed-out kill may terminate only the recycle-safe server
- *  identity recorded by an earlier successful rebuild. */
+ *  captured id. An unresponsive kill may terminate only the recycle-safe
+ *  server identity recorded by an earlier successful rebuild. */
 function rebuildDash(spawn: SyncSpawnFn, recovery?: DashServerRecovery): void {
   try {
     const result = run(spawn, buildKillDashServerArgs());
@@ -961,19 +961,20 @@ function rebuildDash(spawn: SyncSpawnFn, recovery?: DashServerRecovery): void {
       );
     }
   } catch (error) {
-    if (
-      !(error instanceof TmuxError) ||
-      error.kind !== "timeout" ||
-      !recovery
-    ) {
+    const recoverable =
+      error instanceof TmuxError &&
+      (error.kind === "timeout" ||
+        (error.kind === "exit" &&
+          error.stderr.trim().toLowerCase() === "server exited unexpectedly"));
+    if (!recoverable || !recovery) {
       throw error;
     }
-    const result = recovery.recoverTimedOutServer();
+    const result = recovery.recoverUnresponsiveServer();
     if (!result.recovered) {
       throw new TmuxError(
         error.argv,
         `${error.stderr}; identity-guarded recovery refused: ${result.detail}`,
-        "timeout",
+        error.kind,
       );
     }
     process.stderr.write(

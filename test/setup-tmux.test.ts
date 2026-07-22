@@ -1629,7 +1629,7 @@ describe("main() provision / sweep / teardown roles", () => {
     const recorded: Array<{ pid: number; socketPath: string }> = [];
     const dashRecovery: DashServerRecovery = {
       clear: () => recoveryCalls.push("clear"),
-      recoverTimedOutServer: () => {
+      recoverUnresponsiveServer: () => {
         recoveryCalls.push("recover");
         return { recovered: true, detail: "terminated recorded server" };
       },
@@ -1679,12 +1679,62 @@ describe("main() provision / sweep / teardown roles", () => {
     expect(output.stdout).toContain("'dash' rebuilt");
   });
 
+  test("'server exited unexpectedly' recovers through the identity owner, then rebuilds", async () => {
+    const calls: string[][] = [];
+    const recoveryCalls: string[] = [];
+    const dashRecovery: DashServerRecovery = {
+      clear: () => recoveryCalls.push("clear"),
+      recoverUnresponsiveServer: () => {
+        recoveryCalls.push("recover");
+        return { recovered: true, detail: "terminated recorded server" };
+      },
+      record: () => recoveryCalls.push("record"),
+    };
+    const spawn: SyncSpawnFn = (cmd) => {
+      calls.push([...cmd]);
+      if (cmd.join("\0") === buildKillDashServerArgs().join("\0")) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("server exited unexpectedly\n"),
+        };
+      }
+      if (cmd.join("\0") === buildDashServerIdentityArgs().join("\0")) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(`${process.pid} /private/tmp/keeper-test/dash\n`),
+          stderr: Buffer.from(""),
+        };
+      }
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("no session"),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(cmd.includes("new-session") ? "%0" : ""),
+        stderr: Buffer.from(""),
+      };
+    };
+
+    const output = await runProvision({ spawn, dashRecovery });
+    expect(recoveryCalls).toEqual(["recover", "record"]);
+    expect(
+      calls.some((cmd) => cmd[1] === "-L" && cmd[3] === "new-session"),
+    ).toBe(true);
+    expect(output.stderr).toContain("recovered unresponsive dash server");
+    expect(output.stdout).toContain("'dash' rebuilt");
+  });
+
   test("a timed-out dash kill with no recorded owner fails open without claiming a rebuild", async () => {
     const calls: string[][] = [];
     const dashRecovery: DashServerRecovery = {
       clear: () => undefined,
       record: () => undefined,
-      recoverTimedOutServer: () => ({
+      recoverUnresponsiveServer: () => ({
         recovered: false,
         detail: "identity mismatch",
       }),
@@ -1765,7 +1815,7 @@ describe("main() provision / sweep / teardown roles", () => {
         clearCalls++;
       },
       record: () => undefined,
-      recoverTimedOutServer: () => ({ recovered: true, detail: "unused" }),
+      recoverUnresponsiveServer: () => ({ recovered: true, detail: "unused" }),
     };
     const spawn: SyncSpawnFn = (cmd) => {
       calls.push([...cmd]);
