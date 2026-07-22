@@ -46,6 +46,35 @@ export interface EquivalenceCell {
 export type WorkerProvider = "claude" | "gpt";
 
 /**
+ * The TRI-STATE of a `worker_provider` pin read, which NEVER collapses UNKNOWN to
+ * ABSENT: `absent` is a genuine "no pin configured" (pass through, dispatch the
+ * assigned cell), `value` is the observed pin, and `unknown` is an UNOBSERVABLE
+ * authority — a present-but-invalid non-null cell, or (mapped at the read site) a
+ * read that THREW. A cell-bearing work launch that cannot observe the durable pin
+ * REFUSES rather than silently dispatching the unpinned assigned cell.
+ */
+export type ProviderPinRead =
+  | { readonly kind: "absent" }
+  | { readonly kind: "value"; readonly provider: WorkerProvider }
+  | { readonly kind: "unknown"; readonly detail: string };
+
+/** Tri-state a SUCCESSFULLY-read `autopilot_state.worker_provider` cell: a null /
+ *  undefined cell is `absent`, `"claude"` / `"gpt"` is the pinned `value`, and ANY
+ *  other present non-null value is `unknown` (present-but-invalid — never silently
+ *  the unpinned default). A read that THROWS is `unknown` too, mapped by the caller
+ *  wrapping its own read. The SINGLE classifier the manual dispatch path and the
+ *  daemon block-owner redispatch share so their pin authority never drifts. Pure. */
+export function classifyProviderPin(raw: unknown): ProviderPinRead {
+  if (raw === null || raw === undefined) return { kind: "absent" };
+  if (raw === "claude" || raw === "gpt")
+    return { kind: "value", provider: raw };
+  return {
+    kind: "unknown",
+    detail: `present but invalid worker_provider value ${JSON.stringify(raw)}`,
+  };
+}
+
+/**
  * The reduced runtime lookup the pure `applyProviderConstraint` reads — built
  * PRODUCER-SIDE once per cycle from the parsed config and threaded onto the
  * reconcile snapshot (the {@link ProviderEquivalenceSnapshot} field), mirroring

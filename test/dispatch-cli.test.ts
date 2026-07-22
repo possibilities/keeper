@@ -544,6 +544,64 @@ test("plan work: a NULL worker_provider pin is byte-identical to today (assigned
   expect(r.spec?.wrappedEnvelope).toBeUndefined();
 });
 
+// The pin AUTHORITY read is tri-stated: a THROW is UNKNOWN, not ABSENT. A durable
+// gpt pin whose value a by-hand launch cannot observe must NOT collapse to the
+// unpinned assigned Claude cell — a cell-bearing work launch refuses instead.
+test("plan work (cell-bearing): a pin-query THROW refuses — UNKNOWN never collapses to the assigned cell", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      // The worker_provider pin read throws → UNKNOWN (not "no pin").
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      throwOn: "autopilot_state",
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched — no fallback to opus
+  expect(r.stderr).toContain("worker-provider-pin-unknown");
+  expect(r.stderr).toContain("worker_provider");
+});
+
+// A present-but-INVALID pin value is UNKNOWN too — an unobservable authority, not
+// a silent "no pin" — so a cell-bearing launch refuses rather than dispatch opus.
+test("plan work (cell-bearing): a present-but-INVALID pin value refuses (UNKNOWN, not absent)", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir, { model: "opus", tier: "max" }),
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "banana" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined(); // never launched — no fallback to opus
+  expect(r.stderr).toContain("worker-provider-pin-unknown");
+});
+
+// A cell-LESS task is pin-independent: an UNKNOWN pin (here present-invalid) never
+// refuses it, because a cell-less launch invents no translation to begin with.
+test("plan work (cell-less): an UNKNOWN pin does NOT refuse — cell-less invents no translation", async () => {
+  writeMatrix(SOL_MATRIX);
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({
+      epics: epicWith(dir), // no {model,tier} → cell-less
+      autopilotState: [
+        { id: 1, paused: 1, worker_provider: "banana" } as unknown as Row,
+      ],
+    }),
+    dirExists: () => true,
+    probeShadowingWorkManifest: () => null,
+  });
+  expect(r.code).toBeUndefined(); // launched — pin-independent
+  expect(r.spec).toBeDefined();
+  expect(r.spec?.dispatchedModel).toBeUndefined();
+});
+
 // A provider-constraint READ ERROR (the equivalence map fails to load/parse at
 // dispatch) adopts the autopilot owner's fail-closed posture: refuse with the
 // typed map-malformed reason (naming the config + error class), NEVER a silent
@@ -673,15 +731,21 @@ test("plan work: --force deliberately overrides the worktree-mode refusal and la
   expect(r.spec).toBeDefined();
 });
 
-test("plan work: a daemon-unreachable worktree read FAILS OPEN (launches, no refusal)", async () => {
+test("plan work (cell-less): a thrown autopilot_state read FAILS OPEN — race + worktree geometry, pin-independent", async () => {
+  // A CELL-LESS task (no {model,tier}) invents no provider translation, so a
+  // thrown autopilot_state read (race guard + worktree-mode geometry + the pin all
+  // unreachable) fails open — a manual dispatch is the recovery tool when the
+  // daemon is down. This does NOT bless a CELL-BEARING task's UNKNOWN pin: that
+  // refuses (below). The fail-open here covers only the worktree/geometry read.
   const r = await runDispatch(["work::fn-1-x.1"], {
     query: makeQuery({ epics: epicWith(dir), throwOn: "autopilot_state" }),
     dirExists: () => true,
   });
-  // The race guard AND the worktree read both fail open on the throw — a manual
-  // dispatch is the recovery tool when the daemon is down, so it must not block.
-  expect(r.code).toBeUndefined();
+  expect(r.code).toBeUndefined(); // launched — cell-less, geometry read fails open
   expect(r.spec).toBeDefined();
+  // Cell-less ⇒ no cell to translate: no dispatched/constraint fields leak.
+  expect(r.spec?.dispatchedModel).toBeUndefined();
+  expect(r.spec?.dispatchConstraint).toBeUndefined();
 });
 
 test("plan close: worktree mode + a cell axis are BOTH ignored (no refusal, no --plugin-dir)", async () => {

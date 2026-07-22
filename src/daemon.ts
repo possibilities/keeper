@@ -339,7 +339,9 @@ import type {
   RecheckPendingMessage,
 } from "./plan-worker";
 import {
+  classifyProviderPin,
   loadProviderEquivalenceSnapshot,
+  type ProviderPinRead,
   type WorkerProvider,
 } from "./provider-equivalence";
 import {
@@ -9593,6 +9595,29 @@ export function runNativeCrashAttributionProbe(deps: {
 }
 
 /**
+ * Read the durable `worker_provider` pin off the daemon's own db as a TRI-STATE
+ * (ADR 0047), never collapsing UNKNOWN to ABSENT: a successful null/absent cell is
+ * a genuine "no pin", a present `"claude"`/`"gpt"` cell is the pinned value, and a
+ * present-but-invalid value OR a THROWING read is UNKNOWN — the block-owner
+ * redispatch refuses a cell-bearing launch on UNKNOWN rather than dispatching the
+ * unpinned assigned cell. Module-level (not a closure) so a unit test can drive its
+ * classification and its real catch through a seeded db and a throwing stub.
+ */
+export function readWorkerProviderPin(db: Database): ProviderPinRead {
+  try {
+    const row = db
+      .query("SELECT worker_provider FROM autopilot_state WHERE id = 1")
+      .get() as { worker_provider: unknown } | null;
+    return classifyProviderPin(row?.worker_provider);
+  } catch (err) {
+    return {
+      kind: "unknown",
+      detail: `autopilot_state read failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
  * but returns a handle whose `stop()` tears everything down WITHOUT
@@ -15257,21 +15282,6 @@ function startDaemonWithExitAttribution(
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
-  function readWorkerProvider(): WorkerProvider | null {
-    try {
-      const row = db
-        .query("SELECT worker_provider FROM autopilot_state WHERE id = 1")
-        .get() as { worker_provider: string | null } | null;
-      return row?.worker_provider === "claude" || row?.worker_provider === "gpt"
-        ? row.worker_provider
-        : null;
-    } catch {
-      // Match the manual dispatch recovery posture: an unreadable pin does not
-      // silently prevent the owner attachment from using its assigned cell.
-      return null;
-    }
-  }
-
   function blockOwnerHostMatrix(): {
     matrix: MatrixV2;
     axes: HostMatrixAxes;
@@ -15341,7 +15351,18 @@ function startDaemonWithExitAttribution(
 
     const host = blockOwnerHostMatrix();
     if (host == null) return null;
-    const provider = readWorkerProvider();
+    // Tri-state the pin (ADR 0047): an UNKNOWN read (a THROW or a present-but-
+    // invalid value) refuses this cell-bearing redispatch via the visible
+    // dispatch-failed path, NEVER the unpinned assigned cell. Ranks after the
+    // bad-matrix reject, mirroring the manual dispatch order.
+    const pinRead = readWorkerProviderPin(db);
+    if (pinRead.kind === "unknown") {
+      console.error(
+        `[keeperd] # block owner redispatch provider pin read UNKNOWN task=${row.task_id} detail=${pinRead.detail}`,
+      );
+      return null;
+    }
+    const provider = pinRead.kind === "value" ? pinRead.provider : null;
     let effectiveModel = row.model;
     let effectiveTier = row.tier;
     let dispatchedModel: string | null = null;

@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { loadProviderEquivalenceConfig as loadPlanIslandConfig } from "../plugins/plan/src/provider_equivalence.ts";
 import {
   buildProviderEquivalenceMap,
+  classifyProviderPin,
   coerceProviderEquivalenceConfig,
   loadProviderEquivalenceConfig,
   loadProviderEquivalenceSnapshot,
@@ -130,6 +131,36 @@ describe("loadProviderEquivalenceSnapshot fail-closed", () => {
     );
     expect(snap.ok).toBe(false);
     if (!snap.ok) expect(snap.detail).toContain("does-not-exist.yaml");
+  });
+});
+
+describe("classifyProviderPin tri-state (ADR 0047)", () => {
+  test("a null / undefined / absent cell is ABSENT (a genuine no-pin)", () => {
+    expect(classifyProviderPin(null)).toEqual({ kind: "absent" });
+    expect(classifyProviderPin(undefined)).toEqual({ kind: "absent" });
+  });
+
+  test("a valid claude / gpt cell is the pinned VALUE", () => {
+    expect(classifyProviderPin("claude")).toEqual({
+      kind: "value",
+      provider: "claude",
+    });
+    expect(classifyProviderPin("gpt")).toEqual({
+      kind: "value",
+      provider: "gpt",
+    });
+  });
+
+  test("ANY present non-null non-{claude,gpt} value is UNKNOWN, never collapsed to absent", () => {
+    // A present-but-invalid pin is an unobservable authority, NOT "no pin" — a
+    // cell-bearing launch must refuse on it, so it is UNKNOWN (not ABSENT).
+    for (const raw of ["", "codex", "banana", 42, {}, [], true]) {
+      const r = classifyProviderPin(raw);
+      expect(r.kind).toBe("unknown");
+      if (r.kind === "unknown") {
+        expect(r.detail).toContain("worker_provider");
+      }
+    }
   });
 });
 

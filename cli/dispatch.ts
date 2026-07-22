@@ -67,8 +67,10 @@ import { keeperAgentLaunch } from "../src/exec-backend";
 import { buildLauncherArgvPrefix } from "../src/keeper-agent-path";
 import type { QueryFrame, Row } from "../src/protocol";
 import {
+  classifyProviderPin,
   loadProviderEquivalenceSnapshot,
   type ProviderEquivalenceSnapshot,
+  type ProviderPinRead,
 } from "../src/provider-equivalence";
 import type { HostMatrixAxes } from "../src/reconcile-core";
 import {
@@ -743,7 +745,8 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       // Apply the `worker_provider` pin (ADR 0047) BEFORE composing the cell so a
       // manual dispatch and autopilot resolve the SAME dispatched cell for the same
       // task + pin. Read the pin client-side (same query seam as the worktree
-      // refusal); a daemon-unreachable read FAILS OPEN (dispatch the assigned cell).
+      // refusal) as a TRI-STATE — an UNKNOWN pin refuses a cell-bearing launch
+      // rather than collapsing to the unpinned assigned cell (below).
       const assignedModel = cwdResult.model ?? null;
       const assignedTier = cwdResult.tier ?? null;
       let composeModel = assignedModel;
@@ -767,14 +770,43 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       } catch (err) {
         if (!(err instanceof MatrixConfigError)) throw err;
       }
+      // Read the `worker_provider` pin as a TRI-STATE, never collapsing UNKNOWN to
+      // ABSENT. A successful null/absent cell is a genuine "no pin" (pass through);
+      // a read THROW or a present-but-INVALID value is UNKNOWN — the durable pin
+      // authority is unobservable, so a CELL-BEARING work launch refuses rather than
+      // dispatching the unpinned assigned cell (the reconciler applies its durable
+      // pin FIRST; a by-hand launch must not undercut it on a flaky read).
+      let pinRead: ProviderPinRead;
       try {
         const st = await query("autopilot_state", { id: 1 });
-        const raw = (st[0] as { worker_provider?: unknown } | undefined)
-          ?.worker_provider;
-        workerProvider = raw === "claude" || raw === "gpt" ? raw : null;
-      } catch {
-        // Transient read failure — fail open, dispatch the assigned cell.
+        pinRead = classifyProviderPin(
+          (st[0] as { worker_provider?: unknown } | undefined)?.worker_provider,
+        );
+      } catch (err) {
+        pinRead = {
+          kind: "unknown",
+          detail: `autopilot_state read failed: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
+      // A cell-bearing work launch under an UNKNOWN pin refuses — NEVER the
+      // assigned-cell fallback. Gated on `axes` so the bad-matrix reject ranks
+      // first (the reconciler's matrix-first order); a genuinely cell-less task
+      // invents no translation, so it stays pin-independent and never refuses here.
+      if (
+        pinRead.kind === "unknown" &&
+        assignedModel !== null &&
+        assignedTier !== null &&
+        axes !== null
+      ) {
+        die(
+          `refusing to launch ${claudeName}: the autopilot_state.worker_provider ` +
+            `pin read is UNKNOWN (${pinRead.detail}) — refusing a cell-bearing work ` +
+            "launch rather than dispatching the unpinned assigned cell (a durable pin " +
+            "could translate it into the other family); restore the daemon read or fix " +
+            "the pin value, then retry (worker-provider-pin-unknown)",
+        );
+      }
+      workerProvider = pinRead.kind === "value" ? pinRead.provider : null;
       if (
         workerProvider !== null &&
         assignedModel !== null &&

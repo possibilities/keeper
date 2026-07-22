@@ -188,6 +188,7 @@ import {
   readServeHealthHistory,
   readSpillDocument,
   readTaskBlockedReason,
+  readWorkerProviderPin,
   reclassifyPoisonDeadLetter,
   recoverOneDeadLetter,
   repairCheckoutDirty,
@@ -1035,6 +1036,37 @@ test("boot-drain seed: a durable AutopilotPaused{paused:false} resumes PLAYING; 
     .all() as Record<string, unknown>[];
   expect(projectAutopilotPaused(emptyRows)).toBeNull();
   emptyDb.close();
+});
+
+test("readWorkerProviderPin: tri-states the pin, and a real read failure is UNKNOWN (never absent)", () => {
+  // A minimal db stub over the ONE call the reader makes (`query(sql).get()`) so
+  // the success classification is deterministic; the throw case uses a REAL db.
+  const pinDb = (get: () => unknown) =>
+    ({ query: () => ({ get }) }) as unknown as Parameters<
+      typeof readWorkerProviderPin
+    >[0];
+
+  // Success cases thread the raw cell through the shared classifier.
+  expect(
+    readWorkerProviderPin(pinDb(() => ({ worker_provider: "gpt" }))),
+  ).toEqual({ kind: "value", provider: "gpt" });
+  // A null cell AND a missing row are both a genuine "no pin".
+  expect(
+    readWorkerProviderPin(pinDb(() => ({ worker_provider: null }))),
+  ).toEqual({ kind: "absent" });
+  expect(readWorkerProviderPin(pinDb(() => null))).toEqual({ kind: "absent" });
+  // A present-but-invalid value is UNKNOWN — never the silent unpinned default.
+  expect(
+    readWorkerProviderPin(pinDb(() => ({ worker_provider: "banana" }))).kind,
+  ).toBe("unknown");
+
+  // A REAL read failure (a closed db) trips the reader's REAL catch → UNKNOWN, the
+  // fail-closed authority the old fail-open collapsed to a silent null.
+  const { db } = freshMemDb();
+  db.close();
+  const closed = readWorkerProviderPin(db);
+  expect(closed.kind).toBe("unknown");
+  if (closed.kind === "unknown") expect(closed.detail).toContain("read failed");
 });
 
 test("withBootDrainCheckpointTuning disables autocheckpoint inside the body and restores it after", () => {
