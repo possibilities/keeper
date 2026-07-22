@@ -288,6 +288,147 @@ describe("checkEpicTree repo-path semantics + toggle byte-parity", () => {
   });
 });
 
+describe("done-epic history tolerance (validate opt-in)", () => {
+  /** Run checkEpicTree over a lone epic (no tasks) with the tolerance flag set,
+   * so the demote routing is exercised in isolation. */
+  function checkLone(
+    fx: Fixture,
+    eid: string,
+    tolerate: boolean,
+  ): { errors: string[]; warnings: string[] } {
+    const epic = JSON.parse(
+      readFileSync(join(fx.dataDir, "epics", `${eid}.json`), "utf-8"),
+    );
+    const [errors, warnings] = checkEpicTree(
+      eid,
+      epic,
+      {},
+      {},
+      {
+        dataDir: fx.dataDir,
+        allEpicIds: new Set([eid]),
+        stateStore: null,
+        checkFilesystemRepos: true,
+        allEpicDeps: { [eid]: epic.depends_on_epics ?? [] },
+        tolerateDoneEpicDebris: tolerate,
+      },
+    );
+    return { errors, warnings };
+  }
+
+  test("done epic: retired repo + dangling cross-epic dep demote to warnings", () => {
+    const fx = makeFixture();
+    try {
+      writeEpic(fx, "fn-1-hist", {
+        status: "done",
+        primary_repo: "/no/such/retired/repo",
+        touched_repos: ["/no/such/retired/repo"],
+        depends_on_epics: ["fn-99-ghost"],
+      });
+      const out = checkLone(fx, "fn-1-hist", true);
+      // Nothing red — the debris is unfixable history, surfaced as warnings.
+      expect(out.errors).toEqual([]);
+      expect(out.warnings).toContain(
+        "Epic fn-1-hist: dependency fn-99-ghost does not exist",
+      );
+      expect(out.warnings).toContain(
+        "Epic fn-1-hist: primary_repo: path does not exist: /no/such/retired/repo",
+      );
+      expect(out.warnings).toContain(
+        "Epic fn-1-hist: touched_repos entry: path does not exist: /no/such/retired/repo",
+      );
+    } finally {
+      rmSync(fx.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a LIVE epic is never demoted, even with the tolerance flag on", () => {
+    const fx = makeFixture();
+    try {
+      writeEpic(fx, "fn-1-live", {
+        status: "open",
+        primary_repo: "/no/such/retired/repo",
+        touched_repos: ["/no/such/retired/repo"],
+        depends_on_epics: ["fn-99-ghost"],
+      });
+      const out = checkLone(fx, "fn-1-live", true);
+      expect(out.warnings).toEqual([]);
+      expect(out.errors).toContain(
+        "Epic fn-1-live: dependency fn-99-ghost does not exist",
+      );
+      expect(out.errors).toContain(
+        "Epic fn-1-live: primary_repo: path does not exist: /no/such/retired/repo",
+      );
+      expect(out.errors).toContain(
+        "Epic fn-1-live: touched_repos entry: path does not exist: /no/such/retired/repo",
+      );
+    } finally {
+      rmSync(fx.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a done epic WITHOUT the flag stays red — gate/in-memory callers unchanged", () => {
+    const fx = makeFixture();
+    try {
+      writeEpic(fx, "fn-1-gate", {
+        status: "done",
+        primary_repo: "/no/such/retired/repo",
+        depends_on_epics: ["fn-99-ghost"],
+      });
+      const out = checkLone(fx, "fn-1-gate", false);
+      expect(out.warnings).toEqual([]);
+      expect(out.errors).toContain(
+        "Epic fn-1-gate: dependency fn-99-ghost does not exist",
+      );
+      expect(out.errors).toContain(
+        "Epic fn-1-gate: primary_repo: path does not exist: /no/such/retired/repo",
+      );
+    } finally {
+      rmSync(fx.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the epic-done coherence error is NOT demoted — a truly broken done epic stays red", () => {
+    const fx = makeFixture();
+    try {
+      // Done epic with an unfinished task: a real integrity fault, never debris.
+      writeEpic(fx, "fn-1-incoherent", { status: "done" });
+      writeTask(fx, "fn-1-incoherent.1", { status: "todo" });
+      const epic = JSON.parse(
+        readFileSync(
+          join(fx.dataDir, "epics", "fn-1-incoherent.json"),
+          "utf-8",
+        ),
+      );
+      const task = JSON.parse(
+        readFileSync(
+          join(fx.dataDir, "tasks", "fn-1-incoherent.1.json"),
+          "utf-8",
+        ),
+      );
+      const [errors] = checkEpicTree(
+        "fn-1-incoherent",
+        epic,
+        { "fn-1-incoherent.1": task },
+        { "fn-1-incoherent.1": TASK_SPEC },
+        {
+          dataDir: fx.dataDir,
+          allEpicIds: new Set(["fn-1-incoherent"]),
+          stateStore: null,
+          checkFilesystemRepos: true,
+          allEpicDeps: { "fn-1-incoherent": [] },
+          tolerateDoneEpicDebris: true,
+        },
+      );
+      expect(errors).toContain(
+        "Epic fn-1-incoherent: status is 'done' but task fn-1-incoherent.1 has status 'todo'",
+      );
+    } finally {
+      rmSync(fx.dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("INTEGRITY_GATE_VERBS membership", () => {
   test("matches the canonical list exactly (order included)", () => {
     const canonical = [

@@ -52,8 +52,9 @@ export function runList(opts: {
   format: OutputFormat | null;
   limit: number;
   offset: number;
+  status: EpicStatusFilter;
 }): string {
-  const { format, limit, offset } = opts;
+  const { format, limit, offset, status } = opts;
   const ctx = resolveProject(format);
   const store = new LocalFileStateStore(ctx.stateDir);
 
@@ -71,13 +72,13 @@ export function runList(opts: {
     }
   }
 
-  epics.sort(compareEpics);
+  const ordered = orderEpicsForListing(epics, status);
 
-  // Cap counts epics (top-level rows); page after the sort so --offset is
+  // Cap counts epics (top-level rows); page after the order so --offset is
   // stable. Only the paged epics load their nested tasks — total stays the
-  // full epic count.
-  const total = epics.length;
-  const pagedEpics = epics.slice(offset, offset + limit);
+  // filtered epic count.
+  const total = ordered.length;
+  const pagedEpics = ordered.slice(offset, offset + limit);
 
   const tasksDir = join(ctx.dataDir, "tasks");
   const tasksDirExists = existsSync(tasksDir);
@@ -128,6 +129,81 @@ export function runList(opts: {
     (d) => renderHuman(d as { epics?: ListEpic[] }),
   );
   return ctx.projectPath;
+}
+
+/** The listing `--status` selector. "default" is the open-first composite the
+ * shared listing verbs use when no flag is passed. */
+export type EpicStatusFilter = "open" | "done" | "all" | "default";
+
+/** Parse a raw `--status` value into the selector: an absent flag (null) is the
+ * "default" open-first composite; "open"/"done"/"all" pass through; any other
+ * value is an invalid choice the caller reports (returns null). */
+export function parseEpicStatusFilter(
+  raw: string | null,
+): EpicStatusFilter | null {
+  if (raw === null) {
+    return "default";
+  }
+  if (raw === "open" || raw === "done" || raw === "all") {
+    return raw;
+  }
+  return null;
+}
+
+/** Order + status-filter the full epic set BEFORE paging, shared by the `epics`
+ * and `list` verbs. The "default" composite surfaces live work first — open
+ * epics ascending by number, then done (any non-open) epics most-recent-first —
+ * so a board of hundreds of closed epics never pages the open ones out. "open"
+ * / "done" restrict to that section in the same per-section order; "all" is the
+ * flat ascending-by-number listing (equal to the historical order, the scripted
+ * escape hatch). */
+export function orderEpicsForListing(
+  epics: Record<string, unknown>[],
+  filter: EpicStatusFilter,
+): Record<string, unknown>[] {
+  if (filter === "all") {
+    return [...epics].sort(compareEpics);
+  }
+  const open = epics.filter(isOpenEpic);
+  if (filter === "open") {
+    return open.sort(compareEpics);
+  }
+  const done = epics.filter((e) => !isOpenEpic(e));
+  if (filter === "done") {
+    return done.sort(compareDoneRecent);
+  }
+  return [...open.sort(compareEpics), ...done.sort(compareDoneRecent)];
+}
+
+/** An epic counts as open only when its status is exactly "open"; every other
+ * status (done, or any unexpected value) falls into the history section so no
+ * epic is ever dropped from a listing. */
+function isOpenEpic(e: Record<string, unknown>): boolean {
+  return (typeof e.status === "string" ? e.status : "open") === "open";
+}
+
+/** Sort done epics newest-first: updated_at descending (its done transition
+ * bumps the field), then epic number and id string descending as tiebreakers so
+ * the order is a stable total order. */
+function compareDoneRecent(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const ua = recencyKey(a);
+  const ub = recencyKey(b);
+  if (ua !== ub) {
+    return ua < ub ? 1 : -1;
+  }
+  const ka = epicSortKey(a);
+  const kb = epicSortKey(b);
+  if (ka !== kb) {
+    return kb - ka;
+  }
+  return compareIds(idOf(b), idOf(a));
+}
+
+function recencyKey(e: Record<string, unknown>): string {
+  return typeof e.updated_at === "string" ? e.updated_at : "";
 }
 
 /** Sort epics by epic number (unparseable last), id string as tiebreaker so

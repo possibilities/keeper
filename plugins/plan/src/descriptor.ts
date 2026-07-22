@@ -99,6 +99,11 @@ const OPT_EPIC: OptionDescriptor = {
   takesValue: true,
   summary: "Scope to one epic id",
 };
+const OPT_STATUS_LISTING: OptionDescriptor = {
+  name: "--status",
+  takesValue: true,
+  summary: "Filter: open|done|all (default: open first, then recent done)",
+};
 
 // ── subgroup verb sets ───────────────────────────────────────────────────────
 //
@@ -488,7 +493,7 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
   {
     name: "epics",
     summary: "List all epics with the resolved project name and path.",
-    options: [OPT_LIMIT, OPT_OFFSET],
+    options: [OPT_STATUS_LISTING, OPT_LIMIT, OPT_OFFSET],
   },
   {
     name: "epic-question",
@@ -535,7 +540,7 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
   {
     name: "list",
     summary: "List all epics and their tasks in a tree view.",
-    options: [OPT_LIMIT, OPT_OFFSET],
+    options: [OPT_STATUS_LISTING, OPT_LIMIT, OPT_OFFSET],
   },
   {
     name: "mv-repo",

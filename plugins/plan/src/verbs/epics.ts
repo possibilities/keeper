@@ -8,10 +8,10 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { formatOutput, type OutputFormat } from "../format.ts";
-import { parseId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { LocalFileStateStore, loadJsonSafe } from "../store.ts";
+import { type EpicStatusFilter, orderEpicsForListing } from "./list.ts";
 
 interface TaskSummary {
   total: number;
@@ -59,8 +59,9 @@ export function runEpics(opts: {
   format: OutputFormat | null;
   limit: number;
   offset: number;
+  status: EpicStatusFilter;
 }): string {
-  const { format, limit, offset } = opts;
+  const { format, limit, offset, status } = opts;
   const ctx = resolveProject(format);
   const store = new LocalFileStateStore(ctx.stateDir);
 
@@ -78,15 +79,13 @@ export function runEpics(opts: {
     }
   }
 
-  // Sort by epic number; unparseable ids -> 999 (sort last). Stable, matching
-  // Python's list.sort.
-  epics.sort((a, b) => sortKey(a) - sortKey(b));
+  const ordered = orderEpicsForListing(epics, status);
 
-  // Cap counts epics (top-level rows); page after the sort so --offset is
+  // Cap counts epics (top-level rows); page after the order so --offset is
   // stable. Only the paged epics load their per-epic task summary — total stays
-  // the full epic count. Mirrors the list/tasks paging contract.
-  const total = epics.length;
-  const pagedEpics = epics.slice(offset, offset + limit);
+  // the filtered epic count. Mirrors the list/tasks paging contract.
+  const total = ordered.length;
+  const pagedEpics = ordered.slice(offset, offset + limit);
 
   const tasksDir = join(ctx.dataDir, "tasks");
   const tasksDirExists = existsSync(tasksDir);
@@ -158,12 +157,6 @@ export function runEpics(opts: {
 
 function isStatusKey(s: string): s is StatusKey {
   return (STATUS_KEYS as readonly string[]).includes(s);
-}
-
-function sortKey(e: Record<string, unknown>): number {
-  const id = typeof e.id === "string" ? e.id : "";
-  const [epicNum] = parseId(id);
-  return epicNum ?? 999;
 }
 
 /** Match Path.glob(`<eid>.*.json`): filename starts `<eid>.`, ends `.json`. */

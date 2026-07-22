@@ -49,7 +49,11 @@ import { runFindTaskCommit } from "./verbs/find_task_commit.ts";
 import { runFollowupSubmit } from "./verbs/followup_submit.ts";
 import { runGist } from "./verbs/gist.ts";
 import { runInit } from "./verbs/init.ts";
-import { runList } from "./verbs/list.ts";
+import {
+  type EpicStatusFilter,
+  parseEpicStatusFilter,
+  runList,
+} from "./verbs/list.ts";
 import { runMvRepo } from "./verbs/mv_repo.ts";
 import { runReady } from "./verbs/ready.ts";
 import { runReconcile } from "./verbs/reconcile.ts";
@@ -765,6 +769,7 @@ function dispatchCommand(
         format,
         limit: readIntOption(rest, "--limit", 50, 1),
         offset: readIntOption(rest, "--offset", 0, 0),
+        status: readEpicStatusFilter(rest),
       });
       break;
     case "claim":
@@ -963,6 +968,7 @@ function dispatchCommand(
         format,
         limit: readIntOption(rest, "--limit", 50, 1),
         offset: readIntOption(rest, "--offset", 0, 0),
+        status: readEpicStatusFilter(rest),
       });
       break;
     case "mv-repo": {
@@ -1091,6 +1097,21 @@ function readIntOption(
     process.exit(2);
   }
   return n;
+}
+
+/** Read the listing `--status` filter, defaulting to the open-first composite
+ * when absent. An unrecognized value is CLI misuse: a clear stderr line + exit 2
+ * (Click choice-option parity), mirroring readIntOption's malformed-value path. */
+function readEpicStatusFilter(rest: string[]): EpicStatusFilter {
+  const raw = readOption(rest, "--status");
+  const filter = parseEpicStatusFilter(raw);
+  if (filter === null) {
+    process.stderr.write(
+      `keeper plan: --status must be one of open, done, all (got '${raw}')\n`,
+    );
+    process.exit(2);
+  }
+  return filter;
 }
 
 /** The first positional (non-`--`-prefixed) arg, or "" when absent. A value

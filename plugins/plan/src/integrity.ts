@@ -107,6 +107,12 @@ export interface CheckEpicTreeOptions {
   allEpicDeps?: Record<string, string[]> | null;
   allGlobalEpicIds?: Record<string, string> | null;
   epicSpecContent?: string | null;
+  // When true AND the epic's status is "done", retired-repo path failures and
+  // dangling cross-epic deps degrade from errors to warnings — a done epic is
+  // frozen history whose references can no longer be repaired. Only the validate
+  // verb opts in; every live epic and every gate/in-memory caller keeps hard
+  // errors byte-identically.
+  tolerateDoneEpicDebris?: boolean;
 }
 
 /** Pure structural-integrity check returning [errors, warnings]. The single
@@ -127,10 +133,19 @@ export function checkEpicTree(
     allEpicDeps = null,
     allGlobalEpicIds = null,
     epicSpecContent = null,
+    tolerateDoneEpicDebris = false,
   } = opts;
 
   const errors: string[] = [];
   const warnings: string[] = [];
+
+  // Retired-repo path failures and dangling cross-epic deps on a DONE epic are
+  // unfixable history; route them here so the validate verb's tolerance demotes
+  // them to warnings while every live epic keeps them as hard errors.
+  const demoteDebris = tolerateDoneEpicDebris && epicData.status === "done";
+  const debrisSink = (msg: string): void => {
+    (demoteDebris ? warnings : errors).push(msg);
+  };
 
   // --- Epic meta -------------------------------------------------------
   for (const field of ["id", "title", "status"]) {
@@ -165,7 +180,7 @@ export function checkEpicTree(
       !allEpicIds.has(depEid) &&
       (allGlobalEpicIds === null || !(depEid in allGlobalEpicIds))
     ) {
-      errors.push(`Epic ${eid}: dependency ${depEid} does not exist`);
+      debrisSink(`Epic ${eid}: dependency ${depEid} does not exist`);
     }
   }
 
@@ -196,9 +211,9 @@ export function checkEpicTree(
     if (checkFilesystemRepos) {
       const err = validateRepoPath(primaryRepoStr, `Epic ${eid}: primary_repo`);
       if (err !== null) {
-        errors.push(err);
+        debrisSink(err);
       } else if (!sameFile(primaryRepoStr, dirname(dataDir))) {
-        errors.push(
+        debrisSink(
           `Epic ${eid}: primary_repo ${pyRepr(primaryRepoStr)} does not match ` +
             `the epic's data directory parent ${pyRepr(dirname(dataDir))} — epic is mis-located`,
         );
@@ -214,7 +229,7 @@ export function checkEpicTree(
       for (const tr of touchedRepos as string[]) {
         const err = validateRepoPath(tr, `Epic ${eid}: touched_repos entry`);
         if (err !== null) {
-          errors.push(err);
+          debrisSink(err);
         }
       }
     }
@@ -281,7 +296,7 @@ export function checkEpicTree(
       if (checkFilesystemRepos) {
         const err = validateRepoPath(targetRepoStr, `Task ${tid}: target_repo`);
         if (err !== null) {
-          errors.push(err);
+          debrisSink(err);
         }
       }
       // Warn (not error) when target_repo is absent from epic.touched_repos —
@@ -394,7 +409,10 @@ export function checkEpicTreeInMemory(
 export function validateEpicIntegrityWithWarnings(
   epicId: string,
   dataDir: string,
-  opts: { checkFilesystemRepos?: boolean } = {},
+  opts: {
+    checkFilesystemRepos?: boolean;
+    tolerateDoneEpicDebris?: boolean;
+  } = {},
 ): [string[], string[]] {
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
   const epicData = loadJsonSafe(epicPath);
@@ -516,6 +534,7 @@ export function validateEpicIntegrityWithWarnings(
       checkFilesystemRepos: opts.checkFilesystemRepos ?? true,
       allEpicDeps,
       allGlobalEpicIds,
+      tolerateDoneEpicDebris: opts.tolerateDoneEpicDebris ?? false,
     },
   );
   return [[...loadErrors, ...coreErrors], coreWarnings];
@@ -526,7 +545,10 @@ export function validateEpicIntegrityWithWarnings(
 export function validateEpicIntegrity(
   epicId: string,
   dataDir: string,
-  opts: { checkFilesystemRepos?: boolean } = {},
+  opts: {
+    checkFilesystemRepos?: boolean;
+    tolerateDoneEpicDebris?: boolean;
+  } = {},
 ): string[] {
   return validateEpicIntegrityWithWarnings(epicId, dataDir, opts)[0];
 }
