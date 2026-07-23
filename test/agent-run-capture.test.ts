@@ -37,12 +37,14 @@ import type {
 } from "../src/agent/pair-subcommands";
 import type { ResumeDecision } from "../src/agent/resume-policy";
 import {
+  alreadyGoneTmuxError,
   buildRunCaptureEnvelope,
   buildRunControlArtifact,
   cancelOwnedRunFromControlArtifact,
   cancelRunFromControlArtifact,
   captureFromHandle,
   captureLivePartnerResponse,
+  classifyTmuxWindowPresence,
   composeRunCapture,
   createExactRunTeardown,
   isRunControlArtifact,
@@ -821,7 +823,11 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     expect(envelope.elapsed_seconds).toBe(2.6);
   });
 
-  test("window_gone + resolvable transcript with a message → completed (recovered)", async () => {
+  test("window_gone → partner_died, and NEVER mines a message from the transcript", async () => {
+    // Blocker 2: recovery lives in the wait (a real boundary-qualified stop
+    // returns ok). Reaching window_gone means no such stop exists, so capture
+    // must NOT re-read the transcript for interim text — partner_died, message
+    // null, showLastMessage untouched.
     let showCalls = 0;
     const { envelope, exitCode } = await captureFromHandle(
       {
@@ -836,7 +842,7 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
           return {
             ok: true,
             transcriptPath: "/t.jsonl",
-            text: "the leg's real final answer",
+            text: "interim, not terminal",
             found: true,
           };
         },
@@ -847,29 +853,28 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     );
     expect(Object.keys(envelope).sort()).toEqual([...ENVELOPE_KEYS]);
     expect(envelope).toMatchObject({
-      outcome: "completed",
+      outcome: "partner_died",
       handle: "tmux-gone",
       transcript_path: "/t.jsonl",
-      message: "the leg's real final answer",
-      message_found: true,
+      message: null,
+      message_found: false,
     });
-    expect(exitCode).toBe(0);
-    expect(showCalls).toBe(1);
+    expect(exitCode).toBe(4);
+    expect(showCalls).toBe(0);
   });
 
-  test("window_gone + resolvable transcript, found-but-textless → no_message", async () => {
+  test("window_gone + no resolved transcript → partner_died", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       {
         waitForStop: async () => ({
           ok: false,
           reason: "window_gone",
           error: "gone",
-          transcriptPath: "/t.jsonl",
         }),
         showLastMessage: async () => ({
           ok: true,
           transcriptPath: "/t.jsonl",
-          text: null,
+          text: "x",
           found: true,
         }),
         now: () => 0,
@@ -877,87 +882,60 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
       VERB_DEPS,
       { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
     );
-    expect(envelope.outcome).toBe("no_message");
-    expect(exitCode).toBe(0);
-  });
-
-  test("window_gone + transcript resolves but no terminal turn → partner_died", async () => {
-    const { envelope, exitCode } = await captureFromHandle(
-      {
-        waitForStop: async () => ({
-          ok: false,
-          reason: "window_gone",
-          error: "gone",
-          transcriptPath: "/t.jsonl",
-        }),
-        showLastMessage: async () => ({
-          ok: true,
-          transcriptPath: "/t.jsonl",
-          text: null,
-          found: false,
-        }),
-        now: () => 0,
-      },
-      VERB_DEPS,
-      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
-    );
-    expect(envelope).toMatchObject({
-      outcome: "partner_died",
-      message: null,
-      message_found: false,
-    });
-    expect(exitCode).toBe(4);
-  });
-
-  test("window_gone + no resolved transcript → partner_died, no message scan", async () => {
-    let showCalls = 0;
-    const { envelope, exitCode } = await captureFromHandle(
-      {
-        waitForStop: async () => ({
-          ok: false,
-          reason: "window_gone",
-          error: "gone",
-        }),
-        showLastMessage: async () => {
-          showCalls++;
-          return {
-            ok: true,
-            transcriptPath: "/t.jsonl",
-            text: "x",
-            found: true,
-          };
-        },
-        now: () => 0,
-      },
-      VERB_DEPS,
-      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
-    );
     expect(envelope.outcome).toBe("partner_died");
     expect(exitCode).toBe(4);
-    expect(showCalls).toBe(0);
+  });
+});
+
+describe("tmux window presence classifier (Blocker 4 — socket-gone stderr)", () => {
+  // Real stderr shapes probed from the installed tmux (both socket forms):
+  const sMissing =
+    "error connecting to /tmp/keeper-definitely-no-such-socket (No such file or directory)";
+  const lMissing =
+    "error connecting to /private/tmp/tmux-501/keeper-definitely-no-such-server (No such file or directory)";
+  const refused = "error connecting to /tmp/stale.sock (Connection refused)";
+
+  test("alreadyGoneTmuxError matches BOTH -S and -L gone-server socket shapes", () => {
+    expect(alreadyGoneTmuxError(sMissing)).toBe(true);
+    expect(alreadyGoneTmuxError(lMissing)).toBe(true);
+    // Existing in-server misses still match.
+    expect(alreadyGoneTmuxError("can't find window @1")).toBe(true);
+    expect(alreadyGoneTmuxError("no server running on /tmp/x")).toBe(true);
   });
 
-  test("window_gone + ambiguous transcript read → transcript_ambiguous", async () => {
-    const { envelope, exitCode } = await captureFromHandle(
-      {
-        waitForStop: async () => ({
-          ok: false,
-          reason: "window_gone",
-          error: "gone",
-          transcriptPath: "/t.jsonl",
-        }),
-        showLastMessage: async () => ({
-          ok: false,
-          reason: "ambiguous",
-          error: "transcript ambiguous",
-        }),
-        now: () => 0,
-      },
-      VERB_DEPS,
-      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+  test("connection-refused / timeout / other errors stay UNMATCHED (unknown)", () => {
+    // Explicit decision: only a proven-definitive gone signal flips to absent; a
+    // stale socket that merely refuses stays inconclusive so the wait keeps going.
+    expect(alreadyGoneTmuxError(refused)).toBe(false);
+    expect(alreadyGoneTmuxError("tmux command timed out")).toBe(false);
+    expect(alreadyGoneTmuxError("permission denied")).toBe(false);
+  });
+
+  test("classifyTmuxWindowPresence maps exit + stderr to tri-state", () => {
+    expect(classifyTmuxWindowPresence({ exitCode: 0, stderr: "" })).toBe(
+      "present",
     );
-    expect(envelope.outcome).toBe("transcript_ambiguous");
-    expect(exitCode).toBe(4);
+    expect(classifyTmuxWindowPresence({ exitCode: 1, stderr: sMissing })).toBe(
+      "absent",
+    );
+    expect(classifyTmuxWindowPresence({ exitCode: 1, stderr: lMissing })).toBe(
+      "absent",
+    );
+    expect(
+      classifyTmuxWindowPresence({
+        exitCode: 1,
+        stderr: "can't find window @9",
+      }),
+    ).toBe("absent");
+    expect(classifyTmuxWindowPresence({ exitCode: 1, stderr: refused })).toBe(
+      "unknown",
+    );
+    expect(
+      classifyTmuxWindowPresence({
+        exitCode: 124,
+        stderr: "tmux command timed out",
+      }),
+    ).toBe("unknown");
   });
 });
 

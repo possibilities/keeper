@@ -240,11 +240,11 @@ import {
   type SpawnFn,
 } from "./run";
 import {
-  alreadyGoneTmuxError,
   buildRunCaptureEnvelope,
   buildRunControlArtifact,
   captureFromHandle,
   captureLivePartnerResponse,
+  classifyTmuxWindowPresence,
   composeRunCapture,
   createExactRunTeardown,
   type ExactTeardownResult,
@@ -270,7 +270,6 @@ import {
   parseKeeperAgentTmuxArgs,
   resolveTmuxBin,
   TMUX_EXIT,
-  TMUX_TIMEOUT_RESULT_CODE,
   type TmuxCommandRunner,
   TmuxLaunchError,
 } from "./tmux-launch";
@@ -1689,27 +1688,22 @@ function makeVerbDeps(deps: MainDeps): VerbDeps {
 }
 
 /** The window-presence tick backing a wait's positive-gone detection: run the
- *  read-only list-panes probe and classify tri-state. Exit 0 → present; the
- *  timeout sentinel or any non-"already-gone" error → unknown (inconclusive,
- *  keep waiting); a not-found/no-server stderr → absent (positively gone). A
- *  throwing runner (tmux missing) is unknown, never a false absence. */
+ *  read-only list-panes probe and classify tri-state via {@link
+ *  classifyTmuxWindowPresence} (exit 0 → present; a not-found/gone-server/missing-
+ *  socket stderr → absent; a timeout sentinel, connection-refused, or any other
+ *  failure → unknown). A throwing runner (tmux missing) is unknown, never a false
+ *  absence. */
 function probeTmuxWindowPresence(
   run: TmuxCommandRunner,
   command: string[],
 ): WindowLiveness {
-  let result: { exitCode: number; stderr: string };
   try {
-    result = run(command, TMUX_WINDOW_PROBE_TIMEOUT_MS);
+    return classifyTmuxWindowPresence(
+      run(command, TMUX_WINDOW_PROBE_TIMEOUT_MS),
+    );
   } catch {
     return "unknown";
   }
-  if (result.exitCode === 0) {
-    return "present";
-  }
-  if (result.exitCode === TMUX_TIMEOUT_RESULT_CODE) {
-    return "unknown";
-  }
-  return alreadyGoneTmuxError(result.stderr) ? "absent" : "unknown";
 }
 
 /** Per-tick bound for the window-presence probe spawn — a local list-panes

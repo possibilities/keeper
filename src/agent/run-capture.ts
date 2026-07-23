@@ -28,6 +28,10 @@ import type {
   VerbDeps,
   WaitForStopResult,
 } from "./pair-subcommands";
+import {
+  isTmuxKillWindowCommand,
+  type WindowLiveness,
+} from "./transcript-watch";
 
 /**
  * Run-capture envelope contract version. Mirrors `TMUX_SCHEMA_VERSION` (integer,
@@ -114,22 +118,7 @@ export function isRunControlArtifact(
     return false;
   }
   const artifact = value as Record<string, unknown>;
-  const command = artifact.kill_window_command;
   const status = artifact.status;
-  const commandPrefix = Array.isArray(command) ? command.slice(0, -3) : [];
-  const socketArgs = commandPrefix.slice(1);
-  const commandHasExactWindowTail =
-    Array.isArray(command) &&
-    command.length >= 4 &&
-    command.every((token) => typeof token === "string" && token !== "") &&
-    /(?:^|\/)tmux$/.test(String(command[0])) &&
-    socketArgs.length % 2 === 0 &&
-    socketArgs.every(
-      (token, index) => index % 2 === 1 || token === "-L" || token === "-S",
-    ) &&
-    command.at(-3) === "kill-window" &&
-    command.at(-2) === "-t" &&
-    /^@[0-9]+$/.test(String(command.at(-1)));
   return (
     artifact.schema_version === RUN_CONTROL_SCHEMA_VERSION &&
     typeof artifact.run_id === "string" &&
@@ -138,7 +127,7 @@ export function isRunControlArtifact(
     RUN_CAPTURE_AGENTS.has(artifact.agent) &&
     typeof artifact.started_at_ms === "number" &&
     Number.isFinite(artifact.started_at_ms) &&
-    commandHasExactWindowTail &&
+    isTmuxKillWindowCommand(artifact.kill_window_command) &&
     (status === "running" ||
       status === "cancelling" ||
       status === "terminal") &&
@@ -165,13 +154,39 @@ export function buildRunControlArtifact(args: {
   };
 }
 
-/** True when a tmux stderr proves the target window/session (or the whole
- *  server) is already gone — shared by exact teardown and the wait's
- *  positive-gone window probe so both classify "absent" identically. */
+/**
+ * True when a tmux stderr proves the target window/session (or the whole server)
+ * is already gone — shared by exact teardown and the wait's positive-gone window
+ * probe so both classify "absent" identically. Covers the in-server misses
+ * ("can't find window/session", "no server running", …) AND the socket-gone
+ * form both `-L <name>` and `-S <path>` launches emit when the whole server is
+ * down: `error connecting to <socket> (No such file or directory)`. A stale
+ * socket that merely refuses the connection is NOT matched — that stays
+ * inconclusive (see {@link classifyTmuxWindowPresence}).
+ */
 export function alreadyGoneTmuxError(stderr: string): boolean {
-  return /(?:can't find (?:window|session)|no server running|no sessions|session not found|window not found)/i.test(
+  return /(?:can't find (?:window|session)|no server running|no sessions|session not found|window not found|error connecting to [^\n]*\(no such file or directory\))/i.test(
     stderr,
   );
+}
+
+/**
+ * Map a tmux window presence-probe result to tri-state {@link WindowLiveness}.
+ * Exit 0 → the window resolves (present). A not-found / gone-server stderr —
+ * including a missing socket in either `-L`/`-S` form — → absent. EVERYTHING
+ * else stays unknown: a timeout sentinel (`stderr:"tmux command timed out"`), a
+ * permission error, a connection-refused stale socket, any other failure. The
+ * unknown default is deliberate — an inconclusive probe must never terminate a
+ * wait, only a positive absence does.
+ */
+export function classifyTmuxWindowPresence(result: {
+  exitCode: number;
+  stderr: string;
+}): WindowLiveness {
+  if (result.exitCode === 0) {
+    return "present";
+  }
+  return alreadyGoneTmuxError(result.stderr) ? "absent" : "unknown";
 }
 
 /**
@@ -862,71 +877,19 @@ export async function captureFromHandle(
 
   const wait = await deps.waitForStop(handle, verbDeps);
   if (!wait.ok) {
-    if (wait.reason === "partner_died") {
+    // Confirmed leg death, both spellings: a folded-terminal lifecycle
+    // (`partner_died`) or a positively-gone tmux window (`window_gone`). The wait
+    // already did the ACTUAL-STOP-ONLY final re-read on both paths — a real
+    // boundary-qualified stop would have returned `ok`, so reaching here means
+    // NO terminal turn exists. Never mine interim assistant text for a fake
+    // completion; the transcript path rides only as diagnostic detail.
+    if (wait.reason === "partner_died" || wait.reason === "window_gone") {
       return buildRunCaptureEnvelope({
         outcome: "partner_died",
         agent,
         handle: handleId,
         transcriptPath: wait.transcriptPath ?? null,
         resumeTarget: baseResume,
-        elapsedSeconds: elapsed(),
-      });
-    }
-    // The target's tmux window is POSITIVELY gone. Recover the partner's final
-    // message from its transcript via the SAME show-last-message machinery a
-    // normal stop uses — a leg that COMPLETED but whose waiter missed the stop
-    // yields `completed`/`no_message` where recoverable; a transcript that never
-    // resolved or carries no terminal turn is `partner_died`; a collision maps to
-    // its exact `transcript_ambiguous`. NEVER fabricate — ambiguity keeps its arm.
-    if (wait.reason === "window_gone") {
-      const knownPath = wait.transcriptPath ?? null;
-      if (knownPath === null) {
-        return buildRunCaptureEnvelope({
-          outcome: "partner_died",
-          agent,
-          handle: handleId,
-          resumeTarget: baseResume,
-          elapsedSeconds: elapsed(),
-        });
-      }
-      const show = await deps.showLastMessage(
-        { ...handle, transcriptPath: knownPath },
-        verbDeps,
-      );
-      if (!show.ok) {
-        return buildRunCaptureEnvelope({
-          outcome:
-            show.reason === "ambiguous"
-              ? "transcript_ambiguous"
-              : "partner_died",
-          agent,
-          handle: handleId,
-          resumeTarget: baseResume,
-          elapsedSeconds: elapsed(),
-        });
-      }
-      // A found final turn is a real terminal deliverable — `completed` with text,
-      // `no_message` on a tool-only/textless turn. No turn found at all means the
-      // gone leg left nothing recoverable: `partner_died`, never a guessed answer.
-      if (!show.found) {
-        return buildRunCaptureEnvelope({
-          outcome: "partner_died",
-          agent,
-          handle: handleId,
-          transcriptPath: show.transcriptPath,
-          resumeTarget: baseResume,
-          elapsedSeconds: elapsed(),
-        });
-      }
-      const recovered = show.text !== null && show.text.trim() !== "";
-      return buildRunCaptureEnvelope({
-        outcome: recovered ? "completed" : "no_message",
-        agent,
-        handle: handleId,
-        transcriptPath: show.transcriptPath,
-        resumeTarget: baseResume,
-        message: show.text,
-        messageFound: show.found,
         elapsedSeconds: elapsed(),
       });
     }

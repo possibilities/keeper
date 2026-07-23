@@ -9,6 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+  appendFileSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -22,8 +23,10 @@ import { main } from "../src/agent/main";
 import { resolveHandle, runWaitForStop } from "../src/agent/pair-subcommands";
 import {
   findLastMessage,
+  isTmuxKillWindowCommand,
   waitForTranscriptPath,
   waitForTranscriptStop,
+  windowPresenceProbeCommand,
 } from "../src/agent/transcript-watch";
 import {
   BUS_ARTIFACT_REF_TAG,
@@ -652,6 +655,275 @@ describe("positive-gone window probe terminates the wait", () => {
       "-F",
       "#{window_id}",
     ]);
+  });
+});
+
+describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Rider)", () => {
+  // Production-shaped Claude turns: an interim tool_use turn is NOT a stop, a
+  // real end_turn IS a stop, a stop_hook_summary is a terminal but textless stop.
+  const interimTurn = (): string =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        stop_reason: "tool_use",
+        content: [{ type: "text", text: "interim, not terminal" }],
+      },
+    });
+  const realStop = (text: string): string =>
+    JSON.stringify({
+      type: "assistant",
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text }],
+      },
+    });
+  const textlessStop = (): string =>
+    JSON.stringify({
+      type: "system",
+      subtype: "stop_hook_summary",
+      timestamp: new Date().toISOString(),
+      stopReason: "stop",
+    });
+
+  const baseWait = (path: string) => ({
+    agent: "claude" as const,
+    cwd: "/work/proj",
+    env: {},
+    homeDir: tempDir(),
+    startedAtMs: 0,
+    sessionId: "s",
+    transcriptPath: path,
+    stopTimeoutMs: 60_000,
+  });
+
+  test("findLastMessage returns a NONTERMINAL turn's text — the 3ed9 hazard", () => {
+    // The exact minimal shape 3ed9's window-gone arm consumed as completed/exit 0.
+    const path = join(tempDir(), "interim.jsonl");
+    writeFileSync(path, `${interimTurn()}\n`);
+    expect(findLastMessage("claude", path)).toEqual({
+      agent: "claude",
+      text: "interim, not terminal",
+      found: true,
+    });
+  });
+
+  test("(i) interim text + no stop + window gone → windowGone, NOT a completion", async () => {
+    const path = join(tempDir(), "interim.jsonl");
+    writeFileSync(path, `${interimTurn()}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      windowProbe: async () => "absent",
+      sleep: async () => {},
+    });
+    expect(outcome).toEqual({ ok: false, windowGone: true });
+  });
+
+  test("(ii) interim text + a REAL stop + window gone → ok carrying the stop", async () => {
+    const path = join(tempDir(), "stopped.jsonl");
+    writeFileSync(path, `${interimTurn()}\n${realStop("final answer")}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      windowProbe: async () => "absent",
+      sleep: async () => {},
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("final answer");
+  });
+
+  test("(iii) terminal but TEXTLESS stop → ok with null message (maps to no_message)", async () => {
+    const path = join(tempDir(), "textless.jsonl");
+    writeFileSync(path, `${interimTurn()}\n${textlessStop()}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      windowProbe: async () => "absent",
+      sleep: async () => {},
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBeNull();
+  });
+
+  test("(race) a stop FLUSHED as the window vanishes is recovered via the re-scan", async () => {
+    const path = join(tempDir(), "race.jsonl");
+    writeFileSync(path, `${interimTurn()}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      windowProbe: async () => {
+        // The leg flushes its real stop in the same beat its window dies.
+        appendFileSync(path, `${realStop("late final")}\n`);
+        return "absent";
+      },
+      sleep: async () => {},
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("late final");
+  });
+
+  test("(Rider) a stop flushed as the lifecycle folds terminal → recovered, not partner_died", async () => {
+    const path = join(tempDir(), "life-race.jsonl");
+    writeFileSync(path, `${interimTurn()}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      lifecycleProbe: async () => {
+        appendFileSync(path, `${realStop("flushed at death")}\n`);
+        return { kind: "terminal", state: "ended", reason: null };
+      },
+      sleep: async () => {},
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("flushed at death");
+  });
+
+  test("(Rider) lifecycle terminal + only interim text → partner_died (no fake completion)", async () => {
+    const path = join(tempDir(), "life-interim.jsonl");
+    writeFileSync(path, `${interimTurn()}\n`);
+    const outcome = await waitForTranscriptStop({
+      ...baseWait(path),
+      lifecycleProbe: async () => ({
+        kind: "terminal",
+        state: "ended",
+        reason: null,
+      }),
+      sleep: async () => {},
+    });
+    expect(outcome).toMatchObject({ ok: false, partnerDied: true });
+  });
+});
+
+describe("probe argv is gated by the single tmux-command authority (Blocker 3)", () => {
+  test("the exact reviewer fixture: an arbitrary binary yields NO probe", () => {
+    expect(
+      windowPresenceProbeCommand([
+        "/bin/touch",
+        "/tmp/pwn",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBeNull();
+  });
+
+  test("mixed non-string tokens → null (validator rejects the raw value too)", () => {
+    const mixed = ["/usr/bin/tmux", 5, "kill-window", "-t", "@1"] as unknown[];
+    expect(isTmuxKillWindowCommand(mixed)).toBe(false);
+    expect(
+      windowPresenceProbeCommand(mixed as (string | undefined)[] as string[]),
+    ).toBeNull();
+  });
+
+  test("wrong socket shape (unpaired or non -L/-S flag) → null", () => {
+    // Unpaired socket flag (odd socket-arg count).
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "-L",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBeNull();
+    // A non -L/-S flag in the socket-flag slot.
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "-X",
+        "sock",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBeNull();
+  });
+
+  test("non-@digits window target → null", () => {
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "kill-window",
+        "-t",
+        "evil",
+      ]),
+    ).toBeNull();
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "kill-window",
+        "-t",
+        "@1; rm -rf /",
+      ]),
+    ).toBeNull();
+  });
+
+  test("a valid tmux kill-window argv (default + socket) → the read-only list-panes probe", () => {
+    expect(
+      windowPresenceProbeCommand([
+        "/opt/homebrew/bin/tmux",
+        "kill-window",
+        "-t",
+        "@170",
+      ]),
+    ).toEqual([
+      "/opt/homebrew/bin/tmux",
+      "list-panes",
+      "-t",
+      "@170",
+      "-F",
+      "#{window_id}",
+    ]);
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "-L",
+        "wrapped",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toEqual([
+      "/usr/bin/tmux",
+      "-L",
+      "wrapped",
+      "list-panes",
+      "-t",
+      "@1",
+      "-F",
+      "#{window_id}",
+    ]);
+  });
+
+  test("a malicious run.json tmux.command yields NO handle probe → runner never invoked", async () => {
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-evil", {
+      id: "tmux-evil",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "never-appears",
+      startedAtMs: 0,
+      tmux: { command: ["/bin/touch", "/tmp/pwn"], windowId: "@1" },
+    });
+    const resolution = resolveHandle({
+      rest: ["tmux-evil", "--stop-timeout", "40ms"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    // The malformed command produced no probe argv, so nothing can reach a spawn.
+    expect(resolution.handle.tmuxWindowProbeCommand).toBeUndefined();
+    let probeCalls = 0;
+    const result = await runWaitForStop(resolution.handle, {
+      env: {},
+      homeDir: tempDir(),
+      probeWindowPresence: async () => {
+        probeCalls++;
+        return "absent";
+      },
+    });
+    expect(probeCalls).toBe(0);
+    expect(result).toMatchObject({ ok: false, reason: "timeout" });
   });
 });
 

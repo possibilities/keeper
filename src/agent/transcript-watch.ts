@@ -145,19 +145,10 @@ export function defaultTranscriptPathTimeoutMs(agent: AgentKind): number {
 export function windowPresenceProbeCommand(
   killWindowCommand: readonly string[] | null | undefined,
 ): string[] | null {
-  if (!Array.isArray(killWindowCommand) || killWindowCommand.length < 4) {
+  if (!isTmuxKillWindowCommand(killWindowCommand)) {
     return null;
   }
-  if (
-    killWindowCommand.at(-3) !== "kill-window" ||
-    killWindowCommand.at(-2) !== "-t"
-  ) {
-    return null;
-  }
-  const windowId = killWindowCommand.at(-1);
-  if (typeof windowId !== "string" || !/^@[0-9]+$/.test(windowId)) {
-    return null;
-  }
+  const windowId = killWindowCommand.at(-1) as string;
   return [
     ...killWindowCommand.slice(0, -3),
     "list-panes",
@@ -166,6 +157,44 @@ export function windowPresenceProbeCommand(
     "-F",
     "#{window_id}",
   ];
+}
+
+/**
+ * The SINGLE authority for "is this a socket-correct tmux kill-window argv":
+ * `[<abs-or-bare tmux>, (-L|-S <value>)*, "kill-window", "-t", "@<digits>"]`,
+ * every token a non-empty string. run.json / control.json metadata is an
+ * EXECUTABLE argv source, so this gate is what stops an arbitrary binary or a
+ * shell-shaped token from reaching a spawn — `command[0]` must basename to
+ * `tmux`, socket flags must be paired `-L`/`-S`, and the window target must be
+ * exactly `@<digits>`. Shared with {@link windowPresenceProbeCommand} and
+ * run-capture's control validator so the rule lives in exactly one place.
+ */
+export function isTmuxKillWindowCommand(command: unknown): command is string[] {
+  if (!Array.isArray(command) || command.length < 4) {
+    return false;
+  }
+  if (!command.every((token) => typeof token === "string" && token !== "")) {
+    return false;
+  }
+  if (!/(?:^|\/)tmux$/.test(command[0] as string)) {
+    return false;
+  }
+  const socketArgs = command.slice(1, -3);
+  if (socketArgs.length % 2 !== 0) {
+    return false;
+  }
+  if (
+    !socketArgs.every(
+      (token, index) => index % 2 === 1 || token === "-L" || token === "-S",
+    )
+  ) {
+    return false;
+  }
+  return (
+    command.at(-3) === "kill-window" &&
+    command.at(-2) === "-t" &&
+    /^@[0-9]+$/.test(command.at(-1) as string)
+  );
 }
 
 /**
@@ -227,33 +256,31 @@ export async function waitForTranscriptStop(
       : null;
 
   while (true) {
-    const stop =
-      opts.injectedMessageMarker != null
-        ? findStopAfterInjectedMessage(
-            opts.agent,
-            opts.transcriptPath,
-            opts.injectedMessageMarker,
-            opts.transcriptLineFloor ?? 0,
-          )
-        : resumeStopFloor === null
-          ? findTranscriptStop(
-              opts.agent,
-              opts.transcriptPath,
-              opts.startedAtMs,
-            )
-          : findStopPastFloor(opts.agent, opts.transcriptPath, resumeStopFloor);
+    const stop = scanForStop(opts, resumeStopFloor);
     if (stop !== null) {
       return { ok: true, stop };
     }
     const terminal = await probeTerminal(opts.lifecycleProbe);
     if (terminal !== null) {
+      // Stop-flush race: a clean end can write its stop AFTER the last scan but
+      // before this terminal is observed. Re-read once for a boundary-qualified
+      // stop; only a real stop upgrades to a completion — a non-terminal
+      // assistant turn's interim text NEVER launders a death into success.
+      const flushed = scanForStop(opts, resumeStopFloor);
+      if (flushed !== null) {
+        return { ok: true, stop: flushed };
+      }
       return { ok: false, partnerDied: true, terminal };
     }
-    // Positively-gone target while the transcript path IS known: signal window
-    // gone so the caller recovers any final message from that known path (a leg
-    // that stopped just as its waiter missed the stop) instead of burning the
-    // remaining deadline. A settled stop above still wins over a gone window.
+    // Positively-gone target: the window can vanish just after the leg flushes
+    // its stop, so do the SAME actual-stop-only re-read. A boundary-qualified
+    // stop → completion; otherwise the target is gone with no real terminal
+    // turn, so report window gone (never a fabricated end from interim text).
     if (await probeWindowGone(opts.windowProbe)) {
+      const flushed = scanForStop(opts, resumeStopFloor);
+      if (flushed !== null) {
+        return { ok: true, stop: flushed };
+      }
       return { ok: false, windowGone: true };
     }
     if (now() >= deadline) {
@@ -261,6 +288,28 @@ export async function waitForTranscriptStop(
     }
     await wait(pollIntervalMs);
   }
+}
+
+/**
+ * One boundary-qualified stop scan — the injected-marker gate, the resumed-pi
+ * structural floor, or the plain started-at window, exactly as the poll loop
+ * selects. Factored out so the terminal / window-gone stop-flush re-read uses
+ * the IDENTICAL detection as the loop, never a looser last-message fallback.
+ */
+function scanForStop(
+  opts: TranscriptWatchOptions & { transcriptPath: string },
+  resumeStopFloor: number | null,
+): TranscriptStop | null {
+  return opts.injectedMessageMarker != null
+    ? findStopAfterInjectedMessage(
+        opts.agent,
+        opts.transcriptPath,
+        opts.injectedMessageMarker,
+        opts.transcriptLineFloor ?? 0,
+      )
+    : resumeStopFloor === null
+      ? findTranscriptStop(opts.agent, opts.transcriptPath, opts.startedAtMs)
+      : findStopPastFloor(opts.agent, opts.transcriptPath, resumeStopFloor);
 }
 
 /**
