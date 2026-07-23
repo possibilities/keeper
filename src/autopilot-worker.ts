@@ -107,6 +107,7 @@ import {
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
   isOriginContainmentDistressKey,
+  isPendingIntegrationReason,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -767,17 +768,20 @@ export function mergeEscalationFailuresToClear(
 /**
  * Probe each OPEN `work::<taskId>` merge-escalation row for INCIDENT-SPECIFIC positive
  * resolution — the primary clear evidence per {@link mergeEscalationFailuresToClear},
- * bounded to the open merge-incident rows (same git probe class the recover/lane passes
- * already run). Per row, reusing the ONE fan-in reason parser {@link
- * parseMergeConflictReason} the escalation brief reads:
- *   (a) the parsed SOURCE rib is an ancestor of the TARGET base (`gitIsAncestorOf` —
- *       `false` covers not-ancestor AND an errored/timed-out probe → `defer`), AND
- *   (b) the TARGET checkout (`dir`) is clean, on the base branch, with NO merge residue
- *       (`gitMergeReadiness` === `ready`; a half-done resolution reads `dirty`/`mid-merge`),
- * → `merged`. A missing SOURCE branch → `source-absent` (the caller corroborates).
- * Everything else — unparseable reason, missing `dir`, not-yet-ancestor, dirty/mid-merge
- * target, or any thrown git error — → `defer` (never a false clear). Producer-only live
- * git READS, never a fold; NEVER throws past here.
+ * bounded to the open merge-incident rows. Routes by the row's fence CLASS:
+ *   - PINNED (a valid fence) — clears from the DURABLE OBJECTS only ({@link
+ *     probePinnedMergeResolution}), never the movable source ref or branch absence.
+ *   - MALFORMED / legacy pre-fence pending (pending class, no valid fence) — `defer`
+ *     ALWAYS: a fence-less request has no authority to grade its own integration, so
+ *     it clears only on epic-landed evidence (the caller's fallback) or an operator
+ *     clear / re-mint, NEVER movable-branch or source-absence evidence.
+ *   - UNPINNED genuine conflict — the legacy branch-name grading, reusing the ONE fan-in
+ *     reason parser {@link parseMergeConflictReason}: (a) the parsed SOURCE rib is an
+ *     ancestor of the TARGET base (`gitIsAncestorOf`; `false` covers not-ancestor AND an
+ *     errored probe → `defer`), AND (b) the TARGET checkout (`dir`) is clean, on the base
+ *     branch, no merge residue (`gitMergeReadiness` === `ready`) → `merged`; a missing
+ *     SOURCE branch → `source-absent` (the caller corroborates); everything else → `defer`.
+ * Producer-only live git READS, never a fold; NEVER throws past here.
  */
 export async function probeWorkMergeIncidentResolutions(
   rows: readonly { id: string; reason: string; dir: string | null }[],
@@ -802,6 +806,16 @@ export async function probeWorkMergeIncidentResolutions(
           row.id,
           await probePinnedMergeResolution(row.dir, base, pins, run),
         );
+        continue;
+      }
+      if (isPendingIntegrationReason(row.reason)) {
+        // MALFORMED / legacy pre-fence pending row (pending class, no valid fence).
+        // It is EXCLUDED from movable-branch and source-absence evidence — a
+        // fence-less request has no authority to grade its own integration, so it
+        // DEFERS. It clears only on independently positive epic-landed evidence (the
+        // caller's straggler fallback) or an explicit operator clear / re-mint,
+        // never here, preserving the fail-closed distinction.
+        out.set(row.id, "defer");
         continue;
       }
       const srcRef = await run(

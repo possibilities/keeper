@@ -27363,6 +27363,57 @@ test("probe PINNED: an inconclusive base snapshot → defer", async () => {
   expect(v.get("fn-9-pin.1")).toBe("defer");
 });
 
+// A MALFORMED / legacy pre-fence pending row (pending class, no valid fence): the
+// incident probe DEFERS without consulting git at all — a fence-less request has no
+// authority to grade its own integration by the movable source ref or its absence.
+const MALFORMED_MERGE_REASON =
+  "worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.1 into " +
+  `${MERGE_INCIDENT_BASE} — pending owner integration`;
+
+test("probe MALFORMED/legacy pending: DEFER without any git — never movable-branch or source-absence evidence", async () => {
+  let ran = false;
+  const trap: GitRunner = (async () => {
+    ran = true;
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  const v = await probeWorkMergeIncidentResolutions(
+    [{ id: "fn-3-widget.1", reason: MALFORMED_MERGE_REASON, dir: "/lane" }],
+    trap,
+  );
+  expect(v.get("fn-3-widget.1")).toBe("defer");
+  expect(ran).toBe(false);
+});
+
+test("mergeEscalationFailuresToClear: a malformed-pending work row (defer) clears ONLY on epic-landed, never on source-absence / task-terminal / clean target", () => {
+  const workRow = { verb: "work" as const, id: "fn-3-widget.1" };
+  const defer = new Map<string, "merged" | "source-absent" | "defer">([
+    ["fn-3-widget.1", "defer"],
+  ]);
+  // Not landed → RETAINED, even with the task terminal (a `defer` is not a
+  // `source-absent`, so the task-terminal corroboration cannot fire).
+  expect(
+    mergeEscalationFailuresToClear([workRow], new Set(), new Set(), defer),
+  ).toEqual([]);
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(),
+      new Set(),
+      defer,
+      new Set(["fn-3-widget.1"]),
+    ),
+  ).toEqual([]);
+  // Independently positive epic-landed evidence → cleared.
+  expect(
+    mergeEscalationFailuresToClear(
+      [workRow],
+      new Set(["fn-3-widget"]),
+      new Set(),
+      defer,
+    ),
+  ).toEqual([{ verb: "work", id: "fn-3-widget.1" }]);
+});
+
 // ---------------------------------------------------------------------------
 // fn-1144 — the owning-worker liveness gate on the GRACED lane-wedge escalation.
 // A healthy running worker's fan-in base is naturally dirty with WIP, so the graced
