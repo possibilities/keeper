@@ -55,6 +55,16 @@ export interface PoolFailureLogger {
   record(entry: PoolFailureLogEntry): void;
 }
 
+export interface PoolRouteTransition {
+  sessionId: string;
+  quotaScope: CodexQuotaScope;
+  state: "selected" | "retired";
+  alias: string | null;
+  observedAtMs: number;
+}
+
+export type PoolRouteObserver = (transition: PoolRouteTransition) => void;
+
 export interface ScopeQuotaState {
   quota_scope: CodexQuotaScope;
   used_percent: number;
@@ -82,6 +92,8 @@ export interface PersistedPoolState {
 export type PoolAliasPolicy = Record<CodexQuotaScope, string[]>;
 
 interface SessionRoute {
+  session_id: string;
+  quota_scope: CodexQuotaScope;
   alias: string;
   touched_at_ms: number;
 }
@@ -843,6 +855,7 @@ export class PoolRouteState {
     initialAlias?: string,
     initialScope: CodexQuotaScope = CODEX_GENERIC_QUOTA_SCOPE,
     aliasPolicy?: PoolAliasPolicy,
+    private readonly observeRoute?: PoolRouteObserver,
   ) {
     const normalized = normalizeAliases([...aliases]);
     this.aliases = normalized;
@@ -906,7 +919,12 @@ export class PoolRouteState {
         return {
           alias: sticky.alias,
           consumeInitial: false,
-          route: { alias: sticky.alias, touched_at_ms: now },
+          route: {
+            session_id: sessionId,
+            quota_scope: quotaScope,
+            alias: sticky.alias,
+            touched_at_ms: now,
+          },
         };
       }
 
@@ -927,10 +945,18 @@ export class PoolRouteState {
       return {
         alias: selected.alias,
         consumeInitial: initialRoute?.quotaScope === quotaScope,
-        route: { alias: selected.alias, touched_at_ms: now },
+        route: {
+          session_id: sessionId,
+          quota_scope: quotaScope,
+          alias: selected.alias,
+          touched_at_ms: now,
+        },
       };
     });
-    if (!result.ok) this.throwTransactFailure(result);
+    if (!result.ok) {
+      this.retireRoute(key, sessionId, quotaScope, now, true);
+      this.throwTransactFailure(result);
+    }
     this.touchRoute(key, result.value.route);
     this.incrementInFlight(key, result.value.alias);
     if (result.value.consumeInitial) this.initialRoute = undefined;
@@ -977,7 +1003,12 @@ export class PoolRouteState {
       return;
     }
     if (charged) this.consumeInFlight(key, alias);
-    this.touchRoute(key, { alias, touched_at_ms: now });
+    this.touchRoute(key, {
+      session_id: sessionId,
+      quota_scope: quotaScope,
+      alias,
+      touched_at_ms: now,
+    });
   }
 
   releaseSelection(
@@ -1224,10 +1255,18 @@ export class PoolRouteState {
     failureClass: PoolFailureClass,
     now: number,
   ): void {
+    const separator = key.indexOf("\u0000");
+    const quotaScope = key.slice(0, separator) as CodexQuotaScope;
+    const sessionId = key.slice(separator + 1);
     if (failureClass === "context") {
-      this.touchRoute(key, { alias, touched_at_ms: now });
+      this.touchRoute(key, {
+        session_id: sessionId,
+        quota_scope: quotaScope,
+        alias,
+        touched_at_ms: now,
+      });
     } else if (this.routes.get(key)?.alias === alias) {
-      this.routes.delete(key);
+      this.retireRoute(key, sessionId, quotaScope, now);
     }
   }
 
@@ -1340,12 +1379,58 @@ export class PoolRouteState {
   }
 
   private touchRoute(key: string, route: SessionRoute): void {
+    const prior = this.routes.get(key);
     this.routes.delete(key);
     this.routes.set(key, route);
+    if (prior?.alias !== route.alias) {
+      this.notifyRoute({
+        sessionId: route.session_id,
+        quotaScope: route.quota_scope,
+        state: "selected",
+        alias: route.alias,
+        observedAtMs: route.touched_at_ms,
+      });
+    }
     while (this.routes.size > MAX_SESSION_ROUTES) {
-      const oldest = this.routes.keys().next().value as string | undefined;
+      const oldest = this.routes.entries().next().value as
+        | [string, SessionRoute]
+        | undefined;
       if (oldest === undefined) break;
-      this.routes.delete(oldest);
+      this.routes.delete(oldest[0]);
+      this.notifyRoute({
+        sessionId: oldest[1].session_id,
+        quotaScope: oldest[1].quota_scope,
+        state: "retired",
+        alias: null,
+        observedAtMs: route.touched_at_ms,
+      });
+    }
+  }
+
+  private retireRoute(
+    key: string,
+    sessionId: string,
+    quotaScope: CodexQuotaScope,
+    observedAtMs: number,
+    force = false,
+  ): void {
+    const prior = this.routes.get(key);
+    if (prior === undefined && !force) return;
+    this.routes.delete(key);
+    this.notifyRoute({
+      sessionId,
+      quotaScope,
+      state: "retired",
+      alias: null,
+      observedAtMs,
+    });
+  }
+
+  private notifyRoute(transition: PoolRouteTransition): void {
+    try {
+      this.observeRoute?.(transition);
+    } catch {
+      // Route diagnostics never change model serving.
     }
   }
 

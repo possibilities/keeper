@@ -1205,7 +1205,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    // The four job-backed reads share the Session catalog selector contract.
+    // The job-backed reads share the Session catalog selector contract.
     // Their established `--session-id` spelling remains a compatibility alias
     // that enters the same resolver and has no id-only path.
     name: "session",
@@ -1240,6 +1240,28 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             name: "log-count",
             type: "string",
             summary: "Recent-commit count to include (positive int)",
+          },
+        ],
+      },
+      {
+        name: "runtime",
+        summary: "Exact runtime telemetry + proven scoped route (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference (default: ambient auto-detect)",
+          },
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Compatibility alias of --session",
           },
         ],
       },

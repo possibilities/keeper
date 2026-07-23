@@ -1,6 +1,6 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: Structural Pi stream doubles avoid loading peer modules in correctness tests.
 // biome-ignore-all lint/style/noNonNullAssertion: Fixture guards and deferred callbacks establish values before use.
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import {
   existsSync,
   mkdtempSync,
@@ -21,6 +21,7 @@ import {
   CODEX_GENERIC_QUOTA_SCOPE,
   CODEX_SPARK_QUOTA_SCOPE,
 } from "../../../src/codex-quota-scope.ts";
+import { readLatestPiRouteObservation } from "../../../src/session-runtime.ts";
 import { walkClosure } from "../../../test/helpers/depgraph.ts";
 import {
   CredentialVault,
@@ -334,9 +335,17 @@ const savedEnv = {
   KEEPER_PI_CODEX_POOL_REVISION: process.env.KEEPER_PI_CODEX_POOL_REVISION,
   KEEPER_PI_CODEX_POOL_CONFIG_ROOT:
     process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT,
+  KEEPER_SESSION_RUNTIME_DIR: process.env.KEEPER_SESSION_RUNTIME_DIR,
 };
 
+let runtimeTestRoot = "";
+beforeEach(() => {
+  runtimeTestRoot = mkdtempSync(join(tmpdir(), "codex-pool-runtime-"));
+  process.env.KEEPER_SESSION_RUNTIME_DIR = runtimeTestRoot;
+});
+
 afterEach(() => {
+  rmSync(runtimeTestRoot, { recursive: true, force: true });
   extensionDelegateApiKeys.length = 0;
   extensionDelegateImpl = emptyNativeStream;
   for (const [key, value] of Object.entries(savedEnv)) {
@@ -887,8 +896,10 @@ describe("provider registration and compatibility", () => {
   test("active mode keeps sessionless compaction traffic on the root route", async () => {
     const { installCodexPool } = await import("../src/index.ts");
     const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-compaction-"));
+    const originalNow = Date.now;
+    const now = 1_700_000_000_000;
     try {
-      const now = Date.now();
+      Date.now = () => now;
       const aliases = ["keeper-codex-a", "keeper-codex-b"];
       process.env.KEEPER_JOB_ID = "keeper-launch-session";
       process.env.PI_CODING_AGENT_DIR = sandbox;
@@ -934,7 +945,28 @@ describe("provider registration and compatibility", () => {
 
       expect(delegatedSessionIds).toEqual(["root-session"]);
       expect(extensionDelegateApiKeys).toEqual(["fake-access-b"]);
+      expect(
+        readLatestPiRouteObservation(
+          {
+            jobId: "keeper-launch-session",
+            harness: "pi",
+            nativeSessionId: "root-session",
+          },
+          runtimeTestRoot,
+        ),
+      ).toEqual({
+        schema_version: 1,
+        subject_scope: "session",
+        job_id: "keeper-launch-session",
+        native_session_id: "root-session",
+        agent_id: null,
+        quota_scope: "generic",
+        state: "selected",
+        alias: "keeper-codex-b",
+        observed_at_ms: now,
+      });
     } finally {
+      Date.now = originalNow;
       rmSync(sandbox, { recursive: true, force: true });
     }
   });
@@ -1011,6 +1043,7 @@ describe("provider registration and compatibility", () => {
     ).toEqual([
       "../../../src/codex-pool-proof-window.ts",
       "../../../src/codex-quota-scope.ts",
+      "../../../src/session-runtime.ts",
     ]);
   });
 
@@ -1045,6 +1078,206 @@ describe("provider registration and compatibility", () => {
 });
 
 describe("credential and route state", () => {
+  test("publishes sanitized actual scoped-route changes across a Pi retry", async () => {
+    const aliases = ["keeper-codex-a", "keeper-codex-b"];
+    const transitions: Array<{
+      sessionId: string;
+      quotaScope: string;
+      state: string;
+      alias: string | null;
+      observedAtMs: number;
+    }> = [];
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => 100,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      aliasPolicy(aliases),
+      (transition) => transitions.push(transition),
+    );
+    let calls = 0;
+    const events = await collect(
+      createPooledCodexStream(
+        {
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+            () => 100,
+          ),
+          routes,
+          warn: () => {},
+          nativeDelegate: () => stream([]) as any,
+          delegate: () => {
+            calls += 1;
+            return calls === 1
+              ? (stream([
+                  { type: "start", partial: message() },
+                  {
+                    type: "error",
+                    reason: "error",
+                    error: message(
+                      "error",
+                      "quota owner@example.test Bearer route-secret raw-provider-error",
+                    ),
+                  },
+                ]) as any)
+              : (stream([
+                  { type: "start", partial: message() },
+                  { type: "done", reason: "stop", message: message() },
+                ]) as any);
+          },
+        },
+        MODEL as any,
+        CONTEXT as any,
+        { sessionId: "pi-retry-session" },
+      ),
+    );
+
+    expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+    expect(routes.routeFor("pi-retry-session")).toBe("keeper-codex-b");
+    expect(transitions).toEqual([
+      {
+        sessionId: "pi-retry-session",
+        quotaScope: "generic",
+        state: "selected",
+        alias: "keeper-codex-a",
+        observedAtMs: 100,
+      },
+      {
+        sessionId: "pi-retry-session",
+        quotaScope: "generic",
+        state: "retired",
+        alias: null,
+        observedAtMs: 100,
+      },
+      {
+        sessionId: "pi-retry-session",
+        quotaScope: "generic",
+        state: "selected",
+        alias: "keeper-codex-b",
+        observedAtMs: 100,
+      },
+    ]);
+    const serialized = JSON.stringify(transitions);
+    expect(serialized).not.toContain("route-secret");
+    expect(serialized).not.toContain("owner@example.test");
+    expect(serialized).not.toContain("raw-provider-error");
+  });
+
+  test("publishes scope switches, fallback retirement, bounded eviction, and stays fail-open", () => {
+    const aliases = ["keeper-codex-a", "keeper-codex-b"];
+    const scoped: Array<{
+      sessionId: string;
+      quotaScope: string;
+      state: string;
+      alias: string | null;
+      observedAtMs: number;
+    }> = [];
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => 200,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      bothScopesPolicy(aliases),
+      (transition) => scoped.push(transition),
+    );
+    applyScopedUsage(routes, "keeper-codex-a", 10, 10, 200);
+    applyScopedUsage(routes, "keeper-codex-b", 20, 20, 200);
+    const generic = routes.select("scope-session", CODEX_GENERIC_QUOTA_SCOPE);
+    const spark = routes.select("scope-session", CODEX_SPARK_QUOTA_SCOPE);
+    expect(generic).toBe("keeper-codex-a");
+    expect(spark).toBe("keeper-codex-b");
+    routes.recordFailure(
+      "scope-session",
+      generic,
+      "quota",
+      CODEX_GENERIC_QUOTA_SCOPE,
+    );
+    expect(scoped).toEqual([
+      {
+        sessionId: "scope-session",
+        quotaScope: "generic",
+        state: "selected",
+        alias: "keeper-codex-a",
+        observedAtMs: 200,
+      },
+      {
+        sessionId: "scope-session",
+        quotaScope: CODEX_SPARK_QUOTA_SCOPE,
+        state: "selected",
+        alias: "keeper-codex-b",
+        observedAtMs: 200,
+      },
+      {
+        sessionId: "scope-session",
+        quotaScope: "generic",
+        state: "retired",
+        alias: null,
+        observedAtMs: 200,
+      },
+    ]);
+
+    const fallback: typeof scoped = [];
+    const unavailable = new PoolRouteState(
+      aliases,
+      null,
+      () => 300,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      aliasPolicy(aliases, []),
+      (transition) => fallback.push(transition),
+    );
+    expect(() => unavailable.select("fallback-session")).toThrow(
+      "account-pool-exhausted",
+    );
+    expect(fallback).toEqual([
+      {
+        sessionId: "fallback-session",
+        quotaScope: "generic",
+        state: "retired",
+        alias: null,
+        observedAtMs: 300,
+      },
+    ]);
+
+    const evictions: typeof scoped = [];
+    const bounded = new PoolRouteState(
+      aliases,
+      null,
+      () => 400,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      aliasPolicy(aliases),
+      (transition) => evictions.push(transition),
+    );
+    for (let index = 0; index < 257; index += 1) {
+      bounded.select(`evict-${index}`);
+    }
+    expect(bounded.routeFor("evict-0")).toBeUndefined();
+    expect(evictions.at(-1)).toEqual({
+      sessionId: "evict-0",
+      quotaScope: "generic",
+      state: "retired",
+      alias: null,
+      observedAtMs: 400,
+    });
+
+    const throwingObserver = new PoolRouteState(
+      aliases,
+      null,
+      () => 500,
+      undefined,
+      CODEX_GENERIC_QUOTA_SCOPE,
+      aliasPolicy(aliases),
+      () => {
+        throw new Error("diagnostic-write-failed");
+      },
+    );
+    expect(throwingObserver.select("fail-open-session")).toBe("keeper-codex-a");
+  });
+
   test("resolves aliases independently and serializes one refresh per alias", async () => {
     let refreshCalls = 0;
     const storage = new MemoryCredentialStorage(credentials(10));

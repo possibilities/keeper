@@ -21,6 +21,7 @@ import {
   codexQuotaScopeForModelId,
   codexQuotaScopeSupportedByWindows,
 } from "../../../src/codex-quota-scope.ts";
+import { publishPiRouteObservation } from "../../../src/session-runtime.ts";
 import {
   aliasesFromEnvironment,
   type CanonicalOAuth,
@@ -905,6 +906,7 @@ export function installCodexPool(
   const initialScope = initialQuotaScopeFromEnvironment(
     process.env[INITIAL_SCOPE_ENV],
   );
+  let rootSessionId = launchSessionId;
   const routes = new PoolRouteState(
     aliases,
     new PoolStateStore(),
@@ -912,6 +914,20 @@ export function installCodexPool(
     initialScope === undefined ? undefined : process.env[INITIAL_ALIAS_ENV],
     initialScope,
     aliasPolicy ?? undefined,
+    (transition) => {
+      publishPiRouteObservation({
+        schema_version: 1,
+        subject_scope:
+          transition.sessionId === rootSessionId ? "session" : "parent",
+        job_id: launchSessionId,
+        native_session_id: transition.sessionId,
+        agent_id: null,
+        quota_scope: transition.quotaScope,
+        state: transition.state,
+        alias: transition.alias,
+        observed_at_ms: transition.observedAtMs,
+      });
+    },
   );
   const failureLog = new PoolFailureLog();
   const policyBinding = poolAliasPolicyBinding(aliases, aliasPolicy);
@@ -956,7 +972,6 @@ export function installCodexPool(
     return;
   }
 
-  let rootSessionId = launchSessionId;
   pi.on?.("session_start", (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     if (sessionId.trim() !== "") rootSessionId = sessionId;

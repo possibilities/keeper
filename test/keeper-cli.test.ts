@@ -331,6 +331,7 @@ describe("cli/keeper dispatch", () => {
     // Session reads and the process-only termination control are published.
     expect(SUBCOMMAND_META.session.verbs).toEqual([
       "state",
+      "runtime",
       "files",
       "events",
       "summary",
@@ -585,7 +586,7 @@ describe("cli/session group dispatcher", () => {
     const r = await runSession([]);
     expect(r.code).toBeNull();
     expect(r.out).toContain(
-      "keeper session <state|files|events|summary|terminate|release>",
+      "keeper session <state|runtime|files|events|summary|terminate|release>",
     );
     expect(r.err).toBe("");
   });
@@ -595,6 +596,7 @@ describe("cli/session group dispatcher", () => {
     expect(r.code).toBeNull();
     for (const verb of [
       "state",
+      "runtime",
       "files",
       "events",
       "summary",
@@ -610,6 +612,9 @@ describe("cli/session group dispatcher", () => {
     // routed to that exact leaf (and that the leaf help cites no retired name).
     expect((await runSession(["state", "--help"])).out).toContain(
       "keeper session state",
+    );
+    expect((await runSession(["runtime", "--help"])).out).toContain(
+      "keeper session runtime",
     );
     expect((await runSession(["files", "--help"])).out).toContain(
       "keeper session files",
