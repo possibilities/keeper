@@ -963,11 +963,16 @@ test("P0-4 durable conflict: an actor conflict mint round-trips through the REAL
       expected_source_head: string | null;
       expected_base_head: string | null;
       source_class: string | null;
+      fence_state: string | null;
     } | null;
   };
   expect(inc.conflict?.expected_source_head).toBe(sourceHead);
   expect(inc.conflict?.expected_base_head).toBe(targetHead);
   expect(inc.conflict?.source_class).toBe("rib");
+  // The AUTHORITATIVE-PINNED actor conflict is its OWN fence_state — never collapsed to
+  // `unpinned` (the bug that routed the resolver to the movable branch). The resolver merges
+  // the pinned source OBJECT gated on the target-arrival pin (`expected_base_head`).
+  expect(inc.conflict?.fence_state).toBe("actor-conflict");
   db.close();
 
   // (3) PINNED-CLEAR: the resolution probe routes the conflict fence to the PINNED grader —
@@ -1047,6 +1052,45 @@ test("a legacy or malformed fence is surfaced as malformed-pending (fail closed,
     expect(conflict?.fence_state).toBe("malformed");
     expect(degraded).toContain("incident_pending_fence_malformed");
   }
+});
+
+test("a malformed ACTOR `[conflict …]` fence surfaces malformed (fail closed) under a DISTINCT degraded flag, no live-head substitution", () => {
+  const { db } = freshMemDb();
+  const id = "fn-833-actor-malformed";
+  writeEpicFile(tmp, id, { primary_repo: "/repo" });
+  // A GENUINE actor content-conflict reason carrying a `[conflict …]` control token whose
+  // source id is too short to parse a valid fence — malformed-ACTOR, distinct from a legacy
+  // fence-less conflict. It must FAIL CLOSED as `malformed` (never `unpinned`/`actor-conflict`)
+  // and never substitute live branch heads as the missing authority.
+  seedMergeConflict(db, {
+    id,
+    reason: `worktree-merge-conflict: merging keeper/epic/${id}--${id}.2 into keeper/epic/${id} — CONFLICT (content): x.ts [conflict src=${"a".repeat(12)} target=${"b".repeat(40)} class=rib]`,
+    dir: "/repo",
+  });
+  const r = buildEscalationBrief(db, `deconflict::${id}`, tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const conflict = (
+    r.brief.incident as {
+      conflict: {
+        expected_source_head: string | null;
+        expected_base_head: string | null;
+        source_class: string | null;
+        fence_state: string;
+      } | null;
+    }
+  ).conflict;
+  expect(conflict?.fence_state).toBe("malformed");
+  expect(conflict?.expected_source_head).toBeNull();
+  expect(conflict?.expected_base_head).toBeNull();
+  expect(conflict?.source_class).toBeNull();
+  // Surfaced DISTINCTLY from a malformed-pending row so an operator can tell them apart.
+  expect(r.brief.degraded).toContain("incident_actor_fence_malformed");
+  expect(r.brief.degraded).not.toContain("incident_pending_fence_malformed");
+  db.close();
 });
 
 test("direct work and close incident ids resolve fenced claim and grant facts read-only", () => {

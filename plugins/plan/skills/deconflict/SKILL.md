@@ -36,17 +36,21 @@ This phase is unchanged: the flat JSON is your whole context.
 
 ## Phase 1b — Route by fence class
 
-Read `incident.conflict.fence_state`. The deconflicter reconciles the `unpinned`
-genuine-conflict class ONLY; a pending-integration request never reaches it:
+Read `incident.conflict.fence_state`. The deconflicter reconciles the `unpinned` and
+`actor-conflict` genuine-conflict classes; a `pinned` or `malformed` request never
+reaches it:
 
 - `pinned` — a mechanical fast-forward request owned by the work/close session's
   resolver. Do NOT spawn the deconflicter. Decline and stop, noting the incident is
   a pinned fast-forward that resolves through the mechanical path in its owning
   session (never a live-head substitution here).
-- `malformed` — a legacy fence-less pending request. FAIL CLOSED: decline
+- `malformed` — a fence-less or malformed-fence request. FAIL CLOSED: decline
   (`stale_base`) and stop, NEVER substitute live branch heads as the missing
   authority and never spawn the deconflicter.
-- `unpinned` — a genuine content conflict. Continue to Phase 2.
+- `actor-conflict` — an AUTHORITATIVE PINNED genuine content conflict. Continue to
+  Phase 2; the deconflicter merges the pinned source OBJECT (`expected_source_head`)
+  gated on the checkout HEAD matching `expected_base_head`, never a movable branch.
+- `unpinned` — a fence-less genuine content conflict. Continue to Phase 2.
 
 ## Phase 2 — Locate the worktree and pin pre-merge state
 
@@ -57,7 +61,8 @@ Pin these fields from the incident brief JSON:
 - `incident.conflict.repo_dir`
 - `incident.conflict.stderr`
 - `incident.conflict.expected_source_head` / `incident.conflict.expected_base_head`
-  — the durable head fence (both null for the `unpinned` class this phase serves).
+  — the durable head fence (both null for the fence-less `unpinned` class; both a full
+  object id for the `actor-conflict` class — the source object and target-arrival pins).
 - `epic_id` / `task_id` / `lineage` fields you need for close-out
 
 Then confirm the checkout state before spawn:
@@ -106,8 +111,8 @@ BRIEF_REF=deconflict::<ref>
     "source_branch": "<incident.conflict.source_branch>",
     "toplevel": "<git rev-parse --show-toplevel>",
     "expected_heads": {
-      "base_head": "<incident.conflict.expected_base_head; ONLY for a genuine content conflict (never a pending-owner-integration request) may you fall back to the live git rev-parse <base_branch>>",
-      "source_head": "<incident.conflict.expected_source_head; ONLY for a genuine content conflict (never a pending-owner-integration request) may you fall back to the live git rev-parse <source_branch>>"
+      "base_head": "<incident.conflict.expected_base_head; fall back to the live git rev-parse <base_branch> ONLY for the fence-less `unpinned` class — NEVER for a `pinned` pending request or an `actor-conflict`, whose pinned head is authoritative>",
+      "source_head": "<incident.conflict.expected_source_head; fall back to the live git rev-parse <source_branch> ONLY for the fence-less `unpinned` class — NEVER for a `pinned` pending request or an `actor-conflict`, whose pinned head is authoritative>"
     }
   }
 }

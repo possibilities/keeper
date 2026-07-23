@@ -304,8 +304,10 @@ import {
   isRetryableDispatchKey,
   parseDispatchKey,
 } from "../src/dispatch-command";
+import { buildEscalationBrief } from "../cli/escalation-brief";
 import {
   fatalAuditDispatchId,
+  parseConflictHeadFence,
   parseMergeConflictReason,
 } from "../src/dispatch-failure-key";
 import type { LaunchSpec, PaneInfo } from "../src/exec-backend";
@@ -25420,6 +25422,124 @@ test("runProgressActor: a content conflict → a work::<task> escalation carryin
   expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
   expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
   expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
+});
+
+test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_state=actor-conflict → the rendered exact-object resolver instruction → pinned clear", async () => {
+  // (1) DRIVE THE ACTUAL ACTOR — never hand-build the reason. The real mint carries the
+  //     canonical `merging <src> into <base>` grammar PLUS the `[conflict …]` head fence
+  //     pinning the exact source object, target-arrival object, and obligation class.
+  const { run } = actorGit({ conflict: true });
+  const out = await driveActor([actorItem()], run);
+  expect(out.escalations).toHaveLength(1);
+  const reason = out.escalations[0]?.reason;
+  expect(reason).toBeDefined();
+  if (reason === undefined) return;
+  // The actor's own fence round-trips through the REAL parser.
+  expect(parseConflictHeadFence(reason)).toEqual({
+    sourceHead: ACTOR_RIB_OID,
+    targetHead: ACTOR_LANE_OID,
+    sourceClass: "rib",
+  });
+
+  // (2) REAL DispatchFailed FOLD — the actor's reason folds VERBATIM into dispatch_failures
+  //     through the reducer (never a direct projection write), exactly as the daemon mints it.
+  const { db } = freshMemDb();
+  const taskId = "fn-1-foo.4";
+  db.query(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (1, 'reconciler', 'DispatchFailed', 'DispatchFailed', ?)`,
+  ).run(JSON.stringify({ verb: "work", id: taskId, reason, dir: "/lane", ts: 1 }));
+  drain(db);
+  const folded = db
+    .query("SELECT reason FROM dispatch_failures WHERE verb = 'work' AND id = ?")
+    .get(taskId) as { reason: string } | null;
+  expect(folded?.reason).toBe(reason);
+
+  // (3) BRIEF — the deconflict brief classifies the actor conflict as its OWN authoritative
+  //     class and surfaces the pinned heads + obligation class (never null, never `unpinned`).
+  const briefRoot = mkdtempSync(join(tmpdir(), "actor-brief-"));
+  mkdirSync(join(briefRoot, ".keeper", "epics"), { recursive: true });
+  writeFileSync(
+    join(briefRoot, ".keeper", "epics", "fn-1-foo.json"),
+    JSON.stringify({ id: "fn-1-foo", primary_repo: "/repo" }),
+  );
+  try {
+    const r = buildEscalationBrief(db, `work::${taskId}`, briefRoot);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    const conflict = (
+      r.brief.incident as {
+        conflict: {
+          fence_state: string;
+          expected_source_head: string | null;
+          expected_base_head: string | null;
+          source_class: string | null;
+        } | null;
+      }
+    ).conflict;
+    expect(conflict?.fence_state).toBe("actor-conflict");
+    expect(conflict?.expected_source_head).toBe(ACTOR_RIB_OID);
+    expect(conflict?.expected_base_head).toBe(ACTOR_LANE_OID);
+    expect(conflict?.source_class).toBe("rib");
+  } finally {
+    rmSync(briefRoot, { recursive: true, force: true });
+    db.close();
+  }
+
+  // (4) The RENDERED resolver instruction the actor-conflict incident routes to — the managed
+  //     merge-resolver template whose actor-conflict arm the render carries VERBATIM (only the
+  //     frontmatter is substituted) — instructs the EXACT-OBJECT merge gated on the arrival
+  //     pin, never the movable branch.
+  const resolver = readFileSync(
+    join(
+      import.meta.dir,
+      "..",
+      "plugins",
+      "plan",
+      "template",
+      "agents",
+      "merge-resolver.md.tmpl",
+    ),
+    "utf-8",
+  );
+  expect(resolver).toContain("**`actor-conflict`**");
+  expect(resolver).toContain("`git merge --no-ff <expected_source_head>`");
+  expect(resolver).toContain("MUST equal `expected_base_head`");
+  expect(resolver).toContain("MUST equal `expected_source_head`");
+
+  // (5) PINNED CLEAR — the incident-resolution probe clears the actor conflict from the
+  //     DURABLE OBJECTS: both pinned oids ancestors of a stable, clean target base → `merged`,
+  //     the SAME race-free pinned grading the pending class uses, never the movable source ref.
+  const baseOid = ACTOR_LANE_OID;
+  const clearRun = (async (a: string[]) => {
+    const cmd = a.join(" ");
+    if (a[0] === "rev-parse" && cmd.includes("^{commit}")) {
+      return { code: 0, stdout: `${baseOid}\n`, stderr: "" };
+    }
+    if (a[0] === "merge-base" && a.includes("--is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // both pins ancestors of the base
+    }
+    if (a.includes("--git-dir")) return { code: 1, stdout: "", stderr: "" };
+    if (a[0] === "for-each-ref") return { code: 0, stdout: "", stderr: "" };
+    if (
+      cmd === "rev-parse --verify --quiet MERGE_HEAD" ||
+      cmd === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+      cmd === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+      cmd === "rev-parse --verify --quiet REVERT_HEAD"
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // no in-progress residue
+    }
+    if (a[0] === "status") return { code: 0, stdout: "", stderr: "" }; // clean
+    if (cmd === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${CASCADE_RIB4}\n`, stderr: "" }; // on the base
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [{ id: taskId, reason, dir: "/lane" }],
+    clearRun,
+  );
+  expect(verdicts.get(taskId)).toBe("merged");
 });
 
 test("runProgressActor: steady-state ABSENT rib (torn down, base not yet in the lane) → the canonical-base arm is reached and integrated", async () => {

@@ -101,6 +101,9 @@ describe("evaluateGrantBash — diagnosis role (no grant / unblocker)", () => {
     // mutating commands a diagnosis role may not run
     "git commit -m x",
     "git merge origin/main",
+    // the EXACT actor-conflict resolver shape — a full object id, `--no-ff` — stays denied for
+    // a diagnosis role (it may orient, never mutate).
+    "git merge --no-ff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "keeper commit-work 'x'",
     "uv run build",
     // config injection + protected config write
@@ -117,6 +120,9 @@ describe("evaluateGrantBash — diagnosis role (no grant / unblocker)", () => {
 describe("evaluateGrantBash — write-capable role (granted resolve/deconflict/repair)", () => {
   const allow = [
     "git merge origin/main",
+    // the EXACT rendered actor-conflict resolver command — the pinned source OBJECT id with
+    // `--no-ff` — clears the write-capable allowlist (all git except `config`).
+    "git merge --no-ff aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "git commit -m x",
     "git checkout --theirs src/x.ts",
     "git add -A",
