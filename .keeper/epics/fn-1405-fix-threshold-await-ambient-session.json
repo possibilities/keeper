@@ -7,7 +7,7 @@
     "fn-1402-expose-agent-runtime-diagnostics"
   ],
   "id": "fn-1405-fix-threshold-await-ambient-session",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-23T03:10:00.502000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-23T03:08:28.124000Z"
+  "updated_at": "2026-07-23T03:10:00.502000Z"
 }
