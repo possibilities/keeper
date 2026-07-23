@@ -64,13 +64,15 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 Claude launches require the behavior carried by the `integration/keeper` branch of the
 [`possibilities/claude-swap`](https://github.com/possibilities/claude-swap) fork. The installer keeps its
-checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, rebases the
-clean integration branch onto `upstream/main`, and attempts to republish it with force-with-lease. While the
-integration tree still differs, `uv` installs that exact checkout. Once upstream has absorbed every patch and
-the trees match, `uv` installs canonical `realiti4/claude-swap` at the fetched `upstream/main` commit instead,
-so the fork stops serving production automatically. A wrong branch, dirty checkout, fetch/rebase conflict,
-source-selection failure, or clone failure skips installation and sends a best-effort `notifyctl` alert rather
-than installing unverified source. Missing `uv`, a failed sync, or a failed installation is nonfatal to
+checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, requires the
+clean local integration tip to match its freshly fetched fork branch, rebases onto `upstream/main`, and
+republishes a rewritten tip only under an exact force-with-lease. While the integration tree still differs,
+`uv` installs that exact checkout. Once upstream has absorbed every patch and the trees match, `uv` installs
+canonical `realiti4/claude-swap` at the fetched `upstream/main` commit instead, so the fork stops serving
+production automatically. A wrong branch, dirty checkout, local/published mismatch, fetch/rebase/publication
+failure, source-selection failure, or clone failure restores the prior clean tip when needed, skips
+installation, and sends a best-effort `notifyctl` alert rather than installing unverified source. Missing
+`uv`, a failed sync, or a failed installation is nonfatal to
 Keeper's non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
 registered.
 

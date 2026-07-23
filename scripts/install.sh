@@ -365,8 +365,18 @@ claude_swap_sync() {
       claude_swap_notify "checkout has local changes — skipping rebase and install"
       exit 1
     fi
-    if ! safe_tip="$(git rev-parse HEAD)"; then
-      claude_swap_notify "cannot resolve the pre-rebase tip — skipping install"
+    if ! git fetch --quiet origin \
+      "+refs/heads/${claude_swap_branch}:refs/remotes/origin/${claude_swap_branch}"; then
+      claude_swap_notify "git fetch origin/${claude_swap_branch} failed — skipping rebase and install"
+      exit 1
+    fi
+    if ! safe_tip="$(git rev-parse HEAD)" ||
+       ! remote_tip="$(git rev-parse "refs/remotes/origin/${claude_swap_branch}")"; then
+      claude_swap_notify "cannot resolve the local and published integration tips — skipping install"
+      exit 1
+    fi
+    if [ "${safe_tip}" != "${remote_tip}" ]; then
+      claude_swap_notify "local and published '${claude_swap_branch}' tips differ — skipping rebase and install"
       exit 1
     fi
     if ! git fetch --quiet upstream \
@@ -380,8 +390,18 @@ claude_swap_sync() {
       claude_swap_notify "rebase onto upstream/main conflicted; rolled back to pre-rebase tip ${safe_tip:0:10} and skipped install"
       exit 1
     fi
-    if ! git push --force-with-lease origin "${claude_swap_branch}" >/dev/null 2>&1; then
-      claude_swap_notify "rebased locally but could not republish '${claude_swap_branch}' to origin"
+    if ! rebased_tip="$(git rev-parse HEAD)"; then
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      claude_swap_notify "cannot resolve the rebased integration tip; rolled back and skipped install"
+      exit 1
+    fi
+    if [ "${rebased_tip}" != "${safe_tip}" ] &&
+       ! git push \
+         "--force-with-lease=refs/heads/${claude_swap_branch}:${remote_tip}" \
+         origin "HEAD:refs/heads/${claude_swap_branch}" >/dev/null 2>&1; then
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      claude_swap_notify "exact-lease publication of '${claude_swap_branch}' failed; rolled back and skipped install"
+      exit 1
     fi
     echo "install: claude-swap fork rebased cleanly onto upstream/main"
   )

@@ -28,6 +28,11 @@ const RETIRED_CLEANUP = between(
   "retire_keeper_codexbar_cli() {",
   "# 3e. claude-swap CLI:",
 );
+const CLAUDE_SWAP_INSTALL = between(
+  INSTALL,
+  "# 3e. claude-swap CLI:",
+  "# 3f. ripgrep:",
+);
 
 describe("mandatory claude-swap installation", () => {
   test("rebases integration before selecting the fork or canonical upstream", () => {
@@ -40,19 +45,31 @@ describe("mandatory claude-swap installation", () => {
     expect(INSTALL).toContain("git clone --quiet --branch");
     expect(INSTALL).toContain("git status --porcelain");
     expect(INSTALL).toContain("+refs/heads/main:refs/remotes/upstream/main");
+    expect(INSTALL).toContain(
+      `+refs/heads/\${claude_swap_branch}:refs/remotes/origin/\${claude_swap_branch}`,
+    );
     expect(INSTALL).not.toContain("git fetch upstream main --quiet");
     expect(INSTALL).toContain("git rebase upstream/main");
     expect(INSTALL).toContain("git rebase --abort");
     expect(INSTALL).toContain("git reset --hard");
-    expect(INSTALL).toContain("git push --force-with-lease origin");
+    expect(INSTALL).toContain(
+      `--force-with-lease=refs/heads/\${claude_swap_branch}:\${remote_tip}`,
+    );
+    expect(CLAUDE_SWAP_INSTALL).not.toContain(
+      "git push --force-with-lease origin",
+    );
+    expect(INSTALL).toContain(
+      `origin "HEAD:refs/heads/\${claude_swap_branch}"`,
+    );
+    expect(INSTALL).toContain("exact-lease publication");
     expect(INSTALL).toContain("notifyctl show-message");
     expect(INSTALL).toContain("uv tool install --force");
     expect(INSTALL).toContain("diff --quiet upstream/main HEAD --");
     expect(INSTALL).toContain(
       `claude_swap_install_source="git+\${claude_swap_upstream}@\${claude_swap_upstream_tip}"`,
     );
-    expect(INSTALL_DOC).toContain(
-      "the fork stops serving production automatically",
+    expect(INSTALL_DOC).toMatch(
+      /the fork stops serving\s+production automatically/,
     );
     expect(INSTALL).not.toContain("uv tool install --upgrade claude-swap");
     expect(INSTALL.indexOf("git rebase upstream/main")).toBeLessThan(
