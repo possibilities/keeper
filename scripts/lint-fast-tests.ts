@@ -136,6 +136,12 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
       "Reviewed multi-root compiler publication fixture retains its scoped timeout.",
   },
   {
+    file: "test/account-recovery.test.ts",
+    rule: "production-scale-fixture",
+    reason:
+      "Reviewed claude-swap recovery parser byte-limit boundary requires an over-limit payload.",
+  },
+  {
     file: "test/autopilot-worker.test.ts",
     rule: "fixed-sleep",
     reason:
