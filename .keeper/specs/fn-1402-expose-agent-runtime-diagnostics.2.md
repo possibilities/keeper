@@ -65,5 +65,6 @@ Human `keeper usage`, existing scripts using snapshot output, and `keeper agent 
 - [ ] Targeted Usage, routing, and CLI descriptor tests pass deterministically.
 
 ## Done summary
-
+Added keeper usage --json (schema-v1 one-shot envelope, rejects --watch) and a new keeper accounts inspect command reporting separate Claude launch, Codex launch-seed, and scoped Pi runtime routing blocks, reusing the existing inspectRouting/productionCodexSessionInspection seams for compatibility with keeper agent accounts check.
 ## Evidence
+- Commits: 788808bb3655c44c60716a5fedb6584a45969ee6
