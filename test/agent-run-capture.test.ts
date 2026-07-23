@@ -461,6 +461,10 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--resume"], "--resume requires a value"],
     [["claude", "p", "--control"], "--control requires a value"],
     [["claude", "p", "--control-owner"], "--control-owner requires a value"],
+    // An explicit budget beyond the safe-integer range is bad_args, never
+    // silently dropped by the durable run.json bind.
+    [["claude", "p", "--budget", "999999999999999999999ms"], "safe integer"],
+    [["claude", "p", "--budget=999999999999999999999ms"], "safe integer"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);
@@ -2170,6 +2174,20 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       handle: null,
     });
     expect(h.err.join("")).toContain("<cli> must be");
+  });
+
+  test("an out-of-safe-range --budget is bad_args (2), never a silently unbounded launch", async () => {
+    const h = makeHarness({
+      argv: ["run", "claude", "hi", "--budget", "999999999999999999999ms"],
+      rawArgv: true,
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    // No launch fired — the explicit value is rejected before run.json is bound.
+    expect(h.tmuxCommands.length).toBe(0);
   });
 
   /** A harness whose faked tmux + on-disk claude transcript let a `claude` run

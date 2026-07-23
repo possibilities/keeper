@@ -484,13 +484,17 @@ export async function runWaitForStop(
 ): Promise<WaitForStopResult> {
   const now = deps.now ?? Date.now;
   const totalMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+  // A 0 stopTimeoutMs (an over-budget capture, floored to a single non-sleeping
+  // scan by captureFromHandle) means OBSERVATIONS ONLY: each watcher stage does
+  // exactly one scan and NO poll sleep. Pin both relative timeouts to a LITERAL
+  // 0 — deriving a remainder from the wall clock would re-arm a sleep if the
+  // clock moved backward between samples (deadline - a smaller now() > 0). Only a
+  // positive budget derives its remainder from the clock.
+  const observationOnly = totalMs === 0;
   const deadlineMs = now() + totalMs;
-  // Floor the remainder at 0, NOT 1: a 0-budget stopTimeoutMs (an over-budget
-  // capture, floored to a single non-sleeping scan by captureFromHandle) must
-  // stay 0 so each watcher stage does exactly one observation scan and its
-  // deadline check returns before any poll sleep. A 1ms floor would re-arm a
-  // full 250ms poll-sleep on an already-exhausted budget.
-  const remainingForPath = Math.max(0, deadlineMs - now());
+  const remainingForPath = observationOnly
+    ? 0
+    : Math.max(0, deadlineMs - now());
   const pathTimeoutMs =
     handle.agent === "pi"
       ? remainingForPath
@@ -531,9 +535,9 @@ export async function runWaitForStop(
     lifecycleProbe: lifecycleProbe(handle, deps),
     windowProbe: probeWindow,
     transcriptPath,
-    // Same 0-floor as the path stage: preserve an exhausted budget so the stop
-    // stage's single scan returns without a poll sleep.
-    stopTimeoutMs: Math.max(0, deadlineMs - now()),
+    // Same literal-0 rule as the path stage: an exhausted budget observes once
+    // and never sleeps, whatever the wall clock did between samples.
+    stopTimeoutMs: observationOnly ? 0 : Math.max(0, deadlineMs - now()),
     ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });

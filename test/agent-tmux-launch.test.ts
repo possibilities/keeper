@@ -1261,9 +1261,12 @@ describe("--no-artifacts", () => {
 describe("run.json publication is atomic; a failed publish tears down the exact window", () => {
   const RUN_ID = "tmux-abababab-abab-abab-abab-abababababab";
 
-  function launchReqWithFailingWrite(
+  function launchReq(
     stateDir: string,
     tmuxCommands: string[][],
+    fsOverride: Partial<
+      Pick<TmuxLaunchRequest, "writeFile" | "renameFile" | "unlinkFile">
+    >,
   ): TmuxLaunchRequest {
     return {
       agent: "claude",
@@ -1295,25 +1298,15 @@ describe("run.json publication is atomic; a failed publish tears down the exact 
         }
         return { exitCode: 0, stdout: "", stderr: "" };
       },
-      // The injected leaf: the run.json publish write fails after the window is up.
-      writeFile: () => {
-        throw new Error("disk full");
-      },
+      ...fsOverride,
     };
   }
 
-  test("a write failure kills the exact just-created window and leaves no partial run.json", () => {
-    const stateDir = tempDir();
-    const tmuxCommands: string[][] = [];
-    const req = launchReqWithFailingWrite(stateDir, tmuxCommands);
-
-    let thrown: unknown;
-    try {
-      launchKeeperAgentInTmux(req);
-    } catch (err) {
-      thrown = err;
-    }
-
+  function expectPublishFailureTeardown(
+    stateDir: string,
+    tmuxCommands: string[][],
+    thrown: unknown,
+  ): void {
     // (c) the caller sees launch_failed: launchToResolvedHandle maps a
     //     TmuxLaunchError to a failed launch → composeRunCapture's launch_failed.
     expect(thrown).toBeInstanceOf(TmuxLaunchError);
@@ -1321,14 +1314,51 @@ describe("run.json publication is atomic; a failed publish tears down the exact 
     expect((thrown as TmuxLaunchError).message).toContain(
       "failed to publish run metadata",
     );
-
     // (b) teardown targets EXACTLY the just-created window (@7), never a name sweep.
     const kill = tmuxCommands.find((c) => c.includes("kill-window"));
     expect(kill).toEqual(["tmux", "-L", "agents", "kill-window", "-t", "@7"]);
-
     // (a) no partial run.json — and no leftover temp file — remains on disk.
     const runDir = join(stateDir, "tmux-runs", RUN_ID);
     expect(existsSync(join(runDir, "run.json"))).toBe(false);
     expect(readdirSync(runDir).some((f) => f.includes(".tmp"))).toBe(false);
+  }
+
+  test("a WRITE failure kills the exact just-created window and leaves no partial run.json", () => {
+    const stateDir = tempDir();
+    const tmuxCommands: string[][] = [];
+    // The temp-file write itself fails after the window is up.
+    const req = launchReq(stateDir, tmuxCommands, {
+      writeFile: () => {
+        throw new Error("disk full");
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      launchKeeperAgentInTmux(req);
+    } catch (err) {
+      thrown = err;
+    }
+    expectPublishFailureTeardown(stateDir, tmuxCommands, thrown);
+  });
+
+  test("a RENAME failure unlinks the temp file, kills the exact window, and fails the launch", () => {
+    const stateDir = tempDir();
+    const tmuxCommands: string[][] = [];
+    // The temp write succeeds (real fs); the atomic rename over run.json fails —
+    // the temp file must be unlinked (real fs), so no .tmp litter survives.
+    const req = launchReq(stateDir, tmuxCommands, {
+      renameFile: () => {
+        throw new Error("cross-device rename");
+      },
+    });
+
+    let thrown: unknown;
+    try {
+      launchKeeperAgentInTmux(req);
+    } catch (err) {
+      thrown = err;
+    }
+    expectPublishFailureTeardown(stateDir, tmuxCommands, thrown);
   });
 });

@@ -400,8 +400,10 @@ const BOUNDED_DURATION = /^(\d+)(ms|s|m)$/;
 const MAX_WRAPPED_BUDGET_MS = 86_400_000;
 
 /** True when `token` is a bounded duration whose millisecond value is a safe
- *  integer within {@link MAX_WRAPPED_BUDGET_MS}. A shape match alone is NOT a
- *  bound: `999999999m` is shape-valid yet denied. Absent/malformed → false. */
+ *  POSITIVE integer within {@link MAX_WRAPPED_BUDGET_MS}. A shape match alone is
+ *  NOT a bound: `999999999m` is shape-valid yet denied; `0ms`/`0s` are denied too
+ *  (parseDuration rejects a zero duration, so the guard and CLI agree).
+ *  Absent/malformed → false. */
 function boundedDurationWithinMax(token: string | undefined): boolean {
   if (token === undefined) return false;
   const match = BOUNDED_DURATION.exec(token);
@@ -411,7 +413,7 @@ function boundedDurationWithinMax(token: string | undefined): boolean {
   const unit = match[2] as string;
   const ms =
     unit === "ms" ? value : unit === "s" ? value * 1000 : value * 60000;
-  return Number.isSafeInteger(ms) && ms <= MAX_WRAPPED_BUDGET_MS;
+  return Number.isSafeInteger(ms) && ms > 0 && ms <= MAX_WRAPPED_BUDGET_MS;
 }
 const WRAPPED_PROVIDER_BOOLEAN_OPTIONS = new Set(["--reap-window-on-terminal"]);
 const RUN_GATE_STEER =

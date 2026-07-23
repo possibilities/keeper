@@ -548,6 +548,25 @@ export type ParseRunArgsResult =
  * default-absent, so an argv without them stays byte-identical. Pure — exported
  * for tests.
  */
+/** Parse a `--budget` duration and reject a value the durable run.json bind
+ *  cannot represent. An explicitly passed budget beyond the safe-integer range is
+ *  bad_args, NEVER silently discarded: the run.json `Number.isSafeInteger` bind
+ *  would otherwise drop the field, leaving the unbounded wait the caller never
+ *  asked for. */
+function parseBudget(
+  value: string,
+): { ok: true; ms: number } | { ok: false; error: string } {
+  const parsed = parseDuration(value);
+  if (!parsed.ok) return { ok: false, error: `--budget ${parsed.message}` };
+  if (!Number.isSafeInteger(parsed.ms)) {
+    return {
+      ok: false,
+      error: `--budget must be within the safe integer millisecond range (got '${value}')`,
+    };
+  }
+  return { ok: true, ms: parsed.ms };
+}
+
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
   let stopTimeoutMs: number | null = null;
@@ -603,20 +622,15 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       if (value === undefined) {
         return { ok: false, error: "--budget requires a value" };
       }
-      const parsed = parseDuration(value);
-      if (!parsed.ok) {
-        return { ok: false, error: `--budget ${parsed.message}` };
-      }
+      const parsed = parseBudget(value);
+      if (!parsed.ok) return { ok: false, error: parsed.error };
       budgetMs = parsed.ms;
       i += 1;
       continue;
     }
     if (arg.startsWith("--budget=")) {
-      const value = arg.slice("--budget=".length);
-      const parsed = parseDuration(value);
-      if (!parsed.ok) {
-        return { ok: false, error: `--budget ${parsed.message}` };
-      }
+      const parsed = parseBudget(arg.slice("--budget=".length));
+      if (!parsed.ok) return { ok: false, error: parsed.error };
       budgetMs = parsed.ms;
       continue;
     }

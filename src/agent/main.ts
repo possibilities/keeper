@@ -2453,10 +2453,9 @@ async function runResumeCaptureSubcommand(
   if (decision.kind === "live") {
     // A live resume messages an already-running window over the Bus — it opens
     // NO new run.json, so a `--budget` has no durable launch instant to bind the
-    // cumulative ceiling against. Honoring it would let a cold-restarted wait
-    // grant another full budget (the exact incident the durable budget forecloses
-    // for a launched leg). FAIL CLOSED before any Bus send, so a budgeted live
-    // resume never reaches runLivePartnerCapture.
+    // cumulative ceiling against; a cold-restarted wait would then grant another
+    // full budget. A budgeted live resume therefore FAILS CLOSED before any Bus
+    // send and never reaches runLivePartnerCapture.
     if (parsed.budgetMs !== null) {
       deps.writeErr(
         `agent: --budget cannot be combined with a --resume matching the live ` +

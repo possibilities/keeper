@@ -360,6 +360,14 @@ describe("evaluateWrappedBash — the --budget/--stop-timeout ceiling is a numer
       ),
     ).not.toBeNull();
   });
+
+  test("DENIES a zero-duration --budget (0ms/0s) — the guard agrees with parseDuration", () => {
+    // parseDuration rejects a 0 duration; the guard must not admit what the CLI
+    // then refuses, or a wrapped launch/wait fails downstream instead of here.
+    expect(evaluateWrappedBash(wait("0ms"), context)).not.toBeNull();
+    expect(evaluateWrappedBash(wait("0s"), context)).not.toBeNull();
+    expect(evaluateWrappedBash(launch("0ms"), context)).not.toBeNull();
+  });
 });
 
 describe("evaluateWrappedBash — launch-bound AUDIT_READY block", () => {

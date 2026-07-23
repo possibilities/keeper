@@ -728,6 +728,56 @@ describe("an exhausted budget (stopTimeoutMs 0) does one observation scan, never
     expect(result.ok).toBe(false);
     expect(clock.sleeps()).toBe(0);
   });
+
+  // A BACKWARD-moving wall clock (now() 1000 then 900) must NOT resurrect a poll
+  // sleep: deriving `deadline - a smaller now()` yields a positive remainder that
+  // the old code turned into a real timeout. observationOnly pins both stages to
+  // a literal 0. The sleep leaf THROWS so any call fails the test loudly.
+  const backwardClock = (): (() => number) => {
+    let call = 0;
+    return () => (call++ === 0 ? 1000 : 900);
+  };
+  const throwingSleep = async (): Promise<void> => {
+    throw new Error("sleep must never fire on an exhausted (0) budget");
+  };
+
+  test("(path stage, backward clock) observes once, NEVER sleeps", async () => {
+    const handle: ResolvedHandle = {
+      agent: "claude",
+      cwd: "/missing",
+      sessionId: "never-appears",
+      startedAtMs: 1,
+      transcriptPath: null,
+      stopTimeoutMs: 0,
+    };
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: tempDir(),
+      sleep: throwingSleep,
+      now: backwardClock(),
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  test("(stop stage, backward clock) observes once, NEVER sleeps", async () => {
+    const path = join(tempDir(), "nostop.jsonl");
+    writeFileSync(path, `${JSON.stringify({ type: "thinking" })}\n`);
+    const handle: ResolvedHandle = {
+      agent: "claude",
+      cwd: "/work/proj",
+      sessionId: "s",
+      startedAtMs: 0,
+      transcriptPath: path,
+      stopTimeoutMs: 0,
+    };
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: tempDir(),
+      sleep: throwingSleep,
+      now: backwardClock(),
+    });
+    expect(result.ok).toBe(false);
+  });
 });
 
 describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Rider)", () => {
