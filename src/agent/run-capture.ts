@@ -165,7 +165,10 @@ export function buildRunControlArtifact(args: {
   };
 }
 
-function alreadyGoneTmuxError(stderr: string): boolean {
+/** True when a tmux stderr proves the target window/session (or the whole
+ *  server) is already gone — shared by exact teardown and the wait's
+ *  positive-gone window probe so both classify "absent" identically. */
+export function alreadyGoneTmuxError(stderr: string): boolean {
   return /(?:can't find (?:window|session)|no server running|no sessions|session not found|window not found)/i.test(
     stderr,
   );
@@ -866,6 +869,64 @@ export async function captureFromHandle(
         handle: handleId,
         transcriptPath: wait.transcriptPath ?? null,
         resumeTarget: baseResume,
+        elapsedSeconds: elapsed(),
+      });
+    }
+    // The target's tmux window is POSITIVELY gone. Recover the partner's final
+    // message from its transcript via the SAME show-last-message machinery a
+    // normal stop uses — a leg that COMPLETED but whose waiter missed the stop
+    // yields `completed`/`no_message` where recoverable; a transcript that never
+    // resolved or carries no terminal turn is `partner_died`; a collision maps to
+    // its exact `transcript_ambiguous`. NEVER fabricate — ambiguity keeps its arm.
+    if (wait.reason === "window_gone") {
+      const knownPath = wait.transcriptPath ?? null;
+      if (knownPath === null) {
+        return buildRunCaptureEnvelope({
+          outcome: "partner_died",
+          agent,
+          handle: handleId,
+          resumeTarget: baseResume,
+          elapsedSeconds: elapsed(),
+        });
+      }
+      const show = await deps.showLastMessage(
+        { ...handle, transcriptPath: knownPath },
+        verbDeps,
+      );
+      if (!show.ok) {
+        return buildRunCaptureEnvelope({
+          outcome:
+            show.reason === "ambiguous"
+              ? "transcript_ambiguous"
+              : "partner_died",
+          agent,
+          handle: handleId,
+          resumeTarget: baseResume,
+          elapsedSeconds: elapsed(),
+        });
+      }
+      // A found final turn is a real terminal deliverable — `completed` with text,
+      // `no_message` on a tool-only/textless turn. No turn found at all means the
+      // gone leg left nothing recoverable: `partner_died`, never a guessed answer.
+      if (!show.found) {
+        return buildRunCaptureEnvelope({
+          outcome: "partner_died",
+          agent,
+          handle: handleId,
+          transcriptPath: show.transcriptPath,
+          resumeTarget: baseResume,
+          elapsedSeconds: elapsed(),
+        });
+      }
+      const recovered = show.text !== null && show.text.trim() !== "";
+      return buildRunCaptureEnvelope({
+        outcome: recovered ? "completed" : "no_message",
+        agent,
+        handle: handleId,
+        transcriptPath: show.transcriptPath,
+        resumeTarget: baseResume,
+        message: show.text,
+        messageFound: show.found,
         elapsedSeconds: elapsed(),
       });
     }

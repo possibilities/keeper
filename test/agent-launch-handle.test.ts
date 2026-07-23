@@ -102,6 +102,16 @@ describe("launchToResolvedHandle", () => {
       stopTimeoutMs: 5000,
       // Fresh launch: not a resume, so discovery keeps its strict-pin/floor path.
       isResume: false,
+      // The read-only window presence-probe argv derived from the launch's
+      // socket-correct kill-window target (`@1` on the default socket).
+      tmuxWindowProbeCommand: [
+        "/usr/bin/tmux",
+        "list-panes",
+        "-t",
+        "@1",
+        "-F",
+        "#{window_id}",
+      ],
       lifecycleJobId: SESSION_ID,
     });
     expect(errs).toEqual([]);
@@ -132,6 +142,14 @@ describe("launchToResolvedHandle", () => {
       transcriptPath: null,
       stopTimeoutMs: null,
       isResume: true,
+      tmuxWindowProbeCommand: [
+        "/usr/bin/tmux",
+        "list-panes",
+        "-t",
+        "@1",
+        "-F",
+        "#{window_id}",
+      ],
       lifecycleJobId: "child-uuid",
     });
     expect(errs).toEqual([]);

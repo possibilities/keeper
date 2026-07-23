@@ -482,6 +482,179 @@ describe("lifecycle-aware transcript waits", () => {
   });
 });
 
+describe("positive-gone window probe terminates the wait", () => {
+  const absentProbe = async (): Promise<"absent"> => "absent";
+  const presentProbe = async (): Promise<"present"> => "present";
+  const unknownProbe = async (): Promise<"unknown"> => "unknown";
+
+  function noStopTranscript(): string {
+    const path = join(tempDir(), "nostop.jsonl");
+    writeFileSync(path, `${JSON.stringify({ type: "thinking" })}\n`);
+    return path;
+  }
+
+  test("(a) window absent at wait start → windowGone within one tick, no sleep", async () => {
+    let sleeps = 0;
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: noStopTranscript(),
+      stopTimeoutMs: 60_000,
+      windowProbe: absentProbe,
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+    expect(outcome).toEqual({ ok: false, windowGone: true });
+    expect(sleeps).toBe(0);
+  });
+
+  test("(b) window dies MID-wait → windowGone within one tick of the death", async () => {
+    let probes = 0;
+    let sleeps = 0;
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: noStopTranscript(),
+      stopTimeoutMs: 60_000,
+      windowProbe: async () => {
+        probes++;
+        return probes === 1 ? "present" : "absent";
+      },
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+    expect(outcome).toEqual({ ok: false, windowGone: true });
+    expect(sleeps).toBe(1);
+  });
+
+  test("(c) inconclusive probe keeps waiting → genuine timed_out, sleeps exercised", async () => {
+    let now = 0;
+    let sleeps = 0;
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: noStopTranscript(),
+      stopTimeoutMs: 100,
+      pollIntervalMs: 50,
+      windowProbe: unknownProbe,
+      now: () => now,
+      sleep: async (ms) => {
+        sleeps++;
+        now += ms;
+      },
+    });
+    expect(outcome).toEqual({ ok: false, timedOut: true });
+    expect(sleeps).toBeGreaterThan(0);
+  });
+
+  test("(d) live target through the deadline → timed_out, byte-identical to no probe", async () => {
+    const path = noStopTranscript();
+    const runOnce = (
+      windowProbe?: () => Promise<"present" | "absent" | "unknown">,
+    ): Promise<unknown> => {
+      let now = 0;
+      return waitForTranscriptStop({
+        agent: "claude",
+        cwd: "/work/proj",
+        env: {},
+        homeDir: tempDir(),
+        startedAtMs: 0,
+        sessionId: "s",
+        transcriptPath: path,
+        stopTimeoutMs: 100,
+        pollIntervalMs: 50,
+        windowProbe,
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+        },
+      });
+    };
+    const withLiveProbe = await runOnce(presentProbe);
+    const withoutProbe = await runOnce(undefined);
+    expect(withLiveProbe).toEqual({ ok: false, timedOut: true });
+    expect(withLiveProbe).toEqual(withoutProbe);
+  });
+
+  test("(a-path) window absent before any transcript appears → window_gone, no sleep", async () => {
+    let sleeps = 0;
+    const outcome = await waitForTranscriptPath({
+      agent: "claude",
+      cwd: "/missing",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 1,
+      sessionId: "never-appears",
+      pathTimeoutMs: 60_000,
+      windowProbe: absentProbe,
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+    expect(outcome).toEqual({ ok: false, reason: "window_gone" });
+    expect(sleeps).toBe(0);
+  });
+
+  test("runWaitForStop threads a run.json tmux window probe → window_gone", async () => {
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-w1", {
+      id: "tmux-w1",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "never-appears",
+      startedAtMs: 0,
+      tmux: { command: ["/opt/homebrew/bin/tmux"], windowId: "@170" },
+    });
+    const resolution = resolveHandle({
+      rest: ["tmux-w1", "--stop-timeout", "60000ms"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    expect(resolution.handle.tmuxWindowProbeCommand).toEqual([
+      "/opt/homebrew/bin/tmux",
+      "list-panes",
+      "-t",
+      "@170",
+      "-F",
+      "#{window_id}",
+    ]);
+    let probeCommand: string[] | null = null;
+    const result = await runWaitForStop(resolution.handle, {
+      env: {},
+      homeDir: tempDir(),
+      probeWindowPresence: async (command) => {
+        probeCommand = command;
+        return "absent";
+      },
+    });
+    expect(result).toMatchObject({ ok: false, reason: "window_gone" });
+    expect(probeCommand as string[] | null).toEqual([
+      "/opt/homebrew/bin/tmux",
+      "list-panes",
+      "-t",
+      "@170",
+      "-F",
+      "#{window_id}",
+    ]);
+  });
+});
+
 describe("injected-message response boundary", () => {
   test("Claude ignores unrelated stops until the matching Bus notification appears", async () => {
     const path = join(tempDir(), "claude-live.jsonl");

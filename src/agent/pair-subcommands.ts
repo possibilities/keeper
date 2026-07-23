@@ -25,8 +25,10 @@ import {
   type PartnerLifecycleTerminal,
   type TranscriptStop,
   type WaitForPathOutcome,
+  type WindowLiveness,
   waitForTranscriptPath,
   waitForTranscriptStop,
+  windowPresenceProbeCommand,
 } from "./transcript-watch";
 
 /** A run handle resolved to everything the verbs need to read its transcript. */
@@ -59,6 +61,11 @@ export interface ResolvedHandle {
   injectedMessageMarker?: string | null;
   /** Transcript line count sampled before the matching Bus publish. */
   transcriptLineFloor?: number | null;
+  /** The launch's tmux window presence-probe argv (built from run.json's tmux
+   *  block), letting a wait positively detect a gone target within one poll
+   *  tick. Absent for direct-path handles and legacy artifacts with no tmux
+   *  block — the wait then behaves byte-identically (no window probing). */
+  tmuxWindowProbeCommand?: string[] | null;
 }
 
 export interface ResolveHandleArgs {
@@ -198,6 +205,8 @@ function resolveRunId(
     return { ok: false, error: `run metadata has no cwd: ${runJsonPath}` };
   }
 
+  const tmuxWindowProbeCommand = tmuxWindowProbeCommandFromRunJson(parsed);
+
   return {
     ok: true,
     handle: {
@@ -211,6 +220,7 @@ function resolveRunId(
         typeof parsed.startedAtMs === "number" ? parsed.startedAtMs : 0,
       transcriptPath: null,
       stopTimeoutMs,
+      ...(tmuxWindowProbeCommand !== null ? { tmuxWindowProbeCommand } : {}),
       ...(typeof parsed.lifecycleJobId === "string"
         ? { lifecycleJobId: parsed.lifecycleJobId }
         : {}),
@@ -230,10 +240,47 @@ function coerceAgent(value: unknown): AgentKind | null {
     : null;
 }
 
+/**
+ * Build the launch's tmux window presence-probe argv from a run.json `tmux`
+ * block (`{ command: [tmux, ...socketArgs], windowId: "@id" }`). Reconstructs
+ * the socket-correct kill-window argv the launch recorded, then transforms it
+ * into the read-only list-panes probe. Null when the block is absent or
+ * malformed, so a legacy artifact yields no probe (the wait stays byte-identical).
+ */
+function tmuxWindowProbeCommandFromRunJson(
+  parsed: Record<string, unknown>,
+): string[] | null {
+  const tmux = parsed.tmux;
+  if (typeof tmux !== "object" || tmux === null || Array.isArray(tmux)) {
+    return null;
+  }
+  const block = tmux as Record<string, unknown>;
+  const command = Array.isArray(block.command)
+    ? block.command.filter(
+        (token): token is string => typeof token === "string",
+      )
+    : [];
+  const windowId = typeof block.windowId === "string" ? block.windowId : null;
+  if (command.length === 0 || windowId === null) {
+    return null;
+  }
+  return windowPresenceProbeCommand([
+    ...command,
+    "kill-window",
+    "-t",
+    windowId,
+  ]);
+}
+
 export interface VerbDeps {
   env: NodeJS.ProcessEnv;
   homeDir: string;
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
+  /** Run a launch's tmux window presence probe (the argv from
+   *  {@link ResolvedHandle.tmuxWindowProbeCommand}) → tri-state liveness.
+   *  Injected so a wait can positively detect a gone target within one poll
+   *  tick; omitted → no window probing (byte-identical legacy behavior). */
+  probeWindowPresence?: (command: string[]) => Promise<WindowLiveness>;
 }
 
 /**
@@ -250,11 +297,12 @@ export type WaitForStopResult =
   | {
       ok: false;
       error: string;
-      reason?: "timeout" | "ambiguous" | "partner_died";
+      reason?: "timeout" | "ambiguous" | "partner_died" | "window_gone";
       terminal?: PartnerLifecycleTerminal;
       /** Set when the transcript path DID resolve and only the stop wait timed
-       *  out — the caller reads that known path once instead of re-running
-       *  path discovery on a second budget. */
+       *  out (or the window went positively gone while the path was known) — the
+       *  caller reads that known path once to recover a final message instead of
+       *  re-running path discovery on a second budget. */
       transcriptPath?: string;
       /** Set on a `timeout` reason: the Partner liveness re-probed at the
        *  observation deadline, so the caller's guidance separates a positively-
@@ -289,11 +337,23 @@ export async function runWaitForStop(
           defaultTranscriptPathTimeoutMs(handle.agent),
           remainingForPath,
         );
-  const resolved = await resolveTranscriptPath(handle, deps, pathTimeoutMs);
+  const probeWindow = windowProbe(handle, deps);
+  const resolved = await resolveTranscriptPath(
+    handle,
+    deps,
+    pathTimeoutMs,
+    probeWindow,
+  );
   if (!resolved.ok) {
-    return resolved.reason === "partner_died"
-      ? partnerDiedFailure(resolved.terminal)
-      : transcriptPathFailure(resolved.reason);
+    if (resolved.reason === "partner_died") {
+      return partnerDiedFailure(resolved.terminal);
+    }
+    // The window is positively gone and no transcript ever appeared: a truthful
+    // terminal with no message to recover, never a burned deadline.
+    if (resolved.reason === "window_gone") {
+      return windowGoneFailure();
+    }
+    return transcriptPathFailure(resolved.reason);
   }
   const transcriptPath = resolved.path;
   const outcome = await waitForTranscriptStop({
@@ -308,6 +368,7 @@ export async function runWaitForStop(
     injectedMessageMarker: handle.injectedMessageMarker,
     transcriptLineFloor: handle.transcriptLineFloor,
     lifecycleProbe: lifecycleProbe(handle, deps),
+    windowProbe: probeWindow,
     transcriptPath,
     stopTimeoutMs: Math.max(1, deadlineMs - Date.now()),
   });
@@ -321,6 +382,12 @@ export async function runWaitForStop(
         ...partnerDiedFailure(outcome.terminal),
         transcriptPath,
       };
+    }
+    // The window went positively gone while the transcript path is KNOWN: carry
+    // it so the caller recovers the leg's final message from that path (a leg
+    // that stopped as its waiter missed the stop) instead of burning the budget.
+    if ("windowGone" in outcome) {
+      return windowGoneFailure(transcriptPath);
     }
     // The deadline elapsed with no settled stop. Re-probe lifecycle ONCE so the
     // caller reports honest liveness — positively live vs unknown — without ever
@@ -361,9 +428,20 @@ export async function runShowLastMessage(
 ): Promise<ShowLastMessageResult> {
   const resolved = await resolveTranscriptPath(handle, deps);
   if (!resolved.ok) {
-    return resolved.reason === "partner_died"
-      ? partnerDiedFailure(resolved.terminal)
-      : transcriptPathFailure(resolved.reason);
+    if (resolved.reason === "partner_died") {
+      return partnerDiedFailure(resolved.terminal);
+    }
+    // `show-last-message` never window-probes (it passes no probe above), so
+    // `window_gone` is unreachable here; map it defensively to the same
+    // partner-gone terminal rather than a plain path failure.
+    if (resolved.reason === "window_gone") {
+      return partnerDiedFailure({
+        kind: "terminal",
+        state: "killed",
+        reason: "window-absent",
+      });
+    }
+    return transcriptPathFailure(resolved.reason);
   }
   const transcriptPath = resolved.path;
   const last = findLastMessage(handle.agent, transcriptPath, {
@@ -390,6 +468,7 @@ async function resolveTranscriptPath(
   handle: ResolvedHandle,
   deps: VerbDeps,
   pathTimeoutMs?: number,
+  probeWindow?: () => Promise<WindowLiveness>,
 ): Promise<WaitForPathOutcome> {
   if (handle.transcriptPath !== null) {
     return { ok: true, path: handle.transcriptPath };
@@ -406,6 +485,7 @@ async function resolveTranscriptPath(
     injectedMessageMarker: handle.injectedMessageMarker,
     transcriptLineFloor: handle.transcriptLineFloor,
     lifecycleProbe: lifecycleProbe(handle, deps),
+    windowProbe: probeWindow,
     pathTimeoutMs,
   });
 }
@@ -421,6 +501,20 @@ function lifecycleProbe(
   const probe = deps.probePartnerLifecycle;
   return typeof jobId === "string" && jobId !== "" && probe !== undefined
     ? () => probe(jobId)
+    : undefined;
+}
+
+/** Bind the handle's tmux window presence-probe argv to the injected runner, or
+ *  undefined when either is absent — the wait then does no window probing and
+ *  behaves byte-identically to today (lifecycle-probe + deadline only). */
+function windowProbe(
+  handle: ResolvedHandle,
+  deps: VerbDeps,
+): (() => Promise<WindowLiveness>) | undefined {
+  const command = handle.tmuxWindowProbeCommand;
+  const probe = deps.probeWindowPresence;
+  return Array.isArray(command) && command.length > 0 && probe !== undefined
+    ? () => probe(command)
     : undefined;
 }
 
@@ -472,5 +566,24 @@ function transcriptPathFailure(reason: "timeout" | "ambiguous"): {
       reason === "ambiguous"
         ? "transcript ambiguous: multiple concurrent same-cwd sessions match, cannot attribute"
         : "timed out waiting for transcript path",
+  };
+}
+
+/** The positive-gone terminal: the launch's tmux window is absent. When the
+ *  transcript path resolved before the window vanished it rides along so the
+ *  caller recovers a final message from it; otherwise no message is
+ *  recoverable. Distinct from `timeout` — the target is confirmed gone, not
+ *  merely unobserved. */
+function windowGoneFailure(transcriptPath?: string): {
+  ok: false;
+  error: string;
+  reason: "window_gone";
+  transcriptPath?: string;
+} {
+  return {
+    ok: false,
+    reason: "window_gone",
+    ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+    error: "wait target is positively gone: its tmux window is absent",
   };
 }

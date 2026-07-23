@@ -49,7 +49,10 @@ import {
   type TmuxCommandRunner,
   TmuxLaunchError,
 } from "./tmux-launch";
-import { snapshotInvocationStopFloor } from "./transcript-watch";
+import {
+  snapshotInvocationStopFloor,
+  windowPresenceProbeCommand,
+} from "./transcript-watch";
 
 function existingSessionId(args: string[]): string | null {
   for (let i = 0; i < args.length; i++) {
@@ -360,6 +363,9 @@ export function launchToResolvedHandle(
       randomUuid: deps.randomUuid,
       runTmuxCommand: deps.runTmuxCommand,
     });
+    const tmuxWindowProbeCommand = windowPresenceProbeCommand(
+      result.killWindowCommand,
+    );
     const handle: ResolvedHandle = {
       agent,
       cwd: deps.cwd,
@@ -368,6 +374,7 @@ export function launchToResolvedHandle(
       transcriptPath: null,
       stopTimeoutMs,
       isResume: resume !== undefined,
+      ...(tmuxWindowProbeCommand !== null ? { tmuxWindowProbeCommand } : {}),
       ...(lifecycleJobId !== null ? { lifecycleJobId } : {}),
       ...(invocationStopFloor !== null ? { invocationStopFloor } : {}),
     };

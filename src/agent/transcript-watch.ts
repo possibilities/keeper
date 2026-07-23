@@ -33,6 +33,15 @@ export type PartnerLifecycle =
   | { kind: "terminal"; state: "ended" | "killed"; reason: string | null }
   | { kind: "unknown" };
 
+/**
+ * A launch's tmux window liveness as a single positive-existence probe reads it:
+ * `present` (the window resolves), `absent` (POSITIVE evidence it is gone — the
+ * server or window reports not-found), or `unknown` (a transient/inconclusive
+ * probe error). Only `absent` terminates a wait; `unknown` keeps it honest, so
+ * a flaky probe never masquerades as a termination.
+ */
+export type WindowLiveness = "present" | "absent" | "unknown";
+
 export interface TranscriptWatchOptions {
   agent: AgentKind;
   cwd: string;
@@ -52,6 +61,13 @@ export interface TranscriptWatchOptions {
   transcriptLineFloor?: number | null;
   /** Exact folded-job probe. Omitted for direct paths and legacy run artifacts. */
   lifecycleProbe?: () => Promise<PartnerLifecycle>;
+  /** Tri-state positive-existence probe for the launch's OWN tmux window (the
+   *  handle IS a tmux identity). A positively `absent` window terminates the
+   *  wait within one poll tick; `present`/`unknown` keep waiting — an
+   *  inconclusive/transient probe never terminates. Omitted for direct-path
+   *  handles and legacy artifacts with no window target, so the wait then
+   *  behaves byte-identically (lifecycle-probe + deadline only). */
+  windowProbe?: () => Promise<WindowLiveness>;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   /**
@@ -69,7 +85,8 @@ export interface TranscriptWatchOptions {
 export type WaitForStopOutcome =
   | { ok: true; stop: TranscriptStop }
   | { ok: false; timedOut: true }
-  | { ok: false; partnerDied: true; terminal: PartnerLifecycleTerminal };
+  | { ok: false; partnerDied: true; terminal: PartnerLifecycleTerminal }
+  | { ok: false; windowGone: true };
 
 export type PartnerLifecycleTerminal = Extract<
   PartnerLifecycle,
@@ -94,7 +111,7 @@ type TranscriptPathLookup =
  *  DISTINCT non-completed outcome rather than the plain path-timeout. */
 export type WaitForPathOutcome =
   | { ok: true; path: string }
-  | { ok: false; reason: "timeout" | "ambiguous" }
+  | { ok: false; reason: "timeout" | "ambiguous" | "window_gone" }
   | {
       ok: false;
       reason: "partner_died";
@@ -113,6 +130,42 @@ const PI_PATH_TIMEOUT_MS = 120_000;
  */
 export function defaultTranscriptPathTimeoutMs(agent: AgentKind): number {
   return agent === "pi" ? PI_PATH_TIMEOUT_MS : DEFAULT_PATH_TIMEOUT_MS;
+}
+
+/**
+ * Derive the READ-ONLY window-presence probe argv from a launch's socket-correct
+ * `kill-window` argv (`[tmux, ...socketArgs, "kill-window", "-t", "@id"]`) →
+ * `[tmux, ...socketArgs, "list-panes", "-t", "@id", "-F", "#{window_id}"]`. The
+ * probe never mutates: it lists the window's panes, exiting non-zero with a
+ * not-found stderr when the window (or its whole server) is gone. Null when the
+ * input is not a well-formed kill-window argv, so a legacy/malformed control
+ * yields NO probe rather than a guessed target — matching the exact-teardown
+ * ownership discipline the kill argv already carries.
+ */
+export function windowPresenceProbeCommand(
+  killWindowCommand: readonly string[] | null | undefined,
+): string[] | null {
+  if (!Array.isArray(killWindowCommand) || killWindowCommand.length < 4) {
+    return null;
+  }
+  if (
+    killWindowCommand.at(-3) !== "kill-window" ||
+    killWindowCommand.at(-2) !== "-t"
+  ) {
+    return null;
+  }
+  const windowId = killWindowCommand.at(-1);
+  if (typeof windowId !== "string" || !/^@[0-9]+$/.test(windowId)) {
+    return null;
+  }
+  return [
+    ...killWindowCommand.slice(0, -3),
+    "list-panes",
+    "-t",
+    windowId,
+    "-F",
+    "#{window_id}",
+  ];
 }
 
 /**
@@ -144,6 +197,11 @@ export async function waitForTranscriptPath(
     const terminal = await probeTerminal(opts.lifecycleProbe);
     if (terminal !== null) {
       return { ok: false, reason: "partner_died", terminal };
+    }
+    // Positively-gone target: no transcript ever appeared and the window is gone,
+    // so no message is recoverable — a truthful terminal, not a burned deadline.
+    if (await probeWindowGone(opts.windowProbe)) {
+      return { ok: false, reason: "window_gone" };
     }
     if (now() >= deadline) {
       return { ok: false, reason: "timeout" };
@@ -190,6 +248,13 @@ export async function waitForTranscriptStop(
     const terminal = await probeTerminal(opts.lifecycleProbe);
     if (terminal !== null) {
       return { ok: false, partnerDied: true, terminal };
+    }
+    // Positively-gone target while the transcript path IS known: signal window
+    // gone so the caller recovers any final message from that known path (a leg
+    // that stopped just as its waiter missed the stop) instead of burning the
+    // remaining deadline. A settled stop above still wins over a gone window.
+    if (await probeWindowGone(opts.windowProbe)) {
+      return { ok: false, windowGone: true };
     }
     if (now() >= deadline) {
       return { ok: false, timedOut: true };
@@ -510,6 +575,23 @@ async function probeTerminal(
     return outcome.kind === "terminal" ? outcome : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Collapse the tri-state {@link WindowLiveness} probe to the wait's terminate/
+ * keep-waiting decision: ONLY a positively `absent` window terminates the wait
+ * (the target is gone). `present`, `unknown`, an omitted probe, or a throw all
+ * keep waiting — an inconclusive probe must never masquerade as a termination.
+ */
+async function probeWindowGone(
+  probe: TranscriptWatchOptions["windowProbe"],
+): Promise<boolean> {
+  if (probe === undefined) return false;
+  try {
+    return (await probe()) === "absent";
+  } catch {
+    return false;
   }
 }
 

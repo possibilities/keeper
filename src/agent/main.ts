@@ -240,6 +240,7 @@ import {
   type SpawnFn,
 } from "./run";
 import {
+  alreadyGoneTmuxError,
   buildRunCaptureEnvelope,
   buildRunControlArtifact,
   captureFromHandle,
@@ -269,6 +270,7 @@ import {
   parseKeeperAgentTmuxArgs,
   resolveTmuxBin,
   TMUX_EXIT,
+  TMUX_TIMEOUT_RESULT_CODE,
   type TmuxCommandRunner,
   TmuxLaunchError,
 } from "./tmux-launch";
@@ -277,6 +279,7 @@ import {
   snapshotInjectedMessageCaptureBoundary,
   snapshotInvocationStopFloor,
   type TranscriptStop,
+  type WindowLiveness,
 } from "./transcript-watch";
 import {
   enumerateTriplesV2,
@@ -1630,7 +1633,9 @@ async function runTranscriptSubcommand(
         tmuxErrorJson(
           TMUX_EXIT.RETRYABLE,
           result.error,
-          result.reason === "partner_died" ? "partner_died" : undefined,
+          result.reason === "partner_died" || result.reason === "window_gone"
+            ? "partner_died"
+            : undefined,
         ),
       );
       return deps.exit(TMUX_EXIT.RETRYABLE);
@@ -1678,8 +1683,39 @@ function makeVerbDeps(deps: MainDeps): VerbDeps {
     env: deps.env,
     homeDir: deps.transcriptHomeDir,
     probePartnerLifecycle: deps.probePartnerLifecycleFn,
+    probeWindowPresence: (command) =>
+      Promise.resolve(probeTmuxWindowPresence(deps.runTmuxCommandFn, command)),
   };
 }
+
+/** The window-presence tick backing a wait's positive-gone detection: run the
+ *  read-only list-panes probe and classify tri-state. Exit 0 → present; the
+ *  timeout sentinel or any non-"already-gone" error → unknown (inconclusive,
+ *  keep waiting); a not-found/no-server stderr → absent (positively gone). A
+ *  throwing runner (tmux missing) is unknown, never a false absence. */
+function probeTmuxWindowPresence(
+  run: TmuxCommandRunner,
+  command: string[],
+): WindowLiveness {
+  let result: { exitCode: number; stderr: string };
+  try {
+    result = run(command, TMUX_WINDOW_PROBE_TIMEOUT_MS);
+  } catch {
+    return "unknown";
+  }
+  if (result.exitCode === 0) {
+    return "present";
+  }
+  if (result.exitCode === TMUX_TIMEOUT_RESULT_CODE) {
+    return "unknown";
+  }
+  return alreadyGoneTmuxError(result.stderr) ? "absent" : "unknown";
+}
+
+/** Per-tick bound for the window-presence probe spawn — a local list-panes
+ *  returns in milliseconds, so a longer wait means a wedged tmux server, which
+ *  the timeout sentinel maps to `unknown` (keep waiting), never a false gone. */
+const TMUX_WINDOW_PROBE_TIMEOUT_MS = 2_000;
 
 function resolveAgentSockPath(env: NodeJS.ProcessEnv): string {
   const override = (env.KEEPER_SOCK ?? "").trim();

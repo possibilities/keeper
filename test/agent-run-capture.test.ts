@@ -820,6 +820,145 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     // (3550 - 1000) / 1000 = 2.55 → rounded to tenths = 2.6.
     expect(envelope.elapsed_seconds).toBe(2.6);
   });
+
+  test("window_gone + resolvable transcript with a message → completed (recovered)", async () => {
+    let showCalls = 0;
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "wait target is positively gone",
+          transcriptPath: "/t.jsonl",
+        }),
+        showLastMessage: async () => {
+          showCalls++;
+          return {
+            ok: true,
+            transcriptPath: "/t.jsonl",
+            text: "the leg's real final answer",
+            found: true,
+          };
+        },
+        now: () => 500,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+    );
+    expect(Object.keys(envelope).sort()).toEqual([...ENVELOPE_KEYS]);
+    expect(envelope).toMatchObject({
+      outcome: "completed",
+      handle: "tmux-gone",
+      transcript_path: "/t.jsonl",
+      message: "the leg's real final answer",
+      message_found: true,
+    });
+    expect(exitCode).toBe(0);
+    expect(showCalls).toBe(1);
+  });
+
+  test("window_gone + resolvable transcript, found-but-textless → no_message", async () => {
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "gone",
+          transcriptPath: "/t.jsonl",
+        }),
+        showLastMessage: async () => ({
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: null,
+          found: true,
+        }),
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.outcome).toBe("no_message");
+    expect(exitCode).toBe(0);
+  });
+
+  test("window_gone + transcript resolves but no terminal turn → partner_died", async () => {
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "gone",
+          transcriptPath: "/t.jsonl",
+        }),
+        showLastMessage: async () => ({
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: null,
+          found: false,
+        }),
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+    );
+    expect(envelope).toMatchObject({
+      outcome: "partner_died",
+      message: null,
+      message_found: false,
+    });
+    expect(exitCode).toBe(4);
+  });
+
+  test("window_gone + no resolved transcript → partner_died, no message scan", async () => {
+    let showCalls = 0;
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "gone",
+        }),
+        showLastMessage: async () => {
+          showCalls++;
+          return {
+            ok: true,
+            transcriptPath: "/t.jsonl",
+            text: "x",
+            found: true,
+          };
+        },
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.outcome).toBe("partner_died");
+    expect(exitCode).toBe(4);
+    expect(showCalls).toBe(0);
+  });
+
+  test("window_gone + ambiguous transcript read → transcript_ambiguous", async () => {
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "gone",
+          transcriptPath: "/t.jsonl",
+        }),
+        showLastMessage: async () => ({
+          ok: false,
+          reason: "ambiguous",
+          error: "transcript ambiguous",
+        }),
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-gone", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.outcome).toBe("transcript_ambiguous");
+    expect(exitCode).toBe(4);
+  });
 });
 
 describe("captureLivePartnerResponse — delivery and cleanup", () => {

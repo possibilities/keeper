@@ -57,7 +57,7 @@ const TMUX_NEW_SESSION_TIMEOUT_MS = 15_000;
  * TmuxCommandResult. `tmuxError` reclassifies it to the retryable launcher exit
  * code so a contended server surfaces as transient, not a generic internal error.
  */
-const TMUX_TIMEOUT_RESULT_CODE = 124;
+export const TMUX_TIMEOUT_RESULT_CODE = 124;
 
 /**
  * Launcher exit-code taxonomy for tmux mode. A machine caller binds on these:
