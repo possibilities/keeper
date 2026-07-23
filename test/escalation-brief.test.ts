@@ -829,6 +829,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         repo_dir: "/repo",
         expected_source_head: null,
         expected_base_head: null,
+        fence_state: "unpinned",
         owner_redispatch_attempts: 0,
         instance_event_id: null,
         attempt_id: null,
@@ -913,43 +914,49 @@ test("a pinned pending-integration incident surfaces the durable head fence to t
   db.close();
 });
 
-test("a legacy or malformed fence surfaces null pins to the brief (fail closed, no live-head substitution)", () => {
-  const readPins = (id: string, reason: string) => {
+test("a legacy or malformed fence is surfaced as malformed-pending (fail closed, degraded, no live-head substitution)", () => {
+  const read = (id: string, reason: string) => {
     const { db } = freshMemDb();
     writeEpicFile(tmp, id, { primary_repo: "/repo" });
     seedMergeConflict(db, { id, reason, dir: "/repo" });
     const r = buildEscalationBrief(db, `deconflict::${id}`, tmp);
     expect(r.kind).toBe("ok");
-    const conflict =
+    const out =
       r.kind === "ok"
-        ? (
-            r.brief.incident as {
-              conflict: {
-                expected_source_head: string | null;
-                expected_base_head: string | null;
-              } | null;
-            }
-          ).conflict
-        : null;
+        ? {
+            conflict: (
+              r.brief.incident as {
+                conflict: {
+                  expected_source_head: string | null;
+                  expected_base_head: string | null;
+                  fence_state: string;
+                } | null;
+              }
+            ).conflict,
+            degraded: r.brief.degraded,
+          }
+        : { conflict: null, degraded: [] as string[] };
     db.close();
-    return conflict;
+    return out;
   };
-  // Legacy pre-fence pending request (no marker) → both pins null.
-  const legacy = readPins(
-    "fn-831-legacy",
-    "worktree-merge-conflict: merging keeper/epic/fn-831-legacy--fn-831-legacy.2 into keeper/epic/fn-831-legacy — pending owner integration",
-  );
-  expect(legacy?.expected_source_head).toBeNull();
-  expect(legacy?.expected_base_head).toBeNull();
-  // Malformed marker (short sha) → both pins null, never a best-effort salvage.
-  const malformed = readPins(
-    "fn-832-malformed",
-    `worktree-merge-conflict: merging keeper/epic/fn-832-malformed--fn-832-malformed.2 into keeper/epic/fn-832-malformed — pending owner integration [expected src=${"a".repeat(
-      12,
-    )} base=${"b".repeat(40)}]`,
-  );
-  expect(malformed?.expected_source_head).toBeNull();
-  expect(malformed?.expected_base_head).toBeNull();
+  for (const [id, reason] of [
+    [
+      "fn-831-legacy",
+      "worktree-merge-conflict: merging keeper/epic/fn-831-legacy--fn-831-legacy.2 into keeper/epic/fn-831-legacy — pending owner integration",
+    ],
+    [
+      "fn-832-malformed",
+      `worktree-merge-conflict: merging keeper/epic/fn-832-malformed--fn-832-malformed.2 into keeper/epic/fn-832-malformed — pending owner integration [expected src=${"a".repeat(
+        12,
+      )} base=${"b".repeat(40)}]`,
+    ],
+  ] as const) {
+    const { conflict, degraded } = read(id, reason);
+    expect(conflict?.expected_source_head).toBeNull();
+    expect(conflict?.expected_base_head).toBeNull();
+    expect(conflict?.fence_state).toBe("malformed");
+    expect(degraded).toContain("incident_pending_fence_malformed");
+  }
 });
 
 test("direct work and close incident ids resolve fenced claim and grant facts read-only", () => {

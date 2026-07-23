@@ -3443,6 +3443,66 @@ test("the incident-instance precedence arms are re-fold deterministic", () => {
   );
 });
 
+test("the closed binary rule holds an open merge obligation byte-stable against EVERY incoming class", () => {
+  dispatchFailedEvent("work", "fn-bin.4", PENDING_MERGE_REASON, "/lane", 1700);
+  drainAll();
+  const opened = getDispatchFailure("work", "fn-bin.4");
+  const markers0 = incidentMarkers("work", "fn-bin.4");
+  // A future/unknown class, a lane-premerge sibling, confirm_timeout, and a launch
+  // error each leave the obligation BYTE-STABLE (reason / created_at / last_event_id
+  // frozen) while still discharging the incoming attempt's launch window.
+  for (const reason of [
+    "some-future-unknown-reason: whatever",
+    "worktree-lane-premerge-dirty-base: deferring",
+    "confirm_timeout",
+    "launch_failed: exec error",
+  ]) {
+    dispatchedEvent("work", "fn-bin.4", "/lane", 1740);
+    drainAll();
+    dispatchFailedEvent("work", "fn-bin.4", reason, "/lane", 1750);
+    drainAll();
+    const now = getDispatchFailure("work", "fn-bin.4");
+    expect(now?.reason).toBe(PENDING_MERGE_REASON);
+    expect(now?.created_at).toBe(opened?.created_at);
+    expect(now?.last_event_id).toBe(opened?.last_event_id);
+    expect(getPendingDispatch("work", "fn-bin.4")).toBeNull();
+  }
+  expect(incidentMarkers("work", "fn-bin.4")).toEqual(markers0);
+});
+
+test("a merge incident supersedes a lane-premerge or confirm_timeout open row with fresh-instance semantics", () => {
+  for (const [id, priorReason] of [
+    ["fn-lp.4", "worktree-lane-premerge-dirty-base: deferring"],
+    ["fn-ct.4", "confirm_timeout"],
+  ] as const) {
+    dispatchFailedEvent("work", id, priorReason, "/lane", 1700);
+    drainAll();
+    db.run(
+      `UPDATE dispatch_failures
+          SET instance_event_id = 111, human_notified_at = 222,
+              owner_redispatch_attempts = 2, claim_session_id = 'stale'
+        WHERE verb = 'work' AND id = ?`,
+      [id],
+    );
+    const mergeId = dispatchFailedEvent(
+      "work",
+      id,
+      PENDING_MERGE_REASON,
+      "/lane",
+      1750,
+    );
+    drainAll();
+    expect(getDispatchFailure("work", id)?.reason).toBe(PENDING_MERGE_REASON);
+    expect(incidentMarkers("work", id)).toEqual({
+      instance_event_id: mergeId,
+      human_notified_at: null,
+      owner_redispatch_attempts: 0,
+      claim_session_id: null,
+      claimed_at: null,
+    });
+  }
+});
+
 test("DispatchCleared also deletes the pending_dispatches row so an operator clear immediately frees the slot (fn-870)", () => {
   // An operator clear (`keeper autopilot retry`) must free the launch-window slot
   // + per-root mutex immediately, not leave a stale pending until the TTL sweep.

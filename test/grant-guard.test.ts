@@ -549,6 +549,28 @@ describe("decideGrantGuard — Bash", () => {
     ).toBeNull();
   });
 
+  test("the rendered pinned fast-forward `git merge --ff-only <40-hex oid>` is allowed under a valid grant, denied without / expired", () => {
+    const cmd = `git merge --ff-only ${"a".repeat(40)}`;
+    // No grant → denied.
+    expect(
+      decideGrantGuard(bashPayload("merge-resolver", cmd), deps()),
+    ).not.toBeNull();
+    // Valid grant, cwd in the writable root → allowed.
+    expect(
+      decideGrantGuard(
+        bashPayload("merge-resolver", cmd),
+        deps({ grant: validGrant() }),
+      ),
+    ).toBeNull();
+    // Expired grant → denied.
+    expect(
+      decideGrantGuard(
+        bashPayload("merge-resolver", cmd),
+        deps({ grant: { kind: "expired" } }),
+      ),
+    ).not.toBeNull();
+  });
+
   test("a structural write vector is denied even under a valid grant", () => {
     expect(
       decideGrantGuard(

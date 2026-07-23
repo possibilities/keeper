@@ -102,6 +102,7 @@ import {
   FATAL_AUDIT_REASON_TOKEN,
   fatalAuditDispatchId,
   isDupEpicNumberDistressKey,
+  isFullObjectId,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
@@ -127,6 +128,7 @@ import {
   ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
   ORIGIN_CONTAINMENT_DISTRESS_REASON,
   parseMergeConflictReason,
+  parsePendingIntegrationHeads,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
@@ -789,7 +791,19 @@ export async function probeWorkMergeIncidentResolutions(
       continue;
     }
     const { source, base } = parsed;
+    const pins = parsePendingIntegrationHeads(row.reason);
     try {
+      if (pins !== null) {
+        // PINNED row: clear authority comes from the DURABLE OBJECTS only. Branch
+        // ABSENCE and the current source REF are never positive evidence here — a
+        // post-mint source advance would wedge a landed pin, and a force-move /
+        // delete could misgrade the obligation.
+        out.set(
+          row.id,
+          await probePinnedMergeResolution(row.dir, base, pins, run),
+        );
+        continue;
+      }
       const srcRef = await run(
         [
           "rev-parse",
@@ -823,6 +837,65 @@ export async function probeWorkMergeIncidentResolutions(
     }
   }
   return out;
+}
+
+/**
+ * Positive-clear evidence for a PINNED pending-integration row, race-free against
+ * TARGET movement. The exact sequence (gap-5):
+ *   1. take ONE full current target base OID snapshot;
+ *   2. test BOTH durable pins' ancestry against that OBJECT (never a per-command
+ *      re-resolved branch) — either not-ancestor / unresolvable / errored → defer;
+ *   3. require the target checkout clean, on the parsed base, no merge residue;
+ *   4. re-probe checkout HEAD + base ref and require BOTH still equal the snapshot.
+ * Any movement or probe error between (1) and (4) → defer, the row retained. Only
+ * both pins contained + a still-stable clean target → `merged`. NEVER `source-absent`
+ * (absence is not evidence for the pinned class). Throwing is the caller's `defer`.
+ */
+async function probePinnedMergeResolution(
+  dir: string,
+  base: string,
+  pins: { sourceHead: string; baseHead: string },
+  run: WorktreeGitRunner,
+): Promise<WorkMergeIncidentVerdict> {
+  const baseCommit = `refs/heads/${base}^{commit}`;
+  const snap = await run(
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", baseCommit],
+    { cwd: dir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const baseOid = snap.stdout.trim();
+  if (snap.code !== 0 || !isFullObjectId(baseOid)) {
+    return "defer";
+  }
+  for (const pin of [pins.sourceHead, pins.baseHead]) {
+    const anc = await run(["merge-base", "--is-ancestor", pin, baseOid], {
+      cwd: dir,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (anc.code !== 0) {
+      return "defer"; // not-ancestor, unresolvable, or errored — never positive
+    }
+  }
+  const ready = await gitMergeReadiness(dir, shortBranchName(base), run);
+  if (ready.kind !== "ready") {
+    return "defer";
+  }
+  const headAgain = await run(
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"],
+    { cwd: dir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const baseAgain = await run(
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", baseCommit],
+    { cwd: dir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (
+    headAgain.code !== 0 ||
+    baseAgain.code !== 0 ||
+    headAgain.stdout.trim() !== baseOid ||
+    baseAgain.stdout.trim() !== baseOid
+  ) {
+    return "defer"; // target moved (or a probe errored) between snapshot and recheck
+  }
+  return "merged";
 }
 
 /**
@@ -8054,9 +8127,14 @@ export function createWorktreeDriver(
 
           // Pin the durable head fence at mint: the source rib tip (already
           // resolved by `srcRef` above) and the target base tip, both by their
-          // shared-object-store refs so the resolver rechecks the identical
-          // SHAs. An inconclusive base probe DEFERS the mint (a self-clearing
-          // lane-premerge retry) rather than minting a fence-less incident.
+          // shared-object-store refs as FULL object ids. VALIDATE both as full ids
+          // (an inconclusive probe or an abbreviated id DEFERS a self-clearing
+          // lane-premerge retry rather than minting a fence-less or partial-pin
+          // incident), then PROVE the fast-forward precondition — the base must be
+          // an ancestor of the source — before minting the pinned-pending class. A
+          // diverged or inconclusive pair DEFERS: a genuine divergence is NOT the
+          // requested clean fast-forward and needs its own separately minted
+          // genuine-conflict instance, so the pinned class is only ever a real FF.
           const sourceHead = srcRef.stdout.trim();
           const baseRef = await run(
             [
@@ -8069,11 +8147,26 @@ export function createWorktreeDriver(
             { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
           );
           const baseHead = baseRef.stdout.trim();
-          if (baseRef.code !== 0 || baseHead === "" || sourceHead === "") {
+          if (
+            baseRef.code !== 0 ||
+            !isFullObjectId(sourceHead) ||
+            !isFullObjectId(baseHead)
+          ) {
             return {
               ok: false,
               dir: worktreePath,
               reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: head fence probe for ${source} into ${branch} exited ${baseRef.code} — deferring the fan-in`,
+            };
+          }
+          const ffPrecondition = await run(
+            ["merge-base", "--is-ancestor", baseHead, sourceHead],
+            { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+          );
+          if (ffPrecondition.code !== 0) {
+            return {
+              ok: false,
+              dir: worktreePath,
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: fast-forward precondition (${branch} not contained in ${source}) exited ${ffPrecondition.code} — deferring the fan-in`,
             };
           }
           pendingIntegration = {

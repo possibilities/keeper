@@ -17319,6 +17319,7 @@ function makePhantomFanInRun(opts: {
   phantomSources: string[];
   ancestryCode?: number;
   baseHeadCode?: number;
+  ffPreconditionCode?: number;
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   let added = false;
@@ -17343,6 +17344,12 @@ function makePhantomFanInRun(opts: {
       return { code: 0, stdout: `${fanInHeadSha(ref)}\n`, stderr: "" };
     }
     if (joined.startsWith("merge-base --is-ancestor")) {
+      // The fast-forward precondition probe is `merge-base --is-ancestor <baseOid>
+      // <sourceOid>` (both FULL 40-hex) → base contained in source (a valid FF);
+      // the earlier not-already-contained probe is `<source-branch> HEAD`.
+      if (/merge-base --is-ancestor [0-9a-f]{40} [0-9a-f]{40}$/.test(joined)) {
+        return { code: opts.ffPreconditionCode ?? 0, stdout: "", stderr: "" };
+      }
       return { code: opts.ancestryCode ?? 1, stdout: "", stderr: "" };
     }
     if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
@@ -17471,6 +17478,25 @@ test("createWorktreeDriver: an inconclusive head-fence probe never mints a fence
     dir: "/repo.worktrees/keeper-epic-fn-1-foo",
     reason:
       "worktree-lane-premerge-not-ready: head fence probe for keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo exited 128 — deferring the fan-in",
+  });
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("createWorktreeDriver: a stable-but-diverged pair (fast-forward precondition fails) never mints a pending integration", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const { run, cmds } = makePhantomFanInRun({
+    phantomSources: [],
+    ffPreconditionCode: 1,
+  });
+  const res = await createWorktreeDriver(run).provision(
+    makeFanInInfo([source]),
+    null,
+  );
+  expect(res).toEqual({
+    ok: false,
+    dir: "/repo.worktrees/keeper-epic-fn-1-foo",
+    reason:
+      "worktree-lane-premerge-not-ready: fast-forward precondition (keeper/epic/fn-1-foo not contained in keeper/epic/fn-1-foo--fn-1-foo.2) exited 1 — deferring the fan-in",
   });
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
@@ -27054,9 +27080,13 @@ function mergeIncidentRun(opts: {
   }) as unknown as GitRunner;
 }
 
+// The branch-name (unpinned genuine-conflict) probe path — source-absent and the
+// live source ref are positive evidence ONLY here, never for a pinned row.
+const UNPINNED_MERGE_REASON = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.1 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts`;
+
 const mergeIncidentRow = (dir: string | null = "/lane") => ({
   id: "fn-3-widget.1",
-  reason: MERGE_INCIDENT_REASON,
+  reason: UNPINNED_MERGE_REASON,
   dir,
 });
 
@@ -27133,6 +27163,204 @@ test("parseMergeConflictReason round-trips the pendingIntegrationReason builder 
     base: MERGE_INCIDENT_BASE,
     stderr: `pending owner integration [expected src=${MERGE_INCIDENT_SOURCE_HEAD} base=${MERGE_INCIDENT_BASE_HEAD}]`,
   });
+});
+
+// ---------------------------------------------------------------------------
+// probeWorkMergeIncidentResolutions — a PINNED row clears from the DURABLE OBJECTS
+// only (gap-5): ONE current-base OID snapshot, BOTH pins ancestors of that object,
+// the target clean/on-base/no-residue, and HEAD + base ref STILL equal to the
+// snapshot at recheck. Branch absence and the live source ref are NEVER positive
+// evidence here.
+// ---------------------------------------------------------------------------
+
+const PIN_SRC = "1".repeat(40);
+const PIN_BASE = "2".repeat(40);
+const PINNED_PROBE_BASE = "keeper/epic/fn-9-pin";
+const PINNED_PROBE_REASON = pendingIntegrationReason({
+  sourceBranch: "keeper/epic/fn-9-pin--fn-9-pin.1",
+  baseBranch: PINNED_PROBE_BASE,
+  laneDir: "/lane",
+  sourceHead: PIN_SRC,
+  baseHead: PIN_BASE,
+});
+const pinnedRow = { id: "fn-9-pin.1", reason: PINNED_PROBE_REASON, dir: "/lane" };
+
+function pinnedProbeRun(opts: {
+  sourcePinAncestor: boolean;
+  basePinAncestor: boolean;
+  target?: "ready" | "dirty" | "mid-merge";
+  baseMovesOnRecheck?: boolean;
+  headMoved?: boolean;
+  snapshotFails?: boolean;
+  pinAncestryError?: boolean;
+}): GitRunner {
+  const BASE_OID = "a".repeat(40);
+  const OTHER_OID = "b".repeat(40);
+  let baseProbes = 0;
+  return (async (args: string[]) => {
+    const cmd = args.join(" ");
+    if (
+      args[0] === "rev-parse" &&
+      cmd.includes(`refs/heads/${PINNED_PROBE_BASE}^{commit}`)
+    ) {
+      baseProbes += 1;
+      if (opts.snapshotFails === true && baseProbes === 1) {
+        return { code: 128, stdout: "", stderr: "" };
+      }
+      const moved = opts.baseMovesOnRecheck === true && baseProbes >= 2;
+      return {
+        code: 0,
+        stdout: `${moved ? OTHER_OID : BASE_OID}\n`,
+        stderr: "",
+      };
+    }
+    if (cmd === "rev-parse --verify --quiet --end-of-options HEAD^{commit}") {
+      return {
+        code: 0,
+        stdout: `${opts.headMoved === true ? OTHER_OID : BASE_OID}\n`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "merge-base" && args.includes("--is-ancestor")) {
+      if (opts.pinAncestryError === true) {
+        return { code: 128, stdout: "", stderr: "" };
+      }
+      const ok =
+        args[2] === PIN_SRC ? opts.sourcePinAncestor : opts.basePinAncestor;
+      return { code: ok ? 0 : 1, stdout: "", stderr: "" };
+    }
+    if (cmd === "rev-parse --verify --quiet MERGE_HEAD") {
+      return (opts.target ?? "ready") === "mid-merge"
+        ? { code: 0, stdout: "m\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (args[0] === "for-each-ref") return { code: 0, stdout: "", stderr: "" };
+    if (args.includes("--git-dir")) return { code: 1, stdout: "", stderr: "" };
+    if (
+      cmd === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+      cmd === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+      cmd === "rev-parse --verify --quiet REVERT_HEAD"
+    ) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (args[0] === "status") {
+      return (opts.target ?? "ready") === "dirty"
+        ? { code: 0, stdout: " M x\n", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (cmd === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${PINNED_PROBE_BASE}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+}
+
+test("probe PINNED: both pins ancestors of a stable clean base → merged", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({ sourcePinAncestor: true, basePinAncestor: true }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("merged");
+});
+
+test("probe PINNED: a source advance / force-move / delete never misgrades — the pin object still clears", async () => {
+  // The probe never touches the source ref; both pins are ancestors of the
+  // snapshot, so a moved or deleted source branch is irrelevant (never source-absent).
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({ sourcePinAncestor: true, basePinAncestor: true }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("merged");
+});
+
+test("probe PINNED: a base loss/reset — a pin no longer an ancestor → defer", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({ sourcePinAncestor: false, basePinAncestor: true }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
+});
+
+test("probe PINNED: only one pin an ancestor → defer", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({ sourcePinAncestor: true, basePinAncestor: false }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
+});
+
+test("probe PINNED: an ancestry probe error → defer, row retained", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      pinAncestryError: true,
+    }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
+});
+
+test("probe PINNED: a dirty or mid-merge target → defer", async () => {
+  const dirty = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      target: "dirty",
+    }),
+  );
+  expect(dirty.get("fn-9-pin.1")).toBe("defer");
+  const mid = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      target: "mid-merge",
+    }),
+  );
+  expect(mid.get("fn-9-pin.1")).toBe("defer");
+});
+
+test("probe PINNED: the target base advancing between snapshot and recheck → defer this cycle, clears clean next", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      baseMovesOnRecheck: true,
+    }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
+  const next = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({ sourcePinAncestor: true, basePinAncestor: true }),
+  );
+  expect(next.get("fn-9-pin.1")).toBe("merged");
+});
+
+test("probe PINNED: the checkout HEAD off the snapshot at recheck → defer", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      headMoved: true,
+    }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
+});
+
+test("probe PINNED: an inconclusive base snapshot → defer", async () => {
+  const v = await probeWorkMergeIncidentResolutions(
+    [pinnedRow],
+    pinnedProbeRun({
+      sourcePinAncestor: true,
+      basePinAncestor: true,
+      snapshotFails: true,
+    }),
+  );
+  expect(v.get("fn-9-pin.1")).toBe("defer");
 });
 
 // ---------------------------------------------------------------------------

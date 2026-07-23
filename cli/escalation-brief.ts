@@ -57,7 +57,9 @@ import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb, resolveDbPath } from "../src/db";
 import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
 import {
+  classifyPendingIntegration,
   isMergeEscalationReason,
+  type PendingIntegrationClass,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
 } from "../src/dispatch-failure-key";
@@ -166,11 +168,17 @@ export interface DeconflictIncident {
     stderr: string | null;
     repo_dir: string | null;
     /** The durable head fence a pre-minted fan-in (`pending owner integration`)
-     *  incident pins at mint — the source rib and target base branch-tip SHAs the
-     *  resolver rechecks so the requested clean fast-forward is distinguishable
-     *  from a moved head. Both null for a genuine content conflict (unpinned). */
+     *  incident pins at mint — the source rib and target base branch-tip object ids
+     *  the resolver rechecks so the requested clean fast-forward is distinguishable
+     *  from a moved head. Both null unless {@link fence_state} is `pinned`. */
     expected_source_head: string | null;
     expected_base_head: string | null;
+    /** The tri-state fence class: `pinned` (a valid fence — perform the exact-object
+     *  fast-forward), `malformed` (a pending-integration request whose fence is
+     *  absent, duplicated, or malformed — FAIL CLOSED to stale_base, never a live-head
+     *  substitution and never `--no-ff`/deconflicter), or `unpinned` (a genuine
+     *  content conflict — the only class the branch-name + live-snapshot path serves). */
+    fence_state: PendingIntegrationClass;
     /** Durable owner-attachment count consumed by this incident — the collapsed
      *  home of the retired `resolver_dispatched_at` / `merge_escalated_at` lease. */
     owner_redispatch_attempts: number;
@@ -554,6 +562,13 @@ function buildDeconflictIncident(
       degraded.push("incident_reason_unparsed");
     }
     const heads = parsePendingIntegrationHeads(row.reason);
+    const fence_state = classifyPendingIntegration(row.reason);
+    if (fence_state === "malformed") {
+      // A pending-integration request whose fence is absent/duplicated/malformed —
+      // surface it DISTINCTLY (never a silent null-as-genuine), so the resolver
+      // fails it closed rather than treating it as a genuine conflict.
+      degraded.push("incident_pending_fence_malformed");
+    }
     conflict = {
       reason: row.reason,
       source_branch: parsed?.source ?? null,
@@ -562,6 +577,7 @@ function buildDeconflictIncident(
       repo_dir: row.dir,
       expected_source_head: heads?.sourceHead ?? null,
       expected_base_head: heads?.baseHead ?? null,
+      fence_state,
       owner_redispatch_attempts: row.owner_redispatch_attempts,
       instance_event_id: row.instance_event_id,
       attempt_id: row.attempt_id,

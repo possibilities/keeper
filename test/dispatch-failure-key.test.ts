@@ -15,6 +15,7 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  classifyPendingIntegration,
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
@@ -27,11 +28,12 @@ import {
   INSTANT_DEATH_BREAKER_REASON,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
+  isFullObjectId,
   isLaneWedgeDistressKey,
   isLowerPriorityDispatchPlumbingReason,
   isMergeConflictIncidentReason,
   isMergeEscalationReason,
-  isParkedLaunchReason,
+  isPendingIntegrationReason,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -1278,33 +1280,68 @@ describe("pending-integration head fence", () => {
     expect(parsePendingIntegrationHeads("not a merge reason")).toBeNull();
   });
 
+  test("isFullObjectId accepts only full 40-or-64 lowercase hex", () => {
+    expect(isFullObjectId("a".repeat(40))).toBe(true);
+    expect(isFullObjectId("a".repeat(64))).toBe(true);
+    for (const bad of [
+      "a".repeat(7),
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+      "A".repeat(40),
+      "g".repeat(40),
+      "",
+    ]) {
+      expect(isFullObjectId(bad)).toBe(false);
+    }
+  });
+
   test("the strict closed grammar fails closed on every deviation", () => {
     const src = "a".repeat(40);
     const base = "b".repeat(40);
     const reason = (tail: string) =>
       `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — ${PENDING_OWNER_INTEGRATION_TAIL} ${tail}`;
-    // The single, anchored, exactly-40-lowercase-hex marker parses.
+    // A single anchored full-object-id marker parses — sha1 (40) AND sha256 (64).
     expect(
       parsePendingIntegrationHeads(
         reason(`[expected src=${src} base=${base}]`),
       ),
     ).toEqual({ sourceHead: src, baseHead: base });
+    const src64 = "c".repeat(64);
+    const base64 = "d".repeat(64);
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${src64} base=${base64}]`),
+      ),
+    ).toEqual({ sourceHead: src64, baseHead: base64 });
     // Absent marker → null (legacy / fail closed).
     expect(parsePendingIntegrationHeads(reason(""))).toBeNull();
-    // Wrong sha shape (39 / 41 hex, uppercase) → null.
+    // Wrong id shape (7 / 39 / 41 / 63 / 65 hex, uppercase) → null.
+    for (const bad of [
+      "a".repeat(7),
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+      "A".repeat(40),
+    ]) {
+      expect(
+        parsePendingIntegrationHeads(
+          reason(`[expected src=${bad} base=${base}]`),
+        ),
+      ).toBeNull();
+    }
+    // A mixed-validity pair (one good, one bad) → null.
     expect(
       parsePendingIntegrationHeads(
-        reason(`[expected src=${"a".repeat(39)} base=${base}]`),
+        reason(`[expected src=${src} base=${"a".repeat(41)}]`),
       ),
     ).toBeNull();
+    // Prefix junk before the marker → null (the tail must BE the marker).
     expect(
       parsePendingIntegrationHeads(
-        reason(`[expected src=${"a".repeat(41)} base=${base}]`),
-      ),
-    ).toBeNull();
-    expect(
-      parsePendingIntegrationHeads(
-        reason(`[expected src=${"A".repeat(40)} base=${base}]`),
+        reason(`junk [expected src=${src} base=${base}]`),
       ),
     ).toBeNull();
     // Trailing garbage after an otherwise-valid marker → null (not anchored).
@@ -1321,6 +1358,52 @@ describe("pending-integration head fence", () => {
         ),
       ),
     ).toBeNull();
+  });
+
+  test("a genuine-conflict tail carrying a look-alike marker parses ABSENT (no injection)", () => {
+    const src = "a".repeat(40);
+    const base = "b".repeat(40);
+    // A content-conflict reason whose git-stderr tail contains a well-formed marker
+    // must NOT be promoted to pinned authority — the class check (the tail must be
+    // the pending-owner-integration form) rejects it.
+    const injected = `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts [expected src=${src} base=${base}]`;
+    expect(parsePendingIntegrationHeads(injected)).toBeNull();
+    expect(isPendingIntegrationReason(injected)).toBe(false);
+    expect(classifyPendingIntegration(injected)).toBe("unpinned");
+  });
+
+  test("classifyPendingIntegration is tri-state: pinned / malformed / unpinned", () => {
+    const src = "a".repeat(40);
+    const base = "b".repeat(40);
+    const pending = (tail: string) =>
+      `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — ${PENDING_OWNER_INTEGRATION_TAIL}${tail}`;
+    // (a) valid pinned fence.
+    expect(
+      classifyPendingIntegration(
+        pending(` [expected src=${src} base=${base}]`),
+      ),
+    ).toBe("pinned");
+    // (b) pending class, but no valid pair (legacy zero-marker, or malformed).
+    expect(classifyPendingIntegration(pending(""))).toBe("malformed");
+    expect(
+      classifyPendingIntegration(
+        pending(` [expected src=${"a".repeat(12)} base=${base}]`),
+      ),
+    ).toBe("malformed");
+    expect(
+      classifyPendingIntegration(
+        pending(
+          ` [expected src=${src} base=${base}] [expected src=${base} base=${src}]`,
+        ),
+      ),
+    ).toBe("malformed");
+    // (c) genuine content conflict (no pending tail) and a non-merge reason.
+    expect(
+      classifyPendingIntegration(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts`,
+      ),
+    ).toBe("unpinned");
+    expect(classifyPendingIntegration("confirm_timeout")).toBe("unpinned");
   });
 
   test("the fence marker cannot collide with the branch parse or the board pill kind", () => {

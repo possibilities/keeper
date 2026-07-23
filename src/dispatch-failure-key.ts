@@ -1058,9 +1058,21 @@ export function parseMergeConflictReason(
 export const PENDING_OWNER_INTEGRATION_TAIL = "pending owner integration";
 
 /**
+ * A FULL lowercase git object id — sha1 (40) or sha256 (64) hex. The durable head
+ * fence pins full object ids ONLY (never an abbreviated or mixed-case id), so a
+ * pinned head is unambiguous authority a consumer can `merge --ff-only` against.
+ * Deliberately NOT the repo's loose CLI-input {@link
+ * import("./baseline-store").isValidSha} (`{7,64}` mixed-case) — abbreviated and
+ * uppercase ids are rejected here. Pure; NEVER throws.
+ */
+export function isFullObjectId(s: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(s);
+}
+
+/**
  * Build the pinned pending-integration tail: {@link
- * PENDING_OWNER_INTEGRATION_TAIL} plus the `[expected src=<sha> base=<sha>]`
- * durable head fence. The producer probes both branch-tip SHAs at mint and
+ * PENDING_OWNER_INTEGRATION_TAIL} plus the `[expected src=<oid> base=<oid>]`
+ * durable head fence. The producer probes both branch-tip object ids at mint and
  * passes them here; the fold writes the resulting reason verbatim (it never
  * probes), so the fence is re-fold-deterministic. Inverse of {@link
  * parsePendingIntegrationHeads}. Pure.
@@ -1072,33 +1084,75 @@ export function buildPendingIntegrationTail(
   return `${PENDING_OWNER_INTEGRATION_TAIL} [expected src=${sourceHead} base=${baseHead}]`;
 }
 
+/** The em-dash tail of a VALID pinned pending-integration incident — anchored
+ *  BOTH ends so the whole tail must BE exactly the pending marker: the class
+ *  literal, exactly one `[expected …]` marker (no room for a second), each id a
+ *  full 40-or-64 lowercase hex object id, and no prefix or trailing bytes. */
+const PENDING_HEAD_MARKER =
+  /^pending owner integration \[expected src=([0-9a-f]{40}|[0-9a-f]{64}) base=([0-9a-f]{40}|[0-9a-f]{64})\]$/;
+
 /**
- * Extract the durable head fence a pinned pending-integration incident carries —
- * the `[expected src=<sha> base=<sha>]` suffix {@link buildPendingIntegrationTail}
- * appended. Enforces a STRICT CLOSED grammar (mirroring the sanctioned
- * `[keeper-grant-verdict=…]` marker discipline — a consumer keys on the exact
- * token, never salvaged from surrounding prose):
- *   - EXACTLY ONE marker, ANCHORED at the very end of the reason (no trailing
- *     garbage, no substring salvage from the middle);
- *   - each sha EXACTLY 40 lowercase hex.
- * ANY deviation — zero markers (a genuine content conflict or an unpinned legacy
- * pending row), a duplicated marker, a malformed sha, or trailing text — FAILS
- * CLOSED to null. A null caller MUST degrade to its fence-less arm, never fabricate
- * or substitute live branch heads as the missing authority. Reads the whole reason
- * so it is indifferent to how {@link parseMergeConflictReason} splits it. Pure;
+ * Whether a `dispatch_failures.reason` is the pending-owner-integration CLASS —
+ * a `worktree-merge-conflict` incident whose em-dash tail is the pre-minted fan-in
+ * request (`… — pending owner integration …`), pinned or not. The tri-state
+ * discriminant that separates a pending request (valid OR legacy/malformed) from a
+ * GENUINE content conflict (a real git-stderr tail). Read through {@link
+ * parseMergeConflictReason} so a source/base branch containing look-alike text
+ * cannot spoof the class. Pure; NEVER throws.
+ */
+export function isPendingIntegrationReason(reason: string): boolean {
+  return (
+    parseMergeConflictReason(reason)?.stderr?.startsWith(
+      PENDING_OWNER_INTEGRATION_TAIL,
+    ) ?? false
+  );
+}
+
+/**
+ * Extract the durable head fence of a VALID pinned pending-integration incident.
+ * Enforces a STRICT CLOSED grammar (the sanctioned `[keeper-grant-verdict=…]`
+ * marker discipline — key on the exact token, never salvage from prose): the
+ * em-dash tail {@link parseMergeConflictReason} returns must BE EXACTLY {@link
+ * PENDING_HEAD_MARKER} — the pending-owner-integration class literal plus exactly
+ * one `[expected …]` marker, each id a full 40-or-64 lowercase hex object id
+ * ({@link isFullObjectId}), no prefix or trailing bytes, no second marker.
+ * ANY deviation FAILS CLOSED to null: a genuine content conflict, a legacy
+ * fence-less pending row, an abbreviated / uppercase / duplicated / malformed id,
+ * or a genuine-conflict tail carrying look-alike text (the class check via
+ * {@link parseMergeConflictReason} rejects it — the marker can never be salvaged
+ * from a non-pending reason). A null caller MUST degrade to its fence-less arm,
+ * never fabricate or substitute live branch heads as the missing authority. Pure;
  * NEVER throws.
  */
 export function parsePendingIntegrationHeads(
   reason: string,
 ): { sourceHead: string; baseHead: string } | null {
-  const m = /\[expected src=([0-9a-f]{40}) base=([0-9a-f]{40})\]$/.exec(reason);
+  const parsed = parseMergeConflictReason(reason);
+  if (parsed == null || parsed.stderr == null) {
+    return null;
+  }
+  const m = PENDING_HEAD_MARKER.exec(parsed.stderr);
   if (m == null || m[1] === undefined || m[2] === undefined) {
     return null;
   }
-  // Reject a duplicated / ambiguous marker: the opening token appears at most once.
-  const open = "[expected src=";
-  if (reason.indexOf(open) !== reason.lastIndexOf(open)) {
-    return null;
-  }
   return { sourceHead: m[1], baseHead: m[2] };
+}
+
+/** The tri-state class of a merge-conflict `dispatch_failures.reason`:
+ *  - `pinned` — a pending-integration request with EXACTLY one valid fence;
+ *  - `malformed` — a pending-integration request whose fence is absent, duplicated,
+ *    or malformed (a legacy pre-fence row is this class): FAIL CLOSED, never a
+ *    fast-forward and never a live-head substitution;
+ *  - `unpinned` — no pending tail at all (a genuine content conflict, or a
+ *    non-merge reason): the branch-name + live-snapshot path survives ONLY here.
+ *  Pure; NEVER throws. */
+export type PendingIntegrationClass = "pinned" | "malformed" | "unpinned";
+
+export function classifyPendingIntegration(
+  reason: string,
+): PendingIntegrationClass {
+  if (!isPendingIntegrationReason(reason)) {
+    return "unpinned";
+  }
+  return parsePendingIntegrationHeads(reason) != null ? "pinned" : "malformed";
 }

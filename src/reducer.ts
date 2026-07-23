@@ -34,10 +34,8 @@ import {
 import {
   BLOCK_INCIDENT_REASON,
   INSTANT_DEATH_BREAKER_REASON,
-  isLowerPriorityDispatchPlumbingReason,
   isMergeConflictIncidentReason,
   isParkedLaunchReason,
-  parsePendingIntegrationHeads,
   SHARED_DIRTY_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
@@ -4148,49 +4146,37 @@ function foldDispatchFailed(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
-  // Incident-INSTANCE precedence. A worktree-merge-conflict fan-in integration
-  // obligation is an incident instance; overwriting it is instance semantics, not a
-  // blind UPSERT. Decided purely from the persisted reason + this event's reason, so
-  // a re-fold reproduces it exactly.
+  // Incident-INSTANCE precedence — a CLOSED BINARY rule keyed on the merge-conflict
+  // class of the persisted reason and this event's reason (never a plumbing
+  // allowlist). Decided purely from those two reasons, so a re-fold reproduces it
+  // exactly.
   const existingFailure = db
     .query("SELECT reason FROM dispatch_failures WHERE verb = ? AND id = ?")
     .get(payload.verb, payload.id) as { reason: string } | null;
-  const incomingIsMerge = isMergeConflictIncidentReason(payload.reason);
   if (
     existingFailure != null &&
     isMergeConflictIncidentReason(existingFailure.reason)
   ) {
-    // A standing merge obligation holds this key. It clears ONLY on the
-    // reconciler's positive ancestry-plus-clean-target evidence, never here.
-    if (isLowerPriorityDispatchPlumbingReason(payload.reason)) {
-      // A lower-priority dispatch-plumbing failure (slot occupancy / instant-death
-      // / parked launch) never replaces the obligation, and its later reason-scoped
-      // self-clear can never then erase it. Discharge the failed attempt's launch
-      // window and leave the incident untouched.
-      dischargeLaunchWindow(db, payload);
-      return;
-    }
-    const existingPins = parsePendingIntegrationHeads(existingFailure.reason);
-    if (incomingIsMerge && existingPins != null) {
-      // Pins are IMMUTABLE per instance. A merge re-emit that would change or drop
-      // the pinned heads never mutates the open instance — a new pin set is an
-      // authorized clear plus a fresh mint, not an in-place head swap. An identical
-      // re-emit (same pins) falls through to the idempotent UPSERT below.
-      const incomingPins = parsePendingIntegrationHeads(payload.reason);
-      const samePins =
-        incomingPins != null &&
-        incomingPins.sourceHead === existingPins.sourceHead &&
-        incomingPins.baseHead === existingPins.baseHead;
-      if (!samePins) {
-        dischargeLaunchWindow(db, payload);
-        return;
-      }
-    }
-  } else if (incomingIsMerge && existingFailure != null) {
-    // A merge incident SUPERSEDES a lower-priority / non-merge row as a NEW
-    // instance: drop the stale row so the INSERT below mints a fresh
-    // instance_event_id and fresh claim / page-once / reattachment state, never
-    // silently carrying the superseded row's onto the new incident.
+    // A standing merge obligation holds this key. It is BYTE-STABLE against EVERY
+    // incoming DispatchFailed — lower-priority plumbing, a genuine structural
+    // failure, a different-pinned or identical merge re-emit, or any future reason
+    // class: pins and instance are immutable per instance, and a new pin set is an
+    // authorized clear plus a fresh mint. The obligation clears ONLY on the
+    // reconciler's positive ancestry-plus-clean-target evidence (or an operator
+    // retry_dispatch), never as a side effect of an overlay's reason-scoped
+    // self-clear. Leave the row untouched; still discharge the incoming attempt's
+    // launch window.
+    dischargeLaunchWindow(db, payload);
+    return;
+  }
+  if (
+    isMergeConflictIncidentReason(payload.reason) &&
+    existingFailure != null
+  ) {
+    // A merge incident SUPERSEDES a non-merge row (any class) as a NEW instance:
+    // drop the stale row so the INSERT below mints a fresh instance_event_id and
+    // fresh created_at / claim / page-once / reattachment state — the superseded
+    // row's must never silently carry into the merge obligation.
     db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
       payload.verb,
       payload.id,

@@ -34,6 +34,20 @@ keeper escalation-brief deconflict::<ref>
 
 This phase is unchanged: the flat JSON is your whole context.
 
+## Phase 1b — Route by fence class
+
+Read `incident.conflict.fence_state`. The deconflicter reconciles the `unpinned`
+genuine-conflict class ONLY; a pending-integration request never reaches it:
+
+- `pinned` — a mechanical fast-forward request owned by the work/close session's
+  resolver. Do NOT spawn the deconflicter. Decline and stop, noting the incident is
+  a pinned fast-forward that resolves through the mechanical path in its owning
+  session (never a live-head substitution here).
+- `malformed` — a legacy fence-less pending request. FAIL CLOSED: decline
+  (`stale_base`) and stop, NEVER substitute live branch heads as the missing
+  authority and never spawn the deconflicter.
+- `unpinned` — a genuine content conflict. Continue to Phase 2.
+
 ## Phase 2 — Locate the worktree and pin pre-merge state
 
 Pin these fields from the incident brief JSON:
@@ -43,12 +57,7 @@ Pin these fields from the incident brief JSON:
 - `incident.conflict.repo_dir`
 - `incident.conflict.stderr`
 - `incident.conflict.expected_source_head` / `incident.conflict.expected_base_head`
-  — the durable head fence the producer pins at incident mint. A pre-minted
-  `pending owner integration` fan-in request carries BOTH as 40-hex object ids; a
-  genuine content conflict carries neither. A `pending owner integration` request
-  that carries NO valid pins is a legacy fence-less incident: FAIL CLOSED — decline
-  (`stale_base`) and stop, NEVER substitute live branch heads as the missing
-  authority and never spawn the deconflicter for it.
+  — the durable head fence (both null for the `unpinned` class this phase serves).
 - `epic_id` / `task_id` / `lineage` fields you need for close-out
 
 Then confirm the checkout state before spawn:
