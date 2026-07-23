@@ -317,11 +317,11 @@ retire_keeper_codexbar_cli() {
 retire_keeper_codexbar_cli
 unset -f retire_keeper_codexbar_cli
 
-# 3e. claude-swap CLI: install the rebased integration branch from the local
-#     fork checkout. Every run fetches upstream/main and rebases before uv sees
-#     the source. A clone, checkout, dirty-tree, fetch, or rebase failure leaves
-#     the existing tool untouched and notifies the operator; an unrebased tree
-#     is never installed.
+# 3e. claude-swap CLI: maintain the local integration branch while it carries
+#     patches, then install canonical upstream directly once both trees match.
+#     Every run fetches upstream/main and rebases before uv sees the source. A
+#     clone, checkout, dirty-tree, fetch, rebase, or source-selection failure
+#     leaves the existing tool untouched and notifies the operator.
 claude_swap_fork="${HOME}/src/possibilities--claude-swap"
 claude_swap_branch="integration/keeper"
 claude_swap_origin="https://github.com/possibilities/claude-swap.git"
@@ -369,7 +369,8 @@ claude_swap_sync() {
       claude_swap_notify "cannot resolve the pre-rebase tip — skipping install"
       exit 1
     fi
-    if ! git fetch upstream main --quiet; then
+    if ! git fetch --quiet upstream \
+      '+refs/heads/main:refs/remotes/upstream/main'; then
       claude_swap_notify "git fetch upstream/main failed — skipping rebase and install"
       exit 1
     fi
@@ -395,11 +396,30 @@ fi
 if ! command -v uv >/dev/null 2>&1; then
   echo "install: uv unavailable; leaving claude-swap unchanged (non-fatal)" >&2
 elif [ -d "${claude_swap_fork}/.git" ] && claude_swap_sync; then
-  echo "install: install rebased claude-swap fork"
-  if uv tool install --force "${claude_swap_fork}"; then
-    echo "install: rebased claude-swap fork installed"
+  claude_swap_install_source="${claude_swap_fork}"
+  claude_swap_install_label="rebased claude-swap integration fork"
+  if git -C "${claude_swap_fork}" diff --quiet upstream/main HEAD --; then
+    if claude_swap_upstream_tip="$(git -C "${claude_swap_fork}" rev-parse upstream/main)"; then
+      claude_swap_install_source="git+${claude_swap_upstream}@${claude_swap_upstream_tip}"
+      claude_swap_install_label="canonical claude-swap upstream/main ${claude_swap_upstream_tip:0:10}"
+    else
+      claude_swap_notify "cannot resolve canonical upstream/main — skipping install"
+      claude_swap_install_source=""
+    fi
   else
-    claude_swap_notify "uv installation failed — leaving the existing tool unchanged"
+    claude_swap_diff_rc=$?
+    if [ "${claude_swap_diff_rc}" -gt 1 ]; then
+      claude_swap_notify "cannot compare integration/keeper with upstream/main — skipping install"
+      claude_swap_install_source=""
+    fi
+  fi
+  if [ -n "${claude_swap_install_source}" ]; then
+    echo "install: install ${claude_swap_install_label}"
+    if uv tool install --force "${claude_swap_install_source}"; then
+      echo "install: ${claude_swap_install_label} installed"
+    else
+      claude_swap_notify "uv installation failed — leaving the existing tool unchanged"
+    fi
   fi
 else
   echo "install: claude-swap fork was not installed (non-fatal)" >&2

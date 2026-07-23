@@ -30,7 +30,7 @@ const RETIRED_CLEANUP = between(
 );
 
 describe("mandatory claude-swap installation", () => {
-  test("rebases the fork branch before installing its local checkout", () => {
+  test("rebases integration before selecting the fork or canonical upstream", () => {
     expect(INSTALL).toContain("claude_swap_fork=");
     expect(INSTALL).toContain("/src/possibilities--claude-swap");
     expect(INSTALL).toContain('claude_swap_branch="integration/keeper"');
@@ -39,13 +39,21 @@ describe("mandatory claude-swap installation", () => {
     expect(INSTALL).toContain("realiti4/claude-swap.git");
     expect(INSTALL).toContain("git clone --quiet --branch");
     expect(INSTALL).toContain("git status --porcelain");
-    expect(INSTALL).toContain("git fetch upstream main --quiet");
+    expect(INSTALL).toContain("+refs/heads/main:refs/remotes/upstream/main");
+    expect(INSTALL).not.toContain("git fetch upstream main --quiet");
     expect(INSTALL).toContain("git rebase upstream/main");
     expect(INSTALL).toContain("git rebase --abort");
     expect(INSTALL).toContain("git reset --hard");
     expect(INSTALL).toContain("git push --force-with-lease origin");
     expect(INSTALL).toContain("notifyctl show-message");
     expect(INSTALL).toContain("uv tool install --force");
+    expect(INSTALL).toContain("diff --quiet upstream/main HEAD --");
+    expect(INSTALL).toContain(
+      `claude_swap_install_source="git+\${claude_swap_upstream}@\${claude_swap_upstream_tip}"`,
+    );
+    expect(INSTALL_DOC).toContain(
+      "the fork stops serving production automatically",
+    );
     expect(INSTALL).not.toContain("uv tool install --upgrade claude-swap");
     expect(INSTALL.indexOf("git rebase upstream/main")).toBeLessThan(
       INSTALL.indexOf("uv tool install --force"),

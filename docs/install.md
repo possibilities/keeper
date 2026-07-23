@@ -62,14 +62,17 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 ### Claude account routing and Account focuses
 
-Claude launches require the `integration/keeper` branch of the
+Claude launches require the behavior carried by the `integration/keeper` branch of the
 [`possibilities/claude-swap`](https://github.com/possibilities/claude-swap) fork. The installer keeps its
 checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, rebases the
-clean integration branch onto `upstream/main`, attempts to republish it with force-with-lease, then installs
-that exact checkout through `uv`. A wrong branch, dirty checkout, fetch/rebase conflict, or clone failure skips
-installation and sends a best-effort `notifyctl` alert rather than installing unrebased source. Missing
-`uv`, a failed sync, or a failed installation is nonfatal to Keeper's non-Claude surfaces, but Claude
-remains unavailable until `cswap` works and at least one account is registered.
+clean integration branch onto `upstream/main`, and attempts to republish it with force-with-lease. While the
+integration tree still differs, `uv` installs that exact checkout. Once upstream has absorbed every patch and
+the trees match, `uv` installs canonical `realiti4/claude-swap` at the fetched `upstream/main` commit instead,
+so the fork stops serving production automatically. A wrong branch, dirty checkout, fetch/rebase conflict,
+source-selection failure, or clone failure skips installation and sends a best-effort `notifyctl` alert rather
+than installing unverified source. Missing `uv`, a failed sync, or a failed installation is nonfatal to
+Keeper's non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
+registered.
 
 The daemon runs `cswap list --json` on a provider-safe three-minute cadence with jitter and publishes one
 private Capacity observation from each completed response; only a fresh observation supplies routing or
