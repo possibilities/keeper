@@ -265,6 +265,7 @@ import {
   baselineScratchPathFor,
   type EpicLaneBranchSet,
   epicIdFromKeeperLaneEntry,
+  type GitReadOutcome,
   abortInterruptedMerge as gitAbortInterruptedMerge,
   backupThenForceRemoveWorktree as gitBackupThenForceRemoveWorktree,
   baseMergeLockPath as gitBaseMergeLockPath,
@@ -5171,6 +5172,12 @@ export async function assignmentWorktreeReadiness(
   branch: string,
   run: WorktreeGitRunner = gitExec,
   worktreeExists: (p: string) => boolean = existsSync,
+  // OBSERVATIONAL-tier memo (rider 2): a tri-state `git worktree list` snapshot taken
+  // ONCE per repo per cycle and injected, so N dependents in one repo spawn ONE list —
+  // never a per-readiness-call spawn (this host's busy-lag watchdog kills on subprocess
+  // fan-out). Omitted → a fresh per-call list (the actor/launch MUTATION tier passes its
+  // OWN fresh snapshot; it never reuses a possibly-stale cycle memo before an effect).
+  worktreeList?: GitReadOutcome<WorktreeEntry[]>,
 ): Promise<AssignmentWorktreeReadiness> {
   let present: boolean;
   try {
@@ -5185,7 +5192,8 @@ export async function assignmentWorktreeReadiness(
   // worktree on `branch`. Absent/mismatch → `not-ready` (positively observed); a
   // timeout / inconclusive list → `unknown` (transient). Both route to the caller's
   // defer, so a ready-looking-but-unregistered lane is never dispatched into.
-  const listed = await gitListWorktreesResult(worktreePath, run);
+  const listed =
+    worktreeList ?? (await gitListWorktreesResult(worktreePath, run));
   if (listed.kind !== "ok") {
     const detail =
       listed.kind === "timeout" ? "git worktree list timed out" : listed.detail;
@@ -5235,12 +5243,21 @@ export async function assignmentWorktreeReadiness(
 }
 
 /** The ACTUAL target base a dependent's lane resolves against — the SHARED gate↔actor
- *  seam ({@link resolveTaskTarget}). `defer` holds the dependent (enumeration unknown,
- *  or an existing lane's worktree not ready). `target` carries the branch its ribs are
- *  probed against plus whether the lane already EXISTS (the actor repairs an existing
- *  lane, provisions a pre-cut one). */
+ *  seam ({@link resolveTaskTarget}). `defer` is a PURE hold with NO target identity
+ *  (enumeration unknown, pre-cut absent). `repair-needed` is an EXISTING lane whose
+ *  worktree failed readiness — it carries the FULL target identity (branch + path +
+ *  readiness verdict) so the GATE renders its hold AND the ACTOR consumes the SAME value
+ *  as its repair/recreate work item, one probe two consumers, zero re-derivation and zero
+ *  reason-string parsing. `target` is a dispatch-ready lane (existing + ready, or pre-cut). */
 export type TaskTargetResolution =
   | { kind: "defer"; reason: string }
+  | {
+      kind: "repair-needed";
+      targetBranch: string;
+      worktreePath: string;
+      existing: true;
+      readiness: { kind: "not-ready" | "unknown"; detail: string };
+    }
   | {
       kind: "target";
       targetBranch: string;
@@ -5281,12 +5298,16 @@ export async function resolveTaskTarget(
   if (laneSet.branches.has(assignment.branch)) {
     // The lane is ALREADY CUT: the base it sees is its OWN branch. Require the worktree
     // ready before any branch-content evidence counts (a stale/dirty/off-branch existing
-    // lane must NOT clear on ancestry alone).
+    // lane must NOT clear on ancestry alone). A not-ready/unknown existing lane is
+    // `repair-needed`, carrying its FULL identity so the actor repairs THIS exact lane.
     const verdict = await readiness(assignment.worktreePath, assignment.branch);
     if (verdict.kind !== "ready") {
       return {
-        kind: "defer",
-        reason: `assignment-worktree-${verdict.kind}: ${verdict.detail}`,
+        kind: "repair-needed",
+        targetBranch: assignment.branch,
+        worktreePath: assignment.worktreePath,
+        existing: true,
+        readiness: { kind: verdict.kind, detail: verdict.detail },
       };
     }
     return {
@@ -5347,11 +5368,12 @@ export async function computeDeferredSiblingSources(
   worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
   run: WorktreeGitRunner = gitExec,
   worktreesRoot?: string,
-  readiness: (
+  // Injected readiness (tests). When omitted, a per-repo-memoized default is built inside
+  // (rider 2): ONE `git worktree list` per repo per cycle, threaded into the shared probe.
+  readiness?: (
     worktreePath: string,
     branch: string,
-  ) => Promise<AssignmentWorktreeReadiness> = (worktreePath, branch) =>
-    assignmentWorktreeReadiness(worktreePath, branch, run),
+  ) => Promise<AssignmentWorktreeReadiness>,
 ): Promise<Map<string, string>> {
   const deferred = new Map<string, string>();
 
@@ -5373,6 +5395,27 @@ export async function computeDeferredSiblingSources(
       value = { ok: false }; // enumeration error → DEFER every dependent in this repo
     }
     laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  // Rider 2 OBSERVATIONAL tier: memoize the tri-state `git worktree list` ONCE per repo
+  // per cycle (git always lists at least the main worktree, so one spawn covers every
+  // dependent in the repo), then thread it into the shared readiness probe.
+  const worktreeListByRepo = new Map<string, GitReadOutcome<WorktreeEntry[]>>();
+  const memoWorktreeList = async (
+    repoDir: string,
+  ): Promise<GitReadOutcome<WorktreeEntry[]>> => {
+    const hit = worktreeListByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: GitReadOutcome<WorktreeEntry[]>;
+    try {
+      value = await gitListWorktreesResult(repoDir, run);
+    } catch (err) {
+      value = { kind: "inconclusive", detail: `list threw: ${errMsg(err)}` };
+    }
+    worktreeListByRepo.set(repoDir, value);
     return value;
   };
 
@@ -5405,7 +5448,22 @@ export async function computeDeferredSiblingSources(
     }
 
     const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+    const epicBase = baseBranchFor(epic.epic_id);
     for (const { repoDir, plan } of lanes) {
+      // Rider 2: the default readiness fetches the ONE per-repo worktree-list snapshot
+      // LAZILY through the memo, so a repo whose dependents never need a readiness probe
+      // (no done sibling) spawns ZERO `git worktree list`. A test-injected `readiness`
+      // bypasses it entirely (touches no worktree list).
+      const effectiveReadiness =
+        readiness ??
+        (async (wp: string, b: string) =>
+          assignmentWorktreeReadiness(
+            wp,
+            b,
+            run,
+            existsSync,
+            await memoWorktreeList(repoDir),
+          ));
       for (const assignment of plan.assignments) {
         if (assignment.isCloseSink) {
           continue;
@@ -5424,6 +5482,8 @@ export async function computeDeferredSiblingSources(
         if (doneParents.length === 0) {
           continue;
         }
+        const firstRib = () =>
+          ribBranchFor(epic.epic_id, doneParents[0]?.task_id ?? "");
         try {
           const laneSet = await enumerateLanes(repoDir);
           const target = await resolveTaskTarget(
@@ -5432,18 +5492,21 @@ export async function computeDeferredSiblingSources(
             epic.tasks,
             laneSet,
             run,
-            readiness,
+            effectiveReadiness,
           );
           if (target.kind === "defer") {
-            // Visibility rider: when target READINESS (not a not-yet-ancestor rib) is the
-            // immediate blocker, STILL name a blocking rib so the operator rail always
-            // names the unmet source edge — rib + readiness reason together. Every done
-            // sibling's rib is unmet until the held lane is ready, so the first stands in.
-            const firstRib = ribBranchFor(
-              epic.epic_id,
-              doneParents[0]?.task_id ?? "",
+            // Pure defer (enumeration unknown): name the first done rib + reason.
+            deferred.set(dependent.task_id, `${firstRib()} (${target.reason})`);
+            continue;
+          }
+          if (target.kind === "repair-needed") {
+            // An existing lane whose worktree failed readiness — HOLD naming the rib +
+            // readiness reason (the actor consumes the SAME repair-needed value; the gate
+            // never clears on branch content while the worktree is not ready).
+            deferred.set(
+              dependent.task_id,
+              `${firstRib()} (assignment-worktree-${target.readiness.kind}: ${target.readiness.detail})`,
             );
-            deferred.set(dependent.task_id, `${firstRib} (${target.reason})`);
             continue;
           }
           for (const parent of doneParents) {
@@ -5452,7 +5515,25 @@ export async function computeDeferredSiblingSources(
             if (!laneSet.ok) {
               contained = false; // defensive — resolveTaskTarget already deferred
             } else if (!laneSet.branches.has(rib)) {
-              contained = true; // definitively absent → merged-and-torn-down (or base-sat)
+              // P0-A: an ABSENT rib is contained-by-teardown ONLY relative to the CANONICAL
+              // fan-in sink (the epic base), NEVER an arbitrary already-cut dependent branch.
+              // For an EXISTING lane, prove the epic base (which absorbed the torn-down rib)
+              // is an ancestor of THAT lane; a present base not-ancestor/errored → NOT
+              // contained (HOLD). Epic base also gone → the whole epic merged → contained.
+              // A PRE-CUT lane forks off the canonical base region, so the teardown proof
+              // stands (absent → contained).
+              if (target.existing) {
+                contained = laneSet.branches.has(epicBase)
+                  ? await gitIsAncestorOf(
+                      repoDir,
+                      epicBase,
+                      target.targetBranch,
+                      run,
+                    )
+                  : true;
+              } else {
+                contained = true;
+              }
             } else {
               // Present: contained IFF an ancestor of the RESOLVED target base.
               // `gitIsAncestorOf` → false covers not-ancestor AND an errored probe.
@@ -5471,10 +5552,7 @@ export async function computeDeferredSiblingSources(
         } catch {
           // A probe threw — DEFER this dependent conservatively (an inconclusive probe
           // must never proceed: a stale fork is permanent). Names the first done rib.
-          deferred.set(
-            dependent.task_id,
-            ribBranchFor(epic.epic_id, doneParents[0]?.task_id ?? ""),
-          );
+          deferred.set(dependent.task_id, firstRib());
         }
       }
     }

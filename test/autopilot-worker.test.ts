@@ -23969,6 +23969,61 @@ test("computeDeferredSiblingSources: no DONE dependency-siblings → not in the 
   expect(calls.length).toBe(0);
 });
 
+test("computeDeferredSiblingSources: rider 2 — N existing-lane dependents in one repo spawn exactly ONE `git worktree list`", async () => {
+  // A diamond: .2 and .3 both fork off the done .1, both lanes exist. The DEFAULT
+  // readiness (no injected stub) takes ONE memoized worktree-list snapshot for the whole
+  // repo — never one spawn per dependent (this host's watchdog kills on subprocess lag).
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      makeTask({ task_id: "fn-1-foo.1", task_number: 1, worker_phase: "done" }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        worker_phase: "open",
+        depends_on: ["fn-1-foo.1"],
+      }),
+      makeTask({
+        task_id: "fn-1-foo.3",
+        task_number: 3,
+        worker_phase: "open",
+        depends_on: ["fn-1-foo.1"],
+      }),
+    ],
+  });
+  let listSpawns = 0;
+  const run: Parameters<typeof computeDeferredSiblingSources>[2] = async (a) => {
+    if (argvStartsWith(a, "for-each-ref")) {
+      return {
+        code: 0,
+        stdout: [
+          CASCADE_BASE,
+          "keeper/epic/fn-1-foo--fn-1-foo.1",
+          "keeper/epic/fn-1-foo--fn-1-foo.2",
+          "keeper/epic/fn-1-foo--fn-1-foo.3",
+        ].join("\n"),
+        stderr: "",
+      };
+    }
+    if (argvStartsWith(a, "worktree", "list")) {
+      listSpawns += 1;
+      // Omits the lanes → unregistered → not-ready → both dependents HELD before any
+      // per-lane tree probe; the point is the ONE list spawn.
+      return { code: 0, stdout: "worktree /repo\nbranch refs/heads/main\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+  );
+  expect(deferred.has("fn-1-foo.2")).toBe(true);
+  expect(deferred.has("fn-1-foo.3")).toBe(true);
+  expect(listSpawns).toBe(1);
+});
+
 test("computeDeferredSiblingSources: a dependent INHERITING a done sibling's own rib is NOT deferred (its base IS that rib — never a generic epic base)", async () => {
   // `.1` root (base); `.2` forks a rib off base; `.3` INHERITS `.2`'s rib (linear
   // continuation). `.2` DONE, `.3` OPEN. `.3`'s assignment base is `.2`'s own rib, so
@@ -24092,7 +24147,11 @@ test("computeDeferredSiblingSources: EXISTING assignment lane — a done rib in 
     undefined,
     ALWAYS_READY,
   );
-  expect(deferred.get("fn-1-foo.4")).toBe(CASCADE_RIB3);
+  // A stale .4 (its branch behind the base) is HELD. P0-A: the earlier done siblings'
+  // ribs are torn down (absent from the lane set), so their containment is measured
+  // against the epic base — which is NOT an ancestor of the stale .4 — so the first such
+  // sibling blocks; the present rib3 (in the base, not the lane) would block too.
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
 });
 
 test("computeDeferredSiblingSources: EXISTING assignment lane — only the rib becoming an ancestor of the lane's OWN branch clears the gate", async () => {
@@ -24102,6 +24161,7 @@ test("computeDeferredSiblingSources: EXISTING assignment lane — only the rib b
     ancestorPairs: [
       [CASCADE_RIB3, CASCADE_BASE],
       [CASCADE_RIB3, CASCADE_RIB4], // now integrated into the lane itself
+      [CASCADE_BASE, CASCADE_RIB4], // and the base (holding the torn-down .1/.2) too
     ],
   });
   const deferred = await computeDeferredSiblingSources(
@@ -24134,7 +24194,48 @@ test("computeDeferredSiblingSources: EXISTING lane with rib contained AND a clea
   const epic = cascadeEpic({});
   const { run } = existingLaneGit({
     lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
-    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]],
+    // Fully synced: the rib AND the epic base (holding torn-down .1/.2) are in the lane.
+    ancestorPairs: [
+      [CASCADE_RIB3, CASCADE_RIB4],
+      [CASCADE_BASE, CASCADE_RIB4],
+    ],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(false);
+});
+
+test("computeDeferredSiblingSources: P0-A — a DONE sibling's rib TORN DOWN (in the epic base) + a clean/synced but STALE existing lane → MUST HOLD (absence is not containment)", async () => {
+  // The literal negative: .3 (done) fanned into the epic base and its rib was torn down
+  // (absent from the lane set); .4's lane is clean and READY but was cut BEFORE the base
+  // absorbed .3 (the base is NOT an ancestor of .4). An absent rib must NOT be read as
+  // contained by the already-cut .4 — the teardown proof is relative to the epic base,
+  // not .4 — so the dependent HOLDS.
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB4], // every done rib torn down; base present, stale .4
+    ancestorPairs: [], // the base is NOT an ancestor of the stale .4
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+});
+
+test("computeDeferredSiblingSources: P0-A — once the epic base (holding the torn-down rib) becomes an ancestor of the lane → released (real ancestry clears, never absence)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_BASE, CASCADE_RIB4]], // the actor merged the base into the lane
   });
   const deferred = await computeDeferredSiblingSources(
     [epic],
