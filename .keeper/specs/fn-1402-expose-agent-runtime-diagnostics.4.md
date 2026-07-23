@@ -63,5 +63,6 @@ Skills and docs land only after all three implementation contracts exist, so no 
 - [ ] Repository documentation and skill lint gates pass within size limits with forward-facing, PII-free prose.
 
 ## Done summary
-
+Wired the query and await skills to the three new schema-v1 runtime/Usage/routing commands and the context/weekly-quota threshold-await grammar, added the canonical contract to agent-surface-contracts.md, and consolidated README/install/problem-codes guidance with exact recovery commands.
 ## Evidence
+- Commits: 770b2b9ea9657facba56c34557a5d4b829ca45f6
