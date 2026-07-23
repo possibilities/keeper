@@ -84,24 +84,39 @@ const defaultCanonicalize: PathCanonicalizer = async (p) => {
   }
 };
 
+/** Reject a path that is empty, non-absolute, or carries a CR / LF / NUL (ambiguous, multi-line,
+ *  or injection-shaped) — applied to BOTH the raw INPUT and the canonical OUTPUT of {@link
+ *  canonicalizeStrict}. A relative or control-char-bearing path must never reach the
+ *  canonicalizer (a real `realpath` would resolve a relative path against the process cwd and
+ *  select the WRONG lock domain). */
+function isCleanAbsolutePath(p: string): boolean {
+  return p !== "" && isAbsolute(p) && !/[\r\n\0]/.test(p);
+}
+
 /**
- * Canonicalize `path`, then REVALIDATE the canonicalizer's OUTPUT — not only its input: a
- * throwing / null / non-absolute / multi-line (ambiguous) result yields `null` so the caller
- * DEFERS, never degrading to a raw-string compare. The single strict canonicalization seam both
- * the common-dir resolution AND the per-worktree identity route through, so no path trusts an
- * un-revalidated canonical output.
+ * Validate the raw INPUT, canonicalize, then REVALIDATE the canonicalizer's OUTPUT — not only
+ * its input. A non-absolute / empty / CR-LF-NUL RAW path is rejected BEFORE the canonicalizer is
+ * even invoked (a relative admin dir from a buggy deriver would else realpath against the process
+ * cwd and select the wrong lock domain); a throwing / null / non-absolute / control-char OUTPUT
+ * likewise yields `null` so the caller DEFERS, never degrading to a raw-string compare. The
+ * single strict canonicalization seam both the common-dir resolution AND the per-worktree
+ * identity route through.
  */
 async function canonicalizeStrict(
   path: string,
   canonicalize: PathCanonicalizer,
 ): Promise<string | null> {
+  // Reject the raw INPUT before canonicalizing — never realpath a relative / control-char path.
+  if (!isCleanAbsolutePath(path)) {
+    return null;
+  }
   let out: string | null;
   try {
     out = await canonicalize(path);
   } catch {
     return null;
   }
-  if (out === null || !isAbsolute(out) || out.includes("\n")) {
+  if (out === null || !isCleanAbsolutePath(out)) {
     return null;
   }
   return out;

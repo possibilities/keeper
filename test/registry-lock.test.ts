@@ -365,6 +365,32 @@ describe("registry-lock leaf", () => {
     }
   });
 
+  test("withCheckoutLock: a RELATIVE raw admin dir defers with common released — the canonicalizer is NEVER invoked on it", async () => {
+    const log = freshLog();
+    const seen: string[] = [];
+    // A buggy deriver returns a RELATIVE path; a real realpath would resolve it against the
+    // process cwd and select the WRONG lock domain — so the input guard must reject it BEFORE
+    // the canonicalizer is ever called.
+    const canon: PathCanonicalizer = async (p) => {
+      seen.push(p);
+      return p === COMMON ? COMMON : p;
+    };
+    const r = await withCheckoutLock(
+      "/repo",
+      fakeRun(),
+      fakeAcquire(log),
+      async () => "relative/admin",
+      async () => "ok",
+      canon,
+    );
+    expect(isLockDeferred(r)).toBe(true);
+    expect(log.acquired).toEqual([COMMON_LOCK]);
+    expect(log.released).toEqual([COMMON_LOCK]);
+    // The common dir WAS canonicalized; the relative admin dir was NEVER passed to the canonicalizer.
+    expect(seen).toContain(COMMON);
+    expect(seen).not.toContain("relative/admin");
+  });
+
   test("withCheckoutLock: unresolved worktree identity → defer, common released, no per-worktree acquire", async () => {
     const log = freshLog();
     const r = await withCheckoutLock(
