@@ -82,6 +82,9 @@ import {
   type AssignmentWorktreeReadiness,
   assignmentWorktreeReadiness,
   computeDeferredEpicIds,
+  integratePinnedRib,
+  probeLaneIntegrationRegime,
+  recreateLaneOffBase,
   computeDeferredSiblingSources,
   computeDuplicateEpicNumberGroups,
   computeMergedLaneEntries,
@@ -340,7 +343,7 @@ import type {
   ResolvedEpicDep,
   Task,
 } from "../src/types";
-import { parseWorktreeList } from "../src/worktree-git";
+import { type LockAcquirer, parseWorktreeList } from "../src/worktree-git";
 import {
   baseBranchFor,
   repoDirHash,
@@ -24383,6 +24386,431 @@ test("computeDeferredSiblingSources: a readiness-blocked withhold NAMES the bloc
   expect(reason).toContain("keeper/epic/fn-1-foo--fn-1-foo.1");
   expect(reason).toContain("assignment-worktree-not-ready");
   expect(reason).toContain("dirty: M src/foo.ts");
+});
+
+// ---------------------------------------------------------------------------
+// Parts-6 progress actor — fenced primitives (integratePinnedRib /
+// probeLaneIntegrationRegime / recreateLaneOffBase). Rule-driven git fakes; no
+// real git, worktree, lock, or fs. An unmatched call defaults to exit-0/empty.
+// ---------------------------------------------------------------------------
+
+const ACTOR_TGT = "keeper/epic/fn-1-foo--fn-1-foo.4";
+const ACTOR_SRC = "keeper/epic/fn-1-foo--fn-1-foo.3";
+const ACTOR_TGT_OID = "a".repeat(40);
+const ACTOR_SRC_OID = "b".repeat(40);
+const ACTOR_WT = "/wt/fn-1-foo.4";
+const ACTOR_REPO = "/repo";
+const okLock: LockAcquirer = () => ({ release() {} });
+const nullLock: LockAcquirer = () => null;
+
+type FakeRun = (args: string[]) => Promise<{
+  code: number;
+  stdout: string;
+  stderr: string;
+}>;
+
+interface PinnedGitOpts {
+  sourceAbsent?: boolean;
+  srcInTarget?: "yes" | "no" | "unknown";
+  targetInSrc?: "yes" | "no" | "unknown";
+  ffRefused?: boolean;
+  conflict?: boolean;
+  postAncestor?: "yes" | "no" | "unknown";
+  notReadyUnderLock?: boolean;
+  headMovedUnderFence?: boolean;
+  sourceMovedUnderFence?: boolean;
+}
+
+/** A STATEFUL fake for integratePinnedRib: MERGE_HEAD flips present after a conflicted
+ *  two-parent merge (so mergeReadiness reads clean BEFORE the merge and the conflict
+ *  classifier reads it present AFTER), and the HEAD/source rev-parse can diverge on their
+ *  SECOND (under-lock CAS) read to model a raced fence. */
+function pinnedGit(opts: PinnedGitOpts = {}): { run: FakeRun; calls: string[] } {
+  const ancExit = (
+    v: "yes" | "no" | "unknown" | undefined,
+    dflt: "yes" | "no" | "unknown",
+  ): number => {
+    const s = v ?? dflt;
+    return s === "yes" ? 0 : s === "no" ? 1 : GIT_SPAWN_TIMEOUT_CODE;
+  };
+  let headReads = 0;
+  let srcReads = 0;
+  let midMerge = false;
+  const calls: string[] = [];
+  const run: FakeRun = async (a) => {
+    calls.push(a.join(" "));
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
+      headReads += 1;
+      const oid =
+        opts.headMovedUnderFence && headReads >= 2 ? "d".repeat(40) : ACTOR_TGT_OID;
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has(`refs/heads/${ACTOR_SRC}^{commit}`)) {
+      if (opts.sourceAbsent) return { code: 1, stdout: "", stderr: "" };
+      srcReads += 1;
+      const oid =
+        opts.sourceMovedUnderFence && srcReads >= 2 ? "e".repeat(40) : ACTOR_SRC_OID;
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
+      return midMerge
+        ? { code: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "status") {
+      return opts.notReadyUnderLock
+        ? { code: 0, stdout: " M src/foo.ts\n", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
+      return { code: 0, stdout: `${ACTOR_TGT}\n`, stderr: "" };
+    }
+    if (a[0] === "merge-base" && a[1] === "--is-ancestor") {
+      const anc = a[2];
+      const desc = a[3];
+      if (anc === ACTOR_SRC_OID && desc === ACTOR_TGT_OID) {
+        return { code: ancExit(opts.srcInTarget, "no"), stdout: "", stderr: "" };
+      }
+      if (anc === ACTOR_TGT_OID && desc === ACTOR_SRC_OID) {
+        return { code: ancExit(opts.targetInSrc, "no"), stdout: "", stderr: "" };
+      }
+      if (anc === ACTOR_SRC_OID && desc === "HEAD") {
+        return { code: ancExit(opts.postAncestor, "yes"), stdout: "", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "merge" && a[1] === "--ff-only") {
+      return opts.ffRefused
+        ? { code: 1, stdout: "", stderr: "fatal: Not possible to fast-forward" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "merge" && a[1] === "--no-ff") {
+      if (opts.conflict) {
+        midMerge = true;
+        return { code: 1, stdout: "", stderr: "CONFLICT (content)" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "diff" && has("--diff-filter=U")) {
+      return { code: 0, stdout: "src/foo.ts\n", stderr: "" };
+    }
+    if (a[0] === "merge" && a[1] === "--abort") {
+      midMerge = false;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls };
+}
+
+test("integratePinnedRib: source already an ancestor of the target → already-integrated, no merge attempted", async () => {
+  const { run, calls } = pinnedGit({ srcInTarget: "yes" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("already-integrated");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("integratePinnedRib: an ABSENT source rib → already-integrated (torn-down / never-cut)", async () => {
+  const { run, calls } = pinnedGit({ sourceAbsent: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("already-integrated");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("integratePinnedRib: target ⊆ source → an exact-object FAST-FORWARD → integrated", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "yes" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("integrated");
+  expect(calls.some((c) => c === `merge --ff-only ${ACTOR_SRC_OID}`)).toBe(true);
+  expect(calls.some((c) => c.includes("--no-ff"))).toBe(false); // never a divergence merge
+});
+
+test("integratePinnedRib: TRUE DIVERGENCE, clean merge → integrated via a two-parent pinned-object merge", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "no" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("integrated");
+  expect(calls.some((c) => c === `merge --no-ff --no-edit ${ACTOR_SRC_OID}`)).toBe(true);
+});
+
+test("integratePinnedRib: a divergent CONTENT conflict → conflict (aborted cleanly), lane branch NEVER deleted", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "no", conflict: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("conflict");
+  if (out.kind === "conflict") expect(out.conflictedFiles).toContain("src/foo.ts");
+  expect(calls.some((c) => c === "merge --abort")).toBe(true); // aborted → arrival state restored
+  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false); // WIP retained
+});
+
+test("integratePinnedRib: a lock timeout → defer (no merge attempted)", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "no" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, nullLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("lock timeout");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("integratePinnedRib: the target HEAD moves under the fence (CAS) → defer, no merge", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "no", headMovedUnderFence: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("moved under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("integratePinnedRib: the source ref moves under the fence (CAS) → defer, no merge", async () => {
+  const { run } = pinnedGit({ targetInSrc: "no", sourceMovedUnderFence: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("moved under the fence");
+});
+
+test("integratePinnedRib: an INCONCLUSIVE ancestry probe → defer (never read as a negative)", async () => {
+  const { run } = pinnedGit({ srcInTarget: "unknown" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("inconclusive");
+});
+
+test("integratePinnedRib: fast-forward REFUSED (raced non-FF) → defer, never a merge commit", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "yes", ffRefused: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("fast-forward refused");
+  expect(calls.some((c) => c.includes("--no-ff"))).toBe(false);
+});
+
+test("integratePinnedRib: post-merge source-ancestry unproven → defer (positive post-check only)", async () => {
+  const { run } = pinnedGit({ targetInSrc: "no", postAncestor: "no" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("post-merge source-ancestry");
+});
+
+test("integratePinnedRib: target not ready under the lock → defer before merging", async () => {
+  const { run, calls } = pinnedGit({ targetInSrc: "no", notReadyUnderLock: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("not ready under lock");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+interface RegimeGitOpts {
+  readyKind?: "ready" | "dirty" | "mid-merge" | "off-branch";
+  wip?: number | "error";
+  untracked?: string[];
+  untrackedError?: boolean;
+  incomingTree?: string[];
+  incomingTreeTimeout?: boolean;
+}
+
+function regimeGit(opts: RegimeGitOpts = {}): { run: FakeRun } {
+  const readyKind = opts.readyKind ?? "ready";
+  const run: FakeRun = async (a) => {
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
+      return readyKind === "mid-merge"
+        ? { code: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "status") {
+      return readyKind === "dirty"
+        ? { code: 0, stdout: " M src/foo.ts\n", stderr: "" }
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
+      return {
+        code: 0,
+        stdout: readyKind === "off-branch" ? "some-other-branch\n" : `${ACTOR_TGT}\n`,
+        stderr: "",
+      };
+    }
+    if (a[0] === "rev-list" && has("--count")) {
+      return opts.wip === "error"
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: `${opts.wip ?? 0}\n`, stderr: "" };
+    }
+    if (a[0] === "ls-files" && has("--others")) {
+      return opts.untrackedError
+        ? { code: 1, stdout: "", stderr: "" }
+        : { code: 0, stdout: (opts.untracked ?? []).join("\n"), stderr: "" };
+    }
+    if (a[0] === "ls-tree") {
+      return opts.incomingTreeTimeout
+        ? { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" }
+        : { code: 0, stdout: (opts.incomingTree ?? []).join("\n"), stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run };
+}
+
+test("probeLaneIntegrationRegime: committed WIP + clean tree + no untracked → merge", async () => {
+  const { run } = regimeGit({ wip: 2, untracked: [] });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("merge");
+});
+
+test("probeLaneIntegrationRegime: committed WIP + untracked DISJOINT from the incoming set → merge", async () => {
+  const { run } = regimeGit({ wip: 1, untracked: ["notes.txt"], incomingTree: ["src/foo.ts"] });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("merge");
+});
+
+test("probeLaneIntegrationRegime: committed WIP + untracked OVERLAPPING the incoming set → defer (never clobber untracked)", async () => {
+  const { run } = regimeGit({ wip: 1, untracked: ["src/foo.ts"], incomingTree: ["src/foo.ts"] });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("clobber");
+});
+
+test("probeLaneIntegrationRegime: committed WIP + untracked but UNKNOWN clobber evidence → defer", async () => {
+  const { run } = regimeGit({ wip: 1, untracked: ["notes.txt"], incomingTreeTimeout: true });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("unknown");
+});
+
+test("probeLaneIntegrationRegime: no unique commits + fully clean → recreate", async () => {
+  const { run } = regimeGit({ wip: 0, untracked: [] });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("recreate");
+});
+
+test("probeLaneIntegrationRegime: no unique commits but UNTRACKED files present → defer (recreate would destroy them)", async () => {
+  const { run } = regimeGit({ wip: 0, untracked: ["scratch.txt"] });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("untracked");
+});
+
+test("probeLaneIntegrationRegime: tracked DIRT → defer (dirt/recovery owns it), both arms blocked", async () => {
+  const { run } = regimeGit({ readyKind: "dirty", wip: 3 });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("tracked dirt");
+});
+
+test("probeLaneIntegrationRegime: MID-MERGE residue → defer untouched", async () => {
+  const { run } = regimeGit({ readyKind: "mid-merge", wip: 3 });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("mid-merge");
+});
+
+test("probeLaneIntegrationRegime: OFF-BRANCH lane → defer", async () => {
+  const { run } = regimeGit({ readyKind: "off-branch", wip: 3 });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("off-branch");
+});
+
+test("probeLaneIntegrationRegime: an inconclusive unique-commit probe → defer", async () => {
+  const { run } = regimeGit({ wip: "error" });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("unique-commit probe inconclusive");
+});
+
+test("probeLaneIntegrationRegime: an inconclusive untracked probe → defer", async () => {
+  const { run } = regimeGit({ wip: 2, untrackedError: true });
+  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("untracked probe inconclusive");
+});
+
+interface RecreateGitOpts {
+  removeExit?: number; // `worktree remove` exit (non-zero → dirty → defer)
+  deleteExit?: number; // `branch -D` exit
+  pruneExit?: number; // ensure's `worktree prune` exit
+  addExit?: number; // ensure's `worktree add` exit
+}
+
+function recreateGit(opts: RecreateGitOpts = {}): { run: FakeRun; calls: string[] } {
+  const calls: string[] = [];
+  let removed = false;
+  const run: FakeRun = async (a) => {
+    calls.push(a.join(" "));
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "worktree" && a[1] === "list") {
+      // Before removal the lane is registered; after, it is gone (so ensure re-adds).
+      return removed
+        ? { code: 0, stdout: `worktree ${ACTOR_REPO}\nHEAD ${"0".repeat(40)}\nbranch refs/heads/main\n`, stderr: "" }
+        : {
+            code: 0,
+            stdout: `worktree ${ACTOR_REPO}\nbranch refs/heads/main\n\nworktree ${ACTOR_WT}\nbranch refs/heads/${ACTOR_TGT}\n`,
+            stderr: "",
+          };
+    }
+    if (a[0] === "worktree" && a[1] === "remove") {
+      if ((opts.removeExit ?? 0) !== 0) {
+        return { code: opts.removeExit ?? 1, stdout: "", stderr: "contains modified or untracked files" };
+      }
+      removed = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "branch" && a[1] === "-D") {
+      return { code: opts.deleteExit ?? 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "worktree" && a[1] === "prune") {
+      return { code: opts.pruneExit ?? 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--verify")) {
+      // ensure's branch-exists probe — positively absent (deleted) so it re-creates.
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "worktree" && a[1] === "add") {
+      return { code: opts.addExit ?? 0, stdout: "", stderr: opts.addExit ? "add failed" : "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls };
+}
+
+const noopDepLink = async (): Promise<void> => {};
+
+test("recreateLaneOffBase: clean remove + delete + re-cut off the fresh base → recreated", async () => {
+  const { run, calls } = recreateGit({});
+  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", run, noopDepLink);
+  expect(out.kind).toBe("recreated");
+  expect(calls.some((c) => c === `worktree remove ${ACTOR_WT}`)).toBe(true);
+  expect(calls.some((c) => c === `branch -D ${ACTOR_TGT}`)).toBe(true);
+  expect(calls.some((c) => c === `worktree add -b ${ACTOR_TGT} ${ACTOR_WT} keeper/epic/fn-1-foo`)).toBe(true);
+});
+
+test("recreateLaneOffBase: `worktree remove` refuses (raced dirty) → defer, NEVER a force-remove", async () => {
+  const { run, calls } = recreateGit({ removeExit: 1 });
+  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", run, noopDepLink);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("remove refused");
+  // A force flag would sit immediately after `remove` (git: `worktree remove --force <path>`).
+  expect(
+    calls.some(
+      (c) =>
+        c.startsWith("worktree remove --force") ||
+        c.startsWith("worktree remove -f "),
+    ),
+  ).toBe(false);
+  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false); // never delete after a failed remove
+});
+
+test("recreateLaneOffBase: the stale-branch delete fails → defer", async () => {
+  const { run } = recreateGit({ deleteExit: 1 });
+  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", run, noopDepLink);
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("delete the stale lane branch");
+});
+
+test("recreateLaneOffBase: an inconclusive re-cut (prune non-zero) → defer", async () => {
+  const { run } = recreateGit({ pruneExit: 1 });
+  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", run, noopDepLink);
+  expect(out.kind).toBe("defer");
+});
+
+test("recreateLaneOffBase: a positively-failed `worktree add` → failed", async () => {
+  const { run } = recreateGit({ addExit: 1 });
+  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", run, noopDepLink);
+  expect(out.kind).toBe("failed");
 });
 
 // ---------------------------------------------------------------------------

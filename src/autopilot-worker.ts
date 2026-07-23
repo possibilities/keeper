@@ -271,6 +271,7 @@ import {
   branchExists as gitBranchExists,
   classifyLaneOwnership as gitClassifyLaneOwnership,
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
+  classifyMergeAttempt as gitClassifyMergeAttempt,
   commitWorkLockPath as gitCommitWorkLockPath,
   currentBranch as gitCurrentBranch,
   currentBranchResult as gitCurrentBranchResult,
@@ -12288,6 +12289,463 @@ export function epicPresentAndNotDone(
 /** Trailing-slash-tolerant path compare helper for worktree-path equality. */
 function stripTrailingSlashPath(p: string): string {
   return p.length > 1 && p.endsWith("/") ? p.replace(/\/+$/, "") : p;
+}
+
+// ===========================================================================
+// Parts-6 progress actor — fenced primitives.
+//
+// These integrate a DONE sibling's rib into a HELD target (an existing stale
+// dependent lane, or the epic base) so the sibling-source gate clears, removing
+// the existing-stale-lane deadlock the target-selection seam introduces — nothing
+// else integrates a rib into an existing lane (provision's pre-merge is gate-
+// suppressed, the pending-integration owner integrates the BASE, base-freshness
+// merges default). They are PRODUCER-ONLY git side effects (a pinned-object merge
+// under the commit-work flock, or a non-destructive lane recreate) and write NO DB
+// / fold. Every primitive is fully fenced and NEVER throws; the orchestrator wires
+// the no-owner / no-resolver / claim-release-folded liveness gates around them.
+// ===========================================================================
+
+/** A `rev-parse` object resolution — a full oid, a POSITIVELY-absent ref, or UNKNOWN
+ *  (a timeout / non-1 error / non-oid output that must DEFER, never be read as absent). */
+type RevParseOutcome =
+  | { kind: "oid"; oid: string }
+  | { kind: "absent" }
+  | { kind: "unknown"; detail: string };
+
+/** Resolve `rev` to a full object id in `dir`, tri-stated: exit 1 is POSITIVELY absent
+ *  (a torn-down / never-cut ref), exit 0 + a full oid is present, everything else (124
+ *  timeout, other error, a non-oid abbreviation) is UNKNOWN. `--end-of-options` guards a
+ *  `-`-leading name; `^{commit}` peels tags. */
+async function revParseOid(
+  dir: string,
+  rev: string,
+  run: WorktreeGitRunner,
+): Promise<RevParseOutcome> {
+  const r = await run(
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", rev],
+    { cwd: dir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (r.code === 1) {
+    return { kind: "absent" };
+  }
+  if (r.code !== 0) {
+    return {
+      kind: "unknown",
+      detail: r.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${r.code}`,
+    };
+  }
+  const oid = r.stdout.trim();
+  return isFullObjectId(oid)
+    ? { kind: "oid", oid }
+    : { kind: "unknown", detail: "non-oid output" };
+}
+
+/** `git merge-base --is-ancestor`, tri-stated: exit 0 = yes, exit 1 = no, everything
+ *  else (a 124 SIGKILL or a git error) = UNKNOWN (the caller DEFERS — never reads an
+ *  inconclusive probe as a negative). */
+async function isAncestorTri(
+  dir: string,
+  ancestor: string,
+  descendant: string,
+  run: WorktreeGitRunner,
+): Promise<"yes" | "no" | "unknown"> {
+  const r = await run(["merge-base", "--is-ancestor", ancestor, descendant], {
+    cwd: dir,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (r.code === 0) {
+    return "yes";
+  }
+  if (r.code === 1) {
+    return "no";
+  }
+  return "unknown";
+}
+
+/** The outcome of integrating a pinned rib object into a target checkout. */
+export type RibIntegrationOutcome =
+  /** The pinned source is now provably an ancestor of the target HEAD (a merge or FF
+   *  landed and the tree is clean). */
+  | { kind: "integrated" }
+  /** The source was ALREADY contained in the target (or the source ref is gone —
+   *  merged-and-torn-down): nothing to do, a positive no-op. */
+  | { kind: "already-integrated" }
+  /** A GENUINE content conflict — the merge was aborted cleanly (the target's exact
+   *  arrival state + its committed WIP restored); route it to a fan-in incident. */
+  | { kind: "conflict"; conflictedFiles: string[]; stderr: string }
+  /** Inconclusive / raced / locked / structural — retry next cycle, no mutation stuck. */
+  | { kind: "defer"; reason: string };
+
+/**
+ * Integrate a DONE sibling's rib into a target checkout by its EXACT PINNED OBJECT,
+ * race-free against ref movement. The four-way pinned-object classifier (per the exact
+ * snapshot source/target OIDs, never a re-resolved branch):
+ *  1. source ⊆ target → `already-integrated` (no-op);
+ *  2. target ⊆ source → an exact-object FAST-FORWARD (`git merge --ff-only <sourceOid>`
+ *     — which REFUSES to synthesize a merge commit, so a raced non-FF fails cleanly to a
+ *     defer, NEVER a silent divergence merge);
+ *  3. TRUE DIVERGENCE → a clean two-parent merge of the PINNED OBJECT (`git merge --no-ff
+ *     --no-edit <sourceOid>`), reusing {@link classifyMergeAttempt}'s conflict/abort
+ *     grammar; a content conflict aborts cleanly and routes an incident;
+ *  4. inconclusive/error anywhere → defer (never relabel divergence as pinned-FF).
+ * The merge runs UNDER the commit-work flock with a snapshot-fence CAS recheck (both
+ * objects still at the snapshot, HEAD still on the target branch) and POSITIVE post-checks
+ * (the pinned source is now an ancestor of HEAD AND the tree is clean). Producer-only;
+ * NEVER throws.
+ */
+export async function integratePinnedRib(
+  dir: string,
+  targetBranch: string,
+  sourceBranch: string,
+  run: WorktreeGitRunner = gitExec,
+  acquireLock?: LockAcquirer,
+): Promise<RibIntegrationOutcome> {
+  try {
+    // (0) Snapshot the pinned fence: the target HEAD object and the source rib object.
+    const targetHead = await revParseOid(dir, "HEAD^{commit}", run);
+    if (targetHead.kind !== "oid") {
+      return {
+        kind: "defer",
+        reason: `target head unresolved (${targetHead.kind === "absent" ? "absent" : targetHead.detail})`,
+      };
+    }
+    const source = await revParseOid(
+      dir,
+      `refs/heads/${sourceBranch}^{commit}`,
+      run,
+    );
+    if (source.kind === "absent") {
+      return { kind: "already-integrated" }; // torn-down / never-cut rib → nothing to integrate
+    }
+    if (source.kind !== "oid") {
+      return {
+        kind: "defer",
+        reason: `source ref unresolved (${source.detail})`,
+      };
+    }
+    const targetOid = targetHead.oid;
+    const sourceOid = source.oid;
+
+    // (1) source ⊆ target → already integrated.
+    const srcInTarget = await isAncestorTri(dir, sourceOid, targetOid, run);
+    if (srcInTarget === "yes") {
+      return { kind: "already-integrated" };
+    }
+    if (srcInTarget === "unknown") {
+      return {
+        kind: "defer",
+        reason: "source-in-target ancestry inconclusive",
+      };
+    }
+    // (2) target ⊆ source → FAST-FORWARD; else (3) TRUE DIVERGENCE.
+    const targetInSrc = await isAncestorTri(dir, targetOid, sourceOid, run);
+    if (targetInSrc === "unknown") {
+      return {
+        kind: "defer",
+        reason: "target-in-source ancestry inconclusive",
+      };
+    }
+    const strategy: "ff" | "diverged" =
+      targetInSrc === "yes" ? "ff" : "diverged";
+
+    // (4) Take the commit-work flock — the SAME serialization a concurrent commit-work
+    //     acquires, so the integration never races an agent commit in this worktree.
+    const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
+    const lockPath = await gitCommitWorkLockPath(dir, run);
+    const lock = await acquire(lockPath);
+    if (lock === null) {
+      return { kind: "defer", reason: "commit-work lock timeout" };
+    }
+    try {
+      // (5) CAS recheck UNDER the lock: both objects still at the snapshot, HEAD still on
+      //     the target branch. Any movement between snapshot and here → defer.
+      const headAgain = await revParseOid(dir, "HEAD^{commit}", run);
+      const sourceAgain = await revParseOid(
+        dir,
+        `refs/heads/${sourceBranch}^{commit}`,
+        run,
+      );
+      if (
+        headAgain.kind !== "oid" ||
+        sourceAgain.kind !== "oid" ||
+        headAgain.oid !== targetOid ||
+        sourceAgain.oid !== sourceOid
+      ) {
+        return {
+          kind: "defer",
+          reason: "target or source moved under the fence",
+        };
+      }
+      // (6) Re-assert a clean, on-branch, residue-free target right before the merge.
+      const ready = await gitMergeReadiness(dir, targetBranch, run);
+      if (ready.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `target not ready under lock: ${ready.kind}`,
+        };
+      }
+
+      if (strategy === "ff") {
+        const ff = await run(["merge", "--ff-only", sourceOid], {
+          cwd: dir,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        });
+        if (ff.code !== 0) {
+          return {
+            kind: "defer",
+            reason: `fast-forward refused: ${(ff.stdout + ff.stderr).trim().slice(0, 200)}`,
+          };
+        }
+      } else {
+        const merge = await run(["merge", "--no-ff", "--no-edit", sourceOid], {
+          cwd: dir,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        });
+        const outcome = await gitClassifyMergeAttempt(dir, merge, run);
+        switch (outcome.kind) {
+          case "merged":
+          case "already-merged":
+            break;
+          case "conflict":
+            // Aborted cleanly by classifyMergeAttempt (the arrival state + committed WIP
+            // restored); route the genuine content conflict to a fan-in incident.
+            return {
+              kind: "conflict",
+              conflictedFiles: outcome.conflictedFiles,
+              stderr: outcome.stderr,
+            };
+          default:
+            return {
+              kind: "defer",
+              reason: `merge ${outcome.kind}${"stderr" in outcome && outcome.stderr ? `: ${outcome.stderr.slice(0, 160)}` : ""}`,
+            };
+        }
+      }
+      // (7) POSITIVE post-checks: the pinned source is now an ancestor of HEAD AND the
+      //     tree is clean + on-branch. Only then is the integration proven.
+      const post = await isAncestorTri(dir, sourceOid, "HEAD", run);
+      if (post !== "yes") {
+        return { kind: "defer", reason: "post-merge source-ancestry unproven" };
+      }
+      const postReady = await gitMergeReadiness(dir, targetBranch, run);
+      if (postReady.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `post-merge tree not clean: ${postReady.kind}`,
+        };
+      }
+      return { kind: "integrated" };
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    return { kind: "defer", reason: `integration probe threw: ${errMsg(err)}` };
+  }
+}
+
+/** The regime a held dependent LANE is in for integrating a rib — the destructive-edge
+ *  gate keyed on COMMITTED WIP vs UNCOMMITTED dirt (the two are different regimes). */
+export type LaneIntegrationRegime =
+  /** Clean tracked tree, on-branch, no residue, AND unique committed WIP → the rib may be
+   *  MERGED into the lane (the only mutation path for a WIP lane); benign untracked files
+   *  are permitted only when proven disjoint from the incoming object. */
+  | { kind: "merge" }
+  /** No unique commits AND fully clean (tracked + NO untracked) + residue-free + on-branch
+   *  → the lane may be RECREATED off the fresh base (removal destroys nothing). */
+  | { kind: "recreate" }
+  /** Any uncommitted/staged/untracked-overlapping/in-progress residue, or an inconclusive
+   *  probe → DEFER to the dead-writer sweep / dirt-recovery ownership; never mutate. */
+  | { kind: "defer"; reason: string };
+
+/**
+ * Classify a held dependent LANE's integration regime, honoring the committed-WIP vs
+ * uncommitted-dirt split (they are DIFFERENT regimes, and only committed WIP earns the
+ * merge path). `mergeReadiness` (which reads `--untracked-files=no`) establishes tracked
+ * cleanliness + on-branch + residue-freedom; a positive `dirty`/`mid-merge`/`off-branch`
+ * DEFERS to dirt/recovery ownership. Then:
+ *  - unique COMMITS present (rev-list `base..lane` non-empty) → `merge`, but benign
+ *    UNTRACKED files are allowed ONLY when the incoming object's path set is provably
+ *    DISJOINT from them (the established would-clobber probe); overlap or UNKNOWN clobber
+ *    evidence DEFERS (never risk overwriting untracked work);
+ *  - NO unique commits → `recreate`, but ANY untracked file blocks it UNCONDITIONALLY
+ *    (removal could destroy untracked data);
+ *  - any inconclusive probe → DEFER.
+ * Producer-only reads; NEVER throws. The no-owner/no-resolver/no-claim gate is the
+ * orchestrator's, NOT this probe's.
+ */
+export async function probeLaneIntegrationRegime(
+  laneDir: string,
+  laneBranch: string,
+  forkBaseBranch: string,
+  incomingSourceOid: string,
+  run: WorktreeGitRunner = gitExec,
+): Promise<LaneIntegrationRegime> {
+  try {
+    const ready = await gitMergeReadiness(laneDir, laneBranch, run);
+    if (ready.kind === "mid-merge") {
+      return {
+        kind: "defer",
+        reason: `mid-merge residue (MERGE_HEAD=${ready.mergeHead}) — dirt/recovery owns it`,
+      };
+    }
+    if (ready.kind === "off-branch") {
+      return { kind: "defer", reason: `off-branch (HEAD=${ready.head})` };
+    }
+    if (ready.kind === "dirty") {
+      return {
+        kind: "defer",
+        reason: `tracked dirt / in-progress residue: ${ready.detail}`,
+      };
+    }
+    if (ready.kind !== "ready") {
+      return { kind: "defer", reason: `lane not ready: ${ready.kind}` };
+    }
+    // Unique committed WIP: commits on the lane not in its fork base.
+    const wip = await run(
+      [
+        "rev-list",
+        "--count",
+        `refs/heads/${forkBaseBranch}..refs/heads/${laneBranch}`,
+      ],
+      { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (wip.code !== 0) {
+      return {
+        kind: "defer",
+        reason: `unique-commit probe inconclusive (${wip.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${wip.code}`})`,
+      };
+    }
+    const wipCount = Number.parseInt(wip.stdout.trim(), 10);
+    if (Number.isNaN(wipCount)) {
+      return {
+        kind: "defer",
+        reason: "unique-commit probe returned a non-numeric count",
+      };
+    }
+    // Untracked set (mergeReadiness ignored these; they gate BOTH arms differently).
+    const untrackedR = await run(
+      ["ls-files", "--others", "--exclude-standard"],
+      {
+        cwd: laneDir,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      },
+    );
+    if (untrackedR.code !== 0) {
+      return {
+        kind: "defer",
+        reason: `untracked probe inconclusive (${untrackedR.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${untrackedR.code}`})`,
+      };
+    }
+    const untracked = untrackedR.stdout
+      .split("\n")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+
+    if (wipCount > 0) {
+      // COMMITTED WIP → the MERGE arm.
+      if (untracked.length === 0) {
+        return { kind: "merge" };
+      }
+      // Benign untracked files are permitted IFF the incoming object cannot clobber them.
+      const clobber = await gitMergeReadiness(
+        laneDir,
+        laneBranch,
+        run,
+        incomingSourceOid,
+      );
+      if (clobber.kind === "would-clobber") {
+        return {
+          kind: "defer",
+          reason: `untracked would be clobbered by the merge: ${clobber.paths.join(", ").slice(0, 160)}`,
+        };
+      }
+      if (clobber.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `untracked-disjoint evidence unknown: ${clobber.kind}`,
+        };
+      }
+      return { kind: "merge" };
+    }
+    // NO committed WIP → the RECREATE arm — any untracked file blocks it unconditionally.
+    if (untracked.length > 0) {
+      return {
+        kind: "defer",
+        reason: `untracked files present — recreate would destroy them: ${untracked.join(", ").slice(0, 160)}`,
+      };
+    }
+    return { kind: "recreate" };
+  } catch (err) {
+    return { kind: "defer", reason: `regime probe threw: ${errMsg(err)}` };
+  }
+}
+
+/** The outcome of recreating a clean, no-WIP dependent lane off its fresh base. */
+export type LaneRecreateOutcome =
+  | { kind: "recreated" }
+  | { kind: "defer"; reason: string }
+  | { kind: "failed"; reason: string };
+
+/**
+ * Recreate a clean, no-committed-WIP dependent lane off its FRESH base — the non-
+ * destructive path for a stale lane that carries nothing to preserve. The caller has
+ * PROVEN (via {@link probeLaneIntegrationRegime} → `recreate`, plus its own no-owner/
+ * no-resolver/no-claim gate) that the lane is fully clean with no unique commits and no
+ * untracked files. Remove the worktree WITHOUT force (a raced dirty tree REFUSES → defer,
+ * NEVER a blind `--force` progress shortcut), force-delete the stale branch (proven to
+ * hold no unique commits, so nothing is lost), then re-cut the lane off the fresh base
+ * (`ensureWorktree` creates the branch AT the base when absent) and restore its dep link.
+ * Producer-only; NEVER throws.
+ */
+export async function recreateLaneOffBase(
+  repoDir: string,
+  laneDir: string,
+  laneBranch: string,
+  freshBaseBranch: string,
+  run: WorktreeGitRunner = gitExec,
+  ensureDepLink: (
+    sourceCheckout: string,
+    worktreePath: string,
+  ) => Promise<void> = gitEnsureWorktreeDepLink,
+): Promise<LaneRecreateOutcome> {
+  try {
+    const removed = await gitRemoveWorktree(repoDir, laneDir, run);
+    if (removed.kind === "dirty") {
+      return {
+        kind: "defer",
+        reason: `worktree remove refused (raced dirty): ${removed.stderr.slice(0, 160)}`,
+      };
+    }
+    if (!(await gitDeleteBranch(repoDir, laneBranch, run))) {
+      return {
+        kind: "defer",
+        reason: `could not delete the stale lane branch ${laneBranch}`,
+      };
+    }
+    const ensured = await gitEnsureWorktreeResult(
+      repoDir,
+      laneDir,
+      laneBranch,
+      freshBaseBranch,
+      run,
+    );
+    if (ensured.kind === "timeout" || ensured.kind === "inconclusive") {
+      return {
+        kind: "defer",
+        reason: `could not re-cut ${laneBranch} off ${freshBaseBranch}${ensured.kind === "inconclusive" ? ` — ${ensured.detail}` : " (timeout)"}`,
+      };
+    }
+    if (ensured.kind === "error") {
+      return {
+        kind: "failed",
+        reason: `lane recreate failed: ${ensured.detail}`,
+      };
+    }
+    await ensureDepLink(repoDir, laneDir);
+    return { kind: "recreated" };
+  } catch (err) {
+    return { kind: "failed", reason: `lane recreate threw: ${errMsg(err)}` };
+  }
 }
 
 // ---------------------------------------------------------------------------

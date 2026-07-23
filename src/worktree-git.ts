@@ -2187,99 +2187,116 @@ export async function mergeBranchInto(
       cwd: worktreePath,
       timeoutMs: GIT_LOCAL_TIMEOUT_MS,
     });
-    if (merge.code === 0) {
-      return { kind: "merged" };
-    }
-    // A SIGKILLed timeout (124) must NOT be read as a content conflict: a blocking
-    // merge hook is transient, so degrade to a retry-skip. Check it BEFORE the
-    // conflict/abort path (git's 1/128 conflict codes never collide with 124).
-    if (merge.code === GIT_SPAWN_TIMEOUT_CODE) {
-      // B2: a SIGKILLed merge can leave MERGE_HEAD/partial state behind, which
-      // next cycle would read as a spurious conflict. Run the same MERGE_HEAD-
-      // guarded abort here before returning so no residue is left. (The common
-      // case already self-heals — next cycle's mergeReadiness sees a dirty tree
-      // and defers — so this is belt-and-suspenders.) The kind stays
-      // `local-timeout` (a retry-skip) UNLESS the abort itself failed — then the
-      // residue did not clear, so surface the `abort-failed` wedge signal.
-      const abortedT = await abortMergeIfInProgress(worktreePath, run);
-      if (abortedT.kind === "abort-failed") {
-        return { kind: "abort-failed", stderr: abortedT.stderr };
-      }
-      return { kind: "local-timeout" };
-    }
-    // Non-zero: a conflict (or other failure). Capture the unmerged index paths
-    // BEFORE the guarded abort destroys the stage-1/2/3 entries. The U signal is
-    // TRI-STATE — a nonzero / timed-out `diff` is UNKNOWN, NOT proven-zero, so it must
-    // never masquerade as a zero-U structural failure.
-    const unmerged = await run(["diff", "--name-only", "--diff-filter=U"], {
-      cwd: worktreePath,
-      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-    });
-    const conflictedFiles =
-      unmerged.code === 0
-        ? unmerged.stdout
-            .split("\n")
-            .map((path) => path.trim())
-            .filter((path) => path.length > 0)
-        : [];
-    const uEvidence: "positive" | "zero" | "inconclusive" =
-      unmerged.code !== 0
-        ? "inconclusive"
-        : conflictedFiles.length > 0
-          ? "positive"
-          : "zero";
-    // Classify from BOTH signals — the MERGE STATE (`MERGE_HEAD`) AND the unmerged-path
-    // (U) evidence — never from one alone, and never on an UNKNOWN either:
-    //  - state INCONCLUSIVE (probe timed out / errored) → `merge-inconclusive` (any U):
-    //    the state is unknown, so no abort, no claim, no resolver — retry next cycle.
-    //  - state PRESENT → a merge IS in flight and the state is positively OURS: abort it
-    //    DIRECTLY (a re-probe could collapse a timed-out MERGE_HEAD to "absent" and skip
-    //    the abort, stranding residue). Then classify by U: positive = a genuine content
-    //    `conflict`; zero = a STRUCTURAL `merge-failed` (a pre-merge-commit hook that
-    //    rejected AFTER git made `MERGE_HEAD`); INCONCLUSIVE = `merge-inconclusive` (the
-    //    clean owned state IS aborted, but never claim a zero-U structural failure).
-    //  - state ABSENT + zero U → the merge never started → STRUCTURAL `merge-failed`.
-    //  - state ABSENT + positive/inconclusive U → the signals disagree or U is unknown →
-    //    `merge-inconclusive` (never claim clean, never route a resolver).
-    //  - abort itself failed → the checkout is left mid-merge → `abort-failed` wedge.
-    const merged = (merge.stdout + merge.stderr).trim();
-    const mergeState = await probeMergeStateTri(worktreePath, run);
-    if (mergeState === "inconclusive") {
-      return { kind: "merge-inconclusive", stderr: merged };
-    }
-    if (mergeState === "present") {
-      const abort = await run(["merge", "--abort"], {
-        cwd: worktreePath,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      });
-      if (abort.code !== 0) {
-        const out = (abort.stdout + abort.stderr).trim();
-        return {
-          kind: "abort-failed",
-          stderr:
-            abort.code === GIT_SPAWN_TIMEOUT_CODE
-              ? `git merge --abort timed out${out.length > 0 ? `: ${out}` : ""}`
-              : out.length > 0
-                ? out
-                : `git merge --abort failed (exit ${abort.code})`,
-        };
-      }
-      if (uEvidence === "positive") {
-        return { kind: "conflict", stderr: merged, conflictedFiles };
-      }
-      if (uEvidence === "zero") {
-        return { kind: "merge-failed", stderr: merged };
-      }
-      return { kind: "merge-inconclusive", stderr: merged };
-    }
-    // state ABSENT: only a positively-zero U is a structural non-start; a positive or
-    // inconclusive U disagrees with the absent state → inconclusive.
-    return uEvidence === "zero"
-      ? { kind: "merge-failed", stderr: merged }
-      : { kind: "merge-inconclusive", stderr: merged };
+    return classifyMergeAttempt(worktreePath, merge, run);
   } finally {
     lock.release();
   }
+}
+
+/**
+ * Classify the outcome of a `git merge` that already ran UNDER the caller's commit-work
+ * flock — the shared post-merge decision {@link mergeBranchInto} and the parts-6 progress
+ * actor's PINNED-OBJECT integration both reuse, so the two-signal (MERGE_HEAD ∧
+ * unmerged-path) conflict/abort/structural grammar lives in exactly one place. It reads
+ * ONLY the merge-state + U signals of the worktree, never the merged source's name, so it
+ * is identical whether a branch or a pinned commit object was merged. The caller still
+ * owns the lock (this never acquires or releases it) and passes the raw `git merge` result.
+ */
+export async function classifyMergeAttempt(
+  worktreePath: string,
+  merge: Awaited<ReturnType<GitRunner>>,
+  run: GitRunner,
+): Promise<MergeResult> {
+  if (merge.code === 0) {
+    return { kind: "merged" };
+  }
+  // A SIGKILLed timeout (124) must NOT be read as a content conflict: a blocking
+  // merge hook is transient, so degrade to a retry-skip. Check it BEFORE the
+  // conflict/abort path (git's 1/128 conflict codes never collide with 124).
+  if (merge.code === GIT_SPAWN_TIMEOUT_CODE) {
+    // B2: a SIGKILLed merge can leave MERGE_HEAD/partial state behind, which
+    // next cycle would read as a spurious conflict. Run the same MERGE_HEAD-
+    // guarded abort here before returning so no residue is left. (The common
+    // case already self-heals — next cycle's mergeReadiness sees a dirty tree
+    // and defers — so this is belt-and-suspenders.) The kind stays
+    // `local-timeout` (a retry-skip) UNLESS the abort itself failed — then the
+    // residue did not clear, so surface the `abort-failed` wedge signal.
+    const abortedT = await abortMergeIfInProgress(worktreePath, run);
+    if (abortedT.kind === "abort-failed") {
+      return { kind: "abort-failed", stderr: abortedT.stderr };
+    }
+    return { kind: "local-timeout" };
+  }
+  // Non-zero: a conflict (or other failure). Capture the unmerged index paths
+  // BEFORE the guarded abort destroys the stage-1/2/3 entries. The U signal is
+  // TRI-STATE — a nonzero / timed-out `diff` is UNKNOWN, NOT proven-zero, so it must
+  // never masquerade as a zero-U structural failure.
+  const unmerged = await run(["diff", "--name-only", "--diff-filter=U"], {
+    cwd: worktreePath,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  const conflictedFiles =
+    unmerged.code === 0
+      ? unmerged.stdout
+          .split("\n")
+          .map((path) => path.trim())
+          .filter((path) => path.length > 0)
+      : [];
+  const uEvidence: "positive" | "zero" | "inconclusive" =
+    unmerged.code !== 0
+      ? "inconclusive"
+      : conflictedFiles.length > 0
+        ? "positive"
+        : "zero";
+  // Classify from BOTH signals — the MERGE STATE (`MERGE_HEAD`) AND the unmerged-path
+  // (U) evidence — never from one alone, and never on an UNKNOWN either:
+  //  - state INCONCLUSIVE (probe timed out / errored) → `merge-inconclusive` (any U):
+  //    the state is unknown, so no abort, no claim, no resolver — retry next cycle.
+  //  - state PRESENT → a merge IS in flight and the state is positively OURS: abort it
+  //    DIRECTLY (a re-probe could collapse a timed-out MERGE_HEAD to "absent" and skip
+  //    the abort, stranding residue). Then classify by U: positive = a genuine content
+  //    `conflict`; zero = a STRUCTURAL `merge-failed` (a pre-merge-commit hook that
+  //    rejected AFTER git made `MERGE_HEAD`); INCONCLUSIVE = `merge-inconclusive` (the
+  //    clean owned state IS aborted, but never claim a zero-U structural failure).
+  //  - state ABSENT + zero U → the merge never started → STRUCTURAL `merge-failed`.
+  //  - state ABSENT + positive/inconclusive U → the signals disagree or U is unknown →
+  //    `merge-inconclusive` (never claim clean, never route a resolver).
+  //  - abort itself failed → the checkout is left mid-merge → `abort-failed` wedge.
+  const merged = (merge.stdout + merge.stderr).trim();
+  const mergeState = await probeMergeStateTri(worktreePath, run);
+  if (mergeState === "inconclusive") {
+    return { kind: "merge-inconclusive", stderr: merged };
+  }
+  if (mergeState === "present") {
+    const abort = await run(["merge", "--abort"], {
+      cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (abort.code !== 0) {
+      const out = (abort.stdout + abort.stderr).trim();
+      return {
+        kind: "abort-failed",
+        stderr:
+          abort.code === GIT_SPAWN_TIMEOUT_CODE
+            ? `git merge --abort timed out${out.length > 0 ? `: ${out}` : ""}`
+            : out.length > 0
+              ? out
+              : `git merge --abort failed (exit ${abort.code})`,
+      };
+    }
+    if (uEvidence === "positive") {
+      return { kind: "conflict", stderr: merged, conflictedFiles };
+    }
+    if (uEvidence === "zero") {
+      return { kind: "merge-failed", stderr: merged };
+    }
+    return { kind: "merge-inconclusive", stderr: merged };
+  }
+  // state ABSENT: only a positively-zero U is a structural non-start; a positive or
+  // inconclusive U disagrees with the absent state → inconclusive.
+  return uEvidence === "zero"
+    ? { kind: "merge-failed", stderr: merged }
+    : { kind: "merge-inconclusive", stderr: merged };
 }
 
 /** A recover-pass lane ownership verdict. Only `owned` permits teardown. */
