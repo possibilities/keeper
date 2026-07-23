@@ -216,6 +216,7 @@ export type WithholdReasonCode =
   | "autopilot-paused"
   | "not-armed"
   | "merge-gate"
+  | "sibling-source-gate"
   | "dispatch-in-flight"
   | "failed-key"
   | "claim-fence"
@@ -1275,6 +1276,23 @@ export interface ReconcileSnapshot {
    * Optional so a test snapshot may omit it (defaults to no deferral).
    */
   deferredEpicIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  /**
+   * The EPHEMERAL intra-epic sibling-source defer map, keyed PER task id: each
+   * entry maps a NON-DONE dependent task to the DONE dependency-sibling rib branch
+   * (`keeper/epic/<id>--<sibling>`) that is NOT yet an ancestor of the base the
+   * dependent's lane WILL fork off (its ACTUAL {@link parentBranchFor} assignment
+   * branch, never "epic base" generically). Cutting the dependent's lane before that
+   * rib reaches its fork base would fork it off a base missing the sibling's landed
+   * work (a stale-base fork that inverts merge order). Probed ONCE per cycle in
+   * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}) via
+   * {@link computeDeferredSiblingSources}, then read back here as PLAIN DATA by the
+   * pure `reconcile` — which shells git nowhere. NEVER a fold input; mints NO sticky /
+   * `dispatch_failures` row (a deferred dependent re-evaluates every cycle and
+   * dispatches the cycle after its sibling's rib integrates into that base). EMPTY
+   * whenever worktree mode is OFF (a byte-identical no-op for OFF / yolo). Optional so
+   * a test snapshot may omit it (defaults to no deferral).
+   */
+  deferredSiblingSources?: ReadonlyMap<string, string>;
   /**
    * The durable MERGE-LANDED set — every `ok`-classified epic whose lane
    * `keeper/epic/<id>` is merged into LOCAL default (ancestor-of-default, or
@@ -2828,6 +2846,12 @@ const EMPTY_DEFERRED_EPIC_IDS: ReadonlyMap<
   string,
   ReadonlySet<string>
 > = new Map<string, ReadonlySet<string>>();
+/** Shared empty sibling-source defer map — the `snapshot.deferredSiblingSources ?? …`
+ * fallback so the inert (OFF / nothing-deferred) reconcile path allocates no Map. */
+const EMPTY_DEFERRED_SIBLING_SOURCES: ReadonlyMap<string, string> = new Map<
+  string,
+  string
+>();
 const EMPTY_BASE_DRIFT_ENTRIES: readonly BaseDriftEntry[] = [];
 
 /**
@@ -2882,6 +2906,13 @@ export function reconcile(
     string,
     ReadonlySet<string>
   > = snapshot.deferredEpicIds ?? EMPTY_DEFERRED_EPIC_IDS;
+  // The EPHEMERAL intra-epic sibling-source defer map (dependent task id → the DONE
+  // sibling rib not yet contained in the dependent's fork base), probed git-side ONCE
+  // per cycle in `loadReconcileSnapshot` and read here as PLAIN DATA. EMPTY whenever
+  // worktree mode is OFF / nothing is deferred — then the gate arm below is inert and
+  // dispatch stays byte-identical. Read once.
+  const deferredSiblingSources: ReadonlyMap<string, string> =
+    snapshot.deferredSiblingSources ?? EMPTY_DEFERRED_SIBLING_SOURCES;
   // Producer data only: the refresh producer consumes this on a later pass; the
   // verdict core carries it without deriving anything from git or a clock.
   const baseDriftEntries =
@@ -3068,6 +3099,19 @@ export function reconcile(
           withholds.set(taskId, withhold("merge-gate", taskRepoDir));
           continue;
         }
+      }
+      // Intra-epic sibling-source gate (worktree mode): suppress a `work` launch whose
+      // lane would fork off a base that does NOT yet contain a DONE dependency-sibling's
+      // rib — cutting it now would build on a base missing that sibling's landed work
+      // (a stale-base fork). Keyed PER task id → the blocking rib. EPHEMERAL +
+      // producer-probed; mints NO sticky row and re-evaluates every cycle (the sibling's
+      // rib integrates into the base out-of-band, then the dependent dispatches). ABOVE
+      // the budget gate so a deferred dependent consumes no global budget. Inert (empty
+      // map) in OFF / yolo.
+      const blockingRib = deferredSiblingSources.get(taskId);
+      if (blockingRib !== undefined) {
+        withholds.set(taskId, withhold("sibling-source-gate", blockingRib));
+        continue;
       }
       if (state.inFlight.has(key)) {
         withholds.set(taskId, withhold("dispatch-in-flight"));
@@ -4139,9 +4183,11 @@ function attachWorktreeGeometry(
  * root or the close sink). A rib's `inherited` is false and its primary parent is
  * the earliest-in-toposort in-DAG parent on a DIFFERENT branch (the
  * `worktree add ... <commitish>` source). Pure — re-derives the same fork source
- * the topology module used.
+ * the topology module used. Exported so the producer-side intra-epic
+ * sibling-source gate ({@link computeDeferredSiblingSources}) resolves a dependent's
+ * ACTUAL assignment base the SAME way dispatch does — one rule, no drift.
  */
-function parentBranchFor(
+export function parentBranchFor(
   assignment: WorktreeAssignment,
   plan: WorktreePlan,
   tasks: Task[],

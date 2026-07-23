@@ -203,6 +203,7 @@ import {
   type LaneMergedEntry,
   nextIncidentOwnerAttachmentMarker,
   type PlannedLaunch,
+  parentBranchFor,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
   type ReconcileDecision,
@@ -308,6 +309,8 @@ import {
 import {
   baseBranchFor,
   repoDirHash,
+  ribBranchFor,
+  type WorktreePlan,
   worktreePathFor,
   worktreePrecloseDispatchId,
 } from "./worktree-plan";
@@ -5100,6 +5103,144 @@ export async function computeDeferredEpicIds(
           `[autopilot-worker] cross-epic merge-gate: deferring ${epic.epic_id}@${repoR} — probe threw: ${errMsg(err)}`,
         );
         markDeferred(epic.epic_id, repoR);
+      }
+    }
+  }
+  return deferred;
+}
+
+/**
+ * Compute the EPHEMERAL intra-epic sibling-source defer map, keyed PER task id: a
+ * NON-DONE dependent task → the DONE dependency-sibling rib (`keeper/epic/<id>--<sib>`)
+ * that is NOT yet an ancestor of the base the dependent's lane WILL fork off (its ACTUAL
+ * {@link parentBranchFor} assignment branch — the SAME fork source dispatch derives,
+ * never "epic base" generically). Cutting the dependent's lane before that rib reaches
+ * its fork base forks it off a base missing the sibling's landed work (a stale-base
+ * fork that inverts merge order). Producer-side + git-touching — probed ONCE per cycle in
+ * {@link loadReconcileSnapshot} (gated on {@link worktreeMode}), read back by the pure
+ * `reconcile` as plain {@link ReconcileSnapshot.deferredSiblingSources} data. NEVER a
+ * fold input; mints NO sticky / `dispatch_failures` row — a deferred dependent
+ * re-evaluates every cycle and dispatches the cycle after its sibling's rib integrates
+ * into that base (the existing pending-integration owner, or the retro fan-in pass).
+ *
+ * The plan every dependent's base resolves against is the SAME
+ * {@link prepareWorktreeGeometry} geometry dispatch consumes (freshEpoch-aware, across
+ * both `ok` and `clustered` `worktree` groups) — NEVER a fresh non-done-filtered
+ * derivation. That fidelity matters: a dependent that INHERITS or forks off a done
+ * sibling's OWN rib resolves that rib as its base (an ancestor of itself → NOT deferred,
+ * so a linear chain never wedges), while only a dependent forking off a base the rib has
+ * not reached is held. Per non-close-sink assignment T, for each DONE parent P of T
+ * (P ∈ `T.depends_on`, `worker_phase === "done"`), probe P's rib against T's base in the
+ * group's repo:
+ *  - rib DEFINITIVELY ABSENT (a SUCCESSFUL enumeration that omits it) → merged-and-torn-
+ *    down, or P sat on the base (never a rib) → CONTAINED, no defer;
+ *  - rib PRESENT ∧ an ancestor of the base → CONTAINED, no defer;
+ *  - rib PRESENT ∧ NOT an ancestor (or the ancestry probe errored/timed out — both
+ *    collapse to `isAncestorOf`→`false`) → DEFER T naming that rib;
+ *  - enumeration FAILED/timed out, or any probe threw → DEFER (a failed enumeration is
+ *    NEVER read as absent → no false-contained stale fork).
+ * The FIRST blocking rib wins (the dependent is held regardless of the rest). The
+ * per-repo lane enumeration is memoized so N dependents sharing one repo spawn git once.
+ * Conservative-degrade throughout: an inconclusive VCS probe DEFERS (self-heals next
+ * cycle) — a stale fork would be permanent. NEVER throws out of the snapshot build.
+ */
+export async function computeDeferredSiblingSources(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+  worktreesRoot?: string,
+): Promise<Map<string, string>> {
+  const deferred = new Map<string, string>();
+
+  // Per-repo memo so N dependents in one repo enumerate lanes ONCE. A throwing probe
+  // degrades to the conservative value (`{ ok: false }` enumeration → DEFER), never out
+  // of the snapshot build.
+  const laneSetByRepo = new Map<string, EpicLaneBranchSet>();
+  const enumerateLanes = async (
+    repoDir: string,
+  ): Promise<EpicLaneBranchSet> => {
+    const hit = laneSetByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: EpicLaneBranchSet;
+    try {
+      value = await gitEnumerateEpicLaneBranches(repoDir, run);
+    } catch {
+      value = { ok: false }; // enumeration error → DEFER every dependent in this repo
+    }
+    laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  // The SAME geometry dispatch consumes — one derivation, no drift. Pure (no git/fs):
+  // resolution already happened in `worktreeRepoByEpicId`.
+  const { byEpicId } = prepareWorktreeGeometry(
+    epics,
+    worktreeRepoByEpicId,
+    worktreesRoot,
+  );
+
+  for (const epic of epics) {
+    const geom = byEpicId.get(epic.epic_id);
+    if (geom === undefined) {
+      continue;
+    }
+    // Only rib-bearing worktree lanes can fork off a base missing a sibling's work. A
+    // `disabled` / `reject` / `cycle` epic (and a `serial` clustered group) cuts no rib.
+    const lanes: Array<{ repoDir: string; plan: WorktreePlan }> = [];
+    if (geom.kind === "ok") {
+      lanes.push({ repoDir: geom.repoDir, plan: geom.plan });
+    } else if (geom.kind === "clustered") {
+      for (const g of geom.groups) {
+        if (g.mode === "worktree" && g.plan !== undefined) {
+          lanes.push({ repoDir: g.repoDir, plan: g.plan });
+        }
+      }
+    } else {
+      continue;
+    }
+
+    const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+    for (const { repoDir, plan } of lanes) {
+      for (const assignment of plan.assignments) {
+        if (assignment.isCloseSink) {
+          continue;
+        }
+        // The base this dependent's lane WILL fork off — the SAME `parentBranchFor` call
+        // dispatch makes (`attachWorktreeGeometry`), so the gate probes the exact
+        // assignment base, never a generic epic base.
+        const base = parentBranchFor(assignment, plan, epic.tasks);
+        const dependent = taskById.get(assignment.nodeId);
+        if (dependent === undefined) {
+          continue;
+        }
+        for (const depId of dependent.depends_on) {
+          const parent = taskById.get(depId);
+          if (parent === undefined || parent.worker_phase !== "done") {
+            continue; // only a DONE dependency-sibling's rib gates
+          }
+          const rib = ribBranchFor(epic.epic_id, depId);
+          let contained: boolean;
+          try {
+            const lanesSet = await enumerateLanes(repoDir);
+            if (!lanesSet.ok) {
+              contained = false; // enumeration failed → DEFER (never read as absent)
+            } else if (!lanesSet.branches.has(rib)) {
+              contained = true; // definitively absent → merged-and-torn-down (or base-sat)
+            } else {
+              // Present: contained IFF an ancestor of the fork base. `gitIsAncestorOf`
+              // → false covers BOTH not-ancestor AND an errored/timed-out probe → DEFER.
+              contained = await gitIsAncestorOf(repoDir, rib, base, run);
+            }
+          } catch {
+            contained = false; // any probe threw → DEFER conservatively (inconclusive)
+          }
+          if (!contained) {
+            deferred.set(dependent.task_id, rib);
+            break; // first blocking rib wins — the dependent is held regardless of rest
+          }
+        }
       }
     }
   }
@@ -13560,6 +13701,19 @@ export async function loadReconcileSnapshot(
     ? await computeDeferredEpicIds(epics, worktreeRepoByEpicId)
     : new Map<string, Set<string>>();
 
+  // The EPHEMERAL intra-epic sibling-source defer map (dependent task id → the DONE
+  // sibling rib not yet contained in the dependent's ACTUAL fork base) — probed here so
+  // a dependent lane is never cut off a base missing a done sibling's landed work (a
+  // stale-base fork). Reuses the already-resolved toplevels + the same geometry
+  // dispatch derives, adding only per-repo lane-enumeration + ancestry reads (memoized
+  // inside). The gate reads only BRANCH names (never a lane path), so it needs no
+  // `worktreesRoot` — like its sibling producers here. Gated on `worktreeMode` so an OFF
+  // cycle adds ZERO git spawns (empty map = a byte-identical no-op). NEVER throws (every
+  // probe degrades to DEFER).
+  const deferredSiblingSources = worktreeMode
+    ? await computeDeferredSiblingSources(epics, worktreeRepoByEpicId)
+    : new Map<string, string>();
+
   // The durable MERGE-LANDED set — purely observational (drives no dispatch arm),
   // computed here so the worker can emit the `lane_merged` projection each cycle.
   // Lane-capable paths reuse the already-resolved toplevels and memoized git probes;
@@ -13765,6 +13919,7 @@ export async function loadReconcileSnapshot(
     worktreeRepoByEpicId,
     worktreeKnownRoots,
     deferredEpicIds,
+    deferredSiblingSources,
     landedLaneEntries,
     closeRecoveryEligibleIds,
     baseDriftEntries,
