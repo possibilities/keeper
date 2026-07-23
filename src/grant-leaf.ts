@@ -595,6 +595,64 @@ export type GrantVerdict =
   | { kind: "tuple-mismatch"; detail: string }
   | { kind: "malformed"; detail: string };
 
+/** The stable, machine-keyable denial codes the grant-guard / daemon seam
+ *  surfaces so a consumer decision keys on a TYPED code, never free-form,
+ *  model-authored reason prose. Five map 1:1 from a `readGrantLeaf` verdict;
+ *  `command_policy_mismatch` is the guard's Bash / path-policy denial — a grant
+ *  whose action is outside the granted command or writable-root policy, distinct
+ *  from any grant-identity problem. A `grant_absent` (mis-bind) can NEVER surface
+ *  as `grant_expired`: the code is derived from the verdict the reader returned. */
+export type GrantDenialCode =
+  | "valid"
+  | "grant_absent"
+  | "grant_expired"
+  | "tuple_mismatch"
+  | "command_policy_mismatch"
+  | "unknown";
+
+const GRANT_DENIAL_CODES: ReadonlySet<string> = new Set<GrantDenialCode>([
+  "valid",
+  "grant_absent",
+  "grant_expired",
+  "tuple_mismatch",
+  "command_policy_mismatch",
+  "unknown",
+]);
+
+/** Map a `readGrantLeaf` verdict kind to its stable external denial code. */
+export function grantVerdictCode(kind: GrantVerdict["kind"]): GrantDenialCode {
+  switch (kind) {
+    case "valid":
+      return "valid";
+    case "absent":
+      return "grant_absent";
+    case "expired":
+      return "grant_expired";
+    case "tuple-mismatch":
+      return "tuple_mismatch";
+    case "malformed":
+      return "unknown";
+  }
+}
+
+/** The machine-parseable marker embedded at the head of a grant-guard deny
+ *  reason. A consumer keys on this exact `[keeper-grant-verdict=<code>]` token;
+ *  the surrounding reason prose is diagnostic only and never classified on. */
+export function grantDenialTag(code: GrantDenialCode): string {
+  return `[keeper-grant-verdict=${code}]`;
+}
+
+/** Extract the typed denial code a deny reason carries, or null when the reason
+ *  bears no well-formed marker. The ONLY sanctioned way to classify a denial —
+ *  never parse the free-form prose around the tag. */
+export function parseGrantDenialCode(reason: string): GrantDenialCode | null {
+  const matched = reason.match(/\[keeper-grant-verdict=([a-z_]+)\]/);
+  const code = matched?.[1];
+  return code !== undefined && GRANT_DENIAL_CODES.has(code)
+    ? (code as GrantDenialCode)
+    : null;
+}
+
 // ---------------------------------------------------------------------------
 // Leaf-path derivation — the ONE function every consumer shares.
 // ---------------------------------------------------------------------------
@@ -1032,6 +1090,18 @@ export interface GrantEnv {
   HOME?: string;
 }
 
+/** First trimmed-non-empty candidate, or "" when every candidate is unset or
+ *  blank. Never lets a PRESENT-BUT-EMPTY value (e.g. a daemon-launched session's
+ *  `KEEPER_JOB_ID=""`) shadow a real later identity — the failure mode a chained
+ *  `a ?? b` selection has, since `??` falls through only on null/undefined. */
+function firstNonEmpty(...candidates: (string | undefined)[]): string {
+  for (const candidate of candidates) {
+    const trimmed = (candidate ?? "").trim();
+    if (trimmed !== "") return trimmed;
+  }
+  return "";
+}
+
 /** Build the launch-anchored expectation for `agentType`, or null when the env
  *  lacks a core field (no launch identity → no grant can validate). */
 export function grantExpectationFromEnv(
@@ -1060,11 +1130,13 @@ export function grantExpectationFromEnv(
     return expectation;
   }
 
-  const parentJobId = (
-    env.KEEPER_JOB_ID ??
-    env.CLAUDE_CODE_SESSION_ID ??
-    ""
-  ).trim();
+  // First NON-EMPTY launch identity — a daemon-launched session exports
+  // `KEEPER_JOB_ID` present-but-empty, which must fall through to the real
+  // `CLAUDE_CODE_SESSION_ID` rather than shadow it as an empty parent.
+  const parentJobId = firstNonEmpty(
+    env.KEEPER_JOB_ID,
+    env.CLAUDE_CODE_SESSION_ID,
+  );
   const grantsDir = grantsDirOf(env);
   if (parentJobId === "" || grantsDir === "") return null;
   const read = readOwnerPrivateLeaf(
@@ -1110,14 +1182,33 @@ export function grantCoversWrite(
   canonicalTarget: string,
   now: number,
 ): boolean {
+  return grantCoverageCode(env, agentType, canonicalTarget, now) === "valid";
+}
+
+/** Like {@link grantCoversWrite}, but returns the TYPED outcome instead of
+ *  collapsing to a boolean, so a consumer can distinguish WHY a write was refused
+ *  — a genuine `grant_expired` (the only code that may enter a same-session
+ *  replacement path) versus an absent / mismatched / unknown grant, versus a
+ *  `command_policy_mismatch` (a non-escalation or diagnosis-only role, a protected
+ *  path, or a target outside the writable root — all denied even under a valid
+ *  grant). Decisions key on this code; free-form reason prose never authorizes. */
+export function grantCoverageCode(
+  env: GrantEnv,
+  agentType: string | undefined,
+  canonicalTarget: string,
+  now: number,
+): GrantDenialCode {
   const role = escalationRoleFor(agentType);
-  if (role === null || !roleIsWriteCapable(role)) return false;
-  if (isGrantProtectedPath(canonicalTarget)) return false;
+  if (role === null || !roleIsWriteCapable(role))
+    return "command_policy_mismatch";
+  if (isGrantProtectedPath(canonicalTarget)) return "command_policy_mismatch";
   const expectation = grantExpectationFromEnv(env, agentType as string);
-  if (expectation === null) return false;
+  if (expectation === null) return "grant_absent";
   const verdict = readGrantLeaf(grantsDirOf(env), expectation, now);
-  if (verdict.kind !== "valid") return false;
-  return writableRootCovers(verdict.grant.writable_root, canonicalTarget);
+  if (verdict.kind !== "valid") return grantVerdictCode(verdict.kind);
+  return writableRootCovers(verdict.grant.writable_root, canonicalTarget)
+    ? "valid"
+    : "command_policy_mismatch";
 }
 
 /** Canonicalize `abs`, falling back to the nearest existing ancestor + missing

@@ -34,12 +34,17 @@ import {
 } from "../plugins/keeper/plugin/hooks/grant-guard.ts";
 import {
   deriveGrantLeafPath,
+  type GrantDenialCode,
   type GrantExpectation,
   type GrantLeaf,
   type GrantVerdict,
+  grantCoverageCode,
   grantCoversWrite,
+  grantExpectationFromEnv,
+  grantVerdictCode,
   isGrantProtectedPath,
   listGrantLeaves,
+  parseGrantDenialCode,
   readGrantLeaf,
   reapGrantLeaves,
   writableRootCovers,
@@ -1326,5 +1331,419 @@ describe("grantCoversWrite (env + real leaf)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part A — first-non-empty launch-identity selection (the daemon-launched
+// KEEPER_JOB_ID="" mis-bind that read every valid grant as absent).
+// ---------------------------------------------------------------------------
+
+describe("grantExpectationFromEnv — first-non-empty launch identity", () => {
+  test("a present-but-empty KEEPER_JOB_ID falls through to CLAUDE_CODE_SESSION_ID and validates the exact leaf", () => {
+    withGrantTmp((dir) => {
+      const grant = makeGrant({
+        parent_job_id: "owner-session",
+        agent_type: "plan:merge-resolver",
+      });
+      expect(writeGrantLeaf(dir, grant)).toBe(true);
+      const env = {
+        KEEPER_GRANT_DIR: dir,
+        KEEPER_JOB_ID: "",
+        CLAUDE_CODE_SESSION_ID: "owner-session",
+      };
+      const exp = grantExpectationFromEnv(env, "plan:merge-resolver");
+      expect(exp).not.toBeNull();
+      expect(exp?.parentJobId).toBe("owner-session");
+      // End-to-end: the launch-anchored expectation validates the real leaf.
+      expect(readGrantLeaf(dir, exp as GrantExpectation, 5_000).kind).toBe(
+        "valid",
+      );
+    });
+  });
+
+  test("a whitespace-only KEEPER_JOB_ID also falls through", () => {
+    withGrantTmp((dir) => {
+      expect(
+        writeGrantLeaf(
+          dir,
+          makeGrant({
+            parent_job_id: "owner-session",
+            agent_type: "plan:merge-resolver",
+          }),
+        ),
+      ).toBe(true);
+      const exp = grantExpectationFromEnv(
+        {
+          KEEPER_GRANT_DIR: dir,
+          KEEPER_JOB_ID: "   ",
+          CLAUDE_CODE_SESSION_ID: "owner-session",
+        },
+        "plan:merge-resolver",
+      );
+      expect(exp?.parentJobId).toBe("owner-session");
+    });
+  });
+
+  test("a non-empty KEEPER_JOB_ID keeps precedence over CLAUDE_CODE_SESSION_ID", () => {
+    withGrantTmp((dir) => {
+      expect(
+        writeGrantLeaf(
+          dir,
+          makeGrant({
+            parent_job_id: "job-launch",
+            agent_type: "plan:merge-resolver",
+          }),
+        ),
+      ).toBe(true);
+      const exp = grantExpectationFromEnv(
+        {
+          KEEPER_GRANT_DIR: dir,
+          KEEPER_JOB_ID: "job-launch",
+          CLAUDE_CODE_SESSION_ID: "session-launch",
+        },
+        "plan:merge-resolver",
+      );
+      expect(exp?.parentJobId).toBe("job-launch");
+    });
+  });
+
+  test("a foreign session id finds no leaf → null (still fails closed)", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({
+          parent_job_id: "owner-session",
+          agent_type: "plan:merge-resolver",
+        }),
+      );
+      expect(
+        grantExpectationFromEnv(
+          {
+            KEEPER_GRANT_DIR: dir,
+            KEEPER_JOB_ID: "",
+            CLAUDE_CODE_SESSION_ID: "intruder",
+          },
+          "plan:merge-resolver",
+        ),
+      ).toBeNull();
+    });
+  });
+
+  test("both identities empty/blank → null (no launch identity)", () => {
+    expect(
+      grantExpectationFromEnv(
+        {
+          KEEPER_GRANT_DIR: "/some/dir",
+          KEEPER_JOB_ID: "",
+          CLAUDE_CODE_SESSION_ID: "   ",
+        },
+        "plan:merge-resolver",
+      ),
+    ).toBeNull();
+  });
+
+  test("explicit KEEPER_GRANT_PARENT_JOB keeps precedence over the launch identity", () => {
+    const exp = grantExpectationFromEnv(
+      {
+        KEEPER_GRANT_PARENT_JOB: "explicit-parent",
+        KEEPER_GRANT_INCIDENT: "close::fn-1-x",
+        KEEPER_GRANT_FENCING_TOKEN: "7",
+        KEEPER_JOB_ID: "job-launch",
+        CLAUDE_CODE_SESSION_ID: "session-launch",
+      },
+      "plan:merge-resolver",
+    );
+    expect(exp?.parentJobId).toBe("explicit-parent");
+    expect(exp?.fencingToken).toBe(7);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part B — typed verdict/denial codes threaded through the shared coverage seam
+// and surfaced in the grant-guard deny envelope.
+// ---------------------------------------------------------------------------
+
+describe("grantCoverageCode — typed coverage outcome", () => {
+  function grantEnv(dir: string, over?: Record<string, string>) {
+    return {
+      KEEPER_GRANT_DIR: dir,
+      KEEPER_GRANT_PARENT_JOB: "job-1",
+      KEEPER_GRANT_INCIDENT: "close::fn-1-x",
+      KEEPER_GRANT_FENCING_TOKEN: "7",
+      ...over,
+    };
+  }
+
+  test("resolve AND deconflict both cover an in-root target under their live exact grants", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({ agent_type: "plan:merge-resolver", role: "resolve" }),
+      );
+      writeGrantLeaf(
+        dir,
+        makeGrant({ agent_type: "plan:deconflicter", role: "deconflict" }),
+      );
+      const env = grantEnv(dir);
+      expect(
+        grantCoverageCode(
+          env,
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          5_000,
+        ),
+      ).toBe("valid");
+      expect(
+        grantCoverageCode(
+          env,
+          "plan:deconflicter",
+          "/repo/checkout/src/x.ts",
+          5_000,
+        ),
+      ).toBe("valid");
+    });
+  });
+
+  test("an expired grant is grant_expired, NEVER grant_absent", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({
+          agent_type: "plan:merge-resolver",
+          role: "resolve",
+          expires_at: 10_000,
+        }),
+      );
+      expect(
+        grantCoverageCode(
+          grantEnv(dir),
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          50_000,
+        ),
+      ).toBe("grant_expired");
+    });
+  });
+
+  test("a wrong fencing token is tuple_mismatch", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({ agent_type: "plan:merge-resolver", role: "resolve" }),
+      );
+      expect(
+        grantCoverageCode(
+          grantEnv(dir, { KEEPER_GRANT_FENCING_TOKEN: "99" }),
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          5_000,
+        ),
+      ).toBe("tuple_mismatch");
+    });
+  });
+
+  test("outside-root and protected paths are command_policy_mismatch under a valid grant", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({ agent_type: "plan:merge-resolver", role: "resolve" }),
+      );
+      const env = grantEnv(dir);
+      expect(
+        grantCoverageCode(env, "plan:merge-resolver", "/other/x.ts", 5_000),
+      ).toBe("command_policy_mismatch");
+      expect(
+        grantCoverageCode(
+          env,
+          "plan:merge-resolver",
+          "/repo/checkout/.git/config",
+          5_000,
+        ),
+      ).toBe("command_policy_mismatch");
+    });
+  });
+
+  test("a diagnosis-only unblocker and a non-escalation agent are command_policy_mismatch", () => {
+    withGrantTmp((dir) => {
+      const env = grantEnv(dir);
+      expect(
+        grantCoverageCode(env, "unblocker", "/repo/checkout/src/x.ts", 5_000),
+      ).toBe("command_policy_mismatch");
+      expect(
+        grantCoverageCode(env, "work:worker", "/repo/checkout/src/x.ts", 5_000),
+      ).toBe("command_policy_mismatch");
+    });
+  });
+
+  test("a missing leaf is grant_absent", () => {
+    withGrantTmp((dir) => {
+      expect(
+        grantCoverageCode(
+          grantEnv(dir),
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          5_000,
+        ),
+      ).toBe("grant_absent");
+    });
+  });
+
+  test("grantCoversWrite stays a boolean view of grantCoverageCode", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({ agent_type: "plan:merge-resolver", role: "resolve" }),
+      );
+      const env = grantEnv(dir);
+      expect(
+        grantCoversWrite(
+          env,
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          5_000,
+        ),
+      ).toBe(true);
+      expect(
+        grantCoversWrite(
+          env,
+          "plan:merge-resolver",
+          "/repo/checkout/src/x.ts",
+          50_000,
+        ),
+      ).toBe(false);
+    });
+  });
+});
+
+describe("grantVerdictCode / parseGrantDenialCode round-trip", () => {
+  const PAIRS: Array<[GrantVerdict["kind"], GrantDenialCode]> = [
+    ["valid", "valid"],
+    ["absent", "grant_absent"],
+    ["expired", "grant_expired"],
+    ["tuple-mismatch", "tuple_mismatch"],
+    ["malformed", "unknown"],
+  ];
+  for (const [kind, code] of PAIRS) {
+    test(`'${kind}' → '${code}'`, () => {
+      expect(grantVerdictCode(kind)).toBe(code);
+    });
+  }
+
+  test("parseGrantDenialCode reads a tagged reason and rejects an untagged one", () => {
+    expect(
+      parseGrantDenialCode("[keeper-grant-verdict=grant_expired] blah"),
+    ).toBe("grant_expired");
+    expect(parseGrantDenialCode("free-form prose, no marker")).toBeNull();
+    expect(parseGrantDenialCode("[keeper-grant-verdict=bogus] x")).toBeNull();
+  });
+});
+
+describe("grant-guard deny envelope carries the typed verdict code", () => {
+  const CASES: Array<[GrantVerdict, GrantDenialCode]> = [
+    [{ kind: "absent" }, "grant_absent"],
+    [{ kind: "expired" }, "grant_expired"],
+    [{ kind: "tuple-mismatch", detail: "fencing token" }, "tuple_mismatch"],
+    [{ kind: "malformed", detail: "leaf shape invalid" }, "unknown"],
+  ];
+  for (const [verdict, code] of CASES) {
+    test(`an edit-tool mutation under a '${verdict.kind}' grant denies with code '${code}'`, () => {
+      const d = decideGrantGuard(
+        editPayload("Edit", "plan:merge-resolver", `${ROOT}/src/x.ts`),
+        deps({ grant: verdict }),
+      );
+      expect(
+        parseGrantDenialCode(
+          d?.hookSpecificOutput.permissionDecisionReason ?? "",
+        ),
+      ).toBe(code);
+    });
+  }
+
+  test("a grant_absent mis-bind is NEVER narrated as grant_expired", () => {
+    const d = decideGrantGuard(
+      editPayload("Edit", "plan:merge-resolver", `${ROOT}/src/x.ts`),
+      deps({ grant: { kind: "absent" } }),
+    );
+    const reason = d?.hookSpecificOutput.permissionDecisionReason ?? "";
+    expect(parseGrantDenialCode(reason)).toBe("grant_absent");
+    // The machine-keyable marker is grant_absent — the expiry marker is absent
+    // (the reason PROSE may mention grant_expired only as an explanation).
+    expect(reason).toContain("[keeper-grant-verdict=grant_absent]");
+    expect(reason).not.toContain("[keeper-grant-verdict=grant_expired]");
+  });
+
+  test("a protected path and an outside-root target deny with command_policy_mismatch under a valid grant", () => {
+    const protectedDeny = decideGrantGuard(
+      editPayload("Edit", "plan:merge-resolver", `${ROOT}/.git/config`),
+      deps({ grant: validGrant() }),
+    );
+    expect(
+      parseGrantDenialCode(
+        protectedDeny?.hookSpecificOutput.permissionDecisionReason ?? "",
+      ),
+    ).toBe("command_policy_mismatch");
+    const outsideDeny = decideGrantGuard(
+      editPayload("Edit", "plan:merge-resolver", "/elsewhere/x.ts"),
+      deps({ grant: validGrant() }),
+    );
+    expect(
+      parseGrantDenialCode(
+        outsideDeny?.hookSpecificOutput.permissionDecisionReason ?? "",
+      ),
+    ).toBe("command_policy_mismatch");
+  });
+
+  test("a write-capable bash command under an expired grant surfaces grant_expired, not a diagnosis-role narration", () => {
+    const d = decideGrantGuard(
+      bashPayload("plan:merge-resolver", "keeper commit-work 'x'"),
+      deps({ grant: { kind: "expired" } }),
+    );
+    const reason = d?.hookSpecificOutput.permissionDecisionReason ?? "";
+    expect(parseGrantDenialCode(reason)).toBe("grant_expired");
+    expect(reason).not.toContain("diagnosis role");
+  });
+
+  test("a genuine command-policy bash violation is command_policy_mismatch even for a write-capable role", () => {
+    const d = decideGrantGuard(
+      bashPayload("plan:merge-resolver", "python3 -c 'x'"),
+      deps({ grant: validGrant() }),
+    );
+    expect(
+      parseGrantDenialCode(
+        d?.hookSpecificOutput.permissionDecisionReason ?? "",
+      ),
+    ).toBe("command_policy_mismatch");
+  });
+
+  test("end-to-end: an EXPIRED real leaf denies an edit with grant_expired through productionDeps", () => {
+    withGrantTmp((dir) => {
+      writeGrantLeaf(
+        dir,
+        makeGrant({
+          agent_type: "plan:merge-resolver",
+          role: "resolve",
+          expires_at: 10_000,
+        }),
+      );
+      const env = {
+        KEEPER_GRANT_DIR: dir,
+        KEEPER_GRANT_PARENT_JOB: "job-1",
+        KEEPER_GRANT_INCIDENT: "close::fn-1-x",
+        KEEPER_GRANT_FENCING_TOKEN: "7",
+      };
+      const payload = JSON.stringify(
+        editPayload("Edit", "plan:merge-resolver", "/repo/checkout/src/x.ts"),
+      );
+      const d = decideGrantGuardInput(
+        payload,
+        productionDeps(env, () => 50_000),
+      );
+      expect(
+        parseGrantDenialCode(
+          d?.hookSpecificOutput.permissionDecisionReason ?? "",
+        ),
+      ).toBe("grant_expired");
+    });
   });
 });

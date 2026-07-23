@@ -35,8 +35,10 @@ import {
   escalationRoleFor,
   type GrantEnv,
   type GrantVerdict,
+  grantDenialTag,
   grantExpectationFromEnv,
   grantsDirOf,
+  grantVerdictCode,
   isGrantProtectedPath,
   readGrantLeaf,
   realpathNearest,
@@ -855,48 +857,57 @@ function noGrantReason(
   role: EscalationRole,
   kind: GrantVerdict["kind"],
 ): string {
+  const code = grantVerdictCode(kind);
   return (
-    `Escalation subagent (role '${role}') BLOCKED: this mutation requires a valid ` +
-    `daemon-published grant, but the grant verdict is '${kind}'. A confined ` +
-    `escalation subagent's writes are denied by default; the daemon publishes an ` +
-    `exact-tuple, unexpired grant naming the writable checkout when — and only when ` +
-    `— the incident is owned. Diagnose, or return a typed receipt.`
+    `${grantDenialTag(code)} Escalation subagent (role '${role}') BLOCKED: this ` +
+    `mutation requires a valid daemon-published grant, but the typed grant verdict ` +
+    `is '${code}'. A confined escalation subagent's writes are denied by default; ` +
+    `the daemon publishes an exact-tuple, unexpired grant naming the writable ` +
+    `checkout when — and only when — the incident is owned. Only a genuine ` +
+    `'grant_expired' verdict may enter a same-session grant-replacement retry; any ` +
+    `other code fails closed. Diagnose, or return a typed receipt carrying this code.`
   );
 }
 
+const POLICY_TAG = grantDenialTag("command_policy_mismatch");
+
 function protectedReason(target: string): string {
   return (
-    `Escalation subagent BLOCKED: '${target}' is a protected git-config / hook / ` +
-    `credential / harness-config path, denied even under a valid grant.`
+    `${POLICY_TAG} Escalation subagent BLOCKED: '${target}' is a protected ` +
+    `git-config / hook / credential / harness-config path, denied even under a ` +
+    `valid grant.`
   );
 }
 
 function outsideRootReason(target: string, root: string): string {
   return (
-    `Escalation subagent BLOCKED: '${target}' is outside the grant's writable root ` +
-    `'${root}'. A grant authorizes writes ONLY within its granted checkout.`
+    `${POLICY_TAG} Escalation subagent BLOCKED: '${target}' is outside the grant's ` +
+    `writable root '${root}'. A grant authorizes writes ONLY within its granted ` +
+    `checkout.`
   );
 }
 
 function unblockerReason(): string {
   return (
-    "Escalation subagent BLOCKED: the unblocker role is diagnosis-only and may " +
-    "never write source. Leave the task blocked and return a typed receipt."
+    `${POLICY_TAG} Escalation subagent BLOCKED: the unblocker role is ` +
+    "diagnosis-only and may never write source. Leave the task blocked and return " +
+    "a typed receipt."
   );
 }
 
 function bashReason(role: EscalationRole, violation: string): string {
   return (
-    `Escalation subagent (role '${role}') denies this Bash command: ${violation}. ` +
-    "File writes go through the Edit/Write tools (bounded to the granted checkout), " +
-    "never a Bash redirect/heredoc/interpreter. Rework via an allowed command, or " +
-    "return a typed receipt."
+    `${POLICY_TAG} Escalation subagent (role '${role}') denies this Bash command: ` +
+    `${violation}. File writes go through the Edit/Write tools (bounded to the ` +
+    "granted checkout), never a Bash redirect/heredoc/interpreter. Rework via an " +
+    "allowed command, or return a typed receipt."
   );
 }
 
 const MALFORMED_REASON =
-  "Escalation grant guard: the tool payload was malformed or missing its target, " +
-  "so the confined call could not be verified — denied (fail closed).";
+  `${grantDenialTag("unknown")} Escalation grant guard: the tool payload was ` +
+  "malformed or missing its target, so the confined call could not be verified — " +
+  "denied (fail closed).";
 
 // ---------------------------------------------------------------------------
 // Pure decision core.
@@ -970,12 +981,23 @@ function decideBash(
     role,
     writeCapable: grant.writeCapable,
     incidentId: grant.incidentId,
-    ...(deps.wrappedTaskId === undefined
-      ? {}
-      : { taskId: deps.wrappedTaskId }),
+    ...(deps.wrappedTaskId === undefined ? {} : { taskId: deps.wrappedTaskId }),
   };
   const violation = evaluateGrantBash(command, cfg);
-  if (violation !== null) return denyEnvelope(bashReason(role, violation));
+  if (violation !== null) {
+    // A write-capable role whose grant is NOT valid: when the SAME command would
+    // clear the allowlist under a live grant, the only reason it failed is the
+    // missing authority — surface the TYPED grant code, never a "diagnosis role"
+    // narration that would misread an expiry/absence as a permanent role limit.
+    if (
+      grant.verdictKind !== "valid" &&
+      roleIsWriteCapable(role) &&
+      evaluateGrantBash(command, { ...cfg, writeCapable: true }) === null
+    ) {
+      return denyEnvelope(noGrantReason(role, grant.verdictKind));
+    }
+    return denyEnvelope(bashReason(role, violation));
+  }
   // The command cleared the allowlist. A write-capable command (git/build/
   // commit-work) mutates the repo at cwd — bound that cwd to the granted
   // checkout so a write-capable role cannot mutate a foreign tree.
