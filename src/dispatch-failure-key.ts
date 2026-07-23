@@ -957,31 +957,13 @@ export function isSlotOccupancyReason(reason: string): boolean {
  * content conflict. The EXACT leading-token gate ({@link
  * MERGE_ESCALATION_REASON_TOKEN}), so a `worktree-merge` PREFIX
  * (`worktree-merge-lock-timeout`, `worktree-lane-premerge-*`) never matches.
- * The fold's reason-precedence guard reads this to protect an open obligation
- * from a lower-priority overwrite. Pure; NEVER throws.
+ * The fold's incident-instance precedence keys on this: an open merge-conflict
+ * obligation is BYTE-STABLE against every incoming `DispatchFailed` on its key,
+ * and a merge reason superseding a non-merge row mints a fresh instance. Pure;
+ * NEVER throws.
  */
 export function isMergeConflictIncidentReason(reason: string): boolean {
   return leadingReasonToken(reason) === MERGE_ESCALATION_REASON_TOKEN;
-}
-
-/**
- * Whether a `dispatch_failures.reason` is a LOWER-PRIORITY dispatch-plumbing
- * failure — a slot-occupancy signal ({@link isSlotOccupancyReason}: reclaimed
- * or occupied), the instant-death breaker ({@link INSTANT_DEATH_BREAKER_REASON}),
- * or a parked launch ({@link isParkedLaunchReason}). Each describes the launch /
- * slot PLUMBING for a `(verb, id)` key, never a semantic merge-integration
- * obligation. The fold's reason-precedence guard uses this so one of these can
- * never REPLACE a standing {@link isMergeConflictIncidentReason} row on the same
- * key (nor can its own later reason-scoped self-clear then erase that obligation):
- * a merge incident clears ONLY on positive ancestry-plus-clean-target evidence.
- * Pure; NEVER throws.
- */
-export function isLowerPriorityDispatchPlumbingReason(reason: string): boolean {
-  return (
-    isSlotOccupancyReason(reason) ||
-    reason.startsWith(INSTANT_DEATH_BREAKER_REASON) ||
-    isParkedLaunchReason(reason)
-  );
 }
 
 /**

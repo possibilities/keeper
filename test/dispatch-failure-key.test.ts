@@ -25,12 +25,10 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
   FATAL_AUDIT_ID_PREFIX,
-  INSTANT_DEATH_BREAKER_REASON,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
   isFullObjectId,
   isLaneWedgeDistressKey,
-  isLowerPriorityDispatchPlumbingReason,
   isMergeConflictIncidentReason,
   isMergeEscalationReason,
   isPendingIntegrationReason,
@@ -47,7 +45,6 @@ import {
   LANE_WEDGE_DISTRESS_VERB,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
-  PARKED_LAUNCH_REASON_PREFIX,
   PENDING_OWNER_INTEGRATION_TAIL,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
@@ -1476,32 +1473,5 @@ describe("reason precedence", () => {
     expect(
       isMergeConflictIncidentReason("worktree-merge-lock-timeout: x"),
     ).toBe(false);
-  });
-
-  test("isLowerPriorityDispatchPlumbingReason covers slot / instant-death / parked, and nothing semantic", () => {
-    expect(
-      isLowerPriorityDispatchPlumbingReason(
-        `${SLOT_OCCUPIED_REASON_PREFIX}: x`,
-      ),
-    ).toBe(true);
-    expect(
-      isLowerPriorityDispatchPlumbingReason(
-        `${SLOT_RECLAIMED_REASON_PREFIX}: x`,
-      ),
-    ).toBe(true);
-    expect(
-      isLowerPriorityDispatchPlumbingReason(INSTANT_DEATH_BREAKER_REASON),
-    ).toBe(true);
-    expect(
-      isLowerPriorityDispatchPlumbingReason(
-        `${PARKED_LAUNCH_REASON_PREFIX}: x`,
-      ),
-    ).toBe(true);
-    // A merge obligation is NOT lower-priority plumbing (the guard must never
-    // suppress a merge reason replacing a plumbing row).
-    expect(isLowerPriorityDispatchPlumbingReason(pinnedMerge)).toBe(false);
-    expect(isLowerPriorityDispatchPlumbingReason("confirm_timeout")).toBe(
-      false,
-    );
   });
 });
