@@ -96,6 +96,7 @@ import { parsePlanRef } from "./derivers";
 import {
   assertNever,
   buildPendingIntegrationTail,
+  classifyPendingIntegration,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   epicIdFromFatalAuditId,
@@ -107,7 +108,6 @@ import {
   isLaneWedgeDistressKey,
   isMonitorSlotWedgeDistressKey,
   isOriginContainmentDistressKey,
-  isPendingIntegrationReason,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -789,6 +789,17 @@ export async function probeWorkMergeIncidentResolutions(
 ): Promise<Map<string, WorkMergeIncidentVerdict>> {
   const out = new Map<string, WorkMergeIncidentVerdict>();
   for (const row of rows) {
+    // CLASSIFY FIRST — the tri-state fence class decides the routing before any
+    // source probe. A MALFORMED / legacy pre-fence pending row (pending class, no
+    // valid fence) produces its `defer` verdict with ZERO git calls: it is EXCLUDED
+    // from movable-branch and source-absence evidence (a fence-less request has no
+    // authority to grade its own integration), clearing only on independently
+    // positive epic-landed evidence (the caller's straggler fallback) or an explicit
+    // operator clear / re-mint — never here, preserving the fail-closed distinction.
+    if (classifyPendingIntegration(row.reason) === "malformed") {
+      out.set(row.id, "defer");
+      continue;
+    }
     const parsed = parseMergeConflictReason(row.reason);
     if (parsed === null || row.dir === null || row.dir === "") {
       out.set(row.id, "defer");
@@ -808,16 +819,7 @@ export async function probeWorkMergeIncidentResolutions(
         );
         continue;
       }
-      if (isPendingIntegrationReason(row.reason)) {
-        // MALFORMED / legacy pre-fence pending row (pending class, no valid fence).
-        // It is EXCLUDED from movable-branch and source-absence evidence — a
-        // fence-less request has no authority to grade its own integration, so it
-        // DEFERS. It clears only on independently positive epic-landed evidence (the
-        // caller's straggler fallback) or an explicit operator clear / re-mint,
-        // never here, preserving the fail-closed distinction.
-        out.set(row.id, "defer");
-        continue;
-      }
+      // UNPINNED genuine content conflict → the legacy branch-name grading.
       const srcRef = await run(
         [
           "rev-parse",
