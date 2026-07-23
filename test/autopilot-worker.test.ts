@@ -306,6 +306,7 @@ import {
 } from "../src/dispatch-command";
 import { buildEscalationBrief } from "../cli/escalation-brief";
 import {
+  buildConflictHeadFence,
   fatalAuditDispatchId,
   parseConflictHeadFence,
   parseMergeConflictReason,
@@ -25424,7 +25425,7 @@ test("runProgressActor: a content conflict → a work::<task> escalation carryin
   expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
-test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_state=actor-conflict → the rendered exact-object resolver instruction → pinned clear", async () => {
+test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_kind=actor-conflict (legacy fence_state=unpinned) → the rendered pinned-object resolver instruction → pinned clear", async () => {
   // (1) DRIVE THE ACTUAL ACTOR — never hand-build the reason. The real mint carries the
   //     canonical `merging <src> into <base>` grammar PLUS the `[conflict …]` head fence
   //     pinning the exact source object, target-arrival object, and obligation class.
@@ -25471,13 +25472,18 @@ test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_sta
       r.brief.incident as {
         conflict: {
           fence_state: string;
+          fence_kind: string;
           expected_source_head: string | null;
           expected_base_head: string | null;
           source_class: string | null;
         } | null;
       }
     ).conflict;
-    expect(conflict?.fence_state).toBe("actor-conflict");
+    // BOTH surfaces: fence_state stays the LEGACY schema-v1 `unpinned` (wire compatibility,
+    // unchanged), while the NEW fence_kind carries the AUTHORITATIVE `actor-conflict`
+    // discriminator consumers route on, alongside the pinned heads + obligation class.
+    expect(conflict?.fence_state).toBe("unpinned");
+    expect(conflict?.fence_kind).toBe("actor-conflict");
     expect(conflict?.expected_source_head).toBe(ACTOR_RIB_OID);
     expect(conflict?.expected_base_head).toBe(ACTOR_LANE_OID);
     expect(conflict?.source_class).toBe("rib");
@@ -25488,8 +25494,9 @@ test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_sta
 
   // (4) The RENDERED resolver instruction the actor-conflict incident routes to — the managed
   //     merge-resolver template whose actor-conflict arm the render carries VERBATIM (only the
-  //     frontmatter is substituted) — instructs the EXACT-OBJECT merge gated on the arrival
-  //     pin, never the movable branch.
+  //     frontmatter is substituted). It routes on fence_kind, merges the pinned source OBJECT
+  //     gated on the target-arrival pin, verifies the pinned object RESOLVES, and NEVER
+  //     requires the movable source ref to equal its pin (B2); a missing/unknown kind fails closed.
   const resolver = readFileSync(
     join(
       import.meta.dir,
@@ -25502,10 +25509,39 @@ test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_sta
     ),
     "utf-8",
   );
+  expect(resolver).toContain("Branch on `fence_kind`");
   expect(resolver).toContain("**`actor-conflict`**");
   expect(resolver).toContain("`git merge --no-ff <expected_source_head>`");
   expect(resolver).toContain("MUST equal `expected_base_head`");
-  expect(resolver).toContain("MUST equal `expected_source_head`");
+  // B2: verify the pinned source OBJECT resolves; NEVER require the movable source ref == pin.
+  expect(resolver).toContain(
+    "`git rev-parse <expected_source_head>^{commit}` RESOLVES",
+  );
+  expect(resolver).toContain("NEVER require the movable");
+  expect(resolver).not.toContain("(MUST equal `expected_source_head`)");
+  // B1: a missing / unknown fence_kind fails closed.
+  expect(resolver).toContain("FAIL CLOSED");
+
+  // (4b) B1 payload shape — the work Task incident JSON the owning session builds carries the
+  //      NEW fence_kind + source_class EXPLICITLY (a subagent never infers actor authority from
+  //      the heads or reason prose), alongside the legacy fence_state.
+  const workSkill = readFileSync(
+    join(
+      import.meta.dir,
+      "..",
+      "plugins",
+      "plan",
+      "template",
+      "skills",
+      "work.md.tmpl",
+    ),
+    "utf-8",
+  );
+  expect(workSkill).toContain('"fence_kind":"<incident.conflict.fence_kind>"');
+  expect(workSkill).toContain(
+    '"source_class":"<incident.conflict.source_class|null>"',
+  );
+  expect(workSkill).toContain('"fence_state":"<incident.conflict.fence_state>"');
 
   // (5) PINNED CLEAR — the incident-resolution probe clears the actor conflict from the
   //     DURABLE OBJECTS: both pinned oids ancestors of a stable, clean target base → `merged`,
@@ -25540,6 +25576,53 @@ test("runProgressActor conflict → REAL DispatchFailed fold → brief fence_sta
     clearRun,
   );
   expect(verdicts.get(taskId)).toBe("merged");
+});
+
+test("B2: a pinned actor-conflict clears from the DURABLE objects with the source branch ref DELETED — the pinned object is the sole authority, never the movable ref", async () => {
+  // A genuine actor conflict fence. The runner would report the source BRANCH ref as deleted
+  // (a post-mint delete) — but the pinned grader reads ONLY the durable objects (the base
+  // snapshot + both pins' ancestry + a stable clean target), never `refs/heads/<source>`. So a
+  // deleted or moved source ref cannot wedge or substitute the pinned clear.
+  const src = "1".repeat(40);
+  const target = "2".repeat(40);
+  const base = "keeper/epic/fn-7-b2";
+  const reason = `worktree-merge-conflict: merging keeper/epic/fn-7-b2--fn-7-b2.1 into ${base} — CONFLICT (content): x.ts ${buildConflictHeadFence(src, target, "rib")}`;
+  const baseOid = "a".repeat(40);
+  let sourceRefProbed = false;
+  const run = (async (a: string[]) => {
+    const cmd = a.join(" ");
+    if (cmd.includes("refs/heads/keeper/epic/fn-7-b2--fn-7-b2.1")) {
+      sourceRefProbed = true; // must never happen — the pinned grader ignores the source ref
+      return { code: 1, stdout: "", stderr: "" }; // (source branch deleted)
+    }
+    if (a[0] === "rev-parse" && cmd.includes("^{commit}")) {
+      return { code: 0, stdout: `${baseOid}\n`, stderr: "" };
+    }
+    if (a[0] === "merge-base" && a.includes("--is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // both pins ancestors of the base
+    }
+    if (a.includes("--git-dir")) return { code: 1, stdout: "", stderr: "" };
+    if (a[0] === "for-each-ref") return { code: 0, stdout: "", stderr: "" };
+    if (
+      cmd === "rev-parse --verify --quiet MERGE_HEAD" ||
+      cmd === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+      cmd === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+      cmd === "rev-parse --verify --quiet REVERT_HEAD"
+    ) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "status") return { code: 0, stdout: "", stderr: "" };
+    if (cmd === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${base}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [{ id: "fn-7-b2.1", reason, dir: "/lane" }],
+    run,
+  );
+  expect(verdicts.get("fn-7-b2.1")).toBe("merged");
+  expect(sourceRefProbed).toBe(false); // the movable source ref is never even consulted
 });
 
 test("runProgressActor: steady-state ABSENT rib (torn down, base not yet in the lane) → the canonical-base arm is reached and integrated", async () => {
@@ -29108,15 +29191,31 @@ test("probeWorkMergeIncidentResolutions: a MALFORMED-ACTOR fence (a `[conflict �
   // owns it), the DOWNSTREAM zero-git the fence-kind reroute guarantees.
   const shortId = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.1 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict src=${"a".repeat(12)} target=${"b".repeat(40)} class=rib]`;
   const ambiguous = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.2 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict src=${"a".repeat(40)} target=${"b".repeat(40)} class=rib] [conflict src=${"b".repeat(40)} target=${"a".repeat(40)} class=canonical-base]`;
+  // START-count variants: an incomplete start (no `]`), a case-varied `[CONFLICT` start, and
+  // an incomplete start smuggled BEFORE a valid tail fence — each a malformed-actor that must
+  // defer with ZERO git, never the unpinned live-branch fallback.
+  const missingClose = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.3 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict src=oops`;
+  const upper = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.4 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [CONFLICT src=${"a".repeat(40)} target=${"b".repeat(40)} class=rib]`;
+  const smuggled = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.5 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict oops [conflict src=${"a".repeat(40)} target=${"b".repeat(40)} class=rib]`;
   const verdicts = await probeWorkMergeIncidentResolutions(
     [
       { id: "fn-3-widget.1", reason: shortId, dir: "/lane" },
       { id: "fn-3-widget.2", reason: ambiguous, dir: "/lane" },
+      { id: "fn-3-widget.3", reason: missingClose, dir: "/lane" },
+      { id: "fn-3-widget.4", reason: upper, dir: "/lane" },
+      { id: "fn-3-widget.5", reason: smuggled, dir: "/lane" },
     ],
     trap,
   );
-  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
-  expect(verdicts.get("fn-3-widget.2")).toBe("defer");
+  for (const id of [
+    "fn-3-widget.1",
+    "fn-3-widget.2",
+    "fn-3-widget.3",
+    "fn-3-widget.4",
+    "fn-3-widget.5",
+  ]) {
+    expect(verdicts.get(id)).toBe("defer");
+  }
   expect(calls).toBe(0);
 });
 

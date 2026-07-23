@@ -93,7 +93,7 @@ PRIMARY_REPO=<primary_repo>
 TARGET_REPO=<target_repo>
 
 <incident-data>
-{"incident_id":"work::<task_id>","instance_event_id":<n>,"attempt_id":<n|null>,"cwd":"<repo_dir>","source_branch":"<source_branch>","base_branch":"<base_branch>","fence_state":"<incident.conflict.fence_state>","expected_source_head":"<incident.conflict.expected_source_head|null>","expected_base_head":"<incident.conflict.expected_base_head|null>","reason":"<reason>","grant_ref":"<grant_ref|null>","claimant_session_id":"<claimant_session_id>"}
+{"incident_id":"work::<task_id>","instance_event_id":<n>,"attempt_id":<n|null>,"cwd":"<repo_dir>","source_branch":"<source_branch>","base_branch":"<base_branch>","fence_state":"<incident.conflict.fence_state>","fence_kind":"<incident.conflict.fence_kind>","source_class":"<incident.conflict.source_class|null>","expected_source_head":"<incident.conflict.expected_source_head|null>","expected_base_head":"<incident.conflict.expected_base_head|null>","reason":"<reason>","grant_ref":"<grant_ref|null>","claimant_session_id":"<claimant_session_id>"}
 </incident-data>
 ```
 
@@ -111,7 +111,7 @@ A Task drop, extra prose, unknown receipt, invalid JSON, or a reason over 240 UT
 
 ### Deconflicter round
 
-Only an `unpinned` or `actor-conflict` (`incident.conflict.fence_state`) incident may escalate: a `pinned` or `malformed` request has a closed action space, so its resolver returns `resolved` or `stale_base` and never `declined_clean` — never rotate one to the deconflicter. For an `unpinned` or `actor-conflict` incident, only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. The resolver leg's grant does NOT authorize the deconflicter — its authority is a distinct `deconflict` leaf the daemon publishes only after it retires the resolve leaf. Having validated the `declined_clean` receipt, emit the EXPLICIT rotation intent on the SAME incident fence — the daemon rotates the grant only on this typed intent, fenced to the incident instance and this live owner; an ordinary re-claim never rotates authority:
+Only a `legacy` or `actor-conflict` (`incident.conflict.fence_kind`) incident may escalate: a `pending`, `malformed-actor`, `malformed-pending`, or missing/unknown `fence_kind` has a closed action space, so its resolver returns `resolved` or `stale_base` and never `declined_clean` — never rotate one to the deconflicter. For a `legacy` or `actor-conflict` incident, only `receipt=declined_clean` from the resolver may escalate to `plan:deconflicter`. The resolver leg's grant does NOT authorize the deconflicter — its authority is a distinct `deconflict` leaf the daemon publishes only after it retires the resolve leaf. Having validated the `declined_clean` receipt, emit the EXPLICIT rotation intent on the SAME incident fence — the daemon rotates the grant only on this typed intent, fenced to the incident instance and this live owner; an ordinary re-claim never rotates authority:
 
 ```bash
 keeper incident rotate <incident_id> --instance <instance_event_id>

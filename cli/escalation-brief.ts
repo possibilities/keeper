@@ -57,9 +57,11 @@ import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb, resolveDbPath } from "../src/db";
 import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
 import {
-  assertNever,
   classifyMergeConflictFence,
+  classifyPendingIntegration,
   isMergeEscalationReason,
+  type MergeConflictFenceKind,
+  type PendingIntegrationClass,
   parseConflictHeadFence,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
@@ -155,14 +157,6 @@ export interface IncidentClaim {
   claimed_at: number | null;
 }
 
-/** The fence class the resolver / deconflicter branch on — the pending family's tri-state
- *  ({@link import("../src/dispatch-failure-key").PendingIntegrationClass}) plus
- *  `actor-conflict`, an AUTHORITATIVE PINNED genuine actor content conflict whose
- *  `[conflict …]` fence pins the exact source object, the target-arrival object, and the
- *  obligation class. A malformed actor OR pending fence collapses to `malformed` (fail
- *  closed); a fence-less genuine conflict is `unpinned`. */
-export type FenceState = "pinned" | "actor-conflict" | "malformed" | "unpinned";
-
 /** The deconflict incident: the parsed merge-conflict + the resolver jobs. The
  *  conflict block also carries the incident-fenced clear identities
  *  (`instance_event_id` / `attempt_id`) and the live owner's claim so a
@@ -188,19 +182,20 @@ export interface DeconflictIncident {
      *  `canonical-base`), so the resolver knows whether the source is a sibling rib or the
      *  epic base; null for a pending fence or a fence-less legacy conflict. */
     source_class: "rib" | "canonical-base" | null;
-    /** The fence class the resolver / deconflicter branch on:
-     *  - `pinned` — a valid PENDING fast-forward request: the resolver's exact-object
-     *    fast-forward;
-     *  - `actor-conflict` — an AUTHORITATIVE PINNED genuine actor content conflict:
-     *    `expected_source_head` / `expected_base_head` / `source_class` pin the source
-     *    object, the target-arrival object, and the obligation class, so the resolver merges
-     *    the pinned source OBJECT with `--no-ff` gated on the live target HEAD == the arrival
-     *    pin, then reconciles mechanically (declining to the deconflicter like `unpinned`);
-     *  - `malformed` — a pending OR actor request whose fence is absent, duplicated, or
-     *    malformed — FAIL CLOSED to stale_base, never a live-head substitution;
-     *  - `unpinned` — a fence-less genuine content conflict — the only class the branch-name
-     *    + live-snapshot path serves. */
-    fence_state: FenceState;
+    /** The LEGACY schema-v1 pending tri-state — UNCHANGED domain + meaning: `pinned` (a
+     *  valid pending fast-forward request), `malformed` (a malformed pending fence), or
+     *  `unpinned` (any genuine content conflict, actor-minted or not). Preserved verbatim for
+     *  wire compatibility; the AUTHORITY decision routes on {@link fence_kind}, never this. */
+    fence_state: PendingIntegrationClass;
+    /** The NEW closed fence-KIND discriminator every updated managed consumer routes on for
+     *  merge authority — `actor-conflict` (an AUTHORITATIVE PINNED genuine content conflict:
+     *  the resolver merges the pinned source OBJECT gated on the target-arrival pin),
+     *  `pending` (a mechanical fast-forward request), `malformed-actor` / `malformed-pending`
+     *  (fail closed to stale_base, no live-head substitution), or `legacy` (a fence-less
+     *  genuine conflict the live-snapshot path serves). A consumer that receives a
+     *  MISSING/UNKNOWN kind FAILS CLOSED wherever exact actor authority is required — it never
+     *  infers actor authority from the heads or the reason prose. */
+    fence_kind: MergeConflictFenceKind;
     /** Durable owner-attachment count consumed by this incident — the collapsed
      *  home of the retired `resolver_dispatched_at` / `merge_escalated_at` lease. */
     owner_redispatch_attempts: number;
@@ -539,37 +534,29 @@ interface IncidentResult<D> {
   degraded: string[];
 }
 
-/** Map a merge-conflict reason to the consumer {@link FenceState} + an optional degraded
- *  flag, deriving from the CLOSED fence-kind ({@link classifyMergeConflictFence}), not the
- *  pending classifier alone: a valid actor conflict is its own AUTHORITATIVE PINNED class,
- *  distinct from a fence-less `unpinned` conflict and from a fail-closed `malformed` request.
- *  A malformed actor OR pending fence collapses to `malformed` under a DISTINCT degraded
- *  flag. Pure; NEVER throws (the switch is exhaustive over the closed union). */
-function deriveFenceState(reason: string): {
-  fence_state: FenceState;
+/** Derive the LEGACY schema-v1 `fence_state` (pending tri-state via {@link
+ *  classifyPendingIntegration} — UNCHANGED domain + meaning) AND the NEW closed {@link
+ *  MergeConflictFenceKind} discriminator (via {@link classifyMergeConflictFence}) from a
+ *  merge-conflict reason, plus an optional degraded flag surfacing a malformed actor OR
+ *  pending fence DISTINCTLY. Consumers route on `fence_kind` for authority; `fence_state` rides
+ *  for wire compatibility only. Pure; NEVER throws. */
+function deriveFenceFields(reason: string): {
+  fence_state: PendingIntegrationClass;
+  fence_kind: MergeConflictFenceKind;
   degraded: string | null;
 } {
-  const kind = classifyMergeConflictFence(reason);
-  switch (kind) {
-    case "actor-conflict":
-      return { fence_state: "actor-conflict", degraded: null };
-    case "pending":
-      return { fence_state: "pinned", degraded: null };
-    case "malformed-actor":
-      return {
-        fence_state: "malformed",
-        degraded: "incident_actor_fence_malformed",
-      };
-    case "malformed-pending":
-      return {
-        fence_state: "malformed",
-        degraded: "incident_pending_fence_malformed",
-      };
-    case "legacy":
-      return { fence_state: "unpinned", degraded: null };
-    default:
-      return assertNever(kind);
-  }
+  const fence_kind = classifyMergeConflictFence(reason);
+  const degraded =
+    fence_kind === "malformed-actor"
+      ? "incident_actor_fence_malformed"
+      : fence_kind === "malformed-pending"
+        ? "incident_pending_fence_malformed"
+        : null;
+  return {
+    fence_state: classifyPendingIntegration(reason),
+    fence_kind,
+    degraded,
+  };
 }
 
 /** Assemble the deconflict incident: the sticky `close::<epic>` (or, for a
@@ -622,13 +609,14 @@ function buildDeconflictIncident(
     // brief carries durable heads instead of null — the resolver merges the pinned source
     // OBJECT and never re-resolves a movable branch as the authority.
     const conflict_fence = parseConflictHeadFence(row.reason);
-    // fence_state comes from the CLOSED fence-kind: a valid actor conflict is its own
-    // AUTHORITATIVE PINNED class (`actor-conflict`), distinct from a fence-less `unpinned`
-    // conflict; a malformed actor OR pending fence is surfaced DISTINCTLY and fails closed as
-    // `malformed`.
-    const { fence_state, degraded: fenceDegraded } = deriveFenceState(
-      row.reason,
-    );
+    // fence_state stays the LEGACY pending tri-state (wire compatibility); fence_kind is the
+    // NEW closed discriminator every consumer routes on for authority. A malformed actor OR
+    // pending fence is surfaced DISTINCTLY via a degraded flag.
+    const {
+      fence_state,
+      fence_kind,
+      degraded: fenceDegraded,
+    } = deriveFenceFields(row.reason);
     if (fenceDegraded !== null) {
       degraded.push(fenceDegraded);
     }
@@ -643,6 +631,7 @@ function buildDeconflictIncident(
       expected_base_head: heads?.baseHead ?? conflict_fence?.targetHead ?? null,
       source_class: conflict_fence?.sourceClass ?? null,
       fence_state,
+      fence_kind,
       owner_redispatch_attempts: row.owner_redispatch_attempts,
       instance_event_id: row.instance_event_id,
       attempt_id: row.attempt_id,

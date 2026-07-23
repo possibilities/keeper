@@ -36,21 +36,23 @@ This phase is unchanged: the flat JSON is your whole context.
 
 ## Phase 1b — Route by fence class
 
-Read `incident.conflict.fence_state`. The deconflicter reconciles the `unpinned` and
-`actor-conflict` genuine-conflict classes; a `pinned` or `malformed` request never
-reaches it:
+Read `incident.conflict.fence_kind` (NEVER `fence_state`, which is a legacy
+wire-compatibility field). The deconflicter reconciles the `legacy` and `actor-conflict`
+genuine-conflict classes; a `pending`, `malformed-actor`, `malformed-pending`, or
+missing/unknown `fence_kind` never reaches it:
 
-- `pinned` — a mechanical fast-forward request owned by the work/close session's
+- `pending` — a mechanical fast-forward request owned by the work/close session's
   resolver. Do NOT spawn the deconflicter. Decline and stop, noting the incident is
-  a pinned fast-forward that resolves through the mechanical path in its owning
+  a pending fast-forward that resolves through the mechanical path in its owning
   session (never a live-head substitution here).
-- `malformed` — a fence-less or malformed-fence request. FAIL CLOSED: decline
-  (`stale_base`) and stop, NEVER substitute live branch heads as the missing
-  authority and never spawn the deconflicter.
+- `malformed-actor` / `malformed-pending` (or a missing/unknown `fence_kind`) — a
+  fence-less or malformed-fence request. FAIL CLOSED: decline (`stale_base`) and stop,
+  NEVER substitute live branch heads or infer authority from the heads or reason prose,
+  and never spawn the deconflicter.
 - `actor-conflict` — an AUTHORITATIVE PINNED genuine content conflict. Continue to
   Phase 2; the deconflicter merges the pinned source OBJECT (`expected_source_head`)
   gated on the checkout HEAD matching `expected_base_head`, never a movable branch.
-- `unpinned` — a fence-less genuine content conflict. Continue to Phase 2.
+- `legacy` — a fence-less genuine content conflict. Continue to Phase 2.
 
 ## Phase 2 — Locate the worktree and pin pre-merge state
 
@@ -61,7 +63,7 @@ Pin these fields from the incident brief JSON:
 - `incident.conflict.repo_dir`
 - `incident.conflict.stderr`
 - `incident.conflict.expected_source_head` / `incident.conflict.expected_base_head`
-  — the durable head fence (both null for the fence-less `unpinned` class; both a full
+  — the durable head fence (both null for the fence-less `legacy` class; both a full
   object id for the `actor-conflict` class — the source object and target-arrival pins).
 - `epic_id` / `task_id` / `lineage` fields you need for close-out
 
@@ -75,10 +77,15 @@ git rev-parse --show-toplevel
 git branch --show-current
 # expected branches must match
 
+# actor-conflict: the base branch + checkout HEAD MUST equal expected_base_head, and the
+# pinned source OBJECT must RESOLVE — NEVER require the movable <source_branch> ref to
+# equal expected_source_head (a post-mint source advance or delete must not wedge or
+# substitute the pinned object).
+git rev-parse <base_branch>
+git rev-parse <expected_source_head>^{commit}
+# legacy (fence-less): recheck BOTH live branch heads; if either moved from the incident's
+# recorded heads before mutation, the incident is stale.
 git rev-parse <base_branch> <source_branch>
-# the recheck, not the expectation: when the fence is present these live heads
-# must equal the pinned expected_base_head / expected_source_head from the
-# incident, else the incident is stale
 ```
 
 `base_branch`/`source_branch` are as pinned from the brief. For a close-verb
@@ -111,8 +118,8 @@ BRIEF_REF=deconflict::<ref>
     "source_branch": "<incident.conflict.source_branch>",
     "toplevel": "<git rev-parse --show-toplevel>",
     "expected_heads": {
-      "base_head": "<incident.conflict.expected_base_head; fall back to the live git rev-parse <base_branch> ONLY for the fence-less `unpinned` class — NEVER for a `pinned` pending request or an `actor-conflict`, whose pinned head is authoritative>",
-      "source_head": "<incident.conflict.expected_source_head; fall back to the live git rev-parse <source_branch> ONLY for the fence-less `unpinned` class — NEVER for a `pinned` pending request or an `actor-conflict`, whose pinned head is authoritative>"
+      "base_head": "<incident.conflict.expected_base_head; fall back to the live git rev-parse <base_branch> ONLY for the fence-less `legacy` class — NEVER for a `pending` request or an `actor-conflict`, whose pinned head is authoritative>",
+      "source_head": "<incident.conflict.expected_source_head; fall back to the live git rev-parse <source_branch> ONLY for the fence-less `legacy` class — NEVER for a `pending` request or an `actor-conflict`, whose pinned source OBJECT is authoritative and whose movable branch ref is never required to equal the pin>"
     }
   }
 }

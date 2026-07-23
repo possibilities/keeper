@@ -838,6 +838,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         expected_base_head: null,
         source_class: null,
         fence_state: "unpinned",
+        fence_kind: "legacy",
         owner_redispatch_attempts: 0,
         instance_event_id: null,
         attempt_id: null,
@@ -964,15 +965,18 @@ test("P0-4 durable conflict: an actor conflict mint round-trips through the REAL
       expected_base_head: string | null;
       source_class: string | null;
       fence_state: string | null;
+      fence_kind: string | null;
     } | null;
   };
   expect(inc.conflict?.expected_source_head).toBe(sourceHead);
   expect(inc.conflict?.expected_base_head).toBe(targetHead);
   expect(inc.conflict?.source_class).toBe("rib");
-  // The AUTHORITATIVE-PINNED actor conflict is its OWN fence_state — never collapsed to
-  // `unpinned` (the bug that routed the resolver to the movable branch). The resolver merges
-  // the pinned source OBJECT gated on the target-arrival pin (`expected_base_head`).
-  expect(inc.conflict?.fence_state).toBe("actor-conflict");
+  // BOTH surfaces: fence_state stays the LEGACY schema-v1 value (`unpinned` for any genuine
+  // content conflict — wire compatibility, never changed), while the NEW fence_kind carries
+  // the AUTHORITATIVE-PINNED `actor-conflict` discriminator consumers route on. The resolver
+  // merges the pinned source OBJECT gated on the target-arrival pin (`expected_base_head`).
+  expect(inc.conflict?.fence_state).toBe("unpinned");
+  expect(inc.conflict?.fence_kind).toBe("actor-conflict");
   db.close();
 
   // (3) PINNED-CLEAR: the resolution probe routes the conflict fence to the PINNED grader —
@@ -1025,6 +1029,7 @@ test("a legacy or malformed fence is surfaced as malformed-pending (fail closed,
                   expected_source_head: string | null;
                   expected_base_head: string | null;
                   fence_state: string;
+                  fence_kind: string;
                 } | null;
               }
             ).conflict,
@@ -1049,7 +1054,10 @@ test("a legacy or malformed fence is surfaced as malformed-pending (fail closed,
     const { conflict, degraded } = read(id, reason);
     expect(conflict?.expected_source_head).toBeNull();
     expect(conflict?.expected_base_head).toBeNull();
+    // A malformed PENDING request keeps the legacy `malformed` fence_state AND the new
+    // `malformed-pending` fence_kind — both fail-closed, no live-head substitution.
     expect(conflict?.fence_state).toBe("malformed");
+    expect(conflict?.fence_kind).toBe("malformed-pending");
     expect(degraded).toContain("incident_pending_fence_malformed");
   }
 });
@@ -1080,10 +1088,15 @@ test("a malformed ACTOR `[conflict …]` fence surfaces malformed (fail closed) 
         expected_base_head: string | null;
         source_class: string | null;
         fence_state: string;
+        fence_kind: string;
       } | null;
     }
   ).conflict;
-  expect(conflict?.fence_state).toBe("malformed");
+  // A malformed-actor is NOT a pending reason, so its legacy fence_state is `unpinned`
+  // (schema-v1, unchanged), while the NEW fence_kind is `malformed-actor` — the field
+  // consumers route on, which FAILS CLOSED. No live-head substitution (heads null).
+  expect(conflict?.fence_state).toBe("unpinned");
+  expect(conflict?.fence_kind).toBe("malformed-actor");
   expect(conflict?.expected_source_head).toBeNull();
   expect(conflict?.expected_base_head).toBeNull();
   expect(conflict?.source_class).toBeNull();

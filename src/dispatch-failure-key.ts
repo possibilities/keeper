@@ -1149,12 +1149,14 @@ export function buildConflictHeadFence(
 const CONFLICT_HEAD_FENCE =
   / \[conflict src=([0-9a-f]{40}|[0-9a-f]{64}) target=([0-9a-f]{40}|[0-9a-f]{64}) class=(rib|canonical-base)\]$/;
 
-/** A LOOSE `[conflict …]` token detector — any bracketed `conflict`-lead marker, well-formed
- *  or not — so a DUPLICATE / AMBIGUOUS / MALFORMED marker anywhere in the stderr tail is
- *  counted and fails the whole parse closed (never a second marker smuggled past the strict
- *  tail grammar, never a look-alike displacing the real one). `\b` keeps `CONFLICT (content)`
- *  and other unbracketed prose from counting. */
-const CONFLICT_MARKER_LOOSE = /\[conflict\b[^\]]*\]/g;
+/** A broad actor-control START detector — any `[conflict`-lead token, CASE-INSENSITIVE, with
+ *  NO closing `]` required — so an INCOMPLETE (`[conflict src=oops` with no `]`), a case-varied
+ *  (`[CONFLICT …]`), a DUPLICATE, or a SMUGGLED start anywhere in the stderr tail is COUNTED.
+ *  Counting STARTS (not closed markers) is load-bearing: an incomplete or upper-cased start is
+ *  a control token that must fail the parse closed, and an incomplete start sitting BEFORE a
+ *  valid tail fence must still push the count past one. `\b` keeps `CONFLICT (content)` and
+ *  other unbracketed prose from counting. */
+const CONFLICT_START_LOOSE = /\[conflict\b/gi;
 
 /**
  * Extract the durable head fence of a GENUINE actor conflict — the pinned SOURCE object, the
@@ -1164,8 +1166,9 @@ const CONFLICT_MARKER_LOOSE = /\[conflict\b[^\]]*\]/g;
  * (never the branch-name head, never salvaged from prose — the sanctioned marker discipline):
  *   - the reason MUST split on the em-dash so the fence is sought ONLY in the stderr tail (a
  *     branch name carrying look-alike text lives in the head and can never parse as a fence);
- *   - EXACTLY ONE `[conflict …]` token may appear in that tail — a duplicate / ambiguous /
- *     malformed second marker (a crafted stderr smuggling one) fails the whole parse CLOSED;
+ *   - EXACTLY ONE actor-control START (`[conflict`, case-insensitive, closing `]` NOT
+ *     required) may appear in that tail — an incomplete / case-varied / duplicate / smuggled
+ *     start, even one sitting before the valid tail fence, fails the whole parse CLOSED;
  *   - the sole marker must BE the tail-anchored strict grammar: each id a full {@link
  *     isFullObjectId} object id sharing one length (a 40/64 cross-format pair is structurally
  *     impossible within one repo → malformed), the class exactly `rib` or `canonical-base`.
@@ -1186,9 +1189,12 @@ export function parseConflictHeadFence(reason: string): {
   if (stderr == null) {
     return null;
   }
-  // EXACTLY ONE marker in the tail — a duplicate/ambiguous/smuggled second marker fails closed.
-  const markers = stderr.match(CONFLICT_MARKER_LOOSE);
-  if (markers == null || markers.length !== 1) {
+  // EXACTLY ONE actor-control START in the tail — an incomplete (`[conflict …` with no `]`),
+  // case-varied (`[CONFLICT …]`), duplicate, or smuggled start (even one sitting BEFORE the
+  // valid tail fence) pushes the count off one and fails the whole parse CLOSED. Counting
+  // STARTS, not closed markers, is what closes the incomplete-start / case-varied holes.
+  const starts = stderr.match(CONFLICT_START_LOOSE);
+  if (starts == null || starts.length !== 1) {
     return null;
   }
   const m = CONFLICT_HEAD_FENCE.exec(stderr);
@@ -1270,21 +1276,24 @@ export function classifyMergeConflictFence(
 ): MergeConflictFenceKind {
   // Isolate the git-stderr tail — the SAME segment {@link parseConflictHeadFence} keys on —
   // so a `[conflict …]` look-alike in a branch NAME (the head, before the em-dash) never
-  // counts as an actor control token.
+  // counts as an actor control token. Count broad actor-control STARTS (case-insensitive, no
+  // closing `]` required), so an incomplete / case-varied / duplicate / smuggled start counts.
   const stderr = parseMergeConflictReason(reason)?.stderr ?? null;
-  // ACTOR FAMILY FIRST (the ordering fix). A single valid fence is authoritative.
+  const startCount =
+    stderr == null ? 0 : (stderr.match(CONFLICT_START_LOOSE)?.length ?? 0);
+  // ACTOR FAMILY FIRST (the ordering fix). EXACTLY ONE start + a valid strict tail fence is
+  // authoritative — parseConflictHeadFence itself enforces the exactly-one-start gate, so a
+  // consumer reaching the parser directly can never bypass this rule.
   if (parseConflictHeadFence(reason) != null) {
     return "actor-conflict";
   }
-  // Any `[conflict …]` token in the tail without a valid fence is malformed-actor —
-  // classified DISTINCTLY, never null-collapsed to legacy.
-  if (
-    stderr != null &&
-    (stderr.match(CONFLICT_MARKER_LOOSE)?.length ?? 0) > 0
-  ) {
+  // ANY actor-control start(s) that did NOT meet that exact condition (zero-close, case-varied,
+  // duplicated, or smuggled before a valid tail) is malformed-actor — DISTINCT from legacy,
+  // fail closed, never null-collapsed.
+  if (startCount > 0) {
     return "malformed-actor";
   }
-  // PENDING FAMILY SECOND.
+  // ZERO starts → PENDING FAMILY SECOND.
   if (isPendingIntegrationReason(reason)) {
     return parsePendingIntegrationHeads(reason) != null
       ? "pending"

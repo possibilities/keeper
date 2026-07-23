@@ -1735,6 +1735,23 @@ describe("classifyMergeConflictFence — the CLOSED fan-in fence-KIND discrimina
       ),
     ).toBe("legacy");
   });
+
+  test("START-count hardening — an INCOMPLETE / case-varied / smuggled-before-valid actor start → malformed-actor, and parseConflictHeadFence fails closed identically", () => {
+    // (a) An incomplete control START with NO closing `]` — counted as a start, no strict fence.
+    const missingClose = `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts [conflict src=oops`;
+    expect(classifyMergeConflictFence(missingClose)).toBe("malformed-actor");
+    expect(parseConflictHeadFence(missingClose)).toBeNull();
+    // (b) A CASE-VARIED start (`[CONFLICT …]`) — counted case-insensitively; the strict tail
+    //     grammar is case-sensitive, so no valid fence parses.
+    const upper = `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts [CONFLICT src=${src} target=${target} class=rib]`;
+    expect(classifyMergeConflictFence(upper)).toBe("malformed-actor");
+    expect(parseConflictHeadFence(upper)).toBeNull();
+    // (c) An INCOMPLETE start smuggled BEFORE the producer's valid tail fence — TWO starts, one
+    //     valid fence → the count is 2, so it classifies malformed-actor, never authoritative.
+    const smuggled = `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts [conflict oops ${buildConflictHeadFence(src, target, "rib")}`;
+    expect(classifyMergeConflictFence(smuggled)).toBe("malformed-actor");
+    expect(parseConflictHeadFence(smuggled)).toBeNull();
+  });
 });
 
 // ── Fold reason-precedence predicates ──────────────────────────────────────
