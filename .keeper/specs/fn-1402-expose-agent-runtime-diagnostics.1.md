@@ -64,5 +64,6 @@ The command is additive. Existing statusline rendering, `show-job`, query collec
 - [ ] Targeted Session, statusline, CLI registration, and Codex pool tests pass without a real daemon, subprocess, or fixed sleep.
 
 ## Done summary
-
+Added schema-v1 keeper session runtime CLI leaf publishing exact atomic runtime telemetry (subject scope, model/effort, raw context, freshness, route) separate from coalesced jobs telemetry; extended the Pi Codex companion to publish bounded PII-free scoped route observations on retry/fallback/scope-switch/retirement.
 ## Evidence
+- Commits: 123d614ecb109b219e8846d3b737a27477b5c069
