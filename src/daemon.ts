@@ -878,6 +878,61 @@ export function buildRetryDispatchResultMessage(args: {
   };
 }
 
+export interface HandoffDispatchingAdmissionRow {
+  status: string;
+  last_event_id: number | null;
+}
+
+export interface HandoffDispatchingAdmissionDeps {
+  insertMarker: () => number;
+  pump: () => void;
+  readProjection: (
+    handoffId: string,
+  ) => HandoffDispatchingAdmissionRow | null | undefined;
+  noteLine?: (line: string) => void;
+}
+
+function formatHandoffAdmissionError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Durable launch-admission fence for a handoff dispatch marker. The marker is
+ * inserted first, the reducer is pumped synchronously, and the folded projection
+ * decides whether this exact marker still owns launch authorization.
+ */
+export function admitHandoffDispatchingLaunch(
+  handoffId: string,
+  deps: HandoffDispatchingAdmissionDeps,
+): boolean {
+  let markerEventId: number;
+  try {
+    markerEventId = deps.insertMarker();
+  } catch (err) {
+    deps.noteLine?.(
+      `[keeperd] HandoffDispatching mint threw (non-fatal): ${formatHandoffAdmissionError(err)}`,
+    );
+    return false;
+  }
+  try {
+    deps.pump();
+  } catch (err) {
+    deps.noteLine?.(
+      `[keeperd] HandoffDispatching pump threw (non-fatal): ${formatHandoffAdmissionError(err)}`,
+    );
+    return false;
+  }
+  try {
+    const row = deps.readProjection(handoffId);
+    return row?.status === "dispatching" && row.last_event_id === markerEventId;
+  } catch (err) {
+    deps.noteLine?.(
+      `[keeperd] HandoffDispatching projection query threw (non-fatal): ${formatHandoffAdmissionError(err)}`,
+    );
+    return false;
+  }
+}
+
 /**
  * One-shot GC for orphaned `dispatch_failures` rows. A row whose composite
  * `${verb}::${id}` the `retry_dispatch` wire validator would reject is UN-retryable
@@ -13485,85 +13540,72 @@ function startDaemonWithExitAttribution(
   }
 
   /**
-   * Mint a synthetic `HandoffDispatching` event AND reply a durable
-   * `handoff-dispatching-ack{id, ok}`. The reducer's fold advances the matching
-   * `handoffs` row to `dispatching`, stamps `claimed_at` from the event ts (the
-   * lease anchor), and bumps `never_bound_count` (the breaker trips at K=3). The
-   * handoff_id rides the entity-key overload on `session_id` so a re-fold
-   * correlates it WITHOUT re-parsing `data`.
-   *
-   * DURABLE before launch: the worker AWAITS this ack BEFORE it launches, so the
-   * reply MUST fire on every path (`ok:true` once the insert lands, `ok:false`
-   * when it throws). The worker launches only on `ok:true`. NON-FATAL on insert
-   * failure. Mirrors {@link handleDispatchedMint}.
+   * Mint a synthetic `HandoffDispatching` event and reply with durable launch
+   * authorization. The worker awaits this ack before launch; `ok:true` means the
+   * inserted marker is folded and remains the current `dispatching` owner in the
+   * `handoffs` projection. Every insert/pump/query denial replies `ok:false`.
    */
   function handleHandoffDispatchingMint(msg: HandoffDispatchingMessage): void {
     const { id, payload } = msg;
-    const data = JSON.stringify(payload);
-    let ok = false;
-    try {
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: payload.handoff_id,
-        $pid: null,
-        $hook_event: "HandoffDispatching",
-        $event_type: "handoffs",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      ok = true;
-    } catch (err) {
-      console.error(
-        `[keeperd] HandoffDispatching mint threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
+    const ok = admitHandoffDispatchingLaunch(payload.handoff_id, {
+      insertMarker: () => {
+        const inserted = stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: payload.handoff_id,
+          $pid: null,
+          $hook_event: "HandoffDispatching",
+          $event_type: "handoffs",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify(payload),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+          $worktree: null,
+        });
+        return Number(inserted.lastInsertRowid);
+      },
+      pump: () => {
+        wakePending = true;
+        pumpWakes();
+      },
+      readProjection: (handoffId) =>
+        db
+          .query(
+            "SELECT status, last_event_id FROM handoffs WHERE handoff_id = ?",
+          )
+          .get(handoffId) as
+          | { status: string; last_event_id: number | null }
+          | undefined,
+      noteLine: (line) => console.error(line),
+    });
     // Reply on EVERY path — the worker is blocked awaiting this ack before it
-    // launches; a `false` reply tells it to abort. Reply IMMEDIATELY after the
-    // INSERT, BEFORE the (potentially slow) reducer pump. The `?.` keeps it
-    // null-safe on an unselected-handoff boot.
+    // launches; a `false` reply tells it to abort. The `?.` keeps it null-safe on
+    // an unselected-handoff boot.
     handoffWorkerInstance?.postMessage({
       type: "handoff-dispatching-ack",
       id,
       ok,
     } satisfies HandoffDispatchingAckMessage);
-    if (ok) {
-      try {
-        wakePending = true;
-        pumpWakes();
-      } catch (err) {
-        console.error(
-          `[keeperd] HandoffDispatching pump threw (non-fatal, ack already sent): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
   }
 
   /**

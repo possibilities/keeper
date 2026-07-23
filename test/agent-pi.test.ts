@@ -235,6 +235,66 @@ describe("Pi command assembly", () => {
     expect(flagValues(cmd, "--name")).toEqual([]);
   });
 
+  for (const [label, explicitNameArgv] of [
+    ["--name", ["--name", "handoff::slug"]],
+    ["--name=", ["--name=handoff::slug"]],
+    ["-n", ["-n", "handoff::slug"]],
+  ] as const) {
+    test(`explicit Pi names (${label}) preserve argv and publish the birth name`, async () => {
+      const h = piHarness(["--x-no-confirm", ...explicitNameArgv, "hello"]);
+      const cmd = await runAndCapture(h, main);
+      expect(cmd).toEqual(expect.arrayContaining(explicitNameArgv));
+      expect(
+        flagValues(cmd, "--name").length + flagValues(cmd, "-n").length,
+      ).toBe(1);
+      expect(h.birthIntents).toHaveLength(1);
+      expect(h.birthRecords).toHaveLength(1);
+      expect(h.birthIntents[0]?.spawn_name).toBe("handoff::slug");
+      expect(h.birthRecords[0]?.draft.spawn_name).toBe("handoff::slug");
+    });
+  }
+
+  test("a malformed explicit Pi name stays null and does not auto-name", async () => {
+    const h = piHarness(["--x-no-confirm", "--name=", "hello"]);
+    const cmd = await runAndCapture(h, main);
+    expect(cmd).toContain("--name=");
+    expect(flagValues(cmd, "--name")).toEqual([""]);
+    expect(
+      flagValues(cmd, "--name").length + flagValues(cmd, "-n").length,
+    ).toBe(1);
+    expect(h.birthIntents[0]?.spawn_name).toBeNull();
+    expect(h.birthRecords[0]?.draft.spawn_name).toBeNull();
+  });
+
+  test("a required Pi option value does not count as an explicit name", async () => {
+    const h = piHarness([
+      "--x-no-confirm",
+      "--append-system-prompt",
+      "--name=handoff::x",
+      "hello",
+    ]);
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--name")).toContain("proj-001");
+    expect(h.birthIntents[0]?.spawn_name).toBe("proj-001");
+    expect(h.birthRecords[0]?.draft.spawn_name).toBe("proj-001");
+  });
+
+  test("a later Pi name after bare -- is ignored", async () => {
+    const h = piHarness(["--x-no-confirm", "--", "--name=handoff::x", "hello"]);
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--name")).toContain("proj-001");
+    expect(h.birthIntents[0]?.spawn_name).toBe("proj-001");
+    expect(h.birthRecords[0]?.draft.spawn_name).toBe("proj-001");
+  });
+
+  test("a later Pi name after the positional prompt is ignored", async () => {
+    const h = piHarness(["--x-no-confirm", "hello", "--name=handoff::x"]);
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--name")).toContain("proj-001");
+    expect(h.birthIntents[0]?.spawn_name).toBe("proj-001");
+    expect(h.birthRecords[0]?.draft.spawn_name).toBe("proj-001");
+  });
+
   test("arms the keeper pi extension (-e) when the resolver yields flags", async () => {
     const h = piHarness(["--x-no-confirm", "hello"], {
       resolvePiExtensionArgs: () => ["-e", "/fake/keeper-events.ts"],

@@ -59,6 +59,24 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "proj-001",
     ]);
   });
+  test("a Claude required-value option value that looks like --name still generates a session name", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--add-dir", "--name=handoff::x", "hello"],
+      rawArgv: true,
+      randomUuid: () => UUID,
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(cmd).toEqual(
+      expect.arrayContaining([
+        "--add-dir",
+        "--name=handoff::x",
+        "--session-id",
+        UUID,
+        "--name",
+        "proj-001",
+      ]),
+    );
+  });
   test("--continue keeps the persisted session (no id/name injected)", async () => {
     const h = makeHarness({
       argv: ["claude", "--continue"],

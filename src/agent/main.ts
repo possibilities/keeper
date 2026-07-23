@@ -209,12 +209,14 @@ import {
   type VerbDeps,
 } from "./pair-subcommands";
 import {
+  CLAUDE_OPTIONS_WITH_REQUIRED_VALUE,
   findPassthroughCommand,
   findPiPassthroughCommand,
   hasExplicitEffortArg,
   hasExplicitModelArg,
   hasExplicitThinkingArg,
   modelArgValue,
+  PI_OPTIONS_WITH_REQUIRED_VALUE,
   piModelColonThinking,
   resolveStartupEffortOverride,
   resolveStartupModelOverride,
@@ -1298,6 +1300,52 @@ function isBinaryReachable(bin: string): boolean {
  */
 function hasFlagToken(args: string[], flag: string): boolean {
   return args.some((a) => a === flag || a.startsWith(`${flag}=`));
+}
+
+/** Resolve the active harness's top-level explicit session name, if one is actually present. */
+function resolveExplicitSessionName(
+  agent: AgentKind,
+  args: string[],
+): { hasExplicitName: boolean; explicitSessionName: string | null } {
+  const requiredValueOptions =
+    agent === "claude"
+      ? CLAUDE_OPTIONS_WITH_REQUIRED_VALUE
+      : PI_OPTIONS_WITH_REQUIRED_VALUE;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "--" || arg === "-" || !arg.startsWith("-")) {
+      break;
+    }
+
+    if (arg === "--name" || arg === "-n") {
+      const value = args[i + 1];
+      return {
+        hasExplicitName: true,
+        explicitSessionName: value !== undefined && value !== "" ? value : null,
+      };
+    }
+    if (arg.startsWith("--name=")) {
+      const value = arg.slice("--name=".length);
+      return {
+        hasExplicitName: true,
+        explicitSessionName: value !== "" ? value : null,
+      };
+    }
+    if (arg.startsWith("-n=")) {
+      const value = arg.slice("-n=".length);
+      return {
+        hasExplicitName: true,
+        explicitSessionName: value !== "" ? value : null,
+      };
+    }
+
+    const joinedValue = arg.indexOf("=");
+    const option = joinedValue === -1 ? arg : arg.slice(0, joinedValue);
+    if (requiredValueOptions.has(option)) {
+      i += joinedValue === -1 ? 1 : 0;
+    }
+  }
+  return { hasExplicitName: false, explicitSessionName: null };
 }
 
 const CODEX_POOL_PROOF_WINDOW_FLAG = "--x-codex-pool-proof-window=arm";
@@ -4906,13 +4954,13 @@ export async function main(deps: MainDeps): Promise<never> {
   // A fresh launch OR a fork needs a fresh --name (a fork mints a new session
   // id; plain --resume/--continue keeps its persisted title and is excluded).
   const wantSessionName = sessionUuid !== null || hasForkSession;
+  const { hasExplicitName, explicitSessionName } = resolveExplicitSessionName(
+    agent,
+    remainingArgs,
+  );
   // Captured for the pi birth record's spawn_name (display title).
-  let resolvedSessionName: string | null = null;
-  if (
-    wantSessionName &&
-    !remainingArgs.includes("-n") &&
-    !hasFlagToken(remainingArgs, "--name")
-  ) {
+  let resolvedSessionName: string | null = explicitSessionName;
+  if (wantSessionName && !hasExplicitName) {
     const { sessionName, resolvedSlug } = resolveLaunchSessionName(
       remainingArgs,
       deps.cwd,
