@@ -90,6 +90,15 @@ test("Panel cancellation owns exact teardown without a manual reap", async () =>
     attempt: 1,
   });
 
+  // The CURRENT trusted tmux binary this process would execute, injected so the
+  // teardown is host-independent and the test controls the rebinding target.
+  // Deliberately DIFFERENT from the persisted argv0 below.
+  const trustedTmuxBin = "/injected/trusted/bin/tmux";
+  deps.tmuxBin = trustedTmuxBin;
+
+  // The persisted run-control kill argv. Its argv0 (`/opt/tmux`) is a stale filename
+  // that MUST NOT be executed; only the socket + window-target tail is trusted data
+  // that rides through the rebinding unchanged.
   const exactCommand = [
     "/opt/tmux",
     "-S",
@@ -135,7 +144,13 @@ test("Panel cancellation owns exact teardown without a manual reap", async () =>
   };
 
   expect(await panelCancel({ dir, cleanupMs: 10 }, deps)).toBe(0);
-  expect(tmuxCalls).toEqual([exactCommand]);
+  // The rebinding proof: exactly one teardown, whose argv0 is the INJECTED trusted
+  // binary (NOT the persisted `/opt/tmux`), with the persisted socket/target tail
+  // carried through byte-for-byte.
+  expect(tmuxCalls).toEqual([[trustedTmuxBin, ...exactCommand.slice(1)]]);
+  expect(tmuxCalls[0]?.[0]).toBe(trustedTmuxBin);
+  expect(tmuxCalls[0]?.[0]).not.toBe(exactCommand[0]);
+  expect(tmuxCalls[0]?.slice(1)).toEqual(exactCommand.slice(1));
   expect(JSON.parse(readFileSync(attempt.control.path, "utf8"))).toMatchObject({
     status: "terminal",
   });
