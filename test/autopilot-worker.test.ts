@@ -79,6 +79,7 @@ import {
   commitsAheadOfOrigin,
   computeBaseDriftEntries,
   computeCloseRecoveryEligibleIds,
+  type AssignmentWorktreeReadiness,
   computeDeferredEpicIds,
   computeDeferredSiblingSources,
   computeDuplicateEpicNumberGroups,
@@ -23824,6 +23825,62 @@ function cascadeEpic(phases: {
 
 const CASCADE_BASE = "keeper/epic/fn-1-foo";
 const CASCADE_RIB3 = "keeper/epic/fn-1-foo--fn-1-foo.3";
+const CASCADE_RIB4 = "keeper/epic/fn-1-foo--fn-1-foo.4";
+
+/** Injected assignment-worktree readiness stubs (the seam is separate from the git
+ *  runner, so tests drive it directly without faking every `mergeReadiness` command). */
+const ALWAYS_READY = async (): Promise<AssignmentWorktreeReadiness> => ({
+  kind: "ready",
+});
+const readinessStub =
+  (verdict: AssignmentWorktreeReadiness) =>
+  async (): Promise<AssignmentWorktreeReadiness> =>
+    verdict;
+
+/**
+ * A rule-driven git runner for an EXISTING-lane sibling-source probe: like
+ * {@link siblingGit} but the ancestry rule is keyed on the (ancestor, descendant) PAIR
+ * so a rib probed against DIFFERENT targets (its own lane branch vs the epic base) can
+ * differ. `ancestorPairs` are the `[ancestor, descendant]` probes that return exit 0;
+ * reflexivity (`X` ancestor of `X`) is always true; everything else exits 1 (or the
+ * 124 timeout sentinel).
+ */
+function existingLaneGit(opts: {
+  lanes?: string[];
+  enumError?: boolean;
+  ancestorPairs?: Array<[string, string]>;
+  ancestryTimeout?: boolean;
+}): ReturnType<typeof fakeAsyncGit> {
+  const rules: FakeGitRule[] = [];
+  rules.push({
+    when: (a) =>
+      argvStartsWith(a, "for-each-ref") && argvHas(a, "refs/heads/keeper/epic"),
+    result: opts.enumError
+      ? { exitCode: 1 }
+      : { exitCode: 0, stdout: (opts.lanes ?? []).join("\n") },
+  });
+  rules.push({
+    when: (a) =>
+      argvStartsWith(a, "merge-base", "--is-ancestor") && a[2] === a[3],
+    result: { exitCode: 0 },
+  });
+  for (const [anc, desc] of opts.ancestorPairs ?? []) {
+    rules.push({
+      when: (a) =>
+        argvStartsWith(a, "merge-base", "--is-ancestor") &&
+        a[2] === anc &&
+        a[3] === desc,
+      result: { exitCode: 0 },
+    });
+  }
+  rules.push({
+    when: (a) => argvStartsWith(a, "merge-base", "--is-ancestor"),
+    result: opts.ancestryTimeout
+      ? { exitCode: GIT_SPAWN_TIMEOUT_CODE }
+      : { exitCode: 1 },
+  });
+  return fakeAsyncGit(rules);
+}
 
 test("computeDeferredSiblingSources: a DONE sibling rib PRESENT ∧ NOT an ancestor of the dependent's assignment base → DEFERS naming that rib", async () => {
   const epic = cascadeEpic({});
@@ -23937,8 +23994,10 @@ test("computeDeferredSiblingSources: a dependent INHERITING a done sibling's own
       }),
     ],
   });
-  // `.2b`'s rib is present but NOT an ancestor of the epic base; a generic-epic-base
-  // gate would falsely defer `.3`. The correct assignment base for `.3` is `.2b`'s rib.
+  // `.2b`'s rib is present (the lane `.3` INHERITS) but NOT an ancestor of the epic
+  // base; a generic-epic-base gate would falsely defer `.3`. The correct assignment base
+  // for `.3` is `.2b`'s own rib — an ancestor of itself (reflexivity). `.3`'s inherited
+  // worktree is READY.
   const { run } = siblingGit({
     lanes: [
       CASCADE_BASE,
@@ -23951,6 +24010,8 @@ test("computeDeferredSiblingSources: a dependent INHERITING a done sibling's own
     [epic],
     classifyIdentity([epic]),
     run,
+    undefined,
+    ALWAYS_READY,
   );
   expect(deferred.has("fn-1-foo.3")).toBe(false);
 });
@@ -24006,6 +24067,171 @@ test("reconcile end-to-end: the sibling-source gate WITHHOLDS the .4-cascade dep
   expect(
     freed.launches.some((l) => l.verb === "work" && l.id === "fn-1-foo.4"),
   ).toBe(true);
+});
+
+test("computeDeferredSiblingSources: EXISTING assignment lane — a done rib in the EPIC BASE but NOT in the lane's OWN already-cut branch → STILL DEFERS (the two-step miss)", async () => {
+  // `.4`'s lane is ALREADY CUT (its rib is enumerated). `.3` is DONE and its rib is an
+  // ancestor of the EPIC BASE — but `.4`'s branch was forked before `.3` landed, so `.3`
+  // is NOT an ancestor of `.4`'s OWN branch. The gate must measure against the actual
+  // already-cut lane branch, never the fork source or the base — else it clears a lane
+  // that is still stale (the witnessed two-step miss).
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_BASE]], // rib3 in the base, NOT in rib4
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.get("fn-1-foo.4")).toBe(CASCADE_RIB3);
+});
+
+test("computeDeferredSiblingSources: EXISTING assignment lane — only the rib becoming an ancestor of the lane's OWN branch clears the gate", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [
+      [CASCADE_RIB3, CASCADE_BASE],
+      [CASCADE_RIB3, CASCADE_RIB4], // now integrated into the lane itself
+    ],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(false);
+});
+
+test("computeDeferredSiblingSources: EXISTING lane whose branch CONTAINS the rib but whose WORKTREE is stale → STILL WITHHELD (branch content alone never clears)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]], // the rib IS in the lane branch
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    readinessStub({ kind: "not-ready", detail: "dirty: M src/foo.ts" }),
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true); // held on the stale worktree
+});
+
+test("computeDeferredSiblingSources: EXISTING lane with rib contained AND a clean synchronized worktree → released", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(false);
+});
+
+test("computeDeferredSiblingSources: EXISTING lane with an UNKNOWN/missing worktree → DEFERS (never clears on branch evidence alone)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]], // even though the branch contains it
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    readinessStub({ kind: "unknown", detail: "assignment worktree absent" }),
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+});
+
+test("computeDeferredSiblingSources: a done sibling's STATUS never satisfies the gate — only ancestry does (no task-status escape)", async () => {
+  // `.3` is `worker_phase === "done"` yet its rib is NOT an ancestor of the derived base.
+  // Done status is not evidence; the gate defers on ancestry alone.
+  const epic = cascadeEpic({}); // .1/.2/.3 done, .4 open
+  const { run } = siblingGit({ lanes: [CASCADE_BASE, CASCADE_RIB3], contained: [] });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+  );
+  expect(deferred.get("fn-1-foo.4")).toBe(CASCADE_RIB3);
+});
+
+test("computeDeferredSiblingSources: a CLUSTERED multi-repo epic gates a dependent in its worktree group (done sibling rib not yet in the group base)", async () => {
+  // The `.4` cascade shape lives in the /r1 group; a lone /r2 task makes the epic
+  // clustered. The gate must still hold /r1's dependent — a multi-repo epic's dependents
+  // need the gate too.
+  const epic = makeEpic({
+    epic_id: "fn-2-multi",
+    project_dir: "/r1",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-multi.1",
+        epic_id: "fn-2-multi",
+        task_number: 1,
+        target_repo: "/r1",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-2-multi.2",
+        epic_id: "fn-2-multi",
+        task_number: 2,
+        target_repo: "/r1",
+        worker_phase: "done",
+        depends_on: ["fn-2-multi.1"],
+      }),
+      makeTask({
+        task_id: "fn-2-multi.3",
+        epic_id: "fn-2-multi",
+        task_number: 3,
+        target_repo: "/r1",
+        worker_phase: "done",
+        depends_on: ["fn-2-multi.1", "fn-2-multi.2"],
+      }),
+      makeTask({
+        task_id: "fn-2-multi.4",
+        epic_id: "fn-2-multi",
+        task_number: 4,
+        target_repo: "/r1",
+        worker_phase: "open",
+        depends_on: ["fn-2-multi.1", "fn-2-multi.2", "fn-2-multi.3"],
+      }),
+      makeTask({
+        task_id: "fn-2-multi.5",
+        epic_id: "fn-2-multi",
+        task_number: 5,
+        target_repo: "/r2",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  // `.4`'s lane is pre-cut (rib absent), so its target is the /r1 group base; `.3`'s rib
+  // is present but not yet an ancestor of that base → the dependent is gated.
+  const { run } = existingLaneGit({
+    lanes: ["keeper/epic/fn-2-multi", "keeper/epic/fn-2-multi--fn-2-multi.3"],
+    ancestorPairs: [],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyMultiRepo([epic]),
+    run,
+  );
+  expect(deferred.get("fn-2-multi.4")).toBe(
+    "keeper/epic/fn-2-multi--fn-2-multi.3",
+  );
 });
 
 // ---------------------------------------------------------------------------
