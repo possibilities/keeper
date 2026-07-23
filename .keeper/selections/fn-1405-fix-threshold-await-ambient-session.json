@@ -1,0 +1,26 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fixed-shape edit routing the runtime-slot subject through an existing resolveSessionId helper across explicitly named files (cli/await.ts plus a test), with the invariant to preserve already fully specified rather than derived, and medium band covers wiring the real env->leaf-key test.",
+      "spark_exclusion": null,
+      "spark_fit": true,
+      "task_id": "fn-1405-fix-threshold-await-ambient-session.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-23T03:08:28.726000Z",
+  "epic_id": "fn-1405-fix-threshold-await-ambient-session",
+  "input_hash": "54a74fe6b4825a1926bfa8ba5a6c3e5e826207612493e617ec92bd493f9c7db8",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1420251110,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fixed-shape edit routing the runtime-slot subject through an existing resolveSessionId helper across explicitly named files (cli/await.ts plus a test), with the invariant to preserve already fully specified rather than derived, and medium band covers wiring the real env->leaf-key test.\",\"confidence\":0.72,\"spark_fit\":true,\"spark_exclusion\":null}]}\n"
+}
