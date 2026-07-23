@@ -1961,6 +1961,16 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             flags: [FLAG_JSON_ALIAS],
           },
           {
+            name: "recover",
+            summary:
+              "Retry one token-expired Claude account and verify fresh routing evidence",
+            visibility: "public",
+            mutates: true,
+            requires_daemon: false,
+            requires_tty: false,
+            flags: [FLAG_JSON_ALIAS],
+          },
+          {
             name: "codex-pool",
             summary:
               "Enroll aliases and operate proof-gated Codex pool activation",

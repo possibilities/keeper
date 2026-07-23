@@ -33,6 +33,7 @@ export type Dispatch =
   | { kind: "providers-check" }
   // Read-only claude-swap account-routing diagnostics.
   | { kind: "accounts-check"; json: boolean }
+  | { kind: "accounts-recover"; ordinal: number; json: boolean }
   | {
       kind: "accounts-codex-pool";
       operation:
@@ -98,6 +99,8 @@ Usage:
   keeper agent presets list [--json]   List configured presets + panels.
   keeper agent accounts check [--json] Report separate Claude launch-routing and
                                     Codex session-routing health (read-only).
+  keeper agent accounts recover cN [--json]
+                                    Retry one token-expired Claude account.
   keeper agent accounts codex-pool enroll <opaque-alias>
   keeper agent accounts codex-pool status|verify|rollback|recover [--json]
   keeper agent accounts codex-pool proof capture <report> [--json]
@@ -250,6 +253,12 @@ Account routing:
                                     the policy would choose for the next Claude
                                     launch — read-only, reserves nothing. A
                                     Claude launch fails if none is routeable.
+  keeper agent accounts recover cN [--json]
+                                    Force inventory, retry only a token-expired
+                                    account, then require fresh healthy route
+                                    evidence. Creates no Keeper Launch
+                                    reservation or Harness session;
+                                    claude-swap starts a bounded Claude canary.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.
@@ -467,6 +476,25 @@ export function splitSubcommand(argv: string[]): Dispatch {
         return { kind: "usage", unknown: "accounts check" };
       }
       return { kind: "accounts-check", json: rest.includes("--json") };
+    }
+    if (argv[1] === "recover") {
+      const label = argv[2];
+      const rest = argv.slice(3);
+      const match = label === undefined ? null : /^c(0|[1-9]\d*)$/u.exec(label);
+      const ordinal = match === null ? Number.NaN : Number(match[1]);
+      if (
+        match === null ||
+        !Number.isSafeInteger(ordinal) ||
+        rest.length > 1 ||
+        (rest.length === 1 && rest[0] !== "--json")
+      ) {
+        return { kind: "usage", unknown: "accounts recover" };
+      }
+      return {
+        kind: "accounts-recover",
+        ordinal,
+        json: rest[0] === "--json",
+      };
     }
     if (argv[1] === "codex-pool") {
       const verb = argv[2];

@@ -19,6 +19,11 @@ import {
   type TryAcquireRefreshLock,
 } from "./account-observation-refresh";
 import {
+  type RecoveryStateStore,
+  runAutomaticAccountRecovery,
+  type TryAcquireRecoveryLock,
+} from "./account-recovery";
+import {
   cswapListArgv,
   OBSERVATION_FRESHNESS_CEILING_MS,
   OBSERVE_INTERVAL_MS,
@@ -90,6 +95,9 @@ export interface AccountObserverDeps {
   tryAcquireLock?: TryAcquireRefreshLock;
   contentionWaitMs?: number;
   contentionTimeoutMs?: number;
+  cswapBin?: string;
+  tryAcquireRecoveryLock?: TryAcquireRecoveryLock;
+  recoveryStateStore?: RecoveryStateStore;
   /** Bounded diagnostic sink; defaults to worker stderr. */
   logLine?: (message: string) => void;
 }
@@ -103,19 +111,57 @@ export class AccountObserver {
   constructor(private readonly deps: AccountObserverDeps) {}
 
   async runCycleNoThrow(): Promise<void> {
-    try {
-      const result = await runProviderSafeRefresh({
+    const refresh = (
+      force: boolean,
+      requireOwnedCall: boolean = false,
+    ): Promise<RefreshResult> =>
+      runProviderSafeRefresh({
         stateDir: this.deps.stateDir,
         runner: this.deps.runner,
         nowMs: this.deps.clock.nowMs,
         maxAgeMs: Math.max(0, OBSERVE_INTERVAL_MS - 1),
         cswapArgv: this.deps.cswapArgv,
+        signal: this.deps.shutdownSignal,
         tryAcquireLock: this.deps.tryAcquireLock,
         contentionWaitMs: this.deps.contentionWaitMs,
         contentionTimeoutMs: this.deps.contentionTimeoutMs,
         sleep: (ms) => this.deps.clock.sleep(ms, this.deps.shutdownSignal),
+        force,
+        requireOwnedCall,
       });
-      this.noteCadence(result);
+    try {
+      // Every cadence starts by publishing current Capacity. Recovery output is
+      // never allowed to stand in for this observation.
+      const first = await refresh(true);
+      this.noteCadence(first);
+      if (
+        this.deps.shutdownSignal.aborted ||
+        first.outcome === "contended" ||
+        first.observation === null
+      ) {
+        return;
+      }
+      try {
+        const recovery = await runAutomaticAccountRecovery(first.observation, {
+          stateDir: this.deps.stateDir,
+          runner: this.deps.runner,
+          nowMs: this.deps.clock.nowMs,
+          forceRefresh: ({ requireOwnedCall }) =>
+            refresh(true, requireOwnedCall),
+          cswapBin: this.deps.cswapBin,
+          signal: this.deps.shutdownSignal,
+          tryAcquireRecoveryLock: this.deps.tryAcquireRecoveryLock,
+          stateStore: this.deps.recoveryStateStore,
+        });
+        if (recovery !== null && !recovery.ok) {
+          this.log(
+            `[account-observer] automatic recovery ${recovery.account}: ` +
+              `${recovery.outcome}`,
+          );
+        }
+      } catch {
+        this.log("[account-observer] automatic recovery failed (non-fatal)");
+      }
     } catch (err) {
       this.log(
         `[account-observer] cycle threw (non-fatal): ${stringifyErr(err)}`,
@@ -215,28 +261,33 @@ function main(): void {
     clock: REAL_OBSERVER_CLOCK,
     shutdownSignal: shutdownController.signal,
     cswapArgv: cswapListArgv(cswapBin),
+    cswapBin,
   });
-  observer
-    .run()
+  const loop = observer.run();
+
+  parentPort.on("message", (msg: { type?: string } | undefined) => {
+    if (msg?.type === "shutdown") {
+      // The runner owns the provider child. Abort it, close the parent channel,
+      // and let the loop join the child before this Worker exits naturally.
+      shutdownController.abort();
+      parentPort?.close();
+    }
+  });
+
+  loop
     .then(() => {
       if (!shutdownController.signal.aborted) {
         console.error("[account-observer] loop settled unexpectedly");
-        process.exit(1);
+        process.exitCode = 1;
       }
     })
     .catch((err) => {
       console.error(
         `[account-observer] loop threw unexpectedly: ${stringifyErr(err)}`,
       );
-      process.exit(1);
+      process.exitCode = 1;
+      parentPort?.close();
     });
-
-  parentPort.on("message", (msg: { type?: string } | undefined) => {
-    if (msg?.type === "shutdown") {
-      shutdownController.abort();
-      process.exit(0);
-    }
-  });
 }
 
 if (!isMainThread) main();

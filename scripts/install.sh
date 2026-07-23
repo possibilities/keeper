@@ -323,7 +323,7 @@ unset -f retire_keeper_codexbar_cli
 #     the existing tool untouched and notifies the operator; an unrebased tree
 #     is never installed.
 claude_swap_fork="${HOME}/src/possibilities--claude-swap"
-claude_swap_branch="feat/json-account-capacity-metadata"
+claude_swap_branch="integration/keeper"
 claude_swap_origin="https://github.com/possibilities/claude-swap.git"
 claude_swap_upstream="https://github.com/realiti4/claude-swap.git"
 claude_swap_notify() {

@@ -96,7 +96,7 @@ export interface Observation {
   notes: string[];
 }
 
-export type ProviderRunFailure = "timeout" | "spawn";
+export type ProviderRunFailure = "timeout" | "spawn" | "aborted" | "oversize";
 
 export interface ProviderRunOutcome {
   code: number | null;

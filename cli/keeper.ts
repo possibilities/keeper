@@ -375,12 +375,12 @@ export const COMPLETION_RESPONDER = "complete";
 
 /**
  * Build a throwaway Clerc CLI whose command tree mirrors keeper's public surface
- * — every SUBCOMMAND plus each two-level verb registered as a `"<name> <verb>"`
- * nested command — wired to the completions plugin. It exists ONLY to generate
- * completion scripts and serve the hidden responder; it is never a dispatch
- * path. That separation is deliberate: registering the verbs as nested commands
- * (which would break `buildKeeperCli`'s residual pass-through) is safe here and
- * is exactly what lets the responder suggest `keeper plan <verb>`. `completions`
+ * — every SUBCOMMAND plus every recursively nested descriptor verb registered
+ * by its full command path — wired to the completions plugin. It exists ONLY to
+ * generate completion scripts and serve the hidden responder; it is never a
+ * dispatch path. That separation is deliberate: registering the verbs as nested
+ * commands (which would break `buildKeeperCli`'s residual pass-through) is safe
+ * here and lets the responder suggest every documented verb depth. `completions`
  * is skipped — the plugin registers that command (and the hidden `complete`)
  * itself, so both surface as candidates without a double registration.
  *
@@ -391,24 +391,26 @@ export const COMPLETION_RESPONDER = "complete";
  * their dispatchable reality.
  */
 export function buildCompletionCli(version: string): Clerc {
+  const commandAtEveryDepth = (
+    command: CommandDescriptor,
+    parentPath: readonly string[] = [],
+  ): ReturnType<typeof defineCommand>[] => {
+    const path = [...parentPath, command.name];
+    const fullName = path.join(" ");
+    return [
+      defineCommand({
+        name: fullName,
+        description:
+          command.summary === command.name ? fullName : command.summary,
+      }),
+      ...(command.verbs ?? []).flatMap((verb) =>
+        commandAtEveryDepth(verb, path),
+      ),
+    ];
+  };
   const commands = mergedCommandTree()
-    .filter((c) => c.name !== "completions")
-    .flatMap((c) => {
-      const parent = defineCommand({
-        name: c.name,
-        description: c.summary,
-      });
-      const verbs = (c.verbs ?? []).map((verb) =>
-        defineCommand({
-          name: `${c.name} ${verb.name}`,
-          description:
-            verb.summary === verb.name
-              ? `${c.name} ${verb.name}`
-              : verb.summary,
-        }),
-      );
-      return [parent, ...verbs];
-    });
+    .filter((command) => command.name !== "completions")
+    .flatMap((command) => commandAtEveryDepth(command));
   return Clerc.create({ name: "keeper", scriptName: "keeper", version })
     .command(commands)
     .use(completionsPlugin());

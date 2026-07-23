@@ -11,6 +11,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { AccountRecoveryResult } from "../../src/account-recovery";
 import type {
   RequestedRouteResolution,
   RouteResolution,
@@ -239,6 +240,7 @@ export interface HarnessOptions {
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: (fableIntent?: boolean | null) => HarnessRoutingInspection;
+  recoverAccount?: (ordinal: number) => Promise<AccountRecoveryResult>;
   resolveFableIntent?: (target: string) => Promise<boolean | null>;
   setFableFocus?: MainDeps["setFableFocusFn"];
   setNonFableFocus?: MainDeps["setNonFableFocusFn"];
@@ -532,6 +534,16 @@ export function makeHarness(opts: HarnessOptions): Harness {
         ...inspection,
       };
     },
+    recoverAccountFn:
+      opts.recoverAccount ??
+      (async (ordinal) => ({
+        schema_version: 1,
+        operation: "recover",
+        account: `c${ordinal}`,
+        outcome: "recovery-unverified",
+        ok: false,
+        problem_code: "observation-unavailable",
+      })),
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),
     cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",

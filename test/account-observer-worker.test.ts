@@ -13,6 +13,11 @@ import {
   providerSubprocessEnvironment,
 } from "../src/account-observer-worker";
 import {
+  createFileRecoveryStateStore,
+  type RecoveryState,
+  type RecoveryStateStore,
+} from "../src/account-recovery";
+import {
   OBSERVATION_SCHEMA_VERSION,
   observationSidecarPath,
 } from "../src/account-routing-config";
@@ -57,6 +62,17 @@ function fakeLock(): { release(): void } {
   return { release() {} };
 }
 
+function memoryRecoveryStateStore(): RecoveryStateStore {
+  let state: RecoveryState = { schema_version: 1, slots: {} };
+  return {
+    read: () => structuredClone(state),
+    mutate: (update) => {
+      const next = structuredClone(state);
+      if (update(next)) state = next;
+    },
+  };
+}
+
 describe("AccountObserver", () => {
   test("one cycle fetches cswap and publishes a managed-only current sidecar", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
@@ -79,6 +95,61 @@ describe("AccountObserver", () => {
         "claude-swap:3",
       ]);
       expect(JSON.stringify(observation)).not.toContain("default");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("publishes list, recovers one expired slot, then publishes forced verification", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
+    try {
+      const calls: string[][] = [];
+      let lists = 0;
+      const observer = new AccountObserver({
+        stateDir: dir,
+        runner: async (argv) => {
+          calls.push(argv);
+          if (argv[1] === "recover") {
+            return {
+              code: 0,
+              stdout: JSON.stringify({
+                schemaVersion: 1,
+                operation: "recover",
+                accountNumber: 3,
+                recoveryStatus: "recovered",
+              }),
+            };
+          }
+          lists += 1;
+          if (lists <= 2) {
+            return {
+              code: 0,
+              stdout: JSON.stringify({
+                schemaVersion: 1,
+                accounts: [{ number: 3, usageStatus: "token_expired" }],
+              }),
+            };
+          }
+          return outcome();
+        },
+        clock: { nowMs: () => NOW_MS, uniform: () => 0, sleep: async () => {} },
+        shutdownSignal: new AbortController().signal,
+        cswapArgv: CSWAP_ARGV,
+        cswapBin: "CSWAP",
+        tryAcquireLock: () => fakeLock(),
+        tryAcquireRecoveryLock: () => fakeLock(),
+        recoveryStateStore: memoryRecoveryStateStore(),
+      });
+      await observer.runCycleNoThrow();
+      expect(calls).toEqual([
+        CSWAP_ARGV,
+        CSWAP_ARGV,
+        ["CSWAP", "recover", "3", "--json"],
+        CSWAP_ARGV,
+      ]);
+      expect(
+        readObservationSidecar(observationSidecarPath(dir))?.routes[0]?.id,
+      ).toBe("claude-swap:3");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -109,6 +180,82 @@ describe("AccountObserver", () => {
       await observer.runCycleNoThrow();
       expect(sleeps).toBe(1);
       expect(readObservationSidecar(observationSidecarPath(dir))).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("held recovery-state lock defers without blocking worker shutdown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
+    try {
+      const controller = new AbortController();
+      let calls = 0;
+      let stateLockAttempts = 0;
+      const observer = new AccountObserver({
+        stateDir: dir,
+        runner: async () => {
+          calls += 1;
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              schemaVersion: 1,
+              accounts: [{ number: 3, usageStatus: "token_expired" }],
+            }),
+          };
+        },
+        clock: { nowMs: () => NOW_MS, uniform: () => 0, sleep: async () => {} },
+        shutdownSignal: controller.signal,
+        cswapArgv: CSWAP_ARGV,
+        tryAcquireLock: () => fakeLock(),
+        tryAcquireRecoveryLock: () => fakeLock(),
+        recoveryStateStore: createFileRecoveryStateStore(dir, () => {
+          stateLockAttempts += 1;
+          return null;
+        }),
+        logLine: () => {},
+      });
+      await observer.runCycleNoThrow();
+      controller.abort();
+      expect(calls).toBe(1);
+      expect(stateLockAttempts).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("shutdown aborts the in-flight provider call and lets the loop settle", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
+    try {
+      const controller = new AbortController();
+      let started: (() => void) | undefined;
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let receivedSignal: AbortSignal | undefined;
+      const observer = new AccountObserver({
+        stateDir: dir,
+        runner: async (_argv, signal) => {
+          receivedSignal = signal;
+          started?.();
+          await new Promise<void>((resolve) =>
+            signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          return { code: null, stdout: "", failure: "aborted" };
+        },
+        clock: { nowMs: () => NOW_MS, uniform: () => 0, sleep: async () => {} },
+        shutdownSignal: controller.signal,
+        cswapArgv: CSWAP_ARGV,
+        tryAcquireLock: () => fakeLock(),
+        logLine: () => {},
+      });
+      const running = observer.run();
+      await entered;
+      controller.abort();
+      await running;
+      expect(receivedSignal).toBe(controller.signal);
+      expect(readObservationSidecar(observationSidecarPath(dir))?.health).toBe(
+        "absent",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

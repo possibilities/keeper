@@ -507,12 +507,18 @@ function quotaResetSuffix(
     : "";
 }
 
-function issueMessage(issue: LaunchRouteIssue, route: Route | null): string {
+function issueMessage(
+  issue: LaunchRouteIssue,
+  route: Route | null,
+  ordinal?: number,
+): string {
   switch (issue) {
     case "relogin-required":
       return "needs sign-in again";
     case "token-expired":
-      return "has an expired token";
+      return ordinal === undefined
+        ? "has an expired token; keeperd recovery retries automatically"
+        : `has an expired token; keeperd recovery retries automatically, or run \`keeper agent accounts recover c${ordinal}\``;
     case "keychain-unavailable":
       return "credentials are unavailable";
     case "no-credentials":
@@ -581,7 +587,7 @@ function accountFailureDetail(
     ? routeIssues(route, model, fableIntent)
     : [observation.account_issues[routeId] ?? "account-unavailable"];
   return `c${ordinal}: ${issues
-    .map((issue) => issueMessage(issue, route ?? null))
+    .map((issue) => issueMessage(issue, route ?? null, ordinal))
     .join(", ")}`;
 }
 

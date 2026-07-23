@@ -149,6 +149,23 @@ CLI-usage errors (bad args) stay on stderr at exit 2, off the envelope.
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                                                                                                       | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.                 | Retry; if it persists, confirm the daemon and CLI are the same version.                                                                                                                   | conditional       |
 
+## Claude Account recovery (`keeper agent accounts recover cN`)
+
+The version-1 result is bounded and PII-free:
+`{schema_version, operation, account, outcome, ok, problem_code}`. Exit 0 requires a fresh healthy route;
+exit 1 is an operational failure; exit 2 means the current inventory label cannot accept recovery. The
+command creates no Keeper Launch reservation or Harness session. claude-swap recovery intentionally
+starts one bounded Claude canary.
+
+| outcome / code | meaning | recovery | retry-safe |
+| --- | --- | --- | --- |
+| `recovered`, `not-needed` with `ok:true` | An owned post-recovery Capacity observation contains the exact healthy route, or the first owned observation already did. | Continue through normal routing; the command itself creates no Keeper Launch reservation. | no retry needed |
+| `retry-later` | claude-swap declines this request temporarily. | Let keeperd automatic backoff run, or retry explicitly when justified. | yes, but respect backoff |
+| `human-required` | claude-swap requires owner credential repair and automatic retries are suppressed. | Repair the credential in claude-swap, then inspect or explicitly retry the same current `cN`. | deliberate |
+| `tool-failure`, `recovery-busy` | The bounded tool call failed, or another attempt owns the account lock. | Confirm `cswap list --json` works; let the owner finish before retrying. | yes after repair/contention |
+| `recovery-unverified`, `route-unverified` | An owned preflight, revalidation, or post-recovery Capacity boundary did not prove the required fresh route state. | Trust `accounts check --json`, not recovery stdout; wait for healthy Capacity or repair the remaining account issue. | yes after new evidence |
+| `observation-unavailable`, `account-not-found`, `account-not-token-expired` | Fresh inventory cannot resolve the label, or its current issue is not token expiry. | Refresh inventory and use the current label; repair other issues through claude-swap rather than forcing recovery. | `account-not-*`: no unchanged retry |
+
 ## Pi Codex pool (`keeper agent accounts codex-pool`)
 
 The Codex workflow uses a bounded version-1 JSON result with

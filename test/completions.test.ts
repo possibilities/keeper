@@ -126,6 +126,15 @@ describe("completions are generated from the descriptor tree (ADR 0008)", () => 
     }
   });
 
+  test("agent accounts TAB includes the recovery leaf", async () => {
+    const values = candidateValues(
+      await completionResponder(["agent", "accounts", ""], VERSION),
+    );
+    expect(values).toContain("check");
+    expect(values).toContain("recover");
+    expect(values).toContain("codex-pool");
+  });
+
   test("plan TAB enumerates the PLAN plugin descriptor's verbs (merged, not restated)", async () => {
     // The `plan` node carries no verbs in NATIVE_COMMANDS; its completion
     // candidates are merged live from plugins/plan/src/descriptor.ts.

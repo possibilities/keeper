@@ -62,7 +62,7 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 ### Claude account routing and Account focuses
 
-Claude launches require the `feat/json-account-capacity-metadata` branch of the
+Claude launches require the `integration/keeper` branch of the
 [`possibilities/claude-swap`](https://github.com/possibilities/claude-swap) fork. The installer keeps its
 checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, rebases the
 clean integration branch onto `upstream/main`, attempts to republish it with force-with-lease, then installs
@@ -71,11 +71,15 @@ installation and sends a best-effort `notifyctl` alert rather than installing un
 `uv`, a failed sync, or a failed installation is nonfatal to Keeper's non-Claude surfaces, but Claude
 remains unavailable until `cswap` works and at least one account is registered.
 
-The daemon samples `cswap list --json` no faster than the provider-safe three-minute floor, adds jitter after
-each completed cycle, and publishes one private Capacity observation from each completed response; only a
-fresh observation supplies routing or
-focus-setup advice. Concurrent surfaces share claude-swap's persisted request claims and poll plans, so
-repainting inventory cannot bypass provider backoff. claude-swap owns each row's `usageStatus`,
+The daemon runs `cswap list --json` on a provider-safe three-minute cadence with jitter and publishes one
+private Capacity observation from each completed response; only a fresh observation supplies routing or
+focus-setup advice. When a fresh row is `token_expired`, keeperd may lock that slot, make an owned
+revalidation list, prearm backoff, run one due `cswap recover <slot> --json` request, and make an owned
+verification list. Recovery output never supplies a route: only the post-recovery Capacity observation can
+restore routing. Automatic failures use persistent per-account
+3, 6, 12, 24, 48, then 60 minute backoff; `human_required` suppresses automatic retries until fresh
+inventory clears expiry or an operator explicitly retries. Concurrent surfaces share the refresh and
+per-account recovery locks. claude-swap owns each row's `usageStatus`,
 raw quota values, bounded provider account category, and explicit capacity multiplier, including its
 last-good and backoff policy. Keeper admits only `usageStatus: ok`
 routes with valid provenance, required session and weekly windows, and remaining raw quota; Fable work
@@ -137,12 +141,20 @@ are omitted, never guessed. These surfaces are PII-free.
 
 ```sh
 keeper agent accounts check --json
+keeper agent accounts recover c0 --json  # only for a current token-expired c0
 keeper agent accounts fable-focus show --json
 keeper usage
 keeper agent accounts non-fable-focus show --json
 keeper status --json
 keeper board
 ```
+
+`accounts recover cN [--json]` makes an owned list before resolving the current zero-based label and
+refuses any issue other than token expiry. It creates no Keeper Launch reservation or Harness session;
+claude-swap recovery intentionally starts one bounded Claude canary. A successful recovery still makes
+an owned list again and exits successfully only when that exact Account route is fresh and healthy. Use the returned
+PII-free outcome and exit code: 0 means verified `recovered` or `not-needed`, 1 means retry/human/tool or
+verification failure, and 2 means the current label is absent or not token-expired.
 
 `accounts check --json` reports `claude_launch_routing.fable_focus` and
 `claude_launch_routing.non_fable_focus`, alongside current capacity and the route it would choose without

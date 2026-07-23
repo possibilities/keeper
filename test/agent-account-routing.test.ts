@@ -1298,6 +1298,86 @@ describe("keeper agent accounts codex-pool", () => {
   });
 });
 
+describe("keeper agent accounts recover", () => {
+  test("emits bounded JSON without a Keeper reservation or Harness session", async () => {
+    const ordinals: number[] = [];
+    const h = makeHarness({
+      argv: ["accounts", "recover", "c2", "--json"],
+      rawArgv: true,
+      recoverAccount: async (ordinal) => {
+        ordinals.push(ordinal);
+        return {
+          schema_version: 1,
+          operation: "recover",
+          account: `c${ordinal}`,
+          outcome: "recovered",
+          ok: true,
+          problem_code: null,
+        };
+      },
+      selectAccountRoute: () => {
+        throw new Error("account recovery must not reserve");
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(ordinals).toEqual([2]);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      schema_version: 1,
+      operation: "recover",
+      account: "c2",
+      outcome: "recovered",
+      ok: true,
+      problem_code: null,
+    });
+    expect(h.routerCalls()).toBe(0);
+    expect(h.spawned).toEqual([]);
+  });
+
+  test("returns exit 2 when the current account is not token-expired", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "recover", "c0"],
+      rawArgv: true,
+      recoverAccount: async () => ({
+        schema_version: 1,
+        operation: "recover",
+        account: "c0",
+        outcome: "recovery-unverified",
+        ok: false,
+        problem_code: "account-not-token-expired",
+      }),
+    });
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.out.join("")).toContain(
+      "account is not token-expired; recovery refused",
+    );
+    expect(h.spawned).toEqual([]);
+  });
+
+  test("returns exit 1 for retryable, human, tool, and verification failures", async () => {
+    for (const [outcome, problem_code] of [
+      ["retry-later", null],
+      ["human-required", null],
+      ["tool-failure", "tool-failure"],
+      ["recovery-unverified", "route-unverified"],
+    ] as const) {
+      const h = makeHarness({
+        argv: ["accounts", "recover", "c0", "--json"],
+        rawArgv: true,
+        recoverAccount: async () => ({
+          schema_version: 1,
+          operation: "recover",
+          account: "c0",
+          outcome,
+          ok: false,
+          problem_code,
+        }),
+      });
+      expect(await expectExit(main(h.deps))).toBe(1);
+      expect(JSON.parse(h.out.join("")).outcome).toBe(outcome);
+    }
+  });
+});
+
 describe("keeper agent accounts check", () => {
   const inspection = {
     model_scope: null,

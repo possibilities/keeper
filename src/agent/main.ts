@@ -26,6 +26,10 @@ import {
   runProviderSafeRefresh,
 } from "../account-observation-refresh";
 import {
+  type AccountRecoveryResult,
+  runForegroundAccountRecovery,
+} from "../account-recovery";
+import {
   classifyOnDemandRefresh,
   constructObservedFableFocus,
   inspectRouting,
@@ -47,6 +51,7 @@ import {
   KEEPER_ACCOUNT_ROUTE_ENV,
   MAX_OUTPUT_BYTES,
   OBSERVATION_FRESHNESS_CEILING_MS,
+  resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
   resolveCswapCommand,
   SUBPROCESS_TIMEOUT_MS,
@@ -542,6 +547,8 @@ export interface MainDeps {
    * {@link inspectRouting}.
    */
   inspectRoutingFn: (fableIntent?: boolean | null) => RoutingInspection;
+  /** Explicit, reservation-free claude-swap token recovery by cN ordinal. */
+  recoverAccountFn: (ordinal: number) => Promise<AccountRecoveryResult>;
   /** Read one exact jobs row through the daemon. Transport uncertainty remains
    *  unknown and can never be promoted to partner death. */
   probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
@@ -1068,6 +1075,28 @@ export function realDeps(): MainDeps {
               : null,
         fableIntent,
       }),
+    recoverAccountFn: async (ordinal) => {
+      const stateDir = resolveAccountRoutingRoot();
+      const runner = makeBoundedRunner();
+      const nowMs = (): number => Date.now();
+      return runForegroundAccountRecovery({
+        ordinal,
+        stateDir,
+        runner,
+        nowMs,
+        cswapBin,
+        forceRefresh: ({ requireOwnedCall }) =>
+          runProviderSafeRefresh({
+            stateDir,
+            runner,
+            nowMs,
+            maxAgeMs: OBSERVATION_FRESHNESS_CEILING_MS,
+            cswapArgv: cswapListArgv(cswapBin),
+            force: true,
+            requireOwnedCall,
+          }),
+      });
+    },
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin,
@@ -3648,6 +3677,69 @@ async function runCodexPoolCommand(
   );
 }
 
+function accountRecoveryMessage(outcome: AccountRecoveryResult): string {
+  if (outcome.ok) {
+    return outcome.outcome === "not-needed"
+      ? "fresh healthy route already confirmed"
+      : "fresh healthy route confirmed after recovery";
+  }
+  switch (outcome.problem_code) {
+    case "observation-unavailable":
+      return "fresh claude-swap inventory is unavailable";
+    case "account-not-found":
+      return "account label is absent from the current inventory";
+    case "account-not-token-expired":
+      return "account is not token-expired; recovery refused";
+    case "recovery-busy":
+      return "another recovery owns this account";
+    case "route-unverified":
+      return "recovery did not produce fresh healthy route evidence";
+    case "tool-failure":
+      return "claude-swap recovery failed";
+    case null:
+      return outcome.outcome === "human-required"
+        ? "human credential repair is required"
+        : "claude-swap requested a later retry";
+  }
+}
+
+/** No Keeper Launch reservation or Harness session; cswap owns its canary. */
+async function runAccountsRecover(
+  deps: MainDeps,
+  ordinal: number,
+  json: boolean,
+): Promise<never> {
+  let outcome: AccountRecoveryResult;
+  try {
+    outcome = await deps.recoverAccountFn(ordinal);
+  } catch {
+    outcome = {
+      schema_version: 1,
+      operation: "recover",
+      account: `c${ordinal}`,
+      outcome: "tool-failure",
+      ok: false,
+      problem_code: "tool-failure",
+    };
+  }
+  if (json) {
+    deps.write(`${JSON.stringify(outcome)}\n`);
+  } else {
+    deps.write(
+      `account recovery ${outcome.account}: ${outcome.outcome} — ` +
+        `${accountRecoveryMessage(outcome)}\n`,
+    );
+  }
+  if (outcome.ok) return deps.exit(0);
+  if (
+    outcome.problem_code === "account-not-found" ||
+    outcome.problem_code === "account-not-token-expired"
+  ) {
+    return deps.exit(2);
+  }
+  return deps.exit(1);
+}
+
 /**
  * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
  * integration health, observation age, PII-free candidates, and the generic-
@@ -4017,6 +4109,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "accounts-check") {
     return runAccountsCheck(deps, dispatch.json);
+  }
+  if (dispatch.kind === "accounts-recover") {
+    return runAccountsRecover(deps, dispatch.ordinal, dispatch.json);
   }
   if (dispatch.kind === "accounts-codex-pool") {
     return runCodexPoolCommand(deps, dispatch.operation, dispatch.rest);

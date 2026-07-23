@@ -10,6 +10,11 @@ const PLIST = readFileSync(
   join(import.meta.dir, "..", "plist", "arthack.keeperd.plist"),
   "utf8",
 );
+const INSTALL_DOC = readFileSync(
+  join(import.meta.dir, "..", "docs", "install.md"),
+  "utf8",
+);
+const RETIRED_BRANCH = ["feat", "json-account-capacity-metadata"].join("/");
 
 function between(source: string, start: string, end: string): string {
   const from = source.indexOf(start);
@@ -28,9 +33,9 @@ describe("mandatory claude-swap installation", () => {
   test("rebases the fork branch before installing its local checkout", () => {
     expect(INSTALL).toContain("claude_swap_fork=");
     expect(INSTALL).toContain("/src/possibilities--claude-swap");
-    expect(INSTALL).toContain(
-      'claude_swap_branch="feat/json-account-capacity-metadata"',
-    );
+    expect(INSTALL).toContain('claude_swap_branch="integration/keeper"');
+    expect(INSTALL).not.toContain(RETIRED_BRANCH);
+    expect(INSTALL_DOC).not.toContain(RETIRED_BRANCH);
     expect(INSTALL).toContain("realiti4/claude-swap.git");
     expect(INSTALL).toContain("git clone --quiet --branch");
     expect(INSTALL).toContain("git status --porcelain");

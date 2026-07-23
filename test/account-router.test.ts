@@ -304,7 +304,7 @@ describe("mandatory managed account selection", () => {
       error: [
         "Claude cannot start with Fable.",
         "  c0: Fable quota is exhausted.",
-        "  c1: has an expired token.",
+        "  c1: has an expired token; keeperd recovery retries automatically, or run `keeper agent accounts recover c1`.",
         "Next: run `cswap list --json` to refresh status or repair the listed account.",
       ].join("\n"),
     });
