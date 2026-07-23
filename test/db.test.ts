@@ -4045,10 +4045,9 @@ describe("Tier 2 (fn-628.2) plan event indexes", () => {
   });
 
   test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH plan partial indexes (EXPLAIN QUERY PLAN)", () => {
-    // Mirrors the syncPlanLinks cross-session sweep at src/reducer.ts:~2371
-    // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
-    // branches each SEARCH a different new partial index — proving the
-    // optimizer can reach both indexes (the prior OR form could only reach one).
+    // Mirrors the syncPlanLinks cross-session sweep at src/reducer.ts:~2371.
+    // SQLite labels UNION plans differently across runtimes, so the invariant is
+    // that each branch SEARCHES through its dedicated partial index.
     const plan = db
       .prepare(
         `EXPLAIN QUERY PLAN
@@ -4064,7 +4063,6 @@ describe("Tier 2 (fn-628.2) plan event indexes", () => {
       )
       .all() as { detail: string }[];
     const detail = plan.map((r) => r.detail).join(" | ");
-    expect(detail).toMatch(/COMPOUND QUERY/);
     expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_epic/);
     expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_target/);
   });
