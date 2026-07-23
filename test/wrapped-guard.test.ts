@@ -57,11 +57,11 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
   const allow = [
     // delegation surface: the blocking leg launch + resume + wait + read (no shell
     // operators — a clean `keeper agent run` is the whole point of the courier)
-    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
-    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --reap-window-on-terminal",
-    "keeper agent run codex 'address the lint failure' --resume leg-fn-1-x.2 --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
-    "keeper agent wait leg-fn-1-x.2",
-    "keeper agent wait-for-stop leg-fn-1-x.2",
+    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s",
+    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s --reap-window-on-terminal",
+    "keeper agent run codex 'address the lint failure' --resume leg-fn-1-x.2 --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s",
+    'keeper agent wait leg-fn-1-x.2 --stop-timeout 30s --budget 300s --output "$KEEPER_WRAPPED_ENVELOPE"',
+    'keeper agent wait-for-stop leg-fn-1-x.2 --stop-timeout 30s --budget 300s --output "$KEEPER_WRAPPED_ENVELOPE"',
     "keeper agent show-last-message leg-fn-1-x.2",
     "keeper agent providers resolve gpt-5 high",
     `mktemp -d ${join(tmpdir(), "keeper-wrapped-XXXXXX")}`,
@@ -91,7 +91,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
     `${gitRead} log --no-ext-diff --no-textconv -c --format=%H`,
     // a stripped benign wrapper in front of an allowed command
-    "nohup keeper agent wait leg-x",
+    'nohup keeper agent wait leg-x --stop-timeout 30s --budget 300s --output "$KEEPER_WRAPPED_ENVELOPE"',
     // pipes between two allowlisted commands
     `${gitRead} log --no-ext-diff --no-textconv --oneline | git rev-parse HEAD`,
     // a `>` INSIDE single quotes is literal — not a redirect
@@ -239,6 +239,87 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
       expect(evaluateWrappedBash(cmd, context)).not.toBeNull();
     });
   }
+});
+
+describe("evaluateWrappedBash — the durable-budget wait/launch routing (round-4)", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const env = "$KEEPER_WRAPPED_ENVELOPE";
+
+  test("ALLOWS the exact rendered wait: bounded --stop-timeout + REQUIRED --budget + pinned --output", () => {
+    expect(
+      evaluateWrappedBash(
+        `keeper agent wait leg-fn-1-x.2 --stop-timeout 30000ms --budget 590000ms --output "${env}"`,
+        context,
+      ),
+    ).toBeNull();
+  });
+
+  test("DENIES a wait with no --budget (the unbounded escape hatch is closed)", () => {
+    expect(
+      evaluateWrappedBash(
+        "keeper agent wait leg-fn-1-x.2 --stop-timeout 30s",
+        context,
+      ),
+    ).not.toBeNull();
+    // Even a bare handle (the OLD allowed shape) is now denied.
+    expect(
+      evaluateWrappedBash("keeper agent wait leg-fn-1-x.2", context),
+    ).not.toBeNull();
+  });
+
+  test("DENIES a wait --budget with an unbounded (non-duration) value", () => {
+    expect(
+      evaluateWrappedBash(
+        `keeper agent wait leg-fn-1-x.2 --budget forever --output "${env}"`,
+        context,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("DENIES a wait whose --output is not the pinned envelope reference", () => {
+    expect(
+      evaluateWrappedBash(
+        "keeper agent wait leg-fn-1-x.2 --budget 590s --output /tmp/elsewhere",
+        context,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("DENIES a wait with an unknown flag or a second positional", () => {
+    expect(
+      evaluateWrappedBash(
+        `keeper agent wait leg-fn-1-x.2 --budget 590s --output "${env}" --sneaky x`,
+        context,
+      ),
+    ).not.toBeNull();
+    expect(
+      evaluateWrappedBash(
+        `keeper agent wait leg-a leg-b --budget 590s --output "${env}"`,
+        context,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("DENIES a wrapped launch that binds no durable --budget", () => {
+    expect(
+      evaluateWrappedBash(
+        "keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/c.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
+        context,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("ALLOWS a wrapped launch that binds a bounded --budget", () => {
+    expect(
+      evaluateWrappedBash(
+        "keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/c.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s",
+        context,
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("evaluateWrappedBash — launch-bound AUDIT_READY block", () => {
@@ -437,11 +518,11 @@ describe("evaluateWrappedBash — observed launch shapes and static POSIX word r
   };
   const contract = "/private/tmp/keeper-wrapped-249pt0/contract.md";
   const observedLaunches = [
-    `keeper agent run pi 'You are implementing one task in the arthack repo. Work in place and run tests until green.' \\\n  --model openai-codex/gpt-5.6-sol --system-file ${contract} \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
-    `keeper agent run pi 'Read the task brief and implement it in this repo.' \\\n  --resume 4ad8de58-52b3-4de9-b500-53a8a1941a44 \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
+    `keeper agent run pi 'You are implementing one task in the arthack repo. Work in place and run tests until green.' \\\n  --model openai-codex/gpt-5.6-sol --system-file ${contract} \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms --budget 480000ms`,
+    `keeper agent run pi 'Read the task brief and implement it in this repo.' \\\n  --resume 4ad8de58-52b3-4de9-b500-53a8a1941a44 \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms --budget 480000ms`,
     `keeper agent run pi 'line one
 line two
-line three' --model openai-codex/gpt-5.6-sol --system-file ${contract} --session wrapped --name fn-1354-own-pi-skill-shorthands.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
+line three' --model openai-codex/gpt-5.6-sol --system-file ${contract} --session wrapped --name fn-1354-own-pi-skill-shorthands.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms --budget 480000ms`,
   ];
 
   for (const command of observedLaunches) {
@@ -452,7 +533,7 @@ line three' --model openai-codex/gpt-5.6-sol --system-file ${contract} --session
 
   const suffix =
     `--model gpt-5 --system-file ${contract} --session wrapped ` +
-    `--name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s`;
+    `--name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s --budget 300s`;
   const reference: ReadonlyArray<{
     name: string;
     command: string;
@@ -492,7 +573,7 @@ line three' --model openai-codex/gpt-5.6-sol --system-file ${contract} --session
     {
       name: "backslash-newline is removed inside double quotes",
       command: `keeper agent run codex "implement task" --model gpt-5 --system-file ${contract} --session wrapped --name "fn-1-x.\\
-2" --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s`,
+2" --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s --budget 300s`,
       referenceInstructionArgv: ["implement task"],
       expected: "allow",
     },
@@ -519,7 +600,7 @@ describe("evaluateWrappedBash — actionable provider run-gate denials", () => {
     envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
   };
   const binding =
-    '--session wrapped --name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s';
+    '--session wrapped --name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s --budget 300s';
   const cases = [
     {
       construct: "provider harness",
@@ -1218,9 +1299,9 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
 
   test("permits the delegation + close-out Bash surface for a marked subagent", () => {
     for (const cmd of [
-      "keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
-      "keeper agent run codex 'fix lint' --resume leg --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
-      "keeper agent wait leg",
+      "keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s",
+      "keeper agent run codex 'fix lint' --resume leg --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --budget 300s",
+      'keeper agent wait leg --stop-timeout 30s --budget 300s --output "$KEEPER_WRAPPED_ENVELOPE"',
       "keeper commit-work --task-id fn-1-x.2 'feat(x): y'",
       "keeper plan done fn-1-x.2 --summary 'done'",
       "keeper session state",
@@ -1676,6 +1757,6 @@ describe("wrapped-guard hooks.json matcher routes SendMessage", () => {
       wrappedMatchers.some((m) => m.split("|").includes("SendMessage")),
     ).toBe(true);
     // the Bash matcher must NOT accidentally route SendMessage
-    expect(new RegExp("Bash").test("SendMessage")).toBe(false);
+    expect(/Bash/.test("SendMessage")).toBe(false);
   });
 });

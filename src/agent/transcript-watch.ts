@@ -160,14 +160,15 @@ export function windowPresenceProbeCommand(
 }
 
 /**
- * The SINGLE authority for "is this a socket-correct tmux kill-window argv":
- * `[<abs-or-bare tmux>, (-L|-S <value>)*, "kill-window", "-t", "@<digits>"]`,
- * every token a non-empty string. run.json / control.json metadata is an
- * EXECUTABLE argv source, so this gate is what stops an arbitrary binary or a
- * shell-shaped token from reaching a spawn — `command[0]` must basename to
- * `tmux`, socket flags must be paired `-L`/`-S`, and the window target must be
- * exactly `@<digits>`. Shared with {@link windowPresenceProbeCommand} and
- * run-capture's control validator so the rule lives in exactly one place.
+ * The SINGLE STRUCTURAL authority for "is this a socket-correct tmux kill-window
+ * argv": `[<abs-or-bare tmux>, (ZERO or ONE `-L`/`-S <value>` pair),
+ * "kill-window", "-t", "@<digits>"]`, every token a non-empty string. It checks
+ * STRUCTURE only — `command[0]` need only BASENAME to `tmux`, so it MAY accept a
+ * renamed `/tmp/evil/tmux`. It is NOT the execution guard: what makes a renamed
+ * binary inert is the effect-boundary trusted-argv0 replacement
+ * ({@link withTrustedTmuxBin} in run-capture), which swaps argv0 for the current
+ * trusted binary at the spawn. Shared with {@link windowPresenceProbeCommand} and
+ * run-capture's control validator so the structural rule lives in exactly one place.
  */
 export function isTmuxKillWindowCommand(command: unknown): command is string[] {
   if (!Array.isArray(command) || command.length < 4) {

@@ -1006,28 +1006,94 @@ describe("probe argv is gated by the single tmux-command authority (Blocker 3)",
   });
 });
 
-describe("--budget threads a durable cumulative ceiling (Blocker 2)", () => {
-  test("resolveHandle parses --budget into totalBudgetMs alongside the persisted startedAtMs", () => {
-    const stateDir = tempDir();
-    writeRunJson(stateDir, "tmux-b", {
-      id: "tmux-b",
+describe("--budget is a durable, launch-bound ceiling (Blockers 2 + 5)", () => {
+  const writeRun = (
+    stateDir: string,
+    id: string,
+    extra: Record<string, unknown>,
+  ): void =>
+    writeRunJson(stateDir, id, {
+      id,
       agent: "claude",
       cwd: "/work/proj",
-      transcriptSessionId: "sess-b",
+      transcriptSessionId: "s",
       startedAtMs: 1_700_000_000_000,
+      ...extra,
     });
-    const resolution = resolveHandle({
+
+  test("the PERSISTED launch budget is the authority; a MATCHING --budget is accepted", () => {
+    const stateDir = tempDir();
+    writeRun(stateDir, "tmux-b", { budgetMs: 600_000 });
+    const r = resolveHandle({
       rest: ["tmux-b", "--stop-timeout", "60s", "--budget", "10m"],
       cwd: "/work/proj",
       stateDir,
     });
-    expect(resolution.ok).toBe(true);
-    if (!resolution.ok) return;
-    // The durable launch instant comes from run.json (survives a cold restart);
-    // the cumulative ceiling comes from --budget.
-    expect(resolution.handle.startedAtMs).toBe(1_700_000_000_000);
-    expect(resolution.handle.totalBudgetMs).toBe(600_000);
-    expect(resolution.handle.stopTimeoutMs).toBe(60_000);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // The durable launch instant + the ceiling BOTH come from run.json — the flag
+    // only re-declares the same value (survives a cold restart with no memory).
+    expect(r.handle.startedAtMs).toBe(1_700_000_000_000);
+    expect(r.handle.totalBudgetMs).toBe(600_000);
+    expect(r.handle.stopTimeoutMs).toBe(60_000);
+  });
+
+  test("a wait passing a LARGER --budget than the launch-bound value is REJECTED", () => {
+    const stateDir = tempDir();
+    writeRun(stateDir, "tmux-b", { budgetMs: 600_000 });
+    const r = resolveHandle({
+      rest: ["tmux-b", "--budget", "20m"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("--budget with NO durable launch bind is REJECTED (model-supplied budget refused)", () => {
+    const stateDir = tempDir();
+    writeRun(stateDir, "tmux-nb", {}); // no budgetMs bound at launch
+    const r = resolveHandle({
+      rest: ["tmux-nb", "--budget", "10m"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("a bound budget with a non-finite (1e400 → Infinity) launch clock FAILS CLOSED", () => {
+    const stateDir = tempDir();
+    const dir = join(stateDir, "tmux-runs", "tmux-inf");
+    mkdirSync(dir, { recursive: true });
+    // Raw JSON: JSON.parse(1e400) === Infinity — a producer clock that must not
+    // authorize an unbounded wait.
+    writeFileSync(
+      join(dir, "run.json"),
+      '{"id":"tmux-inf","agent":"claude","cwd":"/work/proj","transcriptSessionId":"s","startedAtMs":1e400,"budgetMs":600000}\n',
+    );
+    const r = resolveHandle({
+      rest: ["tmux-inf", "--budget", "10m"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("--budget on a direct transcript path FAILS CLOSED (no durable state)", () => {
+    const r = resolveHandle({
+      rest: ["/abs/transcript.jsonl", "--agent", "claude", "--budget", "10m"],
+      cwd: "/w",
+      stateDir: tempDir(),
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("no --budget on a run with a bound budget still uses the persisted ceiling", () => {
+    const stateDir = tempDir();
+    writeRun(stateDir, "tmux-p", { budgetMs: 600_000 });
+    const r = resolveHandle({ rest: ["tmux-p"], cwd: "/work/proj", stateDir });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.handle.totalBudgetMs).toBe(600_000);
   });
 
   test("--budget requires a value and rejects a bad duration", () => {
@@ -1035,12 +1101,10 @@ describe("--budget threads a durable cumulative ceiling (Blocker 2)", () => {
     expect(
       resolveHandle({ rest: ["h", "--budget"], cwd: "/w", stateDir }),
     ).toEqual({ ok: false, error: "--budget requires a value" });
-    const bad = resolveHandle({
-      rest: ["h", "--budget", "nope"],
-      cwd: "/w",
-      stateDir,
-    });
-    expect(bad.ok).toBe(false);
+    expect(
+      resolveHandle({ rest: ["h", "--budget", "nope"], cwd: "/w", stateDir })
+        .ok,
+    ).toBe(false);
   });
 });
 

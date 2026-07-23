@@ -28,7 +28,11 @@ import { join } from "node:path";
 import type { PresetCatalog } from "../src/agent/config";
 import { splitSubcommand } from "../src/agent/dispatch";
 import { launchToResolvedHandle } from "../src/agent/launch-handle";
-import { main, probeTmuxWindowPresence } from "../src/agent/main";
+import {
+  firstHandleToken,
+  main,
+  probeTmuxWindowPresence,
+} from "../src/agent/main";
 import type {
   ResolvedHandle,
   ShowLastMessageResult,
@@ -201,6 +205,7 @@ function okParse(
     cli: "claude",
     prompt: "p",
     stopTimeoutMs: null,
+    budgetMs: null,
     readOnly: false,
     reapWindowOnTerminal: false,
     systemFile: null,
@@ -940,6 +945,32 @@ describe("tmux window presence classifier (Blocker 4 — socket-gone stderr)", (
   });
 });
 
+describe("firstHandleToken skips flag VALUES (Blocker 4)", () => {
+  const HANDLE = "tmux-test";
+  const EXPECT = ["--stop-timeout", "1ms", "--output", "/e", "--budget", "1s"];
+
+  test("the wire handle is the run id regardless of flag order (values never mistaken for it)", () => {
+    // flags-before-handle: the value-flags' values must NOT be read as the handle.
+    expect(
+      firstHandleToken([
+        "--budget",
+        "1s",
+        HANDLE,
+        "--stop-timeout",
+        "1ms",
+        "--output",
+        "/e",
+      ]),
+    ).toBe(HANDLE);
+    // handle-first order resolves the same.
+    expect(firstHandleToken([HANDLE, ...EXPECT])).toBe(HANDLE);
+    // the `=` forms are single tokens (skipped by the `--` prefix check).
+    expect(firstHandleToken(["--budget=1s", "--output=/e", HANDLE])).toBe(
+      HANDLE,
+    );
+  });
+});
+
 describe("cumulative budget is a producer clock (Blocker 2)", () => {
   const runHandle = (over: Partial<ResolvedHandle> = {}): ResolvedHandle => ({
     ...handle(),
@@ -947,22 +978,82 @@ describe("cumulative budget is a producer clock (Blocker 2)", () => {
     ...over,
   });
 
-  test("launch-age ≥ budget → BLOCKS deterministically WITHOUT waiting", async () => {
+  test("over budget with a READY stop → OBSERVES and returns completed, never parks (Blocker 6)", async () => {
+    // The ORIGINAL incident: a cold wrapper arriving AFTER the leg finished must
+    // capture it, not park. The budget caps SLEEP, not OBSERVATION — one
+    // non-sleeping scan runs even over budget, and a boundary-qualified stop wins.
+    let waits = 0;
+    const { envelope, exitCode, budgetExhausted } = await captureFromHandle(
+      {
+        waitForStop: async () => {
+          waits++;
+          return { ok: true, transcriptPath: "/t.jsonl", stop: STOP };
+        },
+        showLastMessage: async () => ({
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "the answer",
+          found: true,
+        }),
+        now: () => 1_000 + 600_000 + 1, // launch-age past the 600s budget
+      },
+      VERB_DEPS,
+      {
+        handle: runHandle({ totalBudgetMs: 600_000 }),
+        handleId: "tmux-budget",
+        agent: "claude",
+        startMs: 1_000 + 600_000 + 1,
+      },
+    );
+    expect(waits).toBe(1); // the ONE observation scan (never a chunk of sleep)
+    expect(envelope.outcome).toBe("completed");
+    expect(envelope.message).toBe("the answer");
+    expect(budgetExhausted).toBeUndefined();
+    expect(exitCode).toBe(0);
+  });
+
+  test("over budget with an observed DEATH → partner_died, never parked (Blocker 6)", async () => {
+    const { envelope } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "window_gone",
+          error: "gone",
+          transcriptPath: "/t.jsonl",
+        }),
+        showLastMessage: async () => ({
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: null,
+          found: false,
+        }),
+        now: () => 1_000 + 600_001,
+      },
+      VERB_DEPS,
+      {
+        handle: runHandle({ totalBudgetMs: 600_000 }),
+        handleId: "tmux-d",
+        agent: "claude",
+        startMs: 1_000 + 600_001,
+      },
+    );
+    expect(envelope.outcome).toBe("partner_died");
+  });
+
+  test("over budget with NO terminal evidence → budgetExhausted after ONE scan", async () => {
     let waits = 0;
     const { envelope, exitCode, budgetExhausted, timeoutLiveness } =
       await captureFromHandle(
         {
           waitForStop: async () => {
             waits++;
-            return { ok: true, transcriptPath: "/t.jsonl", stop: STOP };
+            return { ok: false, reason: "timeout", error: "t" };
           },
           showLastMessage: async () => ({
-            ok: true,
-            transcriptPath: "/t.jsonl",
-            text: "x",
-            found: true,
+            ok: false,
+            reason: "timeout",
+            error: "t",
           }),
-          // now is 1_000 (launch) + 600_000 budget + 1 → launch-age past budget.
           now: () => 1_000 + 600_000 + 1,
         },
         VERB_DEPS,
@@ -973,7 +1064,7 @@ describe("cumulative budget is a producer clock (Blocker 2)", () => {
           startMs: 1_000 + 600_000 + 1,
         },
       );
-    expect(waits).toBe(0); // the primitive never granted a chunk
+    expect(waits).toBe(1); // ONE non-sleeping observation scan, THEN park
     expect(envelope.outcome).toBe("timed_out");
     expect(budgetExhausted).toBe(true);
     expect(timeoutLiveness).toBe("unknown");
@@ -1010,10 +1101,11 @@ describe("cumulative budget is a producer clock (Blocker 2)", () => {
       );
     const first = await coldCapture();
     expect(first.budgetExhausted).toBe(true);
-    // A second (still-cold) invocation blocks the same way — no second chunk.
+    // A second (still-cold) invocation blocks the same way — one observation scan
+    // each, never a chunk of SLEEP, so no second FULL budget can be burned.
     const second = await coldCapture();
     expect(second.budgetExhausted).toBe(true);
-    expect(waits).toBe(0);
+    expect(waits).toBe(2);
   });
 
   test("launch-age UNDER budget → caps the single wait to the remaining budget", async () => {
@@ -1911,6 +2003,34 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
   });
 
+  test("--budget binds the durable budget into run.json at launch (Blocker 2)", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/budget-proj";
+    const sessionId = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    writeClaudeTranscript(home, cwd, sessionId, "answer");
+    const h = makeHarness({
+      argv: ["run", "claude", "go", "--budget", "590s"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+
+    const runJson = JSON.parse(
+      readFileSync(
+        join(stateDir, "tmux-runs", `tmux-${sessionId}`, "run.json"),
+        "utf8",
+      ),
+    );
+    // The sole durable cumulative-ceiling authority every later wait reads.
+    expect(runJson.budgetMs).toBe(590_000);
+  });
+
   test("a timeout leaves the Partner resident: no reap, control stays running, live guidance", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -2327,6 +2447,51 @@ describe("main() — agent wait", () => {
       message_found: true,
       elapsed_seconds: 0,
       outcome: "completed",
+    });
+  });
+
+  test("--output atomically refreshes the envelope with EVERY wait result (Blocker 3)", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    writeClaudeTranscript(home, cwd, sessionId, "recovered answer");
+    // Durable budget bound at launch; the wait re-declares the SAME value.
+    writeRunJson(stateDir, "tmux-out", {
+      agent: "claude",
+      cwd,
+      transcriptSessionId: sessionId,
+      startedAtMs: 1_000,
+      budgetMs: 590_000,
+    });
+    const outPath = join(tempDir(), "envelope.json");
+    const h = makeHarness({
+      argv: [
+        "wait",
+        "tmux-out",
+        "--stop-timeout",
+        "30s",
+        "--budget",
+        "590s",
+        "--output",
+        outPath,
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      now: () => 2_000,
+    });
+
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    // The wait's OWN result is persisted to the durable envelope path — a cold
+    // wrapper rereads THIS, not the launch envelope.
+    const written = JSON.parse(readFileSync(outPath, "utf8"));
+    expect(written).toMatchObject({
+      handle: "tmux-out",
+      outcome: "completed",
+      message: "recovered answer",
     });
   });
 

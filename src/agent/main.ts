@@ -2111,10 +2111,22 @@ function controlPath(stateDir: string, runId: string): string {
  * echoed into the envelope's `handle`. Mirrors `resolveHandle`'s positional
  * detection (skip `--agent`/`--stop-timeout` values and any other `--flag`).
  */
-function firstHandleToken(rest: string[]): string | null {
+const WAIT_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "--agent",
+  "--stop-timeout",
+  "--budget",
+  "--output",
+]);
+
+export function firstHandleToken(rest: string[]): string | null {
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
-    if (arg === "--agent" || arg === "--stop-timeout") {
+    // A value-flag in the split form (`--budget 1s`) consumes the NEXT token — it
+    // must be skipped, else `1s` is misread as the handle and the wire `handle`
+    // diverges from the resolved run id (destroying cold-continuation
+    // authority). The `=` form (`--budget=1s`) is one token — skipped by the
+    // `--` prefix check below.
+    if (WAIT_VALUE_FLAGS.has(arg)) {
       i += 1;
       continue;
     }
@@ -2266,6 +2278,7 @@ async function runRunCaptureSubcommand(
               name: parsed.name ?? undefined,
             },
             stopTimeoutMs: parsed.stopTimeoutMs,
+            budgetMs: parsed.budgetMs,
           });
           return launched;
         },
@@ -2504,6 +2517,7 @@ async function runResumeCaptureSubcommand(
               name: parsed.name ?? undefined,
             },
             stopTimeoutMs: parsed.stopTimeoutMs,
+            budgetMs: parsed.budgetMs,
             resume: {
               target: decision.resume_target,
               childSessionId,
@@ -2703,9 +2717,12 @@ async function runWaitCaptureSubcommand(
   });
   if (!resolution.ok) {
     deps.writeErr(`agent: ${resolution.error}\n`);
+    // Persist the bad_args envelope to --output too, so a cold wrapper reading
+    // $KEEPER_WRAPPED_ENVELOPE sees the failure rather than a stale prior result.
     return emitRunCapture(
       deps,
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
+      waitOutputPath(rest),
     );
   }
   const verbDeps = makeVerbDeps(deps);
@@ -2715,7 +2732,25 @@ async function runWaitCaptureSubcommand(
     agent: resolution.handle.agent,
     startMs,
   });
-  return emitRunCapture(deps, result);
+  // EVERY wait outcome atomically refreshes the durable envelope, so a wrapper
+  // that dies mid-loop (or a cold restart) rereads THIS result, not the original
+  // launch envelope.
+  return emitRunCapture(deps, result, resolution.handle.outputPath ?? null);
+}
+
+/** The `--output` value in an `agent wait` argv (split or `=` form), or null. */
+function waitOutputPath(rest: string[]): string | null {
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i] as string;
+    if (arg === "--output") {
+      const value = rest[i + 1];
+      return value === undefined || value === "" ? null : value;
+    }
+    if (arg.startsWith("--output=")) {
+      return arg.slice("--output=".length) || null;
+    }
+  }
+  return null;
 }
 
 /**

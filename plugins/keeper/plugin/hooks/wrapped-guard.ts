@@ -380,8 +380,14 @@ const WRAPPED_PROVIDER_VALUE_OPTIONS = new Set([
   "--name",
   "--output",
   "--stop-timeout",
+  "--budget",
   "--resume",
 ]);
+
+/** A bounded duration token (`<digits>ms|s|m`) — the only shape a wrapped
+ *  `--stop-timeout`/`--budget` ceiling may take, so no wrapped wait or launch can
+ *  request an unbounded sleep. */
+const BOUNDED_DURATION = /^\d+(?:ms|s|m)$/;
 const WRAPPED_PROVIDER_BOOLEAN_OPTIONS = new Set(["--reap-window-on-terminal"]);
 const RUN_GATE_STEER =
   "Do not retry the same quoting; use a single short, single-line double-quoted " +
@@ -762,9 +768,7 @@ function wrappedPlanViolation(
 }
 
 function wrappedBusViolation(tokens: string[]): string | null {
-  return tokens.length === 6 &&
-    tokens[2] === "chat" &&
-    tokens[3] === "send"
+  return tokens.length === 6 && tokens[2] === "chat" && tokens[3] === "send"
     ? null
     : "wrapped `keeper bus` permits only `keeper bus chat send <target> <message>`";
 }
@@ -828,6 +832,54 @@ function providerRunPositionals(tokens: readonly string[]): string[] {
   return positional;
 }
 
+/**
+ * A wrapped `agent wait`/`wait-for-stop` must be exactly one handle plus a
+ * REQUIRED bounded `--budget` (the durable cumulative ceiling — no unbounded
+ * escape), a REQUIRED `--output` pinned to the run's envelope (so every result
+ * refreshes durable state for a cold wrapper), and an optional bounded
+ * `--stop-timeout` chunk. Any other flag, an unbounded ceiling, a missing budget,
+ * a wrong output path, or extra positionals deny.
+ */
+function wrappedWaitViolation(
+  tokens: string[],
+  verb: string,
+  context: WrappedCommandContext,
+): string | null {
+  const deny =
+    `wrapped \`keeper agent ${verb}\` requires exactly one handle, a bounded ` +
+    `--budget, and --output pinned to $KEEPER_WRAPPED_ENVELOPE (optional bounded --stop-timeout)`;
+  const positionals: string[] = [];
+  const values = new Map<string, string>();
+  const allowed = new Set(["--stop-timeout", "--budget", "--output"]);
+  for (let index = 3; index < tokens.length; index += 1) {
+    const token = tokens[index] as string;
+    if (!token.startsWith("--")) {
+      positionals.push(token);
+      continue;
+    }
+    if (!allowed.has(token) || values.has(token)) return deny;
+    const value = tokens[index + 1];
+    if (value === undefined || value.startsWith("--")) return deny;
+    values.set(token, value);
+    index += 1;
+  }
+  if (positionals.length !== 1 || positionals[0] === "") return deny;
+  if (
+    values.has("--stop-timeout") &&
+    !BOUNDED_DURATION.test(values.get("--stop-timeout") as string)
+  ) {
+    return deny;
+  }
+  if (!BOUNDED_DURATION.test(values.get("--budget") ?? "")) return deny;
+  if (
+    context.envelopeReference === undefined ||
+    values.get("--output") !== context.envelopeReference
+  ) {
+    return deny;
+  }
+  return null;
+}
+
 function wrappedAgentViolation(
   tokens: string[],
   context: WrappedCommandContext,
@@ -839,12 +891,7 @@ function wrappedAgentViolation(
       : "wrapped provider discovery permits only `keeper agent providers resolve <model> <effort>`";
   }
   if (verb === "wait" || verb === "wait-for-stop") {
-    if (tokens.length === 4) return null;
-    return tokens.length === 6 &&
-      tokens[4] === "--stop-timeout" &&
-      /^\d+(?:ms|s|m)$/.test(tokens[5] as string)
-      ? null
-      : `wrapped \`keeper agent ${verb}\` accepts one handle and an optional bounded --stop-timeout`;
+    return wrappedWaitViolation(tokens, verb, context);
   }
   if (verb === "show-last-message") {
     return tokens.length === 4
@@ -930,14 +977,18 @@ function wrappedAgentViolation(
     values.get("--output") !== context.envelopeReference
   ) {
     bindingOffender = values.get("--output");
-  } else if (!/^\d+(?:ms|s|m)$/.test(values.get("--stop-timeout") ?? "")) {
+  } else if (!BOUNDED_DURATION.test(values.get("--stop-timeout") ?? "")) {
     bindingOffender = values.get("--stop-timeout");
+  } else if (!BOUNDED_DURATION.test(values.get("--budget") ?? "")) {
+    // The launch MUST bind an exact bounded total budget durably (run.json), so
+    // the cumulative ceiling exists before any wait — no unbounded escape hatch.
+    bindingOffender = values.get("--budget");
   } else {
     bindingMismatch = false;
   }
   if (bindingMismatch) {
     return runGateDeny(
-      "launch-context binding construct (--session/--name/--output/--stop-timeout)",
+      "launch-context binding construct (--session/--name/--output/--stop-timeout/--budget)",
       positional,
       bindingOffender,
     );

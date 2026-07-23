@@ -173,6 +173,10 @@ export interface TmuxLaunchRequest {
   startedAtMs: number;
   /** Exact jobs projection identity for lifecycle-aware run-id waits. */
   lifecycleJobId?: string | null;
+  /** `--budget` — the TOTAL leg budget bound DURABLY into run.json so every later
+   *  `agent wait` reads it as the sole cumulative-ceiling authority. Omitted =
+   *  no ceiling. */
+  budgetMs?: number | null;
   /** Structural stop count captured before a resumed invocation starts. */
   invocationStopFloor?: number | null;
   isResume?: boolean;
@@ -1270,6 +1274,13 @@ function writeRunMetadata(
     cwd: req.cwd,
     transcriptSessionId:
       req.resolvedTranscriptSessionId ?? req.transcriptSessionId,
+    // The durable cumulative-budget authority, bound ONCE here (run.json is
+    // write-once); every later `agent wait` reads it and re-declares against it.
+    ...(req.budgetMs != null &&
+    Number.isSafeInteger(req.budgetMs) &&
+    req.budgetMs > 0
+      ? { budgetMs: req.budgetMs }
+      : {}),
     ...(req.lifecycleJobId ? { lifecycleJobId: req.lifecycleJobId } : {}),
     ...(req.invocationStopFloor !== null &&
     req.invocationStopFloor !== undefined

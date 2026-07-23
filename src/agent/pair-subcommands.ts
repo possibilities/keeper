@@ -56,6 +56,13 @@ export interface ResolvedHandle {
    */
   totalBudgetMs?: number | null;
   /**
+   * `--output` path for `agent wait`: the atomic result-file sink the wait writes
+   * its envelope to on EVERY outcome, so a wait's terminal/attribution result
+   * persists for a cold wrapper (the wrapped guard permits only the exact
+   * `$KEEPER_WRAPPED_ENVELOPE` path). Absent = stdout only.
+   */
+  outputPath?: string | null;
+  /**
    * Resume marker threaded into transcript discovery. Claude/Pi stay
    * strict-pinned; a resumed Pi wait anchors on a structural stop-count watermark instead, since pi
    * re-stamps its copied history with resume-time timestamps. Absent/false = fresh
@@ -100,7 +107,8 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
   let handleArg: string | null = null;
   let agentOverride: AgentKind | null = null;
   let stopTimeoutMs: number | null = null;
-  let totalBudgetMs: number | null = null;
+  let declaredBudgetMs: number | null = null;
+  let outputPath: string | null = null;
 
   for (let i = 0; i < args.rest.length; i++) {
     const arg = args.rest[i] as string;
@@ -161,7 +169,7 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
       if (!parsed.ok) {
         return { ok: false, error: `--budget ${parsed.message}` };
       }
-      totalBudgetMs = parsed.ms;
+      declaredBudgetMs = parsed.ms;
       i += 1;
       continue;
     }
@@ -171,7 +179,24 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
       if (!parsed.ok) {
         return { ok: false, error: `--budget ${parsed.message}` };
       }
-      totalBudgetMs = parsed.ms;
+      declaredBudgetMs = parsed.ms;
+      continue;
+    }
+    if (arg === "--output") {
+      const value = args.rest[i + 1];
+      if (value === undefined || value === "") {
+        return { ok: false, error: "--output requires a value" };
+      }
+      outputPath = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--output=")) {
+      const value = arg.slice("--output=".length);
+      if (value === "") {
+        return { ok: false, error: "--output requires a value" };
+      }
+      outputPath = value;
       continue;
     }
     if (handleArg === null) {
@@ -192,6 +217,16 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
         error: "--agent is required when the handle is a transcript path",
       };
     }
+    // A direct transcript path carries NO durable launch state, so a `--budget`
+    // has no producer-owned deadline to bind against — FAIL CLOSED rather than
+    // honor a model-supplied per-call ceiling.
+    if (declaredBudgetMs !== null) {
+      return {
+        ok: false,
+        error:
+          "--budget requires a run-id handle with a durable bound budget (not a transcript path)",
+      };
+    }
     return {
       ok: true,
       handle: {
@@ -201,7 +236,7 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
         startedAtMs: 0,
         transcriptPath: handleArg,
         stopTimeoutMs,
-        ...(totalBudgetMs !== null ? { totalBudgetMs } : {}),
+        ...(outputPath !== null ? { outputPath } : {}),
       },
     };
   }
@@ -211,7 +246,8 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
     args.stateDir,
     agentOverride,
     stopTimeoutMs,
-    totalBudgetMs,
+    declaredBudgetMs,
+    outputPath,
   );
 }
 
@@ -220,7 +256,8 @@ function resolveRunId(
   stateDir: string,
   agentOverride: AgentKind | null,
   stopTimeoutMs: number | null,
-  totalBudgetMs: number | null,
+  declaredBudgetMs: number | null,
+  outputPath: string | null,
 ): HandleResolution {
   const runJsonPath = join(stateDir, "tmux-runs", runId, "run.json");
   if (!existsSync(runJsonPath)) {
@@ -245,6 +282,48 @@ function resolveRunId(
     return { ok: false, error: `run metadata has no cwd: ${runJsonPath}` };
   }
 
+  // The DURABLE producer clock: a FINITE, SAFE, POSITIVE launch instant. A
+  // malformed clock (JSON `1e400` → Infinity, negative, or a future value the
+  // producer never wrote) carries NO cumulative-budget authority.
+  const rawStartedAt = parsed.startedAtMs;
+  const startedAtValid =
+    typeof rawStartedAt === "number" &&
+    Number.isSafeInteger(rawStartedAt) &&
+    rawStartedAt > 0;
+  const startedAtMs = startedAtValid ? (rawStartedAt as number) : 0;
+
+  // The budget ceiling is bound ONCE at launch in owner-private run.json; a
+  // per-call `--budget` may only re-declare the SAME value. A mismatch/increase,
+  // a declared budget with no launch bind, or a bound budget with no valid clock
+  // all FAIL CLOSED before any wait — the durable value is the sole authority.
+  const rawBudget = parsed.budgetMs;
+  const persistedBudgetMs =
+    typeof rawBudget === "number" &&
+    Number.isSafeInteger(rawBudget) &&
+    rawBudget > 0
+      ? rawBudget
+      : null;
+  if (declaredBudgetMs !== null) {
+    if (persistedBudgetMs === null) {
+      return {
+        ok: false,
+        error: `--budget passed but run ${runId} bound no durable budget at launch`,
+      };
+    }
+    if (declaredBudgetMs !== persistedBudgetMs) {
+      return {
+        ok: false,
+        error: `--budget ${declaredBudgetMs}ms mismatches the launch-bound budget ${persistedBudgetMs}ms`,
+      };
+    }
+  }
+  if (persistedBudgetMs !== null && !startedAtValid) {
+    return {
+      ok: false,
+      error: `run ${runId} has a bound budget but no finite positive launch time — refusing an unbounded wait`,
+    };
+  }
+
   const tmuxWindowProbeCommand = tmuxWindowProbeCommandFromRunJson(parsed);
 
   return {
@@ -256,11 +335,13 @@ function resolveRunId(
         typeof parsed.transcriptSessionId === "string"
           ? parsed.transcriptSessionId
           : null,
-      startedAtMs:
-        typeof parsed.startedAtMs === "number" ? parsed.startedAtMs : 0,
+      startedAtMs,
       transcriptPath: null,
       stopTimeoutMs,
-      ...(totalBudgetMs !== null ? { totalBudgetMs } : {}),
+      ...(persistedBudgetMs !== null
+        ? { totalBudgetMs: persistedBudgetMs }
+        : {}),
+      ...(outputPath !== null ? { outputPath } : {}),
       ...(tmuxWindowProbeCommand !== null ? { tmuxWindowProbeCommand } : {}),
       ...(typeof parsed.lifecycleJobId === "string"
         ? { lifecycleJobId: parsed.lifecycleJobId }

@@ -182,6 +182,9 @@ export interface LaunchHandleArgs {
   posture: LaunchPosture;
   /** Caller-supplied stop-wait ceiling threaded into the handle; null = default. */
   stopTimeoutMs: number | null;
+  /** `--budget` — the TOTAL leg budget bound DURABLY into run.json at launch, the
+   *  sole cumulative-ceiling authority later waits read. Null = no ceiling. */
+  budgetMs?: number | null;
   /** Resume-launch inputs; omitted = a fresh launch (byte-unchanged). */
   resume?: LaunchResume;
 }
@@ -202,7 +205,8 @@ export interface LaunchHandleArgs {
 export function launchToResolvedHandle(
   args: LaunchHandleArgs,
 ): RunLaunchResult {
-  const { deps, agent, prompt, posture, stopTimeoutMs, resume } = args;
+  const { deps, agent, prompt, posture, stopTimeoutMs, budgetMs, resume } =
+    args;
   if (agent === "pi") {
     try {
       stampPiPromptCompilerEnv(deps.env, {
@@ -345,6 +349,10 @@ export function launchToResolvedHandle(
         })
       : null;
   try {
+    const boundBudgetMs =
+      budgetMs != null && Number.isSafeInteger(budgetMs) && budgetMs > 0
+        ? budgetMs
+        : null;
     const result = launchKeeperAgentInTmux({
       agent,
       innerArgs: tmuxLaunch.remainingArgs,
@@ -362,6 +370,7 @@ export function launchToResolvedHandle(
       launcherArgvPrefix: deps.launcherArgvPrefix,
       randomUuid: deps.randomUuid,
       runTmuxCommand: deps.runTmuxCommand,
+      ...(boundBudgetMs !== null ? { budgetMs: boundBudgetMs } : {}),
     });
     const tmuxWindowProbeCommand = windowPresenceProbeCommand(
       result.killWindowCommand,
@@ -374,6 +383,9 @@ export function launchToResolvedHandle(
       transcriptPath: null,
       stopTimeoutMs,
       isResume: resume !== undefined,
+      // The launch tail (`agent run`) enforces the same durable ceiling the run
+      // just bound, so its first wait respects it immediately.
+      ...(boundBudgetMs !== null ? { totalBudgetMs: boundBudgetMs } : {}),
       ...(tmuxWindowProbeCommand !== null ? { tmuxWindowProbeCommand } : {}),
       ...(lifecycleJobId !== null ? { lifecycleJobId } : {}),
       ...(invocationStopFloor !== null ? { invocationStopFloor } : {}),

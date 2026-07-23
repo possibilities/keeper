@@ -475,6 +475,10 @@ export type ParseRunArgsResult =
       cli: AgentKind;
       prompt: string;
       stopTimeoutMs: number | null;
+      /** `--budget <dur>` — the TOTAL leg budget bound DURABLY into run.json at
+       *  launch, the sole cumulative-ceiling authority every later `agent wait`
+       *  reads and re-declares against. Null when unset (no cumulative ceiling). */
+      budgetMs: number | null;
       readOnly: boolean;
       /** `--reap-window-on-terminal` — a one-shot leg posture: after the terminal
        *  envelope is written, the handler best-effort kills the tmux window the
@@ -547,6 +551,7 @@ export type ParseRunArgsResult =
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];
   let stopTimeoutMs: number | null = null;
+  let budgetMs: number | null = null;
   let readOnly = false;
   let reapWindowOnTerminal = false;
   let systemFile: string | null = null;
@@ -591,6 +596,28 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
         return { ok: false, error: `--stop-timeout ${parsed.message}` };
       }
       stopTimeoutMs = parsed.ms;
+      continue;
+    }
+    if (arg === "--budget") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--budget requires a value" };
+      }
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--budget ${parsed.message}` };
+      }
+      budgetMs = parsed.ms;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--budget=")) {
+      const value = arg.slice("--budget=".length);
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--budget ${parsed.message}` };
+      }
+      budgetMs = parsed.ms;
       continue;
     }
     if (arg === "--system-file") {
@@ -796,6 +823,7 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     cli: cli as AgentKind,
     prompt,
     stopTimeoutMs,
+    budgetMs,
     readOnly,
     reapWindowOnTerminal,
     systemFile,
@@ -917,40 +945,42 @@ export async function captureFromHandle(
     handle.startedAtMs > 0 ? Math.min(startMs, handle.startedAtMs) : startMs;
   const elapsed = (): number => roundTenths((deps.now() - referenceMs) / 1000);
 
-  // Producer-clock cumulative budget: once the leg's launch-age crosses the
-  // caller-supplied total budget, the wait BLOCKS deterministically and holds
-  // the handle — no per-call chunk timing and no wrapper counting can extend it,
-  // and a cold wrapper reading the same run.json blocks identically. A per-call
-  // clock could not see cumulative age, which is why the prose cap failed live.
+  // Producer-clock cumulative budget: the durable launch instant (`startedAtMs`,
+  // persisted in run.json) gives the leg's launch-age, a cumulative clock that no
+  // per-call chunk timing or wrapper counting can extend and that a cold wrapper
+  // reading the same run.json sees identically. The budget caps SLEEP, never
+  // OBSERVATION — so the wait is bounded to the remaining budget (floored at a
+  // single non-sleeping scan once exhausted), and ONLY a non-terminal result over
+  // budget parks. A boundary-qualified stop or an observed death that is already
+  // present wins first, so a cold wrapper arriving AFTER the leg finished captures
+  // it instead of being parked (the original incident).
   const launchAgeMs =
     handle.totalBudgetMs != null && handle.startedAtMs > 0
       ? deps.now() - handle.startedAtMs
       : null;
-  if (
+  const overBudget =
     handle.totalBudgetMs != null &&
     launchAgeMs !== null &&
-    launchAgeMs >= handle.totalBudgetMs
-  ) {
-    return {
-      ...buildRunCaptureEnvelope({
-        outcome: "timed_out",
-        agent,
-        handle: handleId,
-        resumeTarget: baseResume,
-        elapsedSeconds: elapsed(),
-      }),
-      timeoutLiveness: "unknown",
-      budgetExhausted: true,
-    };
-  }
-  // Cap a single wait so it can never extend PAST the durable deadline, even if
-  // the caller passes a chunk larger than the remaining budget.
+    launchAgeMs >= handle.totalBudgetMs;
+  const exhausted = (): RunCaptureResult => ({
+    ...buildRunCaptureEnvelope({
+      outcome: "timed_out",
+      agent,
+      handle: handleId,
+      resumeTarget: baseResume,
+      elapsedSeconds: elapsed(),
+    }),
+    timeoutLiveness: "unknown",
+    budgetExhausted: true,
+  });
   const waitHandle =
     handle.totalBudgetMs != null && launchAgeMs !== null
       ? {
           ...handle,
+          // Remaining budget, floored at 0 so an over-budget wait does exactly one
+          // non-sleeping observation scan (never another chunk of sleep).
           stopTimeoutMs: Math.max(
-            1,
+            0,
             Math.min(
               handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS,
               handle.totalBudgetMs - launchAgeMs,
@@ -976,6 +1006,14 @@ export async function captureFromHandle(
         resumeTarget: baseResume,
         elapsedSeconds: elapsed(),
       });
+    }
+    // No terminal evidence was observed AND the budget is spent: HOLD the handle
+    // (budget exhausted). Reached only after the one non-sleeping scan above found
+    // neither a boundary-qualified stop nor a death — everything below here is a
+    // non-terminal attribution/timeout outcome, so parking here never masks a
+    // ready completion or an observed death.
+    if (overBudget) {
+      return exhausted();
     }
     // The wait did not reach a stop. When the transcript path DID resolve and
     // only the stop wait timed out, read that known path once for a partial
@@ -1036,11 +1074,14 @@ export async function captureFromHandle(
   const transcriptPath = show.ok ? show.transcriptPath : wait.transcriptPath;
   // For claude, the gated wait stop is the BLESSED settled turn: prefer its own
   // message so a later human-resume turn's whole-file re-scan cannot displace the
-  // answer. Only a structural claude stop (null text) falls back to the re-scan —
-  // and that re-scan (show-last-message → findLastMessage) NEVER surfaces a
-  // NON-terminal tool_use turn's interim text, so a structural end with no real
-  // answer resolves to `no_message`, never a mined completion. Pi keeps the
-  // re-scan-first preference (its stop text is a subset of show-last-message's).
+  // answer. Only a structural claude stop (null text) falls back to the re-scan
+  // (show-last-message → findLastMessage), which recovers a real terminal answer
+  // where one exists. That re-scan is PERMISSIVE: with no terminal answer present
+  // it CAN surface a non-terminal tool_use turn's interim text, so this path may
+  // report `completed` carrying interim text. That is accepted here — the
+  // load-bearing guard against a DEAD leg fabricating success is upstream: a
+  // positively-gone window returns `partner_died` and mines no message. Pi keeps
+  // the re-scan-first preference (its stop text is a subset of show-last-message's).
   let message: string | null;
   let messageFound: boolean;
   if (agent === "claude" && wait.stop.message !== null) {
