@@ -44,6 +44,7 @@ import {
   ensureWorktreeResult,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
+  type InodeProbe,
   isBaselineScratchPath,
   isKeeperLaneEntry,
   isLinkedWorktree,
@@ -3710,6 +3711,18 @@ const FENCE_HEAD_OID = "a".repeat(40);
 const FENCE_SRC_OID = "b".repeat(40);
 const nullFenceLock: LockAcquirer = () => null;
 
+// A pure, deterministic inode probe for the pure-`run` fence fakes — a stable {ino,dev} hashed
+// from the admin-dir path, so distinct paths get distinct inodes and the lock-identity CAS is
+// exercised WITHOUT real fs (the git-boundary pure-seam discipline). Same path → same inode.
+const pathInode: InodeProbe = async (p) => {
+  let h = 2166136261;
+  for (let i = 0; i < p.length; i++) {
+    h ^= p.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return { ino: h >>> 0, dev: 1 };
+};
+
 function fencedGit(
   opts: {
     headOid?: string; // HEAD under the CAS (default matches the expected snapshot)
@@ -3721,10 +3734,14 @@ function fencedGit(
     sourceMoved?: boolean; // the pinned source branch resolves to a DIFFERENT oid under the lock
     // a pseudo-ref probe reads INCONCLUSIVE (exit 0 + empty) instead of positively-absent
     pseudoRefInconclusive?: "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD";
+    // after a conflict's clean abort, HEAD reads a DIFFERENT oid than the pinned target-
+    // arrival (the abort left residue / drifted) → the abort-restoration proof defers (P1-7)
+    postAbortHeadWrong?: boolean;
   } = {},
 ): { run: GitRunner; calls: string[] } {
   let merged = false;
   let midMerge = false;
+  let aborted = false;
   let gitDirReads = 0;
   const calls: string[] = [];
   const run: GitRunner = async (a) => {
@@ -3750,12 +3767,13 @@ function fencedGit(
       return { code: 0, stdout: `${dir}\n`, stderr: "", signal: null };
     }
     if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
-      return {
-        code: 0,
-        stdout: `${opts.headOid ?? FENCE_HEAD_OID}\n`,
-        stderr: "",
-        signal: null,
-      };
+      // After a clean abort, HEAD reads a DIFFERENT oid under `postAbortHeadWrong` — the
+      // restoration proof (P1-7) then defers rather than mint a conflict at a phantom head.
+      const oid =
+        aborted && opts.postAbortHeadWrong
+          ? "9".repeat(40)
+          : (opts.headOid ?? FENCE_HEAD_OID);
+      return { code: 0, stdout: `${oid}\n`, stderr: "", signal: null };
     }
     // SOURCE CAS — the pinned source branch still resolves to the pinned oid (or a DIFFERENT
     // one under `sourceMoved`).
@@ -3858,6 +3876,7 @@ function fencedGit(
     }
     if (a[0] === "merge" && a[1] === "--abort") {
       midMerge = false;
+      aborted = true;
       return { code: 0, stdout: "", stderr: "", signal: null };
     }
     return { code: 0, stdout: "", stderr: "", signal: null };
@@ -3874,6 +3893,7 @@ test("mergePinnedObjectFenced: a lock timeout → defer (no CAS, no merge)", asy
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: nullFenceLock,
   });
   expect(out.kind).toBe("defer");
@@ -3890,6 +3910,7 @@ test("mergePinnedObjectFenced: the source already contained (proven under the lo
     targetBranch: FENCE_TGT,
     strategy: "ff",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("already-integrated");
@@ -3905,6 +3926,7 @@ test("mergePinnedObjectFenced: strategy ff, source ahead → integrated via `mer
     targetBranch: FENCE_TGT,
     strategy: "ff",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("integrated");
@@ -3922,6 +3944,7 @@ test("mergePinnedObjectFenced: strategy diverged → integrated via `merge --no-
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("integrated");
@@ -3939,6 +3962,7 @@ test("mergePinnedObjectFenced: the target HEAD moved under the fence (CAS) → d
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -3956,6 +3980,7 @@ test("mergePinnedObjectFenced: the path is re-registered on ANOTHER branch → d
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -3973,6 +3998,7 @@ test("mergePinnedObjectFenced: the path is UNREGISTERED under the fence → defe
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -3990,6 +4016,7 @@ test("mergePinnedObjectFenced: a fast-forward REFUSED (raced non-ff) → defer, 
     targetBranch: FENCE_TGT,
     strategy: "ff",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -4007,6 +4034,7 @@ test("mergePinnedObjectFenced: the git-dir identity is REPLACED under the lock (
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -4024,6 +4052,7 @@ test("mergePinnedObjectFenced: the pinned source moves between the probe and the
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -4041,6 +4070,7 @@ test("mergePinnedObjectFenced: an INCONCLUSIVE in-progress pseudo-ref probe → 
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("defer");
@@ -4057,6 +4087,7 @@ test("mergePinnedObjectFenced: a divergent CONTENT conflict → conflict carryin
     targetBranch: FENCE_TGT,
     strategy: "diverged",
     run,
+    inodeProbe: pathInode,
     acquireLock: okLock,
   });
   expect(out.kind).toBe("conflict");
@@ -4066,6 +4097,114 @@ test("mergePinnedObjectFenced: a divergent CONTENT conflict → conflict carryin
     expect(out.conflictedFiles).toContain("src/foo.ts");
   }
   expect(calls.some((c) => c === "merge --abort")).toBe(true);
+});
+
+test("mergePinnedObjectFenced: the under-lock authority reads HELD (a claim landed after the snapshot) → defer, no merge [lock #1]", async () => {
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    inodeProbe: pathInode,
+    acquireLock: okLock,
+    underLockAuthority: async () => "held",
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("under-lock authority held");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the under-lock authority reads UNKNOWN (data-version/instance drift) → defer, no merge [lock #2]", async () => {
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    inodeProbe: pathInode,
+    acquireLock: okLock,
+    underLockAuthority: async () => "unknown",
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("under-lock authority unknown");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: a same-path/NEW-inode admin-dir replacement under the lock (before the CAS) → defer, no merge [lock #3]", async () => {
+  // The git-dir PATH is unchanged, but its inode flips on the SECOND probe (the post-acquire
+  // CAS, id1) — a torn-down-then-recreated admin dir. The lock-identity CAS catches it.
+  let n = 0;
+  const flipOn2nd: InodeProbe = async () => {
+    n += 1;
+    return { ino: n >= 2 ? 4242 : 111, dev: 1 };
+  };
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    inodeProbe: flipOn2nd,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("identity replaced under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: a same-path/new-inode replacement AFTER the CAS (adjacent to the effect) → defer, no merge [lock #3]", async () => {
+  // id0 and id1 agree (inode 111), so the post-acquire CAS passes; the inode flips only on the
+  // THIRD probe — the FINAL revalidation immediately before the merge — so a replacement that
+  // slips in after the CAS still defers rather than merge over a stale lock.
+  let n = 0;
+  const flipOn3rd: InodeProbe = async () => {
+    n += 1;
+    return { ino: n >= 3 ? 4242 : 111, dev: 1 };
+  };
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    inodeProbe: flipOn3rd,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("replaced immediately before the merge");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: a clean abort that leaves HEAD off the target-arrival oid → defer, NO conflict minted [lock #7]", async () => {
+  // The merge conflicts and `git merge --abort` exits 0, but the post-abort HEAD is NOT back at
+  // the pinned target-arrival oid — the restoration is unproven, so no `conflict` is minted at a
+  // phantom head; the wedge defers to the recover pass instead.
+  const { run } = fencedGit({ conflict: true, postAbortHeadWrong: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    inodeProbe: pathInode,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("target-arrival oid");
 });
 
 // ---------------------------------------------------------------------------
@@ -4086,7 +4225,8 @@ function reattachGit(
     refAbsent?: boolean; // the preserved ref is unresolved → defer
     refMoved?: boolean; // the ref moves under the reattach lock (CAS) → defer
     branchRegisteredElsewhere?: boolean; // the branch is registered on ANOTHER worktree → defer
-    pathRegistered?: boolean; // the lane path is ALREADY a registered worktree → defer
+    pathRegistered?: boolean; // the lane path is ALREADY registered on the lane branch → RESUMABLE
+    pathRegisteredForeign?: boolean; // the lane path is registered on a DIFFERENT branch → defer
     addFails?: boolean; // `git worktree add` fails → defer, ref preserved, retry
     postUnregistered?: boolean; // the post-add registration is unproven → defer
   } = {},
@@ -4144,6 +4284,11 @@ function reattachGit(
       if (opts.pathRegistered || (added && !opts.postUnregistered)) {
         entries.push(`worktree ${laneDir}\nbranch refs/heads/${laneBranch}`);
       }
+      if (opts.pathRegisteredForeign) {
+        entries.push(
+          `worktree ${laneDir}\nbranch refs/heads/some-foreign-branch`,
+        );
+      }
       return {
         code: 0,
         stdout: `${entries.join("\n\n")}\n`,
@@ -4183,6 +4328,8 @@ async function driveReattach(
       run,
       async () => {}, // ensureDepLink noop
       okLock,
+      undefined, // underLockAuthority (clear)
+      pathInode,
     );
     return { out, calls };
   } finally {
@@ -4216,9 +4363,20 @@ test("reattachLaneWorktree: the branch is already registered on ANOTHER worktree
   expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
 });
 
-test("reattachLaneWorktree: the lane PATH is already a registered worktree (mid-cycle-ready) → defer, no add", async () => {
+test("reattachLaneWorktree: the exact lane path+branch is ALREADY registered (a partial add) → RESUMABLE reattached, SKIP the add, reprove postconditions [lock #4]", async () => {
+  // P1-5: a partial add whose registration landed but whose postconditions/dep-plants did not
+  // is RESUMED (skip the `worktree add`, rerun ALL postconditions + dep planting), never a
+  // permanent defer that orphans the deps.
   const { out, calls } = await driveReattach({ pathRegistered: true });
+  expect(out.kind).toBe("reattached");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
+});
+
+test("reattachLaneWorktree: the lane path is registered on a FOREIGN branch → defer, never reattached (never overwritten) [lock #4]", async () => {
+  const { out, calls } = await driveReattach({ pathRegisteredForeign: true });
   expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("never reattached");
   expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
 });
 
@@ -4234,4 +4392,95 @@ test("reattachLaneWorktree: a `worktree add` failure → defer, the ref is PRESE
   if (out.kind === "defer") expect(out.reason).toContain("ref preserved");
   expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
   expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
+});
+
+test("reattachLaneWorktree: a HUSK-occupied lane path → defer to fenced recovery, NEVER deleted + NEVER added [lock #9]", async () => {
+  // P1-8: reattach eliminates husk deletion — a husk-occupied path is deferred to the
+  // separately fenced recovery/quarantine owner, never rm-rf'd and never overwritten by an add.
+  const repoDir = mkdtempSync(join(tmpdir(), "keeper-reattach-husk-"));
+  const laneDir = join(repoDir, "lane-husk");
+  mkdirSync(join(laneDir, ".claude"), { recursive: true });
+  writeFileSync(join(laneDir, ".claude", "settings.json"), "{}");
+  try {
+    // Fresh path (branch registered nowhere, path unregistered) — but the path is a husk.
+    const { run, calls } = reattachGit(repoDir, laneDir, REATTACH_BRANCH, {});
+    const out = await reattachLaneWorktree(
+      repoDir,
+      laneDir,
+      REATTACH_BRANCH,
+      run,
+      async () => {},
+      okLock,
+      undefined,
+      pathInode,
+    );
+    expect(out.kind).toBe("defer");
+    if (out.kind === "defer") expect(out.reason).toContain("husk");
+    expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+    // NEVER deleted — the husk dir survives for the fenced recovery owner.
+    expect(existsSync(join(laneDir, ".claude", "settings.json"))).toBe(true);
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("reattachLaneWorktree: a RESUMABLE reattach re-plants + PROVES the dep-link (root node_modules) → reattached [lock #4]", async () => {
+  // The lane is already registered (a partial add) but the dep-link was never planted; the
+  // resume re-runs ensureDepLink AND proves the plant before claiming reattached.
+  const repoDir = mkdtempSync(join(tmpdir(), "keeper-reattach-dep-"));
+  mkdirSync(join(repoDir, "node_modules"), { recursive: true });
+  const laneDir = join(repoDir, "lane");
+  mkdirSync(laneDir, { recursive: true });
+  try {
+    const { run, calls } = reattachGit(repoDir, laneDir, REATTACH_BRANCH, {
+      pathRegistered: true,
+    });
+    const out = await reattachLaneWorktree(
+      repoDir,
+      laneDir,
+      REATTACH_BRANCH,
+      run,
+      ensureWorktreeDepLink, // real plant
+      okLock,
+      undefined,
+      pathInode,
+    );
+    expect(out.kind).toBe("reattached");
+    expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false); // resumed, no add
+    // The plant is present + points at the source store.
+    expect(lstatSync(join(laneDir, "node_modules")).isSymbolicLink()).toBe(
+      true,
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("reattachLaneWorktree: a required dep-link plant left UNPROVEN → defer (prove EVERY plant), ref preserved [lock #4]", async () => {
+  // The source carries a node_modules (so a plant is REQUIRED) but ensureDepLink is a noop that
+  // plants nothing — proveAllDepPlants must catch the missing plant and defer, never reattached.
+  const repoDir = mkdtempSync(join(tmpdir(), "keeper-reattach-dep-miss-"));
+  mkdirSync(join(repoDir, "node_modules"), { recursive: true });
+  const laneDir = join(repoDir, "lane");
+  mkdirSync(laneDir, { recursive: true });
+  try {
+    const { run } = reattachGit(repoDir, laneDir, REATTACH_BRANCH, {
+      pathRegistered: true,
+    });
+    const out = await reattachLaneWorktree(
+      repoDir,
+      laneDir,
+      REATTACH_BRANCH,
+      run,
+      async () => {}, // noop — plants nothing
+      okLock,
+      undefined,
+      pathInode,
+    );
+    expect(out.kind).toBe("defer");
+    if (out.kind === "defer")
+      expect(out.reason).toContain("dep-link plant unproven");
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+  }
 });

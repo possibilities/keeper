@@ -60,6 +60,7 @@ import {
   classifyPendingIntegration,
   isMergeEscalationReason,
   type PendingIntegrationClass,
+  parseConflictHeadFence,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
 } from "../src/dispatch-failure-key";
@@ -170,9 +171,15 @@ export interface DeconflictIncident {
     /** The durable head fence a pre-minted fan-in (`pending owner integration`)
      *  incident pins at mint — the source rib and target base branch-tip object ids
      *  the resolver rechecks so the requested clean fast-forward is distinguishable
-     *  from a moved head. Both null unless {@link fence_state} is `pinned`. */
+     *  from a moved head. Also populated by a GENUINE actor conflict's `[conflict …]` head
+     *  fence (the pinned source + target-arrival objects), so the resolver's durable heads
+     *  are never null on an actor-minted content conflict. */
     expected_source_head: string | null;
     expected_base_head: string | null;
+    /** The obligation class an actor conflict pinned in its head fence (`rib` /
+     *  `canonical-base`), so the resolver knows whether the source is a sibling rib or the
+     *  epic base; null for a pending fence or a fence-less legacy conflict. */
+    source_class: "rib" | "canonical-base" | null;
     /** The tri-state fence class: `pinned` (a valid fence — perform the exact-object
      *  fast-forward), `malformed` (a pending-integration request whose fence is
      *  absent, duplicated, or malformed — FAIL CLOSED to stale_base, never a live-head
@@ -562,6 +569,11 @@ function buildDeconflictIncident(
       degraded.push("incident_reason_unparsed");
     }
     const heads = parsePendingIntegrationHeads(row.reason);
+    // A GENUINE actor conflict pins its exact source + target-arrival objects + obligation
+    // class in a `[conflict …]` head fence (distinct from the pending fence), so the resolver
+    // brief carries durable heads instead of null — the resolver never re-resolves a movable
+    // branch as the authority.
+    const conflict_fence = parseConflictHeadFence(row.reason);
     const fence_state = classifyPendingIntegration(row.reason);
     if (fence_state === "malformed") {
       // A pending-integration request whose fence is absent/duplicated/malformed —
@@ -575,8 +587,10 @@ function buildDeconflictIncident(
       base_branch: parsed?.base ?? null,
       stderr: parsed?.stderr ?? null,
       repo_dir: row.dir,
-      expected_source_head: heads?.sourceHead ?? null,
-      expected_base_head: heads?.baseHead ?? null,
+      expected_source_head:
+        heads?.sourceHead ?? conflict_fence?.sourceHead ?? null,
+      expected_base_head: heads?.baseHead ?? conflict_fence?.targetHead ?? null,
+      source_class: conflict_fence?.sourceClass ?? null,
       fence_state,
       owner_redispatch_attempts: row.owner_redispatch_attempts,
       instance_event_id: row.instance_event_id,

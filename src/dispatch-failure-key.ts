@@ -1126,6 +1126,62 @@ export function parsePendingIntegrationHeads(
   return { sourceHead: m[1], baseHead: m[2] };
 }
 
+/**
+ * The em-dash-tail SUFFIX a GENUINE actor content conflict carries so its EXACT pinned
+ * source object, target-arrival object, and obligation class survive the durable mint —
+ * distinct from the pending-integration fence (which IS the whole tail): this rides AFTER
+ * the git stderr as ` [conflict src=<oid> target=<oid> class=<rib|canonical-base>]`. The
+ * producer pins both object ids at mint; the fold writes the reason verbatim (it never
+ * probes), so the fence is re-fold-deterministic. Inverse of {@link parseConflictHeadFence}.
+ * Pure.
+ */
+export function buildConflictHeadFence(
+  sourceOid: string,
+  targetOid: string,
+  sourceClass: "rib" | "canonical-base",
+): string {
+  return `[conflict src=${sourceOid} target=${targetOid} class=${sourceClass}]`;
+}
+
+/** The genuine-conflict head-fence grammar — anchored at the reason's END so the marker
+ *  must be the last bytes: each id a full 40-or-64 lowercase hex object id, the class
+ *  exactly `rib` or `canonical-base`. */
+const CONFLICT_HEAD_FENCE =
+  / \[conflict src=([0-9a-f]{40}|[0-9a-f]{64}) target=([0-9a-f]{40}|[0-9a-f]{64}) class=(rib|canonical-base)\]$/;
+
+/**
+ * Extract the durable head fence of a GENUINE actor conflict — the pinned SOURCE object, the
+ * TARGET-ARRIVAL object, and the obligation class — read back by the resolver brief and the
+ * pinned resolution probe. STRICT closed grammar keyed on the exact `[conflict …]` token
+ * anchored at the end (the sanctioned marker discipline, never salvaged from prose): each id
+ * a full {@link isFullObjectId} object id, both sharing one length (a 40/64 cross-format pair
+ * is structurally impossible within one repo, so it classifies malformed), the class exactly
+ * `rib` or `canonical-base`. ANY deviation FAILS CLOSED to null — a fence-less legacy
+ * conflict, an abbreviated/uppercase/mismatched id, a look-alike stderr tail. A null caller
+ * degrades to the fence-less branch-name arm, never fabricates heads. Pure; NEVER throws.
+ */
+export function parseConflictHeadFence(reason: string): {
+  sourceHead: string;
+  targetHead: string;
+  sourceClass: "rib" | "canonical-base";
+} | null {
+  const m = CONFLICT_HEAD_FENCE.exec(reason);
+  if (
+    m == null ||
+    m[1] === undefined ||
+    m[2] === undefined ||
+    m[3] === undefined ||
+    m[1].length !== m[2].length
+  ) {
+    return null;
+  }
+  return {
+    sourceHead: m[1],
+    targetHead: m[2],
+    sourceClass: m[3] as "rib" | "canonical-base",
+  };
+}
+
 /** The tri-state class of a merge-conflict `dispatch_failures.reason`:
  *  - `pinned` — a pending-integration request with EXACTLY one valid fence;
  *  - `malformed` — a pending-integration request whose fence is absent, duplicated,

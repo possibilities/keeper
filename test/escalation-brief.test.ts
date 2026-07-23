@@ -31,7 +31,14 @@ import {
   main,
   parseEscalationKey,
 } from "../cli/escalation-brief";
-import { buildPendingIntegrationTail } from "../src/dispatch-failure-key";
+import { probeWorkMergeIncidentResolutions } from "../src/autopilot-worker";
+import type { GitRunner } from "../src/commit-work/git-exec";
+import {
+  buildConflictHeadFence,
+  buildPendingIntegrationTail,
+  parseConflictHeadFence,
+  parseMergeConflictReason,
+} from "../src/dispatch-failure-key";
 import { repoToken as deriveRepoToken } from "../src/worktree-plan";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
@@ -829,6 +836,7 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         repo_dir: "/repo",
         expected_source_head: null,
         expected_base_head: null,
+        source_class: null,
         fence_state: "unpinned",
         owner_redispatch_attempts: 0,
         instance_event_id: null,
@@ -912,6 +920,88 @@ test("a pinned pending-integration incident surfaces the durable head fence to t
   expect(inc.conflict?.expected_source_head).toBe(sourceHead);
   expect(inc.conflict?.expected_base_head).toBe(baseHead);
   db.close();
+});
+
+test("P0-4 durable conflict: an actor conflict mint round-trips through the REAL parser → brief → pinned-clear seams [lock #8]", async () => {
+  // The actor's CANONICAL conflict grammar carries the pinned source object, the target-
+  // arrival object, and the obligation class in a `[conflict …]` head fence. Prove the WHOLE
+  // pipeline end-to-end through the real seams (no in-memory field passing):
+  const sourceBranch = "keeper/epic/fn-840-durable--fn-840-durable.3";
+  const targetBranch = "keeper/epic/fn-840-durable--fn-840-durable.4";
+  const sourceHead = "1".repeat(40);
+  const targetHead = "2".repeat(40);
+  const reason =
+    `worktree-merge-conflict: merging ${sourceBranch} into ${targetBranch}` +
+    ` — CONFLICT (content): foo.ts ${buildConflictHeadFence(sourceHead, targetHead, "rib")}`;
+
+  // (1) MINT → PARSE: the canonical grammar is parseMergeConflictReason-parseable AND the
+  //     head fence extracts the exact pins + class.
+  const parsed = parseMergeConflictReason(reason);
+  expect(parsed).toEqual({
+    source: sourceBranch,
+    base: targetBranch,
+    stderr: `CONFLICT (content): foo.ts ${buildConflictHeadFence(sourceHead, targetHead, "rib")}`,
+  });
+  expect(parseConflictHeadFence(reason)).toEqual({
+    sourceHead,
+    targetHead,
+    sourceClass: "rib",
+  });
+
+  // (2) BRIEF: the deconflict brief surfaces the durable heads + class (never null).
+  const { db } = freshMemDb();
+  writeEpicFile(tmp, "fn-840-durable", { primary_repo: "/repo" });
+  seedMergeConflict(db, { id: "fn-840-durable", reason, dir: "/repo" });
+  const r = buildEscalationBrief(db, "deconflict::fn-840-durable", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const inc = r.brief.incident as {
+    conflict: {
+      expected_source_head: string | null;
+      expected_base_head: string | null;
+      source_class: string | null;
+    } | null;
+  };
+  expect(inc.conflict?.expected_source_head).toBe(sourceHead);
+  expect(inc.conflict?.expected_base_head).toBe(targetHead);
+  expect(inc.conflict?.source_class).toBe("rib");
+  db.close();
+
+  // (3) PINNED-CLEAR: the resolution probe routes the conflict fence to the PINNED grader —
+  //     both durable pins ancestors of the (stable, clean) current base → `merged`.
+  const baseOid = "b".repeat(40);
+  const durableRun: GitRunner = (async (args: string[]) => {
+    const cmd = args.join(" ");
+    if (args[0] === "rev-parse" && cmd.includes("^{commit}")) {
+      return { code: 0, stdout: `${baseOid}\n`, stderr: "" };
+    }
+    if (args[0] === "merge-base" && args.includes("--is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // both pins are ancestors of the base
+    }
+    if (args.includes("--git-dir")) return { code: 1, stdout: "", stderr: "" };
+    if (args[0] === "for-each-ref") return { code: 0, stdout: "", stderr: "" };
+    if (
+      cmd === "rev-parse --verify --quiet MERGE_HEAD" ||
+      cmd === "rev-parse --verify --quiet MERGE_AUTOSTASH" ||
+      cmd === "rev-parse --verify --quiet CHERRY_PICK_HEAD" ||
+      cmd === "rev-parse --verify --quiet REVERT_HEAD"
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // no in-progress residue
+    }
+    if (args[0] === "status") return { code: 0, stdout: "", stderr: "" }; // clean
+    if (cmd === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: `${targetBranch}\n`, stderr: "" }; // on the base
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [{ id: "fn-840-durable.4", reason, dir: "/lane" }],
+    durableRun,
+  );
+  expect(verdicts.get("fn-840-durable.4")).toBe("merged");
 });
 
 test("a legacy or malformed fence is surfaced as malformed-pending (fail closed, degraded, no live-head substitution)", () => {

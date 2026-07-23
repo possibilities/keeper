@@ -95,6 +95,7 @@ import {
 import { parsePlanRef } from "./derivers";
 import {
   assertNever,
+  buildConflictHeadFence,
   buildPendingIntegrationTail,
   classifyPendingIntegration,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
@@ -128,6 +129,7 @@ import {
   monitorSlotWedgeJobId,
   ORIGIN_CONTAINMENT_DISTRESS_ID_PREFIX,
   ORIGIN_CONTAINMENT_DISTRESS_REASON,
+  parseConflictHeadFence,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
   routeDispatchFailure,
@@ -302,6 +304,7 @@ import {
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
   supportsMergeTreeWriteTree as gitSupportsMergeTreeWriteTree,
+  type InodeProbe,
   isKeeperLaneEntry,
   keeperLaneIdentity,
   type LockAcquirer,
@@ -825,6 +828,26 @@ export async function probeWorkMergeIncidentResolutions(
         out.set(
           row.id,
           await probePinnedMergeResolution(row.dir, base, pins, run),
+        );
+        continue;
+      }
+      // A GENUINE actor conflict carrying a durable head fence — clear from the DURABLE
+      // objects (both pinned oids ancestors of the current base + a stable clean target),
+      // the SAME race-free pinned grading the pending class uses, never the movable source
+      // ref or branch absence (a post-mint source advance must never misgrade the pin).
+      const conflictPins = parseConflictHeadFence(row.reason);
+      if (conflictPins !== null) {
+        out.set(
+          row.id,
+          await probePinnedMergeResolution(
+            row.dir,
+            base,
+            {
+              sourceHead: conflictPins.sourceHead,
+              baseHead: conflictPins.targetHead,
+            },
+            run,
+          ),
         );
         continue;
       }
@@ -2078,6 +2101,9 @@ export interface WorktreeDriver {
     laneLiveness: LaneMaintenanceProbe | undefined,
     hasActiveResolver: (epicId: string) => boolean,
     recheckAuthority: (item: ProgressActorWorkItem) => ProgressActorAuthority,
+    freshAuthority?: (
+      item: ProgressActorWorkItem,
+    ) => Promise<ProgressActorAuthority>,
   ): Promise<ProgressActorOutcome>;
 }
 
@@ -5357,7 +5383,7 @@ export type BlockingObligation =
  * The FIRST blocking obligation wins. `laneSet` MUST be `ok` (the caller defers otherwise).
  * The two ancestry probes are injected so the caller shares its per-cycle memos. NEVER throws.
  */
-async function firstBlockingObligation(
+export async function firstBlockingObligation(
   doneParents: readonly Task[],
   epicId: string,
   laneSet: { ok: true; branches: ReadonlySet<string> },
@@ -5372,9 +5398,14 @@ async function firstBlockingObligation(
   for (const parent of doneParents) {
     const rib = ribBranchFor(epicId, parent.task_id);
     if (!laneSet.branches.has(rib)) {
+      // Teardown containment is proven ONLY relative to a PRESENT canonical epic base:
+      // a pre-cut lane forking off the epic base ITSELF stands only when that base is
+      // POSITIVELY present (a both-absent state is NOT proof the source is contained — it
+      // false-clears); otherwise the base must be present AND an ancestor of the target.
+      const basePresent = laneSet.branches.has(epicBase);
       const contained =
-        (!target.existing && target.targetBranch === epicBase) ||
-        (laneSet.branches.has(epicBase) &&
+        basePresent &&
+        (target.targetBranch === epicBase ||
           (await epicBaseAncestorOfTarget(epicBase, target.targetBranch)));
       if (!contained) {
         return { kind: "canonical-base", rib, sourceBranch: epicBase };
@@ -9514,6 +9545,7 @@ export function createWorktreeDriver(
       laneLiveness,
       hasActiveResolver,
       recheckAuthority,
+      freshAuthority,
     ) {
       return runProgressActor(
         workItems,
@@ -9525,6 +9557,8 @@ export function createWorktreeDriver(
         recheckAuthority,
         run,
         acquireLock,
+        gitEnsureWorktreeDepLink,
+        freshAuthority,
       );
     },
     async reconcileOrigin(repos) {
@@ -10104,7 +10138,11 @@ async function verifyAndPushOwnerIntegration(
     }
   }
   const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
-  const lock = await acquire(await gitBaseMergeLockPath(repo, run));
+  const baseLockPath = await gitBaseMergeLockPath(repo, run);
+  // A guessed fallback lock path is gone: an unresolved common dir DEFERS as a
+  // transient skip rather than serializing against the wrong flock domain.
+  if (baseLockPath === null) return { kind: "lock-timeout" };
+  const lock = await acquire(baseLockPath);
   if (lock === null) return { kind: "lock-timeout" };
   try {
     const lockedReady = await gitMergeReadiness(repo, defaultBranch, run);
@@ -10883,7 +10921,13 @@ export async function mergeLaneBaseIntoDefault(
   // a concurrent `keeper commit-work` in the main checkout. A bounded acquirer
   // returning null → a transient lock-timeout skip, never a frozen cycle.
   const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
-  const lock = await acquire(await gitBaseMergeLockPath(repo, run));
+  const baseLockPath = await gitBaseMergeLockPath(repo, run);
+  // A guessed fallback lock path is gone: an unresolved common dir DEFERS as a
+  // transient skip rather than serializing against the wrong flock domain.
+  if (baseLockPath === null) {
+    return { kind: "lock-timeout" };
+  }
+  const lock = await acquire(baseLockPath);
   if (lock === null) {
     return { kind: "lock-timeout" };
   }
@@ -12648,16 +12692,14 @@ export type RibIntegrationOutcome =
  * {@link gitMergePinnedObjectFenced}. Both no-op arms go THROUGH the fence — the actor
  * never certifies containment on a pre-lock read.
  *
- * SOURCE-OID SELECTION at the effect boundary (the rib can be torn down between the actor's
- * enumeration and here, so re-resolve it):
- *  - rib PRESENT on a successful enumeration → the rib OID;
- *  - rib DEFINITIVELY ABSENT (exit 1) → the EPIC BASE OID: teardown merged the rib into the
- *    base, so proving the base is contained in the target proves the rib is too — re-pin the
- *    base at the boundary (it can move between observation and effect) and merge THAT through
- *    the fence, NEVER a blind `already-integrated` (an off-branch / path-replaced / drifted
- *    target must never read as integrated);
- *  - rib enumeration UNKNOWN, or the base unresolved when the rib is absent → defer (an
- *    absence on a FAILED enumeration proves nothing).
+ * SOURCE-OID SELECTION at the effect boundary — CLASS-EXACT (the caller's obligation class
+ * already selected the branch: a `rib` item passes the rib, a `canonical-base` item passes
+ * the epic base). This half re-resolves ONLY that exact `sourceBranch` (it can move between
+ * the actor's enumeration and here) and NEVER substitutes a different source: a `rib` whose
+ * ref DEFINITIVELY ABSENTED between the obligation CAS and here → `defer` (the obligation is
+ * stale; only a `canonical-base` ITEM may ever integrate the base — never a silent rib→base
+ * conversion the gate did not authorize); an UNKNOWN enumeration → `defer` (an absence on a
+ * FAILED probe proves nothing).
  * STRATEGY from the PINNED oids (never a re-resolved branch): source ⊆ target → `ff` (the
  * fence's under-lock no-op arm resolves it to `already-integrated`); target ⊆ source → an
  * exact-object FAST-FORWARD; TRUE DIVERGENCE → a two-parent merge; an inconclusive ancestry
@@ -12667,9 +12709,13 @@ export async function integratePinnedRib(
   dir: string,
   targetBranch: string,
   sourceBranch: string,
-  epicBaseBranch: string,
   run: WorktreeGitRunner = gitExec,
   acquireLock?: LockAcquirer,
+  /** The H7 LOAD-BEARING under-lock authority — threaded verbatim into the fence, where it is
+   *  invoked UNDER the lock after every CAS, immediately before the merge (P0-1). */
+  underLockAuthority?: () => Promise<"clear" | "held" | "unknown">,
+  /** The admin-dir inode probe for the fence's lock-identity CAS; the fakes inject it. */
+  inodeProbe?: InodeProbe,
 ): Promise<RibIntegrationOutcome> {
   try {
     // (0) Snapshot the pinned fence: the target HEAD object.
@@ -12682,33 +12728,21 @@ export async function integratePinnedRib(
     }
     const targetOid = targetHead.oid;
 
-    // (1) Source-OID selection: the rib, else the epic base (rib torn down), else defer.
-    const rib = await revParseOid(
+    // (1) CLASS-EXACT source-OID selection: re-resolve ONLY the caller-selected source
+    //     branch. Absent (the obligation went stale) OR unknown → defer; NEVER a base
+    //     fallback (a rib→canonical-base conversion the gate never authorized).
+    const src = await revParseOid(
       dir,
       `refs/heads/${sourceBranch}^{commit}`,
       run,
     );
-    let sourceOid: string;
-    let sourceBranchUsed = sourceBranch;
-    if (rib.kind === "oid") {
-      sourceOid = rib.oid;
-    } else if (rib.kind === "absent") {
-      const base = await revParseOid(
-        dir,
-        `refs/heads/${epicBaseBranch}^{commit}`,
-        run,
-      );
-      if (base.kind !== "oid") {
-        return {
-          kind: "defer",
-          reason: `rib torn down but epic base unresolved (${base.kind === "absent" ? "absent" : base.detail})`,
-        };
-      }
-      sourceOid = base.oid;
-      sourceBranchUsed = epicBaseBranch;
-    } else {
-      return { kind: "defer", reason: `source ref unresolved (${rib.detail})` };
+    if (src.kind !== "oid") {
+      return {
+        kind: "defer",
+        reason: `source ref unresolved (${src.kind === "absent" ? "absent — obligation stale, never a base fallback" : src.detail})`,
+      };
     }
+    const sourceOid = src.oid;
 
     // (2) Classify the strategy from the PINNED oids. An inconclusive probe never reads as
     //     a negative; the source ⊆ target no-op is resolved UNDER the lock by the fence, so
@@ -12737,12 +12771,14 @@ export async function integratePinnedRib(
     //     positive post-checks.
     return gitMergePinnedObjectFenced(dir, {
       sourceOid,
-      sourceBranch: sourceBranchUsed,
+      sourceBranch,
       expectedHeadOid: targetOid,
       targetBranch,
       strategy,
       run,
       acquireLock,
+      underLockAuthority,
+      inodeProbe,
     });
   } catch (err) {
     return { kind: "defer", reason: `integration probe threw: ${errMsg(err)}` };
@@ -12831,6 +12867,15 @@ export async function runProgressActor(
     sourceCheckout: string,
     worktreePath: string,
   ) => Promise<void> = gitEnsureWorktreeDepLink,
+  /** The H7 LOAD-BEARING under-lock authority — a genuinely FRESH live-state re-read per item,
+   *  passed INTO the fence so it runs UNDER the lock immediately before the effect (P0-1). The
+   *  pre-lock synchronous {@link recheckAuthority} stays a cheap early gate; THIS is the load-
+   *  bearing one. Absent → the fence treats each effect as unauthorized-cleared (fast tier). */
+  freshAuthority?: (
+    item: ProgressActorWorkItem,
+  ) => Promise<ProgressActorAuthority>,
+  /** The admin-dir inode probe for the fence's lock-identity CAS; the actor fakes inject it. */
+  inodeProbe?: InodeProbe,
 ): Promise<ProgressActorOutcome> {
   const resolved: string[] = [];
   const failures: ProgressActorFailure[] = [];
@@ -12957,11 +13002,12 @@ export async function runProgressActor(
         ) {
           continue;
         }
-        // (5) H7 fresh-authority recheck immediately before the effect.
+        // (5) H7 pre-lock fresh-authority recheck — a cheap early gate; the LOAD-BEARING
+        //     recheck is `freshAuthority` invoked UNDER the reattach lock (below).
         if (recheckAuthority(item) !== "clear") {
           continue;
         }
-        // (6) EFFECT — the H8 reattach fence.
+        // (6) EFFECT — the H8 reattach fence, gated UNDER its lock by the fresh live recheck.
         const out = await gitReattachLaneWorktree(
           repoDir,
           item.worktreePath,
@@ -12969,6 +13015,8 @@ export async function runProgressActor(
           run,
           ensureDepLink,
           acquireLock ?? defaultCommitWorkLockAcquirer,
+          freshAuthority === undefined ? undefined : () => freshAuthority(item),
+          inodeProbe,
         );
         if (out.kind === "reattached") {
           resolved.push(item.taskId);
@@ -13015,28 +13063,38 @@ export async function runProgressActor(
       ) {
         continue; // the obligation drifted / cleared → defer, never re-select
       }
-      // (5) H7 fresh-authority recheck immediately before the effect.
+      // (5) H7 pre-lock fresh-authority recheck — a cheap early gate; the LOAD-BEARING
+      //     recheck is `freshAuthority` invoked UNDER the merge fence's lock (below).
       if (recheckAuthority(item) !== "clear") {
         continue;
       }
-      // (6) EFFECT — integrate the pinned source through the commit-work fence. An
-      //     unregistered / dirty target defers inside the fence (the gate re-emits a reattach
-      //     item / dirt-recovery owns it); a conflict escalates minted from the exact pins.
+      // (6) EFFECT — integrate the pinned source through the commit-work fence, gated UNDER
+      //     its lock by the fresh live recheck. An unregistered / dirty target defers inside
+      //     the fence (the gate re-emits a reattach item / dirt-recovery owns it); a conflict
+      //     escalates minted from the exact pins.
       const out = await integratePinnedRib(
         item.worktreePath,
         item.targetBranch,
         item.sourceBranch,
-        epicBase,
         run,
         acquireLock,
+        freshAuthority === undefined ? undefined : () => freshAuthority(item),
+        inodeProbe,
       );
       if (out.kind === "integrated" || out.kind === "already-integrated") {
         resolved.push(item.taskId);
         integratedAny = true;
       } else if (out.kind === "conflict") {
+        // Durable mint in the CANONICAL `merging <source> into <base>` grammar
+        // (parseMergeConflictReason-parseable → the brief + resolution probe get the
+        // branches) PLUS the durable head fence pinning the EXACT source object, the
+        // target-arrival object, and the obligation class — so the pinned resolution
+        // probe clears from durable objects, never movable branch prose.
         escalations.push({
           taskId: item.taskId,
-          reason: `worktree-merge-conflict: ${item.sourceObligation} ${out.sourceOid} into ${item.targetBranch} (${out.targetOid}) — ${out.stderr.slice(0, 160)}`,
+          reason:
+            `${MERGE_ESCALATION_REASON_TOKEN}: merging ${item.sourceBranch} into ${item.targetBranch}` +
+            ` — ${out.stderr.slice(0, 120)} ${buildConflictHeadFence(out.sourceOid, out.targetOid, item.sourceObligation)}`,
           dir: item.worktreePath,
           conflictedFiles: out.conflictedFiles,
           sourceOid: out.sourceOid,
@@ -16059,6 +16117,15 @@ function main(): void {
                 }
                 return false;
               };
+              // The DB watermark captured right before the actor runs — the under-lock
+              // authority fences any merge/reattach whose DB changed since (drift → re-derive
+              // next cycle), ON TOP of the exact live claim/resolver re-read below.
+              const preActorDataVersion =
+                (
+                  db.query("PRAGMA data_version").get() as {
+                    data_version?: number;
+                  } | null
+                )?.data_version ?? 0;
               const actor = await deps.worktree.progressActor(
                 snapshot.progressActorWorkItems ?? [],
                 snapshot.epics,
@@ -16066,11 +16133,10 @@ function main(): void {
                 snapshot.worktreesRoot,
                 laneMaintenanceProbe,
                 hasActiveResolver,
-                // H7 FRESH-AUTHORITY recheck — re-observe the LIVE liveness/resolver state at
-                // the effect boundary (the lane-liveness probe reads live pane state; the
-                // resolver check reads the claimed-incident keys), never a stale cycle
-                // decision. A live claimant on the item's lane, or an active resolver on its
-                // epic, HOLDS it (zero mutation); else `clear` proceeds.
+                // H7 PRE-LOCK fresh-authority recheck — a cheap early gate off the snapshot's
+                // live liveness/resolver observations. A live claimant on the item's lane, or
+                // an active resolver on its epic, HOLDS it; else `clear`. The LOAD-BEARING
+                // recheck is `freshAuthority` (below), run UNDER the fence's lock.
                 (item) => {
                   if (hasActiveResolver(item.epicId)) {
                     return "held";
@@ -16082,6 +16148,51 @@ function main(): void {
                   }).kind === "defer"
                     ? "held"
                     : "clear";
+                },
+                // H7 LOAD-BEARING under-lock authority — a GENUINELY FRESH re-read of the LIVE
+                // claim/resolver/claim-release rows on the worker's own read-only connection
+                // (never the cycle snapshot), invoked INSIDE the fence's held lock immediately
+                // before the effect. A claimed incident on the item's epic, or a live (non-
+                // released) dispatch claim on its task, HOLDS the effect; a DB write since the
+                // pre-actor capture (data-version drift) → `unknown` (defer, re-derive next
+                // cycle); a failed re-read fails CLOSED to `unknown`. Only `clear` mutates.
+                async (item): Promise<ProgressActorAuthority> => {
+                  try {
+                    for (const row of db
+                      .query(
+                        `SELECT verb, id FROM dispatch_failures
+                           WHERE verb IN ('work','close') AND claim_session_id IS NOT NULL`,
+                      )
+                      .all() as { verb: string; id: string }[]) {
+                      const key = `${row.verb}::${row.id}`;
+                      if (
+                        key === dispatchKey("close", item.epicId) ||
+                        key.startsWith(`work::${item.epicId}.`)
+                      ) {
+                        return "held";
+                      }
+                    }
+                    const claim = db
+                      .query(
+                        "SELECT state FROM dispatch_claims WHERE verb = 'work' AND id = ?",
+                      )
+                      .get(item.taskId) as { state: string } | null;
+                    if (claim !== null && claim.state !== "released") {
+                      return "held";
+                    }
+                    const nowDataVersion =
+                      (
+                        db.query("PRAGMA data_version").get() as {
+                          data_version?: number;
+                        } | null
+                      )?.data_version ?? 0;
+                    if (nowDataVersion !== preActorDataVersion) {
+                      return "unknown";
+                    }
+                    return "clear";
+                  } catch {
+                    return "unknown";
+                  }
                 },
               );
               for (const f of actor.failures) {

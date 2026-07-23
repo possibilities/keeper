@@ -402,22 +402,24 @@ export async function commitWorkLockPath(
  * `keeper-commit-work.lock` a `keeper commit-work` in that main checkout takes,
  * and the two still collide; a linked lane's commit-work (keyed on its own
  * `--git-dir`) is a distinct path and stays isolated (a lane commit touches its
- * own branch, never default). On a git error / empty stdout, falls back to the
- * worktree-anchored absolute `<cwd>/.git/keeper-commit-work.lock` — never a bare
- * relative `.git`.
+ * own branch, never default). On a git error / empty stdout the common dir is
+ * UNRESOLVED: returns `null` (NO guessed `<cwd>/.git` fallback — a fallback path can
+ * name a DIFFERENT flock than the real common dir, so a structural mutation would
+ * serialize against the wrong domain). The caller DEFERS to a transient retry.
  */
 export async function baseMergeLockPath(
   cwd: string,
   run: GitRunner = gitExec,
-): Promise<string> {
+): Promise<string | null> {
   const res = await run(
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    { cwd },
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
   );
   const commonDir = res.stdout.trim();
-  const dir =
-    res.code === 0 && commonDir.length > 0 ? commonDir : joinPath(cwd, ".git");
-  return joinPath(dir, "keeper-commit-work.lock");
+  if (res.code !== 0 || commonDir.length === 0) {
+    return null;
+  }
+  return joinPath(resolve(commonDir), "keeper-commit-work.lock");
 }
 
 /**
@@ -1826,6 +1828,56 @@ export function isWorktreeDepPlant(
 }
 
 /**
+ * Prove EVERY dep-link {@link ensureWorktreeDepLink} would plant for `sourceCheckout` is
+ * present at `worktreePath` — the checkout-root `node_modules` AND each nested-package
+ * `node_modules` — not merely the top-level one (P1-5). "Required" is source-driven: a plant
+ * location counts only when the source actually carries a `node_modules` there (a nested
+ * package with no install contributes nothing, exactly as the provisioning seam skips it).
+ * Each required location's planted entry must be a byte-identical {@link isWorktreeDepPlant};
+ * the FIRST missing/foreign one is returned so the reattach caller can defer NAMING it. Pure
+ * over the injected fs; a probe error propagates to the caller's try/catch (→ defer).
+ */
+async function proveAllDepPlants(
+  sourceCheckout: string,
+  worktreePath: string,
+  fs: WorktreeDepLinkFs = worktreeDepLinkFs,
+): Promise<{ ok: true } | { ok: false; missing: string }> {
+  const relDirs = [
+    "",
+    ...(await discoverNestedPackageDirs(sourceCheckout, fs)),
+  ];
+  for (const relDir of relDirs) {
+    const sourceNodeModules = resolve(
+      sourceCheckout,
+      relDir,
+      WORKTREE_DEP_LINK_NAME,
+    );
+    let required = false;
+    try {
+      await fs.lstat(sourceNodeModules);
+      required = true;
+    } catch (err) {
+      if (!isEnoent(err) && !isEnotdir(err)) throw err;
+    }
+    if (!required) continue;
+    const relLink =
+      relDir === ""
+        ? WORKTREE_DEP_LINK_NAME
+        : `${relDir}/${WORKTREE_DEP_LINK_NAME}`;
+    let planted: string | undefined;
+    try {
+      planted = await readlink(resolve(worktreePath, relLink));
+    } catch {
+      planted = undefined;
+    }
+    if (!isWorktreeDepPlant(sourceCheckout, relLink, planted)) {
+      return { ok: false, missing: relLink };
+    }
+  }
+  return { ok: true };
+}
+
+/**
  * Ensure a worktree exists at `path` on `branch`, forked off `commitish` (the
  * parent lane's committed tip, or the base branch for a root). Idempotent + crash-
  * recoverable:
@@ -2384,14 +2436,51 @@ async function strictWorktreeReadiness(
   return { kind: "ready" };
 }
 
-/** The stable git-dir / common-dir / commit-work-lock identity of a worktree, pinned at
- *  lock acquisition and RE-DERIVED under the lock so a remove/re-add that moved the admin
- *  dir can never leave a caller holding an obsolete lock while mutating the replacement.
- *  `null` on any probe failure/empty (the caller DEFERS). */
+/** The stable identity of a worktree's admin dir — its git-dir + common-dir PATHS plus the
+ *  git-dir's on-disk INODE ({@link Stats.ino}/{@link Stats.dev}) — pinned at lock acquisition
+ *  and RE-DERIVED under the lock so a remove/re-add that moved OR silently SWAPPED the admin
+ *  dir at the SAME path can never leave a caller holding an obsolete lock while mutating the
+ *  new one. The string paths alone miss a same-path/new-inode swap (a torn-down-then-
+ *  recreated linked worktree admin dir), so identity carries the inode: two identities are
+ *  the SAME admin dir only when path AND (ino, dev) match. `null` on any probe/stat failure
+ *  or empty read (the caller DEFERS). */
+interface LockIdentity {
+  gitDir: string;
+  commonDir: string;
+  lockPath: string;
+  /** The per-worktree structural lock — the COMMON dir's `keeper-commit-work.lock` (== the
+   *  base-merge lock). In the main worktree this equals {@link lockPath}; a linked lane's
+   *  common dir is the shared ref store, so the two are distinct paths. */
+  structuralLockPath: string;
+  ino: number;
+  dev: number;
+}
+
+/**
+ * The git admin dir's on-disk inode probe — the same-path/new-inode swap detector. Injectable
+ * so the pure-`run` fence fakes exercise the lock-identity CAS WITHOUT real fs (the git-boundary
+ * pure-seam discipline); production uses {@link defaultInodeProbe} (a real `lstat`). Returns
+ * `null` on any stat failure — an admin dir mid-replacement is an UNKNOWN identity → the caller
+ * DEFERS rather than proceed over it.
+ */
+export type InodeProbe = (
+  path: string,
+) => Promise<{ ino: number; dev: number } | null>;
+
+const defaultInodeProbe: InodeProbe = async (path) => {
+  try {
+    const st = await lstat(path);
+    return { ino: st.ino, dev: st.dev };
+  } catch {
+    return null;
+  }
+};
+
 async function resolveLockIdentity(
   cwd: string,
   run: GitRunner,
-): Promise<{ gitDir: string; commonDir: string; lockPath: string } | null> {
+  inodeProbe: InodeProbe = defaultInodeProbe,
+): Promise<LockIdentity | null> {
   const gitDirR = await run(
     ["rev-parse", "--path-format=absolute", "--git-dir"],
     { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
@@ -2410,10 +2499,69 @@ async function resolveLockIdentity(
   ) {
     return null;
   }
+  const gitDirAbs = resolve(gitDir);
+  const commonDirAbs = resolve(commonDir);
+  // Inode of the git admin dir — the same-path/new-inode swap detector. A probe failure
+  // (the admin dir is being swapped right now) is an UNKNOWN identity → defer.
+  const st = await inodeProbe(gitDirAbs);
+  if (st === null) {
+    return null;
+  }
   return {
-    gitDir: resolve(gitDir),
-    commonDir: resolve(commonDir),
-    lockPath: joinPath(resolve(gitDir), "keeper-commit-work.lock"),
+    gitDir: gitDirAbs,
+    commonDir: commonDirAbs,
+    lockPath: joinPath(gitDirAbs, "keeper-commit-work.lock"),
+    structuralLockPath: joinPath(commonDirAbs, "keeper-commit-work.lock"),
+    ino: st.ino,
+    dev: st.dev,
+  };
+}
+
+/** True when two {@link LockIdentity} snapshots name the SAME admin dir — path AND inode.
+ *  A same-path/new-inode replacement fails this (the git-dir was torn down + recreated),
+ *  so a caller holding a lock over the old inode DEFERS rather than mutating the replacement. */
+function sameLockIdentity(a: LockIdentity, b: LockIdentity): boolean {
+  return (
+    a.gitDir === b.gitDir &&
+    a.commonDir === b.commonDir &&
+    a.ino === b.ino &&
+    a.dev === b.dev
+  );
+}
+
+/**
+ * Acquire the STABLE common-dir structural flock and the per-worktree flock in FIXED ORDER —
+ * `structuralLockPath` first, then `worktreeLockPath` — returning ONE releasable handle whose
+ * `release()` unwinds in reverse. The common-dir lock is the domain every keeper worktree
+ * add/remove/prune + base merge serializes on, so acquiring it first (a single global order)
+ * makes a lock-order cycle impossible. When the two paths COINCIDE (the main worktree, whose
+ * `--git-dir` == `--git-common-dir`) the second acquire is SKIPPED — a second `flock` on the
+ * same path from a distinct fd would self-block the process against its own held lock. A
+ * timeout on either → release whatever was taken and return `null` (the caller defers). The
+ * acquirer is injected so the fast tier stubs the real flock.
+ */
+async function acquireStructuralAndWorktreeLocks(
+  structuralLockPath: string,
+  worktreeLockPath: string,
+  acquire: LockAcquirer,
+): Promise<{ release(): void } | null> {
+  const structural = await acquire(structuralLockPath);
+  if (structural === null) {
+    return null;
+  }
+  if (worktreeLockPath === structuralLockPath) {
+    return structural;
+  }
+  const perWorktree = await acquire(worktreeLockPath);
+  if (perWorktree === null) {
+    structural.release();
+    return null;
+  }
+  return {
+    release() {
+      perWorktree.release();
+      structural.release();
+    },
   };
 }
 
@@ -2441,19 +2589,27 @@ export type FencedMergeOutcome =
  * pinned-object integration routes every effect through (both no-op arms included). The
  * caller has already classified `strategy` from the pinned oids (a fast-forward when the
  * target is contained in the source, else a two-parent divergence merge); this function
- * owns the whole effect boundary UNDER the commit-work flock:
- *  1. acquire the per-worktree commit-work flock (a timeout → `defer`, never a freeze);
- *  2. CAS the target HEAD is STILL the pinned `expectedHeadOid` (any drift → `defer`);
- *  3. FRESH `git worktree list` registration — the exact normalized `worktreePath` is a
+ * owns the whole effect boundary UNDER the strictly-resolved structural + per-worktree flocks:
+ *  1. acquire the STABLE common-dir structural flock AND the per-worktree flock in FIXED
+ *     ORDER (common first, then per-worktree — the same order every keeper structural mutation
+ *     acquires, so no lock-order cycle); a timeout → `defer`, never a freeze;
+ *  2. LOCK-IDENTITY CAS: re-derive the admin-dir identity — path AND INODE — under the locks;
+ *     a remove/re-add that moved OR same-path/new-inode SWAPPED the admin dir → `defer`;
+ *  3. CAS the target HEAD is STILL the pinned `expectedHeadOid` (any drift → `defer`);
+ *  4. FRESH `git worktree list` registration — the exact normalized `worktreePath` is a
  *     registered worktree on `targetBranch` (a path swapped out / re-registered / torn down
  *     between observation and effect → `defer`, NEVER a silent merge into the wrong tree);
- *  4. {@link mergeReadiness} clean + on-branch + residue-free;
- *  5. the NO-OP arm proven HERE, under the lock: the pinned source already an ancestor of
+ *  5. {@link mergeReadiness} clean + on-branch + residue-free;
+ *  6. the NO-OP arm proven HERE, under the lock: the pinned source already an ancestor of
  *     HEAD → `already-integrated` (never certified on a pre-lock read);
- *  6. `git merge --ff-only <sourceOid>` (ff) or `git merge --no-ff --no-edit <sourceOid>`
+ *  7. `underLockAuthority` — the LOAD-BEARING FRESH live-claim recheck (a claim that appeared
+ *     between the cycle snapshot and here HOLDS the effect), then a FINAL inode revalidation
+ *     immediately adjacent to the effect (a replacement AFTER the CAS → `defer`);
+ *  8. `git merge --ff-only <sourceOid>` (ff) or `git merge --no-ff --no-edit <sourceOid>`
  *     (diverged) classified via the module-private {@link classifyMergeAttempt} — a raced
- *     non-ff fails cleanly to `defer`, a content conflict aborts cleanly to `conflict`;
- *  7. POSITIVE post-checks — the pinned source is now an ancestor of the NEW HEAD AND the
+ *     non-ff fails cleanly to `defer`, a content conflict aborts cleanly then re-proves
+ *     restoration UNDER THE SAME LOCK before minting `conflict`;
+ *  9. POSITIVE post-checks — the pinned source is now an ancestor of the NEW HEAD AND the
  *     tree is clean + on-branch — before `integrated` is claimed.
  * Producer-only; NEVER throws (a thrown probe is a `defer`).
  */
@@ -2467,30 +2623,42 @@ export async function mergePinnedObjectFenced(
     strategy: "ff" | "diverged";
     run?: GitRunner;
     acquireLock?: LockAcquirer;
+    /** The H7 LOAD-BEARING under-lock authority — a genuinely FRESH re-read of live claim /
+     *  resolver / claim-release state (never the cycle snapshot), invoked AFTER every CAS,
+     *  immediately before the merge. `held`/`unknown` → zero mutation (`defer`); only `clear`
+     *  proceeds. Absent → treated as `clear` (the fast-tier fence stub). */
+    underLockAuthority?: () => Promise<"clear" | "held" | "unknown">;
+    /** The admin-dir inode probe for the lock-identity CAS; injected by the fence fakes. */
+    inodeProbe?: InodeProbe;
   },
 ): Promise<FencedMergeOutcome> {
   const run = opts.run ?? gitExec;
   const acquire = opts.acquireLock ?? defaultLockAcquirer;
+  const inodeProbe = opts.inodeProbe ?? defaultInodeProbe;
   try {
-    // (1) Pin the lock identity at acquisition — the flock lives at the worktree's OWN git
-    //     dir, so a moved admin dir must be detectable under the lock. [H3]
-    const id0 = await resolveLockIdentity(worktreePath, run);
+    // (1) Pin the lock identity at acquisition — path AND inode. A moved OR same-path/new-
+    //     inode-swapped admin dir must be detectable under the locks. [H3]
+    const id0 = await resolveLockIdentity(worktreePath, run, inodeProbe);
     if (id0 === null) {
       return { kind: "defer", reason: "lock identity unresolved" };
     }
-    const lock = await acquire(id0.lockPath);
-    if (lock === null) {
+    // FIXED-ORDER dual acquire: the STABLE common-dir structural flock first (the domain every
+    // keeper worktree add/remove/prune + base merge serializes on), then the per-worktree
+    // flock. They coincide in the main worktree (one path → one acquire, never a self-block).
+    const held = await acquireStructuralAndWorktreeLocks(
+      id0.structuralLockPath,
+      id0.lockPath,
+      acquire,
+    );
+    if (held === null) {
       return { kind: "defer", reason: "commit-work lock timeout" };
     }
     try {
-      // (2) LOCK-IDENTITY CAS: re-derive under the lock; a remove/re-add that moved the
-      //     admin dir leaves us holding an obsolete lock over a replacement → defer. [H3]
-      const id1 = await resolveLockIdentity(worktreePath, run);
-      if (
-        id1 === null ||
-        id1.gitDir !== id0.gitDir ||
-        id1.commonDir !== id0.commonDir
-      ) {
+      // (2) LOCK-IDENTITY CAS: re-derive under the locks; a remove/re-add that MOVED or a
+      //     same-path/new-inode REPLACEMENT of the admin dir leaves us holding an obsolete
+      //     lock over a replacement → defer. [H3]
+      const id1 = await resolveLockIdentity(worktreePath, run, inodeProbe);
+      if (id1 === null || !sameLockIdentity(id1, id0)) {
         return {
           kind: "defer",
           reason: "lock/git-dir identity replaced under the fence",
@@ -2614,7 +2782,35 @@ export async function mergePinnedObjectFenced(
           reason: "under-lock source-ancestry inconclusive",
         };
       }
-      // (9) Merge the PINNED OBJECT — ff refuses to synthesize a merge (a raced non-ff fails
+      // (7a) LOAD-BEARING under-lock authority — a genuinely FRESH re-read of the live claim /
+      //      resolver / claim-release state (never the cycle snapshot). A claimant that
+      //      appeared between the snapshot and here HOLDS the effect (zero mutation); an
+      //      inconclusive read fails closed. Only `clear` proceeds.
+      if (opts.underLockAuthority !== undefined) {
+        let authority: "clear" | "held" | "unknown";
+        try {
+          authority = await opts.underLockAuthority();
+        } catch {
+          authority = "unknown";
+        }
+        if (authority !== "clear") {
+          return {
+            kind: "defer",
+            reason: `under-lock authority ${authority} — a live claimant/resolver holds the effect`,
+          };
+        }
+      }
+      // (7b) FINAL inode revalidation IMMEDIATELY adjacent to the effect — a same-path/new-
+      //      inode replacement AFTER the earlier CAS (or during the async authority read)
+      //      leaves us holding an obsolete lock over a replacement admin dir → defer.
+      const idEffect = await resolveLockIdentity(worktreePath, run, inodeProbe);
+      if (idEffect === null || !sameLockIdentity(idEffect, id0)) {
+        return {
+          kind: "defer",
+          reason: "lock/git-dir identity replaced immediately before the merge",
+        };
+      }
+      // (8) Merge the PINNED OBJECT — ff refuses to synthesize a merge (a raced non-ff fails
       //     cleanly), divergence takes a clean two-parent merge; a content conflict carries
       //     the exact pins for the incident receipt. [H4c]
       if (opts.strategy === "ff") {
@@ -2638,7 +2834,25 @@ export async function mergePinnedObjectFenced(
           case "merged":
           case "already-merged":
             break;
-          case "conflict":
+          case "conflict": {
+            // P1-7 ABORT-RESTORATION PROOF: classifyMergeAttempt's clean abort returned the
+            // tree to its pre-merge state, but a `conflict` is only mintable when that
+            // restoration is POSITIVELY re-proven UNDER THE SAME LOCK — the admin-dir identity
+            // is still ours, the target is still registered on its branch, HEAD is back at the
+            // pinned target-arrival OID, and the tree is strictly clean with NO in-progress
+            // pseudo-ref residue. Anything unproven → defer (a wedge the recover pass owns),
+            // never a `conflict` minted over an unrestored / drifted tree.
+            const restored = await proveAbortRestoration(
+              worktreePath,
+              opts.targetBranch,
+              opts.expectedHeadOid,
+              id0,
+              run,
+              inodeProbe,
+            );
+            if (restored.kind !== "restored") {
+              return { kind: "defer", reason: restored.reason };
+            }
             return {
               kind: "conflict",
               conflictedFiles: outcome.conflictedFiles,
@@ -2646,6 +2860,7 @@ export async function mergePinnedObjectFenced(
               sourceOid: opts.sourceOid,
               targetOid: opts.expectedHeadOid,
             };
+          }
           default:
             return {
               kind: "defer",
@@ -2675,7 +2890,7 @@ export async function mergePinnedObjectFenced(
       }
       return { kind: "integrated" };
     } finally {
-      lock.release();
+      held.release();
     }
   } catch (err) {
     return {
@@ -2683,6 +2898,68 @@ export async function mergePinnedObjectFenced(
       reason: `fenced merge threw: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+/**
+ * Re-prove, UNDER THE ALREADY-HELD LOCK, that a conflicted `git merge --abort` genuinely
+ * restored the target to its pre-merge state before a `conflict` is minted (P1-7). Positive
+ * proof of every axis, else a typed `defer` reason:
+ *  - lock/admin-dir IDENTITY unchanged (path + inode) — the abort ran in the tree we locked;
+ *  - the exact path is STILL a registered worktree on `targetBranch`;
+ *  - HEAD is back at the pinned `expectedHeadOid` (the target-arrival object);
+ *  - the tree is strictly clean, on-branch, with NO in-progress pseudo-ref residue.
+ * A `conflict` minted over an unrestored / drifted / mid-merge tree would page a resolver at
+ * a phantom head, so anything unproven is a wedge the recover pass owns. Bounded; never throws
+ * (the fenced caller's try/catch maps a throw to defer).
+ */
+async function proveAbortRestoration(
+  worktreePath: string,
+  targetBranch: string,
+  expectedHeadOid: string,
+  id0: LockIdentity,
+  run: GitRunner,
+  inodeProbe: InodeProbe,
+): Promise<{ kind: "restored" } | { kind: "defer"; reason: string }> {
+  const idAfter = await resolveLockIdentity(worktreePath, run, inodeProbe);
+  if (idAfter === null || !sameLockIdentity(idAfter, id0)) {
+    return {
+      kind: "defer",
+      reason: "post-abort lock/git-dir identity replaced — no conflict minted",
+    };
+  }
+  const listed = await listWorktreesResult(worktreePath, run);
+  if (listed.kind !== "ok") {
+    return {
+      kind: "defer",
+      reason: `post-abort registration probe ${listed.kind} — no conflict minted`,
+    };
+  }
+  const entry = listed.value.find((e) => samePath(e.path, worktreePath));
+  if (entry === undefined || entry.branch !== `refs/heads/${targetBranch}`) {
+    return {
+      kind: "defer",
+      reason: `post-abort registration ${entry === undefined ? "absent" : `on ${entry.branch ?? "(detached)"}`} — no conflict minted`,
+    };
+  }
+  const head = await run(
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"],
+    { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (head.code !== 0 || head.stdout.trim() !== expectedHeadOid) {
+    return {
+      kind: "defer",
+      reason:
+        "post-abort HEAD != target-arrival oid — abort left residue, no conflict minted",
+    };
+  }
+  const ready = await strictWorktreeReadiness(worktreePath, targetBranch, run);
+  if (ready.kind !== "ready") {
+    return {
+      kind: "defer",
+      reason: `post-abort tree not restored: ${ready.reason} — no conflict minted`,
+    };
+  }
+  return { kind: "restored" };
 }
 
 /** The outcome of a non-destructive lane reattach. */
@@ -2695,15 +2972,26 @@ export type ReattachOutcome =
  * Non-destructively REATTACH a preserved lane branch's missing/unregistered checkout —
  * the recreate-elimination replacement for a lane whose branch survives but whose worktree
  * is gone. A missing checkout has NO trustworthy per-worktree lock yet, so this runs under
- * a STABLE git-common-dir structural lock ({@link baseMergeLockPath}) keyed to the repo's
- * shared ref store. Under the lock: PIN the preserved branch ref oid (never create/reset a
- * ref); prove via tri-state enumeration that the branch is registered NOWHERE and the exact
- * path is unregistered; prove the path is ABSENT or holds ONLY the content-gated keeper
- * husk (foreign content → defer, never overwritten); CAS the ref did not move; `git worktree
- * add <path> <branch>` for the EXISTING ref (never `-b`); then POSITIVELY prove exact
- * registration/path/branch, HEAD == the preserved ref, a strict-clean residue-free tree, and
- * the dep-link plant. A partial add / link failure CONVERGES on retry while PRESERVING the
- * ref — this function NEVER removes, resets, or deletes a ref. Producer-only; NEVER throws.
+ * the STABLE strictly-resolved git-common-dir structural lock ({@link baseMergeLockPath},
+ * NO guessed fallback — an unresolved common dir DEFERS) keyed to the repo's shared ref
+ * store, with the admin-dir identity (path + inode) pinned and revalidated adjacent to the
+ * effect. Under the lock: PIN the preserved branch ref oid (never create/reset a ref); prove
+ * via tri-state enumeration where the branch and the exact path are registered; then:
+ *  - RESUMABLE (P1-5): the exact `laneDir` is ALREADY registered on `laneBranch` — a partial
+ *    add whose registration landed but whose postconditions/dep-plants did not. SKIP the add
+ *    and re-run ALL postconditions + dep planting (idempotent). Reject only a FOREIGN/
+ *    MISMATCHED registration (the path on another branch, or the branch at another path);
+ *  - FRESH: the path is POSITIVELY ABSENT (P1-8 — a keeper husk or foreign content is NEVER
+ *    deleted here; it DEFERS to the separately fenced recovery/quarantine ownership). CAS the
+ *    ref did not move, `git worktree add <path> <branch>` for the EXISTING ref (never `-b`).
+ * Both paths then POSITIVELY prove exact registration/path/branch, HEAD == the preserved ref,
+ * a strict-clean residue-free tree, and EVERY required dep-link plant (root AND each nested
+ * package, not just the top level — {@link proveAllDepPlants}); a missing plant DEFERS naming
+ * it, so dep-link readiness is surfaced to the gate (and a future C3 launch check must gate on
+ * the same proof before dispatching into the lane). The `underLockAuthority` fresh live-claim
+ * recheck gates the effect (add on fresh, dep plant on resume). A partial add / link failure
+ * CONVERGES on retry while PRESERVING the ref — this function NEVER removes, resets, or deletes
+ * a ref or a path. Producer-only; NEVER throws.
  */
 export async function reattachLaneWorktree(
   repoDir: string,
@@ -2715,15 +3003,37 @@ export async function reattachLaneWorktree(
     worktreePath: string,
   ) => Promise<void> = ensureWorktreeDepLink,
   acquireLock: LockAcquirer = defaultLockAcquirer,
+  /** The H7 LOAD-BEARING under-lock authority — a FRESH live claim/resolver recheck invoked
+   *  immediately before the mutation (the add on a fresh reattach, the dep plant on a resume);
+   *  `held`/`unknown` → zero mutation (`defer`). Absent → `clear` (the fast-tier stub). */
+  underLockAuthority?: () => Promise<"clear" | "held" | "unknown">,
+  /** The admin-dir inode probe for the lock-identity CAS; injected by the reattach fakes. */
+  inodeProbe: InodeProbe = defaultInodeProbe,
 ): Promise<ReattachOutcome> {
   const refSpec = `refs/heads/${laneBranch}^{commit}`;
   try {
-    const lockPath = await baseMergeLockPath(repoDir, run);
-    const lock = await acquireLock(lockPath);
+    // STRICTLY-resolved common-dir structural lock — no guessed fallback path.
+    const structuralLockPath = await baseMergeLockPath(repoDir, run);
+    if (structuralLockPath === null) {
+      return {
+        kind: "defer",
+        reason: "reattach structural lock path unresolved — retry",
+      };
+    }
+    const lock = await acquireLock(structuralLockPath);
     if (lock === null) {
       return { kind: "defer", reason: "base-merge lock timeout" };
     }
     try {
+      // Pin the repo admin-dir identity (path + inode) — revalidated adjacent to the effect
+      // so a same-path/new-inode replacement under the lock is caught.
+      const id0 = await resolveLockIdentity(repoDir, run, inodeProbe);
+      if (id0 === null) {
+        return {
+          kind: "defer",
+          reason: "reattach lock identity unresolved — retry",
+        };
+      }
       // Pin the PRESERVED branch ref oid — a reattach never creates or resets a ref.
       const refProbe = await run(
         ["rev-parse", "--verify", "--quiet", "--end-of-options", refSpec],
@@ -2736,7 +3046,7 @@ export async function reattachLaneWorktree(
           reason: `preserved lane ref unresolved (${refProbe.code === 1 ? "absent" : refProbe.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${refProbe.code}`})`,
         };
       }
-      // Tri-state enumeration: the branch is registered NOWHERE, and the path is unregistered.
+      // Tri-state enumeration → classify the registration state (RESUMABLE vs FRESH vs reject).
       const listed = await listWorktreesResult(repoDir, run);
       if (listed.kind !== "ok") {
         return {
@@ -2744,64 +3054,110 @@ export async function reattachLaneWorktree(
           reason: `worktree registration probe ${listed.kind}`,
         };
       }
-      if (listed.value.some((e) => e.branch === `refs/heads/${laneBranch}`)) {
+      const branchEntry = listed.value.find(
+        (e) => e.branch === `refs/heads/${laneBranch}`,
+      );
+      const pathEntry = listed.value.find((e) => samePath(e.path, laneDir));
+      // REJECT foreign/mismatched: the path is registered on ANOTHER branch, or the branch is
+      // registered at ANOTHER path. Never overwrite/steal a foreign registration.
+      if (
+        pathEntry !== undefined &&
+        pathEntry.branch !== `refs/heads/${laneBranch}`
+      ) {
         return {
           kind: "defer",
-          reason: "lane branch already registered elsewhere",
+          reason: `lane path registered on ${pathEntry.branch ?? "(detached)"}, expected ${laneBranch} — never reattached`,
         };
       }
-      if (listed.value.some((e) => samePath(e.path, laneDir))) {
-        return { kind: "defer", reason: "lane path already registered" };
+      if (branchEntry !== undefined && !samePath(branchEntry.path, laneDir)) {
+        return {
+          kind: "defer",
+          reason:
+            "lane branch already registered at another path — never reattached",
+        };
       }
-      // Path state: ABSENT or a content-gated keeper husk only; foreign content → defer.
-      const root = resolve(laneDir);
-      let pathState: "absent" | "husk" | "foreign";
-      try {
-        const st = await lstat(root);
-        pathState = !st.isDirectory()
-          ? "foreign"
-          : (await isResidueOnlyDir(root, root, true))
-            ? "husk"
-            : "foreign";
-      } catch (err) {
-        if (isEnoent(err)) {
-          pathState = "absent";
-        } else {
-          throw err;
+      // RESUMABLE when the exact path is already registered on the lane branch (a partial add):
+      // skip the add, rerun ALL postconditions + dep planting. Else FRESH (path unregistered).
+      const resumable = pathEntry !== undefined;
+      if (!resumable) {
+        // FRESH add requires a POSITIVELY ABSENT path — a husk or foreign content DEFERS to
+        // the fenced recovery/quarantine owner; reattach NEVER deletes a path (P1-8).
+        const root = resolve(laneDir);
+        let pathState: "absent" | "husk" | "foreign";
+        try {
+          const st = await lstat(root);
+          pathState = !st.isDirectory()
+            ? "foreign"
+            : (await isResidueOnlyDir(root, root, true))
+              ? "husk"
+              : "foreign";
+        } catch (err) {
+          if (isEnoent(err)) {
+            pathState = "absent";
+          } else {
+            throw err;
+          }
+        }
+        if (pathState !== "absent") {
+          return {
+            kind: "defer",
+            reason:
+              pathState === "husk"
+                ? "lane path holds a keeper husk — deferred to fenced recovery ownership, never deleted by reattach"
+                : "lane path holds foreign content — never overwritten",
+          };
+        }
+        // CAS: the preserved ref did not move under the lock.
+        const refAgain = await run(
+          ["rev-parse", "--verify", "--quiet", "--end-of-options", refSpec],
+          { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+        );
+        if (refAgain.code !== 0 || refAgain.stdout.trim() !== refOid) {
+          return {
+            kind: "defer",
+            reason: "lane ref moved under the reattach lock",
+          };
         }
       }
-      if (pathState === "foreign") {
+      // LOAD-BEARING under-lock authority + FINAL inode revalidation, immediately before the
+      // effect (the add on fresh, the dep plant on resume). A live claimant that appeared, or
+      // a same-path/new-inode admin-dir replacement after the CAS → zero mutation, defer.
+      if (underLockAuthority !== undefined) {
+        let authority: "clear" | "held" | "unknown";
+        try {
+          authority = await underLockAuthority();
+        } catch {
+          authority = "unknown";
+        }
+        if (authority !== "clear") {
+          return {
+            kind: "defer",
+            reason: `under-lock authority ${authority} — a live claimant/resolver holds the lane`,
+          };
+        }
+      }
+      const idEffect = await resolveLockIdentity(repoDir, run, inodeProbe);
+      if (idEffect === null || !sameLockIdentity(idEffect, id0)) {
         return {
           kind: "defer",
-          reason: "lane path holds foreign content — never overwritten",
+          reason:
+            "reattach lock/git-dir identity replaced immediately before the effect",
         };
       }
-      if (pathState === "husk") {
-        await pruneWorktreeHusk(repoDir, laneDir, run);
+      if (!resumable) {
+        // Reattach the EXISTING ref (never `-b`).
+        const add = await run(["worktree", "add", laneDir, laneBranch], {
+          cwd: repoDir,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        });
+        if (add.code !== 0) {
+          return {
+            kind: "defer",
+            reason: `worktree add ${add.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `failed (exit ${add.code}): ${(add.stdout + add.stderr).trim().slice(0, 140)}`} — ref preserved, retry`,
+          };
+        }
       }
-      // CAS: the preserved ref did not move under the lock.
-      const refAgain = await run(
-        ["rev-parse", "--verify", "--quiet", "--end-of-options", refSpec],
-        { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-      );
-      if (refAgain.code !== 0 || refAgain.stdout.trim() !== refOid) {
-        return {
-          kind: "defer",
-          reason: "lane ref moved under the reattach lock",
-        };
-      }
-      // Reattach the EXISTING ref (never `-b`).
-      const add = await run(["worktree", "add", laneDir, laneBranch], {
-        cwd: repoDir,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      });
-      if (add.code !== 0) {
-        return {
-          kind: "defer",
-          reason: `worktree add ${add.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `failed (exit ${add.code}): ${(add.stdout + add.stderr).trim().slice(0, 140)}`} — ref preserved, retry`,
-        };
-      }
-      // POSITIVE postconditions — any miss defers PRESERVING the ref (converge next cycle).
+      // POSITIVE postconditions (BOTH paths) — any miss defers PRESERVING the ref (converge).
       const post = await listWorktreesResult(repoDir, run);
       if (
         post.kind !== "ok" ||
@@ -2847,27 +3203,13 @@ export async function reattachLaneWorktree(
           reason: "dep-link plant threw — ref preserved, retry",
         };
       }
-      // Positively prove the top-level plant when the source carries dependencies.
-      let sourceHasDeps = false;
-      try {
-        await lstat(resolve(repoDir, WORKTREE_DEP_LINK_NAME));
-        sourceHasDeps = true;
-      } catch (err) {
-        if (!isEnoent(err)) throw err;
-      }
-      if (sourceHasDeps) {
-        let planted: string | undefined;
-        try {
-          planted = await readlink(resolve(laneDir, WORKTREE_DEP_LINK_NAME));
-        } catch {
-          planted = undefined;
-        }
-        if (!isWorktreeDepPlant(repoDir, WORKTREE_DEP_LINK_NAME, planted)) {
-          return {
-            kind: "defer",
-            reason: "dep-link plant unproven — ref preserved, retry",
-          };
-        }
+      // Prove EVERY required dep-link plant (root AND nested packages), not just the top level.
+      const plants = await proveAllDepPlants(repoDir, laneDir);
+      if (!plants.ok) {
+        return {
+          kind: "defer",
+          reason: `dep-link plant unproven (${plants.missing}) — ref preserved, retry`,
+        };
       }
       return { kind: "reattached" };
     } finally {

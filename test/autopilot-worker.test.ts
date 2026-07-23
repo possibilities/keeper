@@ -82,6 +82,7 @@ import {
   type AssignmentWorktreeReadiness,
   assignmentWorktreeReadiness,
   computeDeferredEpicIds,
+  firstBlockingObligation,
   integratePinnedRib,
   type ProgressActorAuthority,
   runProgressActor,
@@ -344,7 +345,11 @@ import type {
   ResolvedEpicDep,
   Task,
 } from "../src/types";
-import { type LockAcquirer, parseWorktreeList } from "../src/worktree-git";
+import {
+  type InodeProbe,
+  type LockAcquirer,
+  parseWorktreeList,
+} from "../src/worktree-git";
 import {
   baseBranchFor,
   repoDirHash,
@@ -24745,6 +24750,46 @@ test("computeDeferredSiblingSources: PRE-CUT gate correction — once the epic b
 });
 
 // ---------------------------------------------------------------------------
+// firstBlockingObligation — the shared containment classifier (P1-6): teardown
+// containment is proven ONLY relative to a POSITIVELY PRESENT canonical epic base.
+// ---------------------------------------------------------------------------
+
+const FBO_EPIC = "fn-1-foo";
+const FBO_BASE = "keeper/epic/fn-1-foo";
+const FBO_RIB = "keeper/epic/fn-1-foo--fn-1-foo.3";
+const fboParents = [{ task_id: "fn-1-foo.3" }] as unknown as Task[];
+const fboProbeYes = async () => true;
+const fboProbeNo = async () => false;
+
+test("firstBlockingObligation: BOTH the rib AND the epic base ABSENT (pre-cut target==base) → HOLD a canonical-base obligation, never a both-absent false-clear [lock #5 / P1-6]", async () => {
+  // The pre-cut lane forks off the epic base itself (target==base, not yet cut), and NEITHER
+  // the rib nor the base is present. A both-absent state is NOT proof the source is contained.
+  const out = await firstBlockingObligation(
+    fboParents,
+    FBO_EPIC,
+    { ok: true, branches: new Set<string>() }, // both absent
+    { targetBranch: FBO_BASE, existing: false },
+    FBO_BASE,
+    fboProbeNo,
+    fboProbeNo,
+  );
+  expect(out.kind).toBe("canonical-base");
+});
+
+test("firstBlockingObligation: the epic base POSITIVELY PRESENT with target==base → contained (a legitimate teardown-clear)", async () => {
+  const out = await firstBlockingObligation(
+    fboParents,
+    FBO_EPIC,
+    { ok: true, branches: new Set([FBO_BASE]) }, // base present
+    { targetBranch: FBO_BASE, existing: false },
+    FBO_BASE,
+    fboProbeNo,
+    fboProbeYes,
+  );
+  expect(out.kind).toBe("contained");
+});
+
+// ---------------------------------------------------------------------------
 // Parts-6 progress actor fenced primitive — integratePinnedRib. Rule-driven git
 // fakes; no real git, worktree, lock, or fs. An unmatched call defaults to
 // exit-0/empty.
@@ -24760,6 +24805,17 @@ const ACTOR_WT = "/wt/fn-1-foo.4";
 const ACTOR_REPO = "/repo";
 const okLock: LockAcquirer = () => ({ release() {} });
 const nullLock: LockAcquirer = () => null;
+
+// A pure, deterministic admin-dir inode probe for the pure-`run` fence fakes — a stable
+// {ino,dev} hashed from the path, so the lock-identity CAS is exercised WITHOUT real fs.
+const actorInode: InodeProbe = async (p) => {
+  let h = 2166136261;
+  for (let i = 0; i < p.length; i++) {
+    h ^= p.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return { ino: h >>> 0, dev: 1 };
+};
 
 // cwd-aware so a `worktree list` fake can echo the caller's cwd as the registered path —
 // the fence + recreate re-prove read the list from the lane dir, the ensure re-adds from
@@ -24917,36 +24973,42 @@ function pinnedGit(opts: PinnedGitOpts = {}): { run: FakeRun; calls: string[] } 
 
 test("integratePinnedRib: source already an ancestor of the target → already-integrated (proven under the lock), no merge", async () => {
   const { run, calls } = pinnedGit({ srcInTarget: "yes" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("already-integrated");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("integratePinnedRib: rib torn down + base NOT yet in target → the EPIC BASE is merged → integrated", async () => {
-  const { run, calls } = pinnedGit({ ribAbsent: true, baseInTarget: false, targetInSrc: "no" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+test("integratePinnedRib: a CANONICAL-BASE item (source = epic base, diverged from target) → the base is merged → integrated", async () => {
+  // CLASS-EXACT: only a `canonical-base` item ever integrates the epic base — the caller
+  // passes the epic base AS the source branch. The rib is NEVER substituted for the base.
+  const { run, calls } = pinnedGit({ baseInTarget: false, targetInSrc: "no" });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_EPIC_BASE, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("integrated");
   expect(calls.some((c) => c === `merge --no-ff --no-edit ${ACTOR_BASE_OID}`)).toBe(true);
 });
 
-test("integratePinnedRib: rib torn down + base ALREADY in target → already-integrated (base absorbed the rib), no merge", async () => {
-  const { run, calls } = pinnedGit({ ribAbsent: true, baseInTarget: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+test("integratePinnedRib: a CANONICAL-BASE item whose base is ALREADY in the target → already-integrated, no merge", async () => {
+  const { run, calls } = pinnedGit({ baseInTarget: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_EPIC_BASE, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("already-integrated");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("integratePinnedRib: rib torn down AND epic base unresolved → defer (absence proves nothing without the base)", async () => {
-  const { run, calls } = pinnedGit({ ribAbsent: true, baseAbsent: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+test("integratePinnedRib: a `rib` item whose rib ref ABSENTED under the fence → defer, NEVER a base fallback", async () => {
+  // The rib went stale between the obligation CAS and here (definitively absent, exit 1).
+  // CLASS-EXACT: a `rib` item NEVER falls back to the epic base — it defers as stale.
+  const { run, calls } = pinnedGit({ ribAbsent: true });
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("epic base unresolved");
+  if (out.kind === "defer") expect(out.reason).toContain("obligation stale");
+  // the epic base is NEVER re-pinned for a rib item (that would merge an unauthorized object)
+  expect(calls.some((c) => c.includes(`refs/heads/${ACTOR_EPIC_BASE}^{commit}`))).toBe(false);
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
 test("integratePinnedRib: a FAILED rib enumeration (unknown) → defer, NEVER a base fallback", async () => {
   const { run, calls } = pinnedGit({ ribEnumFailed: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("source ref unresolved");
   // a failed enumeration must NOT re-pin the epic base (that would merge an unproven object)
@@ -24956,7 +25018,7 @@ test("integratePinnedRib: a FAILED rib enumeration (unknown) → defer, NEVER a 
 
 test("integratePinnedRib: target ⊆ source → an exact-object FAST-FORWARD → integrated", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "yes" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("integrated");
   expect(calls.some((c) => c === `merge --ff-only ${ACTOR_SRC_OID}`)).toBe(true);
   expect(calls.some((c) => c.includes("--no-ff"))).toBe(false); // never a divergence merge
@@ -24964,14 +25026,14 @@ test("integratePinnedRib: target ⊆ source → an exact-object FAST-FORWARD →
 
 test("integratePinnedRib: TRUE DIVERGENCE, clean merge → integrated via a two-parent pinned-object merge", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("integrated");
   expect(calls.some((c) => c === `merge --no-ff --no-edit ${ACTOR_SRC_OID}`)).toBe(true);
 });
 
 test("integratePinnedRib: a divergent CONTENT conflict → conflict (aborted cleanly), lane branch NEVER deleted", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no", conflict: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("conflict");
   if (out.kind === "conflict") expect(out.conflictedFiles).toContain("src/foo.ts");
   expect(calls.some((c) => c === "merge --abort")).toBe(true); // aborted → arrival state restored
@@ -24980,7 +25042,7 @@ test("integratePinnedRib: a divergent CONTENT conflict → conflict (aborted cle
 
 test("integratePinnedRib: a lock timeout → defer (no merge attempted)", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, nullLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, nullLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("lock timeout");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
@@ -24988,7 +25050,7 @@ test("integratePinnedRib: a lock timeout → defer (no merge attempted)", async 
 
 test("integratePinnedRib: the target HEAD moves under the fence (CAS) → defer, no merge", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no", headMovedUnderFence: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("moved under the fence");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
@@ -24998,7 +25060,7 @@ test("integratePinnedRib: the lane path is re-registered on ANOTHER branch under
   // Pre-lock ancestry says source ⊆ target (a would-be no-op); the path-replacement guard
   // must still DEFER, never certify already-integrated on a swapped tree.
   const { run, calls } = pinnedGit({ srcInTarget: "yes", registrationBranch: "refs/heads/other" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("registered on refs/heads/other");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
@@ -25006,7 +25068,7 @@ test("integratePinnedRib: the lane path is re-registered on ANOTHER branch under
 
 test("integratePinnedRib: the lane path is UNREGISTERED under the fence → defer, no merge", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no", registrationAbsent: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("registration absent under the fence");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
@@ -25014,14 +25076,14 @@ test("integratePinnedRib: the lane path is UNREGISTERED under the fence → defe
 
 test("integratePinnedRib: an INCONCLUSIVE ancestry probe → defer (never read as a negative)", async () => {
   const { run } = pinnedGit({ srcInTarget: "unknown" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("inconclusive");
 });
 
 test("integratePinnedRib: fast-forward REFUSED (raced non-FF) → defer, never a merge commit", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "yes", ffRefused: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("fast-forward refused");
   expect(calls.some((c) => c.includes("--no-ff"))).toBe(false);
@@ -25029,14 +25091,14 @@ test("integratePinnedRib: fast-forward REFUSED (raced non-FF) → defer, never a
 
 test("integratePinnedRib: post-merge source-ancestry unproven → defer (positive post-check only)", async () => {
   const { run } = pinnedGit({ targetInSrc: "no", postAncestor: "no" });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("post-merge source-ancestry");
 });
 
 test("integratePinnedRib: target not ready under the lock → defer before merging", async () => {
   const { run, calls } = pinnedGit({ targetInSrc: "no", notReadyUnderLock: true });
-  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, ACTOR_EPIC_BASE, run, okLock);
+  const out = await integratePinnedRib(ACTOR_TGT, ACTOR_TGT, ACTOR_SRC, run, okLock, undefined, actorInode);
   expect(out.kind).toBe("defer");
   if (out.kind === "defer") expect(out.reason).toContain("not ready under lock");
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
@@ -25301,6 +25363,8 @@ async function driveActor(
     run,
     okLock,
     async () => {},
+    undefined, // freshAuthority (the pre-lock recheckAuthority gates these)
+    actorInode,
   );
 }
 
