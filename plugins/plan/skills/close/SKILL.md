@@ -73,7 +73,7 @@ EPIC_ID=<epic_id>
 PRIMARY_REPO=<primary_repo>
 
 <incident-data>
-{"incident_id":"close::<epic_id>","instance_event_id":<n>,"attempt_id":<n|null>,"cwd":"<repo_dir>","source_branch":"<source_branch>","base_branch":"<base_branch>","reason":"<reason>","grant_ref":"<grant_ref|null>","claimant_session_id":"<claimant_session_id>"}
+{"incident_id":"close::<epic_id>","instance_event_id":<n>,"attempt_id":<n|null>,"cwd":"<repo_dir>","source_branch":"<source_branch>","base_branch":"<base_branch>","expected_source_head":"<incident.conflict.expected_source_head|null>","expected_base_head":"<incident.conflict.expected_base_head|null>","reason":"<reason>","grant_ref":"<grant_ref|null>","claimant_session_id":"<claimant_session_id>"}
 </incident-data>
 ```
 

@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { isRetryableDispatchKey } from "../src/dispatch-command";
 import {
   assertNever,
+  buildPendingIntegrationTail,
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
@@ -23,10 +24,14 @@ import {
   EVENTS_INGEST_STALL_DISTRESS_REASON,
   EVENTS_INGEST_STALL_DISTRESS_VERB,
   FATAL_AUDIT_ID_PREFIX,
+  INSTANT_DEATH_BREAKER_REASON,
   isDupEpicNumberDistressKey,
   isEventsIngestStallDistressKey,
   isLaneWedgeDistressKey,
+  isLowerPriorityDispatchPlumbingReason,
+  isMergeConflictIncidentReason,
   isMergeEscalationReason,
+  isParkedLaunchReason,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isSharedWedgeDistressKey,
@@ -40,6 +45,9 @@ import {
   LANE_WEDGE_DISTRESS_VERB,
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
+  PARKED_LAUNCH_REASON_PREFIX,
+  PENDING_OWNER_INTEGRATION_TAIL,
+  parsePendingIntegrationHeads,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
@@ -1241,5 +1249,85 @@ describe("fn-1164.3 stuck-state-sentinel distress vocabulary", () => {
     expect(
       isRetryableDispatchKey(STUCK_SENTINEL_DISTRESS_VERB, cwdMissingKey),
     ).toBe(true);
+  });
+});
+
+// ── Durable head fence — pin builder + parser ──────────────────────────────
+
+describe("pending-integration head fence", () => {
+  test("buildPendingIntegrationTail round-trips through parsePendingIntegrationHeads", () => {
+    const src = "a".repeat(40);
+    const base = "b".repeat(40);
+    const tail = buildPendingIntegrationTail(src, base);
+    expect(tail.startsWith(PENDING_OWNER_INTEGRATION_TAIL)).toBe(true);
+    // The fence rides the em-dash tail of a full merge-conflict reason.
+    const reason = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.2 into keeper/epic/fn-1 — ${tail}`;
+    expect(parsePendingIntegrationHeads(reason)).toEqual({
+      sourceHead: src,
+      baseHead: base,
+    });
+  });
+
+  test("an unpinned genuine-conflict reason carries no fence", () => {
+    expect(
+      parsePendingIntegrationHeads(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): foo.ts`,
+      ),
+    ).toBeNull();
+    expect(parsePendingIntegrationHeads("not a merge reason")).toBeNull();
+  });
+});
+
+// ── Fold reason-precedence predicates ──────────────────────────────────────
+
+describe("reason precedence", () => {
+  const pinnedMerge = `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — ${buildPendingIntegrationTail(
+    "a".repeat(40),
+    "b".repeat(40),
+  )}`;
+
+  test("isMergeConflictIncidentReason matches a merge incident on either verb, never a merge-prefix sibling", () => {
+    expect(isMergeConflictIncidentReason(pinnedMerge)).toBe(true);
+    expect(
+      isMergeConflictIncidentReason(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT`,
+      ),
+    ).toBe(true);
+    // A `worktree-merge` PREFIX (not the exact token) never matches.
+    expect(
+      isMergeConflictIncidentReason(
+        `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: x`,
+      ),
+    ).toBe(false);
+    expect(
+      isMergeConflictIncidentReason("worktree-merge-lock-timeout: x"),
+    ).toBe(false);
+  });
+
+  test("isLowerPriorityDispatchPlumbingReason covers slot / instant-death / parked, and nothing semantic", () => {
+    expect(
+      isLowerPriorityDispatchPlumbingReason(
+        `${SLOT_OCCUPIED_REASON_PREFIX}: x`,
+      ),
+    ).toBe(true);
+    expect(
+      isLowerPriorityDispatchPlumbingReason(
+        `${SLOT_RECLAIMED_REASON_PREFIX}: x`,
+      ),
+    ).toBe(true);
+    expect(
+      isLowerPriorityDispatchPlumbingReason(INSTANT_DEATH_BREAKER_REASON),
+    ).toBe(true);
+    expect(
+      isLowerPriorityDispatchPlumbingReason(
+        `${PARKED_LAUNCH_REASON_PREFIX}: x`,
+      ),
+    ).toBe(true);
+    // A merge obligation is NOT lower-priority plumbing (the guard must never
+    // suppress a merge reason replacing a plumbing row).
+    expect(isLowerPriorityDispatchPlumbingReason(pinnedMerge)).toBe(false);
+    expect(isLowerPriorityDispatchPlumbingReason("confirm_timeout")).toBe(
+      false,
+    );
   });
 });

@@ -59,6 +59,7 @@ import { parsePlanRef, REPO_TOKEN_RE } from "../src/derivers";
 import {
   isMergeEscalationReason,
   parseMergeConflictReason,
+  parsePendingIntegrationHeads,
 } from "../src/dispatch-failure-key";
 import { escalationRoleFor } from "../src/grant-leaf";
 import { keeperStateDir } from "../src/keeper-state-dir";
@@ -164,6 +165,12 @@ export interface DeconflictIncident {
     base_branch: string | null;
     stderr: string | null;
     repo_dir: string | null;
+    /** The durable head fence a pre-minted fan-in (`pending owner integration`)
+     *  incident pins at mint — the source rib and target base branch-tip SHAs the
+     *  resolver rechecks so the requested clean fast-forward is distinguishable
+     *  from a moved head. Both null for a genuine content conflict (unpinned). */
+    expected_source_head: string | null;
+    expected_base_head: string | null;
     /** Durable owner-attachment count consumed by this incident — the collapsed
      *  home of the retired `resolver_dispatched_at` / `merge_escalated_at` lease. */
     owner_redispatch_attempts: number;
@@ -546,12 +553,15 @@ function buildDeconflictIncident(
     if (parsed == null) {
       degraded.push("incident_reason_unparsed");
     }
+    const heads = parsePendingIntegrationHeads(row.reason);
     conflict = {
       reason: row.reason,
       source_branch: parsed?.source ?? null,
       base_branch: parsed?.base ?? null,
       stderr: parsed?.stderr ?? null,
       repo_dir: row.dir,
+      expected_source_head: heads?.sourceHead ?? null,
+      expected_base_head: heads?.baseHead ?? null,
       owner_redispatch_attempts: row.owner_redispatch_attempts,
       instance_event_id: row.instance_event_id,
       attempt_id: row.attempt_id,

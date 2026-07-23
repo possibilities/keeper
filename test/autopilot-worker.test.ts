@@ -10130,9 +10130,13 @@ function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   provisionConflictedFiles?: (info: WorktreeLaunchInfo) => string[];
   provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
-  provisionPending?: (
-    info: WorktreeLaunchInfo,
-  ) => { sourceBranch: string; baseBranch: string; laneDir: string } | null;
+  provisionPending?: (info: WorktreeLaunchInfo) => {
+    sourceBranch: string;
+    baseBranch: string;
+    laneDir: string;
+    sourceHead: string;
+    baseHead: string;
+  } | null;
   // A fan-in LANE pre-merge failure — the self-clearing shape `{ ok:false, reason,
   // dir }` (a `worktree-lane-premerge` reason + the base lane worktree path), NEVER
   // `retry:true`. The real driver returns `dir: worktreePath` for it.
@@ -14191,6 +14195,8 @@ test("runReconcileCycle: pending fan-in is recorded before the owning work launc
       sourceBranch,
       baseBranch: "keeper/epic/fn-1-foo",
       laneDir,
+      sourceHead: "a".repeat(40),
+      baseHead: "b".repeat(40),
     }),
   });
   const { deps, log, setJobByKey } = makeFakeDeps({ worktree: driver });
@@ -14218,8 +14224,7 @@ test("runReconcileCycle: pending fan-in is recorded before the owning work launc
     {
       verb: "work",
       id: "fn-1-foo.1",
-      reason:
-        "worktree-merge-conflict: merging keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo — pending owner integration",
+      reason: `worktree-merge-conflict: merging keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo — pending owner integration [expected src=${"a".repeat(40)} base=${"b".repeat(40)}]`,
       dir: laneDir,
       conflictedFiles: null,
       ts: 1_700_000_000,
@@ -17301,9 +17306,19 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
  * A fake GitRunner for `createWorktreeDriver.provision` fan-in tests.
  * `phantomSources` do not resolve; every other source is pending integration.
  */
+/** A stable 40-hex fake branch-tip SHA per ref, so the pinned head fence a
+ *  provisioned pending-integration incident carries is deterministic in fixtures. */
+function fanInHeadSha(ref: string): string {
+  const branch = ref.replace(/^refs\/heads\//, "").replace(/\^\{commit\}$/, "");
+  let h = 0;
+  for (const c of branch) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h.toString(16).padStart(8, "0").repeat(5);
+}
+
 function makePhantomFanInRun(opts: {
   phantomSources: string[];
   ancestryCode?: number;
+  baseHeadCode?: number;
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   let added = false;
@@ -17317,7 +17332,15 @@ function makePhantomFanInRun(opts: {
     if (joined.includes("^{commit}")) {
       const ref = args[args.length - 1] ?? "";
       const isPhantom = phantoms.some((p) => ref.includes(p));
-      return { code: isPhantom ? 1 : 0, stdout: "", stderr: "" };
+      if (isPhantom) {
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      // A base-branch head probe (a ref with no `--` rib separator) can be forced
+      // inconclusive to prove the durable head fence probe DEFERS the mint.
+      if (opts.baseHeadCode !== undefined && !ref.includes("--")) {
+        return { code: opts.baseHeadCode, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: `${fanInHeadSha(ref)}\n`, stderr: "" };
     }
     if (joined.startsWith("merge-base --is-ancestor")) {
       return { code: opts.ancestryCode ?? 1, stdout: "", stderr: "" };
@@ -17408,6 +17431,8 @@ test("createWorktreeDriver: provision leaves a real source unmerged and returns 
       sourceBranch: source,
       baseBranch: "keeper/epic/fn-1-foo",
       laneDir: "/repo.worktrees/keeper-epic-fn-1-foo",
+      sourceHead: fanInHeadSha(source),
+      baseHead: fanInHeadSha("keeper/epic/fn-1-foo"),
     },
   });
   expect(cmds).not.toContain(`merge --no-edit ${phantom}`);
@@ -17427,6 +17452,26 @@ test("createWorktreeDriver: provision prepares only the first unresolved source 
     expect(res.pendingIntegration?.sourceBranch).toBe(source);
   }
   expect(cmds.some((c) => c.includes(`${later}^{commit}`))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("createWorktreeDriver: an inconclusive head-fence probe never mints a fence-less pending integration manifest", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const { run, cmds } = makePhantomFanInRun({
+    phantomSources: [],
+    baseHeadCode: 128,
+  });
+  const res = await createWorktreeDriver(run).provision(
+    makeFanInInfo([source]),
+    null,
+  );
+
+  expect(res).toEqual({
+    ok: false,
+    dir: "/repo.worktrees/keeper-epic-fn-1-foo",
+    reason:
+      "worktree-lane-premerge-not-ready: head fence probe for keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo exited 128 — deferring the fan-in",
+  });
   expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
@@ -26947,10 +26992,14 @@ test("mergeEscalationFailuresToClear: an unparseable id is skipped (never cleare
 // ---------------------------------------------------------------------------
 
 const MERGE_INCIDENT_BASE = "keeper/epic/fn-3-widget";
+const MERGE_INCIDENT_SOURCE_HEAD = "c".repeat(40);
+const MERGE_INCIDENT_BASE_HEAD = "d".repeat(40);
 const MERGE_INCIDENT_REASON = pendingIntegrationReason({
   sourceBranch: "keeper/epic/fn-3-widget--fn-3-widget.1",
   baseBranch: MERGE_INCIDENT_BASE,
   laneDir: "/repo.worktrees/keeper-epic-fn-3-widget",
+  sourceHead: MERGE_INCIDENT_SOURCE_HEAD,
+  baseHead: MERGE_INCIDENT_BASE_HEAD,
 });
 
 function mergeIncidentRun(opts: {
@@ -27082,7 +27131,7 @@ test("parseMergeConflictReason round-trips the pendingIntegrationReason builder 
   expect(parsed).toEqual({
     source: "keeper/epic/fn-3-widget--fn-3-widget.1",
     base: MERGE_INCIDENT_BASE,
-    stderr: "pending owner integration",
+    stderr: `pending owner integration [expected src=${MERGE_INCIDENT_SOURCE_HEAD} base=${MERGE_INCIDENT_BASE_HEAD}]`,
   });
 });
 

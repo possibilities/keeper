@@ -28,6 +28,7 @@ import {
   raiseTmuxProjectionFloor,
   truncateEphemeralProjections,
 } from "../src/db";
+import { buildPendingIntegrationTail } from "../src/dispatch-failure-key";
 import {
   __resetEpicIndexMemoForTest,
   applyEvent,
@@ -3166,6 +3167,132 @@ test("DispatchFailed deletes the matching pending_dispatches row in the same fol
   // pending row is gone.
   expect(getDispatchFailure("plan-plan", "fn-fail.1")).not.toBeNull();
   expect(getPendingDispatch("plan-plan", "fn-fail.1")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Reason-precedence guard — a standing worktree-merge-conflict fan-in
+// integration obligation on a `(verb, id)` key must survive a lower-priority
+// dispatch-plumbing re-failure (slot occupancy / instant-death / parked launch)
+// on the same key. The obligation clears ONLY on positive ancestry-plus-clean-
+// target evidence (the reconciler's merge-resolution level-clear), never as a
+// side effect of a plumbing overlay's own reason-scoped self-clear.
+// ---------------------------------------------------------------------------
+
+const PENDING_MERGE_REASON =
+  "worktree-merge-conflict: merging keeper/epic/fn-cascade--fn-cascade.3 into " +
+  `keeper/epic/fn-cascade — ${buildPendingIntegrationTail(
+    "a".repeat(40),
+    "b".repeat(40),
+  )}`;
+
+test("a lower-priority plumbing failure preserves an open merge obligation and still discharges its pending row", () => {
+  // Open the fan-in merge incident on the dependent lane's key.
+  dispatchFailedEvent(
+    "work",
+    "fn-cascade.4",
+    PENDING_MERGE_REASON,
+    "/lane",
+    1700,
+  );
+  drainAll();
+  const opened = getDispatchFailure("work", "fn-cascade.4");
+  expect(opened?.reason).toBe(PENDING_MERGE_REASON);
+
+  // A fresh dispatch attempt lands a pending row, then fails slot-occupied on the
+  // SAME key. The merge obligation must NOT be overwritten, but the failed
+  // attempt's launch-window row must still be discharged.
+  dispatchedEvent("work", "fn-cascade.4", "/lane", 1740);
+  drainAll();
+  expect(getPendingDispatch("work", "fn-cascade.4")).not.toBeNull();
+  dispatchFailedEvent(
+    "work",
+    "fn-cascade.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1750,
+  );
+  drainAll();
+  const afterSlot = getDispatchFailure("work", "fn-cascade.4");
+  expect(afterSlot?.reason).toBe(PENDING_MERGE_REASON);
+  expect(afterSlot?.created_at).toBe(opened?.created_at);
+  expect(getPendingDispatch("work", "fn-cascade.4")).toBeNull();
+
+  // Instant-death and parked-launch re-failures are likewise suppressed.
+  dispatchFailedEvent(
+    "work",
+    "fn-cascade.4",
+    "instant-death-breaker",
+    "/lane",
+    1760,
+  );
+  dispatchFailedEvent(
+    "work",
+    "fn-cascade.4",
+    "parked-launch: tmux keeper-work:0.0",
+    "/lane",
+    1770,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-cascade.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+
+  // Positive-evidence clear (the reconciler's merge-resolution level-clear) is the
+  // ONLY discharge — it drops the row.
+  dispatchClearedEvent("work", "fn-cascade.4");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-cascade.4")).toBeNull();
+});
+
+test("precedence is directional: a merge obligation may replace a prior lower-priority plumbing row", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-dir.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1700,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-dir.4")?.reason).toBe(
+    "slot-occupied: pane foreground still claude",
+  );
+  dispatchFailedEvent("work", "fn-dir.4", PENDING_MERGE_REASON, "/lane", 1750);
+  drainAll();
+  expect(getDispatchFailure("work", "fn-dir.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+});
+
+test("the reason-precedence guard is re-fold deterministic (rewind + re-drain preserves the obligation)", () => {
+  dispatchFailedEvent("work", "fn-rf.4", PENDING_MERGE_REASON, "/lane", 1700);
+  dispatchFailedEvent(
+    "work",
+    "fn-rf.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1750,
+  );
+  dispatchFailedEvent(
+    "work",
+    "fn-rf.4",
+    "instant-death-breaker",
+    "/lane",
+    1800,
+  );
+  drainAll();
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(after).toEqual(before);
+  expect(getDispatchFailure("work", "fn-rf.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
 });
 
 test("DispatchCleared also deletes the pending_dispatches row so an operator clear immediately frees the slot (fn-870)", () => {

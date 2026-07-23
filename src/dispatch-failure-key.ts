@@ -950,6 +950,41 @@ export function isSlotOccupancyReason(reason: string): boolean {
 }
 
 /**
+ * Whether a `dispatch_failures.reason` is a worktree-merge-conflict INCIDENT —
+ * a standing fan-in merge-integration obligation on the row, VERB-AGNOSTIC (a
+ * `close`-sink epic fan-in OR a `work`-lane task fan-in) and covering BOTH the
+ * pre-minted `pending owner integration` fast-forward request and a genuine
+ * content conflict. The EXACT leading-token gate ({@link
+ * MERGE_ESCALATION_REASON_TOKEN}), so a `worktree-merge` PREFIX
+ * (`worktree-merge-lock-timeout`, `worktree-lane-premerge-*`) never matches.
+ * The fold's reason-precedence guard reads this to protect an open obligation
+ * from a lower-priority overwrite. Pure; NEVER throws.
+ */
+export function isMergeConflictIncidentReason(reason: string): boolean {
+  return leadingReasonToken(reason) === MERGE_ESCALATION_REASON_TOKEN;
+}
+
+/**
+ * Whether a `dispatch_failures.reason` is a LOWER-PRIORITY dispatch-plumbing
+ * failure — a slot-occupancy signal ({@link isSlotOccupancyReason}: reclaimed
+ * or occupied), the instant-death breaker ({@link INSTANT_DEATH_BREAKER_REASON}),
+ * or a parked launch ({@link isParkedLaunchReason}). Each describes the launch /
+ * slot PLUMBING for a `(verb, id)` key, never a semantic merge-integration
+ * obligation. The fold's reason-precedence guard uses this so one of these can
+ * never REPLACE a standing {@link isMergeConflictIncidentReason} row on the same
+ * key (nor can its own later reason-scoped self-clear then erase that obligation):
+ * a merge incident clears ONLY on positive ancestry-plus-clean-target evidence.
+ * Pure; NEVER throws.
+ */
+export function isLowerPriorityDispatchPlumbingReason(reason: string): boolean {
+  return (
+    isSlotOccupancyReason(reason) ||
+    reason.startsWith(INSTANT_DEATH_BREAKER_REASON) ||
+    isParkedLaunchReason(reason)
+  );
+}
+
+/**
  * Whether a `dispatch_failures.reason` is an escalatable close-sink merge
  * conflict — the EXACT leading-token gate ({@link MERGE_ESCALATION_REASON_TOKEN};
  * a `worktree-merge` prefix must NOT match). Routes through {@link
@@ -1006,4 +1041,54 @@ export function parseMergeConflictReason(
     return null;
   }
   return { source, base, stderr };
+}
+
+/**
+ * The em-dash tail every pre-minted fan-in `worktree-merge-conflict` incident
+ * carries (the class {@link parseMergeConflictReason} returns as `stderr`),
+ * distinguishing the requested clean integration from a genuine content
+ * conflict (whose tail is a git stderr). A DURABLE HEAD FENCE rides this tail as
+ * the ` [expected src=<sha> base=<sha>]` suffix {@link
+ * buildPendingIntegrationTail} appends and {@link parsePendingIntegrationHeads}
+ * reads back: the producer pins BOTH branch-tip SHAs at incident mint so the
+ * resolver can tell the requested exact fast-forward (source strictly containing
+ * base, both heads still at their pins) from a moved head, and never mistakes the
+ * former for `stale_base`.
+ */
+export const PENDING_OWNER_INTEGRATION_TAIL = "pending owner integration";
+
+/**
+ * Build the pinned pending-integration tail: {@link
+ * PENDING_OWNER_INTEGRATION_TAIL} plus the `[expected src=<sha> base=<sha>]`
+ * durable head fence. The producer probes both branch-tip SHAs at mint and
+ * passes them here; the fold writes the resulting reason verbatim (it never
+ * probes), so the fence is re-fold-deterministic. Inverse of {@link
+ * parsePendingIntegrationHeads}. Pure.
+ */
+export function buildPendingIntegrationTail(
+  sourceHead: string,
+  baseHead: string,
+): string {
+  return `${PENDING_OWNER_INTEGRATION_TAIL} [expected src=${sourceHead} base=${baseHead}]`;
+}
+
+/**
+ * Extract the durable head fence a pinned pending-integration incident carries —
+ * the `[expected src=<sha> base=<sha>]` suffix {@link buildPendingIntegrationTail}
+ * appended. Returns null when the reason carries no fence (a genuine content
+ * conflict, or an unpinned legacy pending row), so a caller degrades to its
+ * non-fenced path rather than fabricating heads. Reads the whole reason so it is
+ * indifferent to how {@link parseMergeConflictReason} splits it. Pure; NEVER
+ * throws.
+ */
+export function parsePendingIntegrationHeads(
+  reason: string,
+): { sourceHead: string; baseHead: string } | null {
+  const m = /\[expected src=([0-9a-f]{7,40}) base=([0-9a-f]{7,40})\]/.exec(
+    reason,
+  );
+  if (m == null || m[1] === undefined || m[2] === undefined) {
+    return null;
+  }
+  return { sourceHead: m[1], baseHead: m[2] };
 }

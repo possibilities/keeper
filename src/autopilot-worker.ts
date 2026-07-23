@@ -95,6 +95,7 @@ import {
 import { parsePlanRef } from "./derivers";
 import {
   assertNever,
+  buildPendingIntegrationTail,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   epicIdFromFatalAuditId,
@@ -1716,6 +1717,12 @@ export interface PendingIntegrationManifest {
   sourceBranch: string;
   baseBranch: string;
   laneDir: string;
+  /** The source rib's branch-tip SHA the producer pinned at mint — the durable
+   *  head fence the resolver rechecks so the requested clean fast-forward is
+   *  distinguishable from a moved head. */
+  sourceHead: string;
+  /** The target base's branch-tip SHA the producer pinned at mint. */
+  baseHead: string;
 }
 
 export function pendingIntegrationReason(
@@ -1723,7 +1730,10 @@ export function pendingIntegrationReason(
 ): string {
   return (
     `${MERGE_ESCALATION_REASON_TOKEN}: merging ${manifest.sourceBranch} into ` +
-    `${manifest.baseBranch} — pending owner integration`
+    `${manifest.baseBranch} — ${buildPendingIntegrationTail(
+      manifest.sourceHead,
+      manifest.baseHead,
+    )}`
   );
 }
 
@@ -8042,10 +8052,36 @@ export function createWorktreeDriver(
             };
           }
 
+          // Pin the durable head fence at mint: the source rib tip (already
+          // resolved by `srcRef` above) and the target base tip, both by their
+          // shared-object-store refs so the resolver rechecks the identical
+          // SHAs. An inconclusive base probe DEFERS the mint (a self-clearing
+          // lane-premerge retry) rather than minting a fence-less incident.
+          const sourceHead = srcRef.stdout.trim();
+          const baseRef = await run(
+            [
+              "rev-parse",
+              "--quiet",
+              "--verify",
+              "--end-of-options",
+              `refs/heads/${branch}^{commit}`,
+            ],
+            { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+          );
+          const baseHead = baseRef.stdout.trim();
+          if (baseRef.code !== 0 || baseHead === "" || sourceHead === "") {
+            return {
+              ok: false,
+              dir: worktreePath,
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: head fence probe for ${source} into ${branch} exited ${baseRef.code} — deferring the fan-in`,
+            };
+          }
           pendingIntegration = {
             sourceBranch: source,
             baseBranch: branch,
             laneDir: worktreePath,
+            sourceHead,
+            baseHead,
           };
           break;
         }

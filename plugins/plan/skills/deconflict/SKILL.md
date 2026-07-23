@@ -42,6 +42,10 @@ Pin these fields from the incident brief JSON:
 - `incident.conflict.base_branch`
 - `incident.conflict.repo_dir`
 - `incident.conflict.stderr`
+- `incident.conflict.expected_source_head` / `incident.conflict.expected_base_head`
+  — the durable head fence the producer pinned at incident mint (both non-null for
+  a pre-minted `pending owner integration` fast-forward request, both null for a
+  genuine content conflict)
 - `epic_id` / `task_id` / `lineage` fields you need for close-out
 
 Then confirm the checkout state before spawn:
@@ -55,6 +59,9 @@ git branch --show-current
 # expected branches must match
 
 git rev-parse <base_branch> <source_branch>
+# the recheck, not the expectation: when the fence is present these live heads
+# must equal the pinned expected_base_head / expected_source_head from the
+# incident, else the incident is stale
 ```
 
 `base_branch`/`source_branch` are as pinned from the brief. For a close-verb
@@ -87,8 +94,8 @@ BRIEF_REF=deconflict::<ref>
     "source_branch": "<incident.conflict.source_branch>",
     "toplevel": "<git rev-parse --show-toplevel>",
     "expected_heads": {
-      "base_head": "<git rev-parse <incident.conflict.base_branch>>",
-      "source_head": "<git rev-parse <incident.conflict.source_branch>>"
+      "base_head": "<incident.conflict.expected_base_head, else the live git rev-parse <base_branch> for an unpinned genuine conflict>",
+      "source_head": "<incident.conflict.expected_source_head, else the live git rev-parse <source_branch> for an unpinned genuine conflict>"
     }
   }
 }

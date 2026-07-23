@@ -31,6 +31,7 @@ import {
   main,
   parseEscalationKey,
 } from "../cli/escalation-brief";
+import { buildPendingIntegrationTail } from "../src/dispatch-failure-key";
 import { repoToken as deriveRepoToken } from "../src/worktree-plan";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
@@ -826,6 +827,8 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
         base_branch: "main",
         stderr: "CONFLICT (content): foo.ts",
         repo_dir: "/repo",
+        expected_source_head: null,
+        expected_base_head: null,
         owner_redispatch_attempts: 0,
         instance_event_id: null,
         attempt_id: null,
@@ -871,6 +874,42 @@ test("byte-equality regression: a deconflict brief's full shape is unchanged", (
     },
     degraded: ["incident_resolver_job_missing"],
   });
+  db.close();
+});
+
+test("a pinned pending-integration incident surfaces the durable head fence to the deconflict brief", () => {
+  const { db } = freshMemDb();
+  const sourceHead = "1".repeat(40);
+  const baseHead = "2".repeat(40);
+  writeEpicFile(tmp, "fn-830-pin", { primary_repo: "/repo" });
+  seedMergeConflict(db, {
+    id: "fn-830-pin",
+    reason:
+      "worktree-merge-conflict: merging keeper/epic/fn-830-pin--fn-830-pin.2 into keeper/epic/fn-830-pin — " +
+      buildPendingIntegrationTail(sourceHead, baseHead),
+    dir: "/repo",
+  });
+
+  const r = buildEscalationBrief(db, "deconflict::fn-830-pin", tmp);
+  expect(r.kind).toBe("ok");
+  if (r.kind !== "ok") {
+    db.close();
+    return;
+  }
+  const inc = r.brief.incident as {
+    conflict: {
+      source_branch: string | null;
+      base_branch: string | null;
+      expected_source_head: string | null;
+      expected_base_head: string | null;
+    } | null;
+  };
+  expect(inc.conflict?.source_branch).toBe(
+    "keeper/epic/fn-830-pin--fn-830-pin.2",
+  );
+  expect(inc.conflict?.base_branch).toBe("keeper/epic/fn-830-pin");
+  expect(inc.conflict?.expected_source_head).toBe(sourceHead);
+  expect(inc.conflict?.expected_base_head).toBe(baseHead);
   db.close();
 });
 

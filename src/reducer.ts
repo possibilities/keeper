@@ -34,6 +34,8 @@ import {
 import {
   BLOCK_INCIDENT_REASON,
   INSTANT_DEATH_BREAKER_REASON,
+  isLowerPriorityDispatchPlumbingReason,
+  isMergeConflictIncidentReason,
   isParkedLaunchReason,
   SHARED_DIRTY_DISTRESS_VERB,
 } from "./dispatch-failure-key";
@@ -4110,6 +4112,29 @@ function extractDispatchClearedPayload(
 }
 
 /**
+ * Discharge the in-flight `pending_dispatches` launch-window row a
+ * `DispatchFailed` reconciles for its `(verb, id[, attemptId])` pair. Idempotent
+ * DELETE — a no-op when no pending row exists. Shared by every arm of {@link
+ * foldDispatchFailed} so a suppressed failure still cannot leak a phantom row.
+ */
+function dischargeLaunchWindow(
+  db: Database,
+  payload: DispatchFailedPayload,
+): void {
+  if (payload.attemptId == null) {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+      [payload.verb, payload.id],
+    );
+  } else {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+      [payload.verb, payload.id, payload.attemptId],
+    );
+  }
+}
+
+/**
  * Fold one synthetic `DispatchFailed` event. UPSERT on `(verb, id)`: the first
  * failure INSERTs a row stamped `created_at = payload.ts`; subsequent failures
  * UPDATE the mutable fields and PRESERVE `created_at` so the "sticky since" view
@@ -4121,6 +4146,23 @@ function foldDispatchFailed(db: Database, event: Event): void {
   const payload = extractDispatchFailedPayload(event);
   if (payload == null) {
     return;
+  }
+  // Reason-precedence guard: a lower-priority dispatch-plumbing failure (slot
+  // occupancy / instant-death / parked launch) must never REPLACE a standing
+  // worktree-merge-conflict incident on the same `(verb, id)` — the fan-in
+  // integration obligation clears ONLY on positive ancestry-plus-clean-target
+  // evidence (the reconciler's merge-resolution level-clear), never as a side
+  // effect of a plumbing overlay's own reason-scoped self-clear. Decided purely
+  // from the persisted reason + this event's reason, so a re-fold reproduces it
+  // exactly. The failed attempt's launch-window row is still discharged.
+  if (isLowerPriorityDispatchPlumbingReason(payload.reason)) {
+    const open = db
+      .query("SELECT reason FROM dispatch_failures WHERE verb = ? AND id = ?")
+      .get(payload.verb, payload.id) as { reason: string } | null;
+    if (open != null && isMergeConflictIncidentReason(open.reason)) {
+      dischargeLaunchWindow(db, payload);
+      return;
+    }
   }
   if (isParkedLaunchReason(payload.reason)) {
     const claim = db
@@ -4195,18 +4237,8 @@ function foldDispatchFailed(db: Database, event: Event): void {
   // A `DispatchFailed` also discharges any in-flight `pending_dispatches` row
   // for the same pair: the outbox ordering (mint `Dispatched` BEFORE `launch()`)
   // means a launch failure leaves both rows, and this arm reconciles them in the
-  // same fold. Idempotent DELETE — no-op when no pending row exists.
-  if (payload.attemptId == null) {
-    db.run(
-      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
-      [payload.verb, payload.id],
-    );
-  } else {
-    db.run(
-      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
-      [payload.verb, payload.id, payload.attemptId],
-    );
-  }
+  // same fold.
+  dischargeLaunchWindow(db, payload);
 }
 
 /**
