@@ -1,7 +1,12 @@
 import { type ChildProcess, execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { piLaunchRouteHint } from "../../../src/session-runtime.ts";
+import {
+  type PiRouteObservation,
+  piLaunchRouteHint,
+  type RuntimeTarget,
+  readLatestPiRouteObservation,
+} from "../../../src/session-runtime.ts";
 
 const CONTEXT_GLYPH = "\uf295";
 const LANE_GLYPH = "⑂";
@@ -63,6 +68,7 @@ interface FooterState {
   insertions: number;
   deletions: number;
   version: string;
+  account: string;
 }
 
 interface FooterRenderInput extends FooterState {
@@ -95,28 +101,71 @@ export function compactPiKeeperLane(branch: string): string {
   return `${LANE_GLYPH} ${compactEpic}--${compactPlanId(taskId)}`;
 }
 
-export function resolvePiAccountLabel(
-  env: NodeJS.ProcessEnv = process.env,
-): string {
+function resolvePiAliasLabel(alias: string, env: NodeJS.ProcessEnv): string {
   if (env[CODEX_POOL_MODE_ENV] !== "active") return "";
-  const initialAlias = (env[CODEX_POOL_INITIAL_ALIAS_ENV] ?? "").trim();
   const rawAliases = (env[CODEX_POOL_ALIASES_ENV] ?? "").trim();
-  if (initialAlias === "" || rawAliases === "") return "";
+  if (alias === "" || rawAliases === "") return "";
   try {
     const aliases = JSON.parse(rawAliases) as unknown;
     if (
       !Array.isArray(aliases) ||
       aliases.length === 0 ||
       aliases.length > CODEX_POOL_MAX_ALIASES ||
-      aliases.some((alias) => typeof alias !== "string")
+      aliases.some((candidate) => typeof candidate !== "string")
     ) {
       return "";
     }
-    const position = aliases.indexOf(initialAlias);
+    const position = aliases.indexOf(alias);
     return position === -1 ? "" : `codex-${position + 1}`;
   } catch {
     return "";
   }
+}
+
+export function resolvePiAccountLabel(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return resolvePiAliasLabel(
+    (env[CODEX_POOL_INITIAL_ALIAS_ENV] ?? "").trim(),
+    env,
+  );
+}
+
+function resolvePiNativeSessionId(ctx: PiFooterContext): string | null {
+  try {
+    const candidate = ctx.sessionManager?.getSessionId().trim() ?? "";
+    return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate)
+      ? candidate
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolvePiAccountDisplay(
+  jobId: string,
+  ctx: PiFooterContext,
+  readRoute: (target: RuntimeTarget) => PiRouteObservation | null,
+  env: NodeJS.ProcessEnv,
+): string {
+  const hint = resolvePiAccountLabel(env);
+  if (hint === "") return "";
+  const nativeSessionId = resolvePiNativeSessionId(ctx);
+  if (nativeSessionId === null) return `~${hint}`;
+  try {
+    const route = readRoute({
+      jobId,
+      harness: "pi",
+      nativeSessionId,
+    });
+    if (route?.state === "selected" && route.alias !== null) {
+      const actual = resolvePiAliasLabel(route.alias, env);
+      if (actual !== "") return actual;
+    }
+  } catch {
+    // Route diagnostics are advisory; retain the launch hint on read failure.
+  }
+  return `~${hint}`;
 }
 
 function stripAnsi(value: string): string {
@@ -311,15 +360,7 @@ export function buildPiTelemetryPayload(
   version: string,
 ): string {
   const usage = ctx.getContextUsage?.();
-  let nativeSessionId: string | null = null;
-  try {
-    const candidate = ctx.sessionManager?.getSessionId().trim() ?? "";
-    if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate)) {
-      nativeSessionId = candidate;
-    }
-  } catch {
-    nativeSessionId = null;
-  }
+  const nativeSessionId = resolvePiNativeSessionId(ctx);
   return JSON.stringify({
     session_id: jobId,
     context_window: {
@@ -373,6 +414,8 @@ function writeTelemetry(
 export interface PiStatusFooterDeps {
   probeGit?: typeof probePiFooterGit;
   writeTelemetry?: typeof writeTelemetry;
+  readRoute?: (target: RuntimeTarget) => PiRouteObservation | null;
+  env?: NodeJS.ProcessEnv;
   version?: string;
   getMonitorCount?: () => number;
 }
@@ -402,17 +445,22 @@ export function installPiStatusFooter(
   try {
     const canRender =
       ctx.mode === "tui" && typeof ctx.ui.setFooter === "function";
+    const readRoute = deps.readRoute ?? readLatestPiRouteObservation;
+    const env = deps.env ?? process.env;
     const state: FooterState = {
       project: basename(ctx.cwd) || ctx.cwd,
       insertions: 0,
       deletions: 0,
       version: deps.version ?? resolvePiVersion(),
+      account: resolvePiAccountDisplay(jobId, ctx, readRoute, env),
     };
     const probeGit = deps.probeGit ?? probePiFooterGit;
     const publishTelemetry = deps.writeTelemetry ?? writeTelemetry;
     let requestRender = (): void => {};
     const effort = (): string => pi.getThinkingLevel?.() ?? "";
     const refresh = (): void => {
+      state.account = resolvePiAccountDisplay(jobId, ctx, readRoute, env);
+      requestRender();
       if (canRender) {
         void probeGit(ctx.cwd)
           .then((git) => {
@@ -450,10 +498,6 @@ export function installPiStatusFooter(
                 network: (process.env.ANTHROPIC_BASE_URL ?? "").startsWith(
                   "http://127.0.0.1:",
                 ),
-                account: (() => {
-                  const hint = resolvePiAccountLabel();
-                  return hint === "" ? "" : `hint:${hint}`;
-                })(),
               },
               theme,
               width,

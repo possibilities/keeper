@@ -19,6 +19,7 @@ import {
   resolvePiAccountLabel,
   resolvePiVersion,
 } from "../plugins/keeper/pi-extension/status-footer";
+import type { PiRouteObservation } from "../src/session-runtime";
 
 const plainTheme = { fg: (_color: string, text: string) => text };
 
@@ -65,6 +66,83 @@ describe("Pi keeper status footer", () => {
         KEEPER_PI_CODEX_POOL_MODE: "native",
       }),
     ).toBe("");
+  });
+
+  test("replaces the launch hint marker with the published route", () => {
+    const env = {
+      KEEPER_PI_CODEX_POOL_MODE: "active",
+      KEEPER_PI_CODEX_POOL_ALIASES: '["opaque-primary","opaque-alternate"]',
+      KEEPER_PI_CODEX_POOL_INITIAL_ALIAS: "opaque-alternate",
+    };
+    let route: PiRouteObservation | null = null;
+    let footerFactory:
+      | ((
+          tui: { requestRender(): void },
+          theme: PiFooterTheme,
+          footerData: PiFooterData,
+        ) => {
+          render(width: number): string[];
+          invalidate(): void;
+          dispose?(): void;
+        })
+      | undefined;
+    const refresh = installPiStatusFooter(
+      { getThinkingLevel: () => "high" },
+      {
+        cwd: "/work/keeper",
+        mode: "tui",
+        model: { id: "model-1", contextWindow: 100_000 },
+        sessionManager: { getSessionId: () => "native-1" },
+        getContextUsage: () => ({
+          tokens: 1_000,
+          contextWindow: 100_000,
+          percent: 1,
+        }),
+        ui: {
+          setFooter: (factory) => {
+            footerFactory = factory;
+          },
+        },
+      },
+      "job-1",
+      {
+        env,
+        version: "pi-test",
+        readRoute: () => route,
+        writeTelemetry: () => {},
+        probeGit: async () => ({
+          project: "keeper",
+          insertions: 0,
+          deletions: 0,
+        }),
+      },
+    );
+    if (footerFactory === undefined) throw new Error("footer not installed");
+    const footer = footerFactory({ requestRender() {} }, plainTheme, {
+      getGitBranch: () => "main",
+      onBranchChange: () => () => {},
+    });
+
+    expect(footer.render(100)[0]).toEndWith("~codex-2");
+
+    route = {
+      schema_version: 1,
+      subject_scope: "session",
+      job_id: "job-1",
+      native_session_id: "native-1",
+      agent_id: null,
+      quota_scope: "generic",
+      state: "selected",
+      alias: "opaque-alternate",
+      observed_at_ms: 100,
+    };
+    refresh();
+    expect(footer.render(100)[0]).toEndWith("codex-2");
+    expect(footer.render(100)[0]).not.toEndWith("~codex-2");
+
+    route = { ...route, alias: "opaque-primary", observed_at_ms: 200 };
+    refresh();
+    expect(footer.render(100)[0]).toEndWith("codex-1");
   });
 
   test("shows only the running Monitor count below the statusline", () => {
