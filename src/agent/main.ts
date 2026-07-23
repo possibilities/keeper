@@ -1621,6 +1621,7 @@ async function runTranscriptSubcommand(
     rest,
     cwd: deps.cwd,
     stateDir: deps.launcherStateDir,
+    now: deps.now,
   });
   if (!resolution.ok) {
     deps.writeErr(`keeper agent: ${resolution.error}\n`);
@@ -2450,6 +2451,19 @@ async function runResumeCaptureSubcommand(
     return emitBad();
   }
   if (decision.kind === "live") {
+    // A live resume messages an already-running window over the Bus — it opens
+    // NO new run.json, so a `--budget` has no durable launch instant to bind the
+    // cumulative ceiling against. Honoring it would let a cold-restarted wait
+    // grant another full budget (the exact incident the durable budget forecloses
+    // for a launched leg). FAIL CLOSED before any Bus send, so a budgeted live
+    // resume never reaches runLivePartnerCapture.
+    if (parsed.budgetMs !== null) {
+      deps.writeErr(
+        `agent: --budget cannot be combined with a --resume matching the live ` +
+          `Partner ${decision.job_id} — a live resume binds no durable budget.\n`,
+      );
+      return emitBad();
+    }
     return runLivePartnerCapture(deps, parsed, agent, verbDeps, decision);
   }
   if (decision.kind === "ambiguous") {
@@ -2714,6 +2728,7 @@ async function runWaitCaptureSubcommand(
     rest,
     cwd: deps.cwd,
     stateDir: deps.launcherStateDir,
+    now: deps.now,
   });
   if (!resolution.ok) {
     deps.writeErr(`agent: ${resolution.error}\n`);

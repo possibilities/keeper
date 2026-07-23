@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   utimesSync,
   writeFileSync,
@@ -12,6 +13,7 @@ import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
   collectUnsettledPanelRunIds,
+  launchKeeperAgentInTmux,
   parseKeeperAgentTmuxArgs,
   resolveKeeperAgentBin,
   resolveTmuxBin,
@@ -19,6 +21,7 @@ import {
   sweepRunArtifacts,
   TMUX_EXIT,
   TmuxLaunchError,
+  type TmuxLaunchRequest,
   tmuxSpawnEnv,
 } from "../src/agent/tmux-launch";
 import { expectExit, makeHarness } from "./helpers/agent-main-harness";
@@ -1252,5 +1255,80 @@ describe("--no-artifacts", () => {
     expect(parsed.enabled).toBe(true);
     expect(parsed.options.noArtifacts).toBe(true);
     expect(parsed.remainingArgs).toEqual(["hello"]);
+  });
+});
+
+describe("run.json publication is atomic; a failed publish tears down the exact window", () => {
+  const RUN_ID = "tmux-abababab-abab-abab-abab-abababababab";
+
+  function launchReqWithFailingWrite(
+    stateDir: string,
+    tmuxCommands: string[][],
+  ): TmuxLaunchRequest {
+    return {
+      agent: "claude",
+      innerArgs: ["hello"],
+      options: {
+        session: "work",
+        windowName: null,
+        socketName: "agents",
+        socketPath: null,
+        detached: true,
+        noArtifacts: false,
+        env: [],
+      },
+      env: {},
+      cwd: "/work/proj",
+      transcriptSessionId: null,
+      startedAtMs: 123,
+      stateDir,
+      tmuxBin: "tmux",
+      launcherArgvPrefix: ["/bin/bun", "/code/keeper/cli/keeper.ts", "agent"],
+      randomUuid: () => "abababab-abab-abab-abab-abababababab",
+      runTmuxCommand: (cmd) => {
+        tmuxCommands.push(cmd);
+        if (cmd.includes("has-session")) {
+          return { exitCode: 1, stdout: "", stderr: "no session" };
+        }
+        if (cmd.includes("new-session") || cmd.includes("new-window")) {
+          return { exitCode: 0, stdout: "work\x01@7\x01%8\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      // The injected leaf: the run.json publish write fails after the window is up.
+      writeFile: () => {
+        throw new Error("disk full");
+      },
+    };
+  }
+
+  test("a write failure kills the exact just-created window and leaves no partial run.json", () => {
+    const stateDir = tempDir();
+    const tmuxCommands: string[][] = [];
+    const req = launchReqWithFailingWrite(stateDir, tmuxCommands);
+
+    let thrown: unknown;
+    try {
+      launchKeeperAgentInTmux(req);
+    } catch (err) {
+      thrown = err;
+    }
+
+    // (c) the caller sees launch_failed: launchToResolvedHandle maps a
+    //     TmuxLaunchError to a failed launch → composeRunCapture's launch_failed.
+    expect(thrown).toBeInstanceOf(TmuxLaunchError);
+    expect((thrown as TmuxLaunchError).exitCode).toBe(TMUX_EXIT.INTERNAL);
+    expect((thrown as TmuxLaunchError).message).toContain(
+      "failed to publish run metadata",
+    );
+
+    // (b) teardown targets EXACTLY the just-created window (@7), never a name sweep.
+    const kill = tmuxCommands.find((c) => c.includes("kill-window"));
+    expect(kill).toEqual(["tmux", "-L", "agents", "kill-window", "-t", "@7"]);
+
+    // (a) no partial run.json — and no leftover temp file — remains on disk.
+    const runDir = join(stateDir, "tmux-runs", RUN_ID);
+    expect(existsSync(join(runDir, "run.json"))).toBe(false);
+    expect(readdirSync(runDir).some((f) => f.includes(".tmp"))).toBe(false);
   });
 });

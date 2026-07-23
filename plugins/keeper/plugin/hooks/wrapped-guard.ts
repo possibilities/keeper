@@ -386,8 +386,33 @@ const WRAPPED_PROVIDER_VALUE_OPTIONS = new Set([
 
 /** A bounded duration token (`<digits>ms|s|m`) — the only shape a wrapped
  *  `--stop-timeout`/`--budget` ceiling may take, so no wrapped wait or launch can
- *  request an unbounded sleep. */
-const BOUNDED_DURATION = /^\d+(?:ms|s|m)$/;
+ *  request an unbounded sleep. Capturing form: group 1 = digits, group 2 = unit. */
+const BOUNDED_DURATION = /^(\d+)(ms|s|m)$/;
+
+/** 24h in ms — the maximum a wrapped worker's `--budget`/`--stop-timeout` ceiling
+ *  may resolve to. A wrapped provider leg's cumulative `--budget` IS the cell's
+ *  `stop_timeout_ms`, which the host matrix caps at MAX_STOP_TIMEOUT_MS
+ *  (src/agent/matrix.ts); this mirrors that ceiling, so every supported config
+ *  value is admitted while a courier cannot name an effectively-unbounded budget
+ *  (e.g. `999999999m` ≈ 1,900 years). The guard's node-only import rules forbid
+ *  importing matrix.ts, so the value is duplicated and kept in lockstep by these
+ *  paired comments. */
+const MAX_WRAPPED_BUDGET_MS = 86_400_000;
+
+/** True when `token` is a bounded duration whose millisecond value is a safe
+ *  integer within {@link MAX_WRAPPED_BUDGET_MS}. A shape match alone is NOT a
+ *  bound: `999999999m` is shape-valid yet denied. Absent/malformed → false. */
+function boundedDurationWithinMax(token: string | undefined): boolean {
+  if (token === undefined) return false;
+  const match = BOUNDED_DURATION.exec(token);
+  if (match === null) return false;
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value)) return false;
+  const unit = match[2] as string;
+  const ms =
+    unit === "ms" ? value : unit === "s" ? value * 1000 : value * 60000;
+  return Number.isSafeInteger(ms) && ms <= MAX_WRAPPED_BUDGET_MS;
+}
 const WRAPPED_PROVIDER_BOOLEAN_OPTIONS = new Set(["--reap-window-on-terminal"]);
 const RUN_GATE_STEER =
   "Do not retry the same quoting; use a single short, single-line double-quoted " +
@@ -866,11 +891,11 @@ function wrappedWaitViolation(
   if (positionals.length !== 1 || positionals[0] === "") return deny;
   if (
     values.has("--stop-timeout") &&
-    !BOUNDED_DURATION.test(values.get("--stop-timeout") as string)
+    !boundedDurationWithinMax(values.get("--stop-timeout"))
   ) {
     return deny;
   }
-  if (!BOUNDED_DURATION.test(values.get("--budget") ?? "")) return deny;
+  if (!boundedDurationWithinMax(values.get("--budget"))) return deny;
   if (
     context.envelopeReference === undefined ||
     values.get("--output") !== context.envelopeReference
@@ -977,11 +1002,12 @@ function wrappedAgentViolation(
     values.get("--output") !== context.envelopeReference
   ) {
     bindingOffender = values.get("--output");
-  } else if (!BOUNDED_DURATION.test(values.get("--stop-timeout") ?? "")) {
+  } else if (!boundedDurationWithinMax(values.get("--stop-timeout"))) {
     bindingOffender = values.get("--stop-timeout");
-  } else if (!BOUNDED_DURATION.test(values.get("--budget") ?? "")) {
+  } else if (!boundedDurationWithinMax(values.get("--budget"))) {
     // The launch MUST bind an exact bounded total budget durably (run.json), so
-    // the cumulative ceiling exists before any wait — no unbounded escape hatch.
+    // the cumulative ceiling exists before any wait — and it may not exceed the
+    // matrix-capped ceiling, so no unbounded (or ~1,900-year) escape hatch.
     bindingOffender = values.get("--budget");
   } else {
     bindingMismatch = false;

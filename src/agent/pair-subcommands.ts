@@ -88,6 +88,11 @@ export interface ResolveHandleArgs {
   rest: string[];
   cwd: string;
   stateDir: string;
+  /** Wall-clock the run.json launch instant is validated against. run.json is
+   *  published BEFORE any wait begins, so a persisted `startedAtMs` in the future
+   *  never came from the producer — the resolver rejects it (see resolveRunId).
+   *  Injected for tests; defaults to Date.now(). */
+  now?: () => number;
 }
 
 export type HandleResolution =
@@ -248,6 +253,7 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
     stopTimeoutMs,
     declaredBudgetMs,
     outputPath,
+    (args.now ?? Date.now)(),
   );
 }
 
@@ -258,6 +264,7 @@ function resolveRunId(
   stopTimeoutMs: number | null,
   declaredBudgetMs: number | null,
   outputPath: string | null,
+  nowMs: number,
 ): HandleResolution {
   const runJsonPath = join(stateDir, "tmux-runs", runId, "run.json");
   if (!existsSync(runJsonPath)) {
@@ -282,27 +289,39 @@ function resolveRunId(
     return { ok: false, error: `run metadata has no cwd: ${runJsonPath}` };
   }
 
-  // The DURABLE producer clock: a FINITE, SAFE, POSITIVE launch instant. A
-  // malformed clock (JSON `1e400` → Infinity, negative, or a future value the
-  // producer never wrote) carries NO cumulative-budget authority.
+  // The DURABLE producer clock: a FINITE, SAFE, POSITIVE launch instant that was
+  // published BEFORE this wait began, so it must be `<= now`. A malformed clock
+  // (JSON `1e400` → Infinity, negative), or a future value the producer never
+  // wrote (a torn/forged run.json), carries NO cumulative-budget authority.
   const rawStartedAt = parsed.startedAtMs;
   const startedAtValid =
     typeof rawStartedAt === "number" &&
     Number.isSafeInteger(rawStartedAt) &&
-    rawStartedAt > 0;
+    rawStartedAt > 0 &&
+    rawStartedAt <= nowMs;
   const startedAtMs = startedAtValid ? (rawStartedAt as number) : 0;
 
   // The budget ceiling is bound ONCE at launch in owner-private run.json; a
   // per-call `--budget` may only re-declare the SAME value. A mismatch/increase,
   // a declared budget with no launch bind, or a bound budget with no valid clock
   // all FAIL CLOSED before any wait — the durable value is the sole authority.
+  // A `budgetMs` field that is PRESENT but not a safe positive integer is a
+  // corrupted/torn ceiling, NOT a legacy-unbound run: fail closed rather than
+  // silently widen an intended cap to no cap.
   const rawBudget = parsed.budgetMs;
+  const budgetFieldPresent = rawBudget !== undefined;
   const persistedBudgetMs =
     typeof rawBudget === "number" &&
     Number.isSafeInteger(rawBudget) &&
     rawBudget > 0
       ? rawBudget
       : null;
+  if (budgetFieldPresent && persistedBudgetMs === null) {
+    return {
+      ok: false,
+      error: `run ${runId} has a present but invalid budgetMs — refusing to treat a corrupted ceiling as unbounded`,
+    };
+  }
   if (declaredBudgetMs !== null) {
     if (persistedBudgetMs === null) {
       return {
@@ -409,6 +428,14 @@ export interface VerbDeps {
    *  Injected so a wait can positively detect a gone target within one poll
    *  tick; omitted → no window probing (byte-identical legacy behavior). */
   probeWindowPresence?: (command: string[]) => Promise<WindowLiveness>;
+  /** The poll-tick sleep threaded into both watcher stages. Injected so a test
+   *  can prove an over-budget wait does exactly one observation scan and NEVER
+   *  sleeps; omitted → the watcher's own default real-time sleep. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The wall-clock the deadline math reads, threaded end-to-end (runWaitForStop
+   *  AND both watcher stages) so a test can freeze time and prove the exhausted-
+   *  budget floor deterministically; omitted → Date.now. */
+  now?: () => number;
 }
 
 /**
@@ -455,9 +482,15 @@ export async function runWaitForStop(
   handle: ResolvedHandle,
   deps: VerbDeps,
 ): Promise<WaitForStopResult> {
+  const now = deps.now ?? Date.now;
   const totalMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-  const deadlineMs = Date.now() + totalMs;
-  const remainingForPath = Math.max(1, deadlineMs - Date.now());
+  const deadlineMs = now() + totalMs;
+  // Floor the remainder at 0, NOT 1: a 0-budget stopTimeoutMs (an over-budget
+  // capture, floored to a single non-sleeping scan by captureFromHandle) must
+  // stay 0 so each watcher stage does exactly one observation scan and its
+  // deadline check returns before any poll sleep. A 1ms floor would re-arm a
+  // full 250ms poll-sleep on an already-exhausted budget.
+  const remainingForPath = Math.max(0, deadlineMs - now());
   const pathTimeoutMs =
     handle.agent === "pi"
       ? remainingForPath
@@ -498,7 +531,11 @@ export async function runWaitForStop(
     lifecycleProbe: lifecycleProbe(handle, deps),
     windowProbe: probeWindow,
     transcriptPath,
-    stopTimeoutMs: Math.max(1, deadlineMs - Date.now()),
+    // Same 0-floor as the path stage: preserve an exhausted budget so the stop
+    // stage's single scan returns without a poll sleep.
+    stopTimeoutMs: Math.max(0, deadlineMs - now()),
+    ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   // A bounded timeout maps to the caller's RETRYABLE (exit 4) path, mirroring the
   // transcript-path timeout above — a retryable transient, not a wrong answer.
@@ -615,6 +652,8 @@ async function resolveTranscriptPath(
     lifecycleProbe: lifecycleProbe(handle, deps),
     windowProbe: probeWindow,
     pathTimeoutMs,
+    ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 }
 

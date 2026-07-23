@@ -79,6 +79,14 @@ export interface Matrix {
 export const DEFAULT_STOP_TIMEOUT_MS = 7_200_000;
 export const DEFAULT_MAX_ATTEMPTS = 2;
 
+/** The operational ceiling on a cell's `stop_timeout_ms` — 24h, 12x the
+ *  task-spec-fixed 2h default. A wrapped provider leg's cumulative `--budget` IS
+ *  the cell's `stop_timeout_ms`, so bounding the config here is what lets the
+ *  wrapped-guard hook enforce an identical finite maximum that covers every
+ *  supported config value (a provider leg with no stop in 24h is a wedge, not a
+ *  longer turn). Keep in lockstep with the guard's `MAX_WRAPPED_BUDGET_MS`. */
+export const MAX_STOP_TIMEOUT_MS = 86_400_000;
+
 /** The matrix config path under the (KEEPER_CONFIG_DIR-overridable) config dir. */
 export function matrixConfigPath(): string {
   return join(keeperConfigDir(), "matrix.yaml");
@@ -460,6 +468,7 @@ function parseDefaults(value: unknown, configPath: string): MatrixDefaults {
       "stop_timeout_ms",
       DEFAULT_STOP_TIMEOUT_MS,
       configPath,
+      MAX_STOP_TIMEOUT_MS,
     ),
     max_attempts: parsePositiveInt(
       value.max_attempts,
@@ -475,6 +484,7 @@ function parsePositiveInt(
   key: string,
   fallback: number,
   configPath: string,
+  max?: number,
 ): number {
   if (value === null || value === undefined) {
     return fallback;
@@ -482,6 +492,11 @@ function parsePositiveInt(
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
     throw new ConfigError(
       `defaults.${key} must be a positive integer in ${configPath}`,
+    );
+  }
+  if (max !== undefined && value > max) {
+    throw new ConfigError(
+      `defaults.${key} must not exceed ${max} in ${configPath}`,
     );
   }
   return value;

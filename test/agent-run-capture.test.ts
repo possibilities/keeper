@@ -2742,6 +2742,50 @@ describe("main() — agent run --resume", () => {
     expect(h.tmuxCommands.length).toBe(0);
   });
 
+  test("--budget + live resume → bad_args, NO Bus send (a live resume binds no durable budget)", async () => {
+    const home = tempDir();
+    const cwd = "/work/live-budget";
+    const sessionId = "77777777-7777-7777-7777-777777777777";
+    writeClaudeTranscript(home, cwd, sessionId, "pre-existing stop");
+    let sends = 0;
+    const h = makeHarness({
+      argv: ["run", "claude", "hi", "--resume", "reviewer", "--budget", "300s"],
+      rawArgv: true,
+      transcriptHomeDir: home,
+      resolveResumeDecision: () => ({
+        kind: "live",
+        job_id: "job-live-budget",
+        harness: "claude",
+        title: "reviewer",
+        resume_target: sessionId,
+        cwd,
+        pid: 7007,
+        start_time: "start-7",
+      }),
+      sendBusArtifact: async () => {
+        sends++;
+        return {
+          result: "delivered",
+          recipients: 1,
+          recipient_activity: {
+            status: "active",
+            reason: "main-turn",
+            observed_at: 7,
+          },
+        };
+      },
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(2);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
+    // The guard fails closed BEFORE runLivePartnerCapture — no Bus send fires.
+    expect(sends).toBe(0);
+    expect(h.err.join("")).toContain("--budget cannot be combined");
+    expect(h.tmuxCommands.length).toBe(0);
+  });
+
   test("a delivered live timeout leaves the Partner live and names non-resending recovery", async () => {
     const home = tempDir();
     const cwd = "/work/live-timeout";

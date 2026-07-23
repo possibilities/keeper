@@ -4,8 +4,10 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -194,6 +196,12 @@ export interface TmuxLaunchRequest {
   launcherArgvPrefix: string[];
   randomUuid: () => string;
   runTmuxCommand: TmuxCommandRunner;
+  /** run.json publication fs seam (temp-file write + same-dir atomic rename).
+   *  Injected so a publication-failure test drives the exact teardown path;
+   *  each defaults to its node:fs primitive. */
+  writeFile?: (path: string, data: string) => void;
+  renameFile?: (from: string, to: string) => void;
+  unlinkFile?: (path: string) => void;
 }
 
 export interface TmuxLaunchResult {
@@ -612,16 +620,29 @@ export function launchKeeperAgentInTmux(
     }
   }
   if (runDir !== null && launchScript !== null) {
-    writeRunMetadata(req, {
-      id: runId,
-      runDir,
-      launchScript,
-      session: target.session,
-      windowId: target.windowId,
-      paneId: target.paneId,
-      windowName,
-      tmuxBase,
-    });
+    try {
+      writeRunMetadata(req, {
+        id: runId,
+        runDir,
+        launchScript,
+        session: target.session,
+        windowId: target.windowId,
+        paneId: target.paneId,
+        windowName,
+        tmuxBase,
+      });
+    } catch (err) {
+      // run.json publication failed AFTER the window opened: a running window
+      // with no resolvable handle is unrecoverable litter, so kill the EXACT
+      // just-created window (this launch's windowId, never a name sweep) and
+      // fail the launch (→ launch_failed) rather than return a handle-less
+      // success.
+      runTmux(req, [...tmuxBase, "kill-window", "-t", target.windowId]);
+      throw new TmuxLaunchError(
+        `failed to publish run metadata: ${(err as Error).message}`,
+        TMUX_EXIT.INTERNAL,
+      );
+    }
   }
 
   if (req.options.detached) {
@@ -1299,10 +1320,28 @@ function writeRunMetadata(
     runDir: meta.runDir,
     launchScript: meta.launchScript,
   };
-  writeFileSync(
-    join(meta.runDir, "run.json"),
-    `${JSON.stringify(data, null, 2)}\n`,
-  );
+  // Publish atomically: a torn or failed write must never leave a running window
+  // pointing at a half-written run.json (an unresolvable handle). Write a
+  // same-directory temp file, then rename over the final path — the rename is
+  // atomic, so a reader sees either the complete metadata or nothing.
+  const write = req.writeFile ?? writeFileSync;
+  const rename = req.renameFile ?? renameSync;
+  const unlink = req.unlinkFile ?? unlinkSync;
+  const finalPath = join(meta.runDir, "run.json");
+  const tmpPath = join(meta.runDir, `run.json.${meta.paneId}.tmp`);
+  try {
+    write(tmpPath, `${JSON.stringify(data, null, 2)}\n`);
+    rename(tmpPath, finalPath);
+  } catch (err) {
+    // Best-effort: a torn temp write leaves no litter beside the never-created
+    // run.json. The publication failure itself propagates to the caller.
+    try {
+      unlink(tmpPath);
+    } catch {
+      /* the temp file may not exist — ignore */
+    }
+    throw err;
+  }
 }
 
 function tmuxError(prefix: string, result: TmuxCommandResult): TmuxLaunchError {

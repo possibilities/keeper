@@ -20,7 +20,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { renderMessageNotification } from "../cli/bus";
 import { main } from "../src/agent/main";
-import { resolveHandle, runWaitForStop } from "../src/agent/pair-subcommands";
+import {
+  type ResolvedHandle,
+  resolveHandle,
+  runWaitForStop,
+} from "../src/agent/pair-subcommands";
 import {
   findLastMessage,
   isTmuxKillWindowCommand,
@@ -658,6 +662,74 @@ describe("positive-gone window probe terminates the wait", () => {
   });
 });
 
+describe("an exhausted budget (stopTimeoutMs 0) does one observation scan, never sleeps", () => {
+  // Real-seam composition: the REAL runWaitForStop drives the REAL
+  // waitForTranscriptPath / waitForTranscriptStop; only the leaf sleep + clock
+  // are injected. captureFromHandle floors an over-budget wait to stopTimeoutMs
+  // 0, which runWaitForStop must preserve (never re-floor to 1ms) so each stage
+  // returns after one scan without a 250ms poll sleep. The clock is frozen and
+  // advanced ONLY by a real sleep, so a re-armed 1ms floor deterministically
+  // clocks up a sleep (fails) while the 0-floor returns before any sleep.
+  function frozenClock(): {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    sleeps: () => number;
+  } {
+    let t = 1_700_000_000_000;
+    let n = 0;
+    return {
+      now: () => t,
+      sleep: async (ms) => {
+        n++;
+        t += ms;
+      },
+      sleeps: () => n,
+    };
+  }
+
+  test("(path stage) a run-id handle with no transcript times out with ZERO sleeps", async () => {
+    const clock = frozenClock();
+    const handle: ResolvedHandle = {
+      agent: "claude",
+      cwd: "/missing",
+      sessionId: "never-appears",
+      startedAtMs: 1,
+      transcriptPath: null,
+      stopTimeoutMs: 0,
+    };
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: tempDir(),
+      sleep: clock.sleep,
+      now: clock.now,
+    });
+    expect(result.ok).toBe(false);
+    expect(clock.sleeps()).toBe(0);
+  });
+
+  test("(stop stage) a direct-path handle with no stop times out with ZERO sleeps", async () => {
+    const clock = frozenClock();
+    const path = join(tempDir(), "nostop.jsonl");
+    writeFileSync(path, `${JSON.stringify({ type: "thinking" })}\n`);
+    const handle: ResolvedHandle = {
+      agent: "claude",
+      cwd: "/work/proj",
+      sessionId: "s",
+      startedAtMs: 0,
+      transcriptPath: path,
+      stopTimeoutMs: 0,
+    };
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: tempDir(),
+      sleep: clock.sleep,
+      now: clock.now,
+    });
+    expect(result.ok).toBe(false);
+    expect(clock.sleeps()).toBe(0);
+  });
+});
+
 describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Rider)", () => {
   // Production-shaped Claude turns: an interim tool_use turn is NOT a stop, a
   // real end_turn IS a stop, a stop_hook_summary is a terminal but textless stop.
@@ -1105,6 +1177,68 @@ describe("--budget is a durable, launch-bound ceiling (Blockers 2 + 5)", () => {
       resolveHandle({ rest: ["h", "--budget", "nope"], cwd: "/w", stateDir })
         .ok,
     ).toBe(false);
+  });
+
+  test("a launch instant in the FUTURE (now + 1) is rejected — a bound run fails closed", () => {
+    const stateDir = tempDir();
+    const now = 1_700_000_000_000;
+    writeRunJson(stateDir, "tmux-future", {
+      id: "tmux-future",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "s",
+      startedAtMs: now + 1,
+      budgetMs: 600_000,
+    });
+    // run.json is published BEFORE the wait begins, so a startedAtMs past `now`
+    // never came from the producer — it carries no cumulative-budget authority,
+    // and a bound run with no valid clock fails closed.
+    const r = resolveHandle({
+      rest: ["tmux-future", "--budget", "10m"],
+      cwd: "/work/proj",
+      stateDir,
+      now: () => now,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("a launch instant EXACTLY at now is accepted (<= now is strict, no future slop)", () => {
+    const stateDir = tempDir();
+    const now = 1_700_000_000_000;
+    writeRunJson(stateDir, "tmux-eq", {
+      id: "tmux-eq",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "s",
+      startedAtMs: now,
+      budgetMs: 600_000,
+    });
+    const r = resolveHandle({
+      rest: ["tmux-eq", "--budget", "10m"],
+      cwd: "/work/proj",
+      stateDir,
+      now: () => now,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.handle.startedAtMs).toBe(now);
+    expect(r.handle.totalBudgetMs).toBe(600_000);
+  });
+
+  test("a PRESENT but invalid budgetMs fails closed (a corrupted ceiling is never read as unbounded)", () => {
+    const stateDir = tempDir();
+    // Each budgetMs is PRESENT in run.json but not a safe positive integer — a
+    // torn/corrupted ceiling, distinct from an absent field (legacy-unbound).
+    // Even with NO --budget flag, none of these may silently widen to no cap.
+    for (const [id, budgetMs] of [
+      ["tmux-neg", -5],
+      ["tmux-zero", 0],
+      ["tmux-str", "600000"],
+    ] as const) {
+      writeRun(stateDir, id, { budgetMs });
+      const r = resolveHandle({ rest: [id], cwd: "/work/proj", stateDir });
+      expect(r.ok).toBe(false);
+    }
   });
 });
 

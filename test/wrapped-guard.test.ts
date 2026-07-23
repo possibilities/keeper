@@ -322,6 +322,46 @@ describe("evaluateWrappedBash — the durable-budget wait/launch routing (round-
   });
 });
 
+describe("evaluateWrappedBash — the --budget/--stop-timeout ceiling is a numeric bound (round-5)", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const env = "$KEEPER_WRAPPED_ENVELOPE";
+  const wait = (budget: string): string =>
+    `keeper agent wait leg-fn-1-x.2 --stop-timeout 30s --budget ${budget} --output "${env}"`;
+  const launch = (budget: string): string =>
+    `keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/c.md --session wrapped --name fn-1-x.2 --output "${env}" --stop-timeout 300s --budget ${budget}`;
+
+  test("DENIES a shape-valid but oversized --budget (~1,900 years) on both wait and launch", () => {
+    // A regex shape (`999999999m`) is not a bound — it must be denied.
+    expect(evaluateWrappedBash(wait("999999999m"), context)).not.toBeNull();
+    expect(evaluateWrappedBash(launch("999999999m"), context)).not.toBeNull();
+  });
+
+  test("ADMITS the exact supported budgets: the 2h matrix default and the 24h ceiling", () => {
+    // 7200000ms = matrix defaults.stop_timeout_ms; 86400000ms = MAX ceiling.
+    for (const budget of ["7200000ms", "86400000ms", "7200s", "1440m"]) {
+      expect(evaluateWrappedBash(wait(budget), context)).toBeNull();
+      expect(evaluateWrappedBash(launch(budget), context)).toBeNull();
+    }
+  });
+
+  test("DENIES a budget ONE ms over the 24h ceiling", () => {
+    expect(evaluateWrappedBash(wait("86400001ms"), context)).not.toBeNull();
+    expect(evaluateWrappedBash(launch("86400001ms"), context)).not.toBeNull();
+  });
+
+  test("DENIES an oversized --stop-timeout chunk (same ceiling as --budget)", () => {
+    expect(
+      evaluateWrappedBash(
+        `keeper agent wait leg-fn-1-x.2 --stop-timeout 999999999m --budget 300s --output "${env}"`,
+        context,
+      ),
+    ).not.toBeNull();
+  });
+});
+
 describe("evaluateWrappedBash — launch-bound AUDIT_READY block", () => {
   const context = {
     taskId: "fn-1-x.2",
@@ -1115,6 +1155,21 @@ describe("decideWrappedGuard — jurisdiction ladder", () => {
       tool_input: { file_path: `${REPO}/src/x.ts` },
     };
     expect(decide(p)).not.toBeNull();
+  });
+});
+
+describe("decideWrappedGuard — the --budget ceiling denies through the REAL guard", () => {
+  const oversizedWait =
+    'keeper agent wait leg-fn-1-x.2 --stop-timeout 30s --budget 999999999m --output "$KEEPER_WRAPPED_ENVELOPE"';
+
+  test("a MARKED subagent's oversized --budget wait is denied via the envelope", () => {
+    const d = decide(bashPayload(oversizedWait));
+    expect(d).not.toBeNull();
+    expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("an UNMARKED session with the SAME oversized command is byte-inert (null)", () => {
+    expect(decide(bashPayload(oversizedWait), {})).toBeNull();
   });
 });
 

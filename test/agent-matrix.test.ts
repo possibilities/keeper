@@ -313,6 +313,34 @@ describe("loadMatrix fail-loud shapes", () => {
       ).toThrow(/claude\|pi/);
     },
   );
+
+  test("a defaults.stop_timeout_ms over the 24h ceiling is fail-loud", () => {
+    // The wrapped provider-leg budget IS the cell's stop_timeout_ms; capping it
+    // here (MAX_STOP_TIMEOUT_MS = 86400000) is what lets the wrapped-guard hook
+    // enforce an identical finite maximum covering every supported config value.
+    expect(() =>
+      loadMatrix(
+        writeMatrix(
+          VALID_MATRIX.replace(
+            "stop_timeout_ms: 3600000",
+            "stop_timeout_ms: 86400001",
+          ),
+        ),
+      ),
+    ).toThrow(/stop_timeout_ms must not exceed/);
+  });
+
+  test("a defaults.stop_timeout_ms exactly at the 24h ceiling is accepted", () => {
+    const m = loadMatrix(
+      writeMatrix(
+        VALID_MATRIX.replace(
+          "stop_timeout_ms: 3600000",
+          "stop_timeout_ms: 86400000",
+        ),
+      ),
+    ) as Matrix;
+    expect(m.defaults.stop_timeout_ms).toBe(86_400_000);
+  });
 });
 
 describe("pure derivations", () => {
