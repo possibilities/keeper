@@ -1143,29 +1143,55 @@ export function buildConflictHeadFence(
   return `[conflict src=${sourceOid} target=${targetOid} class=${sourceClass}]`;
 }
 
-/** The genuine-conflict head-fence grammar — anchored at the reason's END so the marker
+/** The genuine-conflict head-fence grammar — anchored at the stderr tail's END so the marker
  *  must be the last bytes: each id a full 40-or-64 lowercase hex object id, the class
  *  exactly `rib` or `canonical-base`. */
 const CONFLICT_HEAD_FENCE =
   / \[conflict src=([0-9a-f]{40}|[0-9a-f]{64}) target=([0-9a-f]{40}|[0-9a-f]{64}) class=(rib|canonical-base)\]$/;
 
+/** A LOOSE `[conflict …]` token detector — any bracketed `conflict`-lead marker, well-formed
+ *  or not — so a DUPLICATE / AMBIGUOUS / MALFORMED marker anywhere in the stderr tail is
+ *  counted and fails the whole parse closed (never a second marker smuggled past the strict
+ *  tail grammar, never a look-alike displacing the real one). `\b` keeps `CONFLICT (content)`
+ *  and other unbracketed prose from counting. */
+const CONFLICT_MARKER_LOOSE = /\[conflict\b[^\]]*\]/g;
+
 /**
  * Extract the durable head fence of a GENUINE actor conflict — the pinned SOURCE object, the
  * TARGET-ARRIVAL object, and the obligation class — read back by the resolver brief and the
  * pinned resolution probe. STRICT closed grammar keyed on the exact `[conflict …]` token
- * anchored at the end (the sanctioned marker discipline, never salvaged from prose): each id
- * a full {@link isFullObjectId} object id, both sharing one length (a 40/64 cross-format pair
- * is structurally impossible within one repo, so it classifies malformed), the class exactly
- * `rib` or `canonical-base`. ANY deviation FAILS CLOSED to null — a fence-less legacy
- * conflict, an abbreviated/uppercase/mismatched id, a look-alike stderr tail. A null caller
- * degrades to the fence-less branch-name arm, never fabricates heads. Pure; NEVER throws.
+ * anchored at the END of the git-STDERR segment {@link parseMergeConflictReason} isolates
+ * (never the branch-name head, never salvaged from prose — the sanctioned marker discipline):
+ *   - the reason MUST split on the em-dash so the fence is sought ONLY in the stderr tail (a
+ *     branch name carrying look-alike text lives in the head and can never parse as a fence);
+ *   - EXACTLY ONE `[conflict …]` token may appear in that tail — a duplicate / ambiguous /
+ *     malformed second marker (a crafted stderr smuggling one) fails the whole parse CLOSED;
+ *   - the sole marker must BE the tail-anchored strict grammar: each id a full {@link
+ *     isFullObjectId} object id sharing one length (a 40/64 cross-format pair is structurally
+ *     impossible within one repo → malformed), the class exactly `rib` or `canonical-base`.
+ * ANY deviation FAILS CLOSED to null — a fence-less legacy conflict, an abbreviated/uppercase/
+ * mismatched id, a duplicated/displaced marker, a look-alike stderr or branch tail. A null
+ * caller degrades to the fence-less branch-name arm, never fabricates heads. Distinct token
+ * from the pending fence's `[expected …]`, so the two grammars parse side-by-side without
+ * collision. Pure; NEVER throws.
  */
 export function parseConflictHeadFence(reason: string): {
   sourceHead: string;
   targetHead: string;
   sourceClass: "rib" | "canonical-base";
 } | null {
-  const m = CONFLICT_HEAD_FENCE.exec(reason);
+  // Isolate the git-stderr tail: a fence look-alike in a branch name (the head, before the
+  // em-dash) is structurally excluded, exactly as the pending fence keys on the stderr tail.
+  const stderr = parseMergeConflictReason(reason)?.stderr;
+  if (stderr == null) {
+    return null;
+  }
+  // EXACTLY ONE marker in the tail — a duplicate/ambiguous/smuggled second marker fails closed.
+  const markers = stderr.match(CONFLICT_MARKER_LOOSE);
+  if (markers == null || markers.length !== 1) {
+    return null;
+  }
+  const m = CONFLICT_HEAD_FENCE.exec(stderr);
   if (
     m == null ||
     m[1] === undefined ||

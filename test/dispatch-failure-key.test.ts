@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 import { isRetryableDispatchKey } from "../src/dispatch-command";
 import {
   assertNever,
+  buildConflictHeadFence,
   buildPendingIntegrationTail,
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
@@ -46,6 +47,7 @@ import {
   leadingReasonToken,
   MERGE_ESCALATION_REASON_TOKEN,
   PENDING_OWNER_INTEGRATION_TAIL,
+  parseConflictHeadFence,
   parseMergeConflictReason,
   parsePendingIntegrationHeads,
   routeDispatchFailure,
@@ -1446,6 +1448,161 @@ describe("pending-integration head fence", () => {
     });
     // The board pill keys on the leading token, unaffected by the tail marker.
     expect(classifyDispatchFailure(pinned)).toBe("merge-conflict");
+  });
+});
+
+describe("genuine-conflict head fence (P0-4 negative matrix)", () => {
+  const src = "a".repeat(40);
+  const target = "b".repeat(40);
+  // The fence rides the git-stderr tail of a full merge-conflict reason (a leading space,
+  // exactly as the actor mints it after the truncated stderr).
+  const reason = (fence: string) =>
+    `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.3 into keeper/epic/fn-1--fn-1.4 — CONFLICT (content): foo.ts ${fence}`;
+
+  test("buildConflictHeadFence round-trips through parseConflictHeadFence — both classes, sha1 AND sha256", () => {
+    for (const cls of ["rib", "canonical-base"] as const) {
+      expect(
+        parseConflictHeadFence(
+          reason(buildConflictHeadFence(src, target, cls)),
+        ),
+      ).toEqual({ sourceHead: src, targetHead: target, sourceClass: cls });
+    }
+    const s64 = "c".repeat(64);
+    const t64 = "d".repeat(64);
+    expect(
+      parseConflictHeadFence(reason(buildConflictHeadFence(s64, t64, "rib"))),
+    ).toEqual({ sourceHead: s64, targetHead: t64, sourceClass: "rib" });
+  });
+
+  test("EXACTLY ONE tail-anchored marker — duplicate / trailing / non-tail → parse absent (fail closed)", () => {
+    // A duplicate/ambiguous second marker fails the whole parse closed.
+    expect(
+      parseConflictHeadFence(
+        reason(
+          `${buildConflictHeadFence(src, target, "rib")} ${buildConflictHeadFence(target, src, "canonical-base")}`,
+        ),
+      ),
+    ).toBeNull();
+    // Trailing garbage after an otherwise-valid marker → not tail-anchored → null.
+    expect(
+      parseConflictHeadFence(
+        `${reason(buildConflictHeadFence(src, target, "rib"))} trailing`,
+      ),
+    ).toBeNull();
+    // A well-formed marker NOT at the tail (stderr continues past it) → null.
+    expect(
+      parseConflictHeadFence(
+        reason(
+          `${buildConflictHeadFence(src, target, "rib")} then more stderr`,
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  test("equal-length lowercase OIDs — wrong length / uppercase / cross-format → parse absent", () => {
+    for (const bad of [
+      "a".repeat(7),
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+      "A".repeat(40),
+      "g".repeat(40),
+    ]) {
+      expect(
+        parseConflictHeadFence(
+          reason(`[conflict src=${bad} target=${target} class=rib]`),
+        ),
+      ).toBeNull();
+    }
+    // A cross-format pair (one 40-hex, one 64-hex) → null (must share one length).
+    expect(
+      parseConflictHeadFence(
+        reason(`[conflict src=${src} target=${"c".repeat(64)} class=rib]`),
+      ),
+    ).toBeNull();
+    expect(
+      parseConflictHeadFence(
+        reason(`[conflict src=${"c".repeat(64)} target=${target} class=rib]`),
+      ),
+    ).toBeNull();
+  });
+
+  test("CLOSED class union rib|canonical-base — any other class → parse absent", () => {
+    for (const cls of [
+      "base",
+      "canonical",
+      "ribbon",
+      "rib ",
+      "RIB",
+      "",
+      "merge",
+    ]) {
+      expect(
+        parseConflictHeadFence(
+          reason(`[conflict src=${src} target=${target} class=${cls}]`),
+        ),
+      ).toBeNull();
+    }
+  });
+
+  test("INJECTION — a branch name carrying fence-look-alike text never parses as a fence", () => {
+    // The look-alike lives in the branch-name HEAD (before the em-dash); the parser keys ONLY
+    // on the isolated stderr tail, so it is structurally excluded.
+    const injectedBranch = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/x[conflict src=${src} target=${target} class=rib] into keeper/epic/y — CONFLICT (content): foo.ts`;
+    expect(parseConflictHeadFence(injectedBranch)).toBeNull();
+  });
+
+  test("INJECTION — a crafted stderr cannot smuggle a second marker or displace the real one", () => {
+    // The stderr itself carries a well-formed look-alike; the appended real fence makes TWO
+    // markers → parse absent, so the smuggled one can neither win nor displace the real tail.
+    const smuggled = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/a into keeper/epic/b — CONFLICT [conflict src=${src} target=${target} class=canonical-base] more ${buildConflictHeadFence(target, src, "rib")}`;
+    expect(parseConflictHeadFence(smuggled)).toBeNull();
+    // A lone look-alike buried mid-stderr (no real tail fence) also parses absent.
+    const buried = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/a into keeper/epic/b — CONFLICT [conflict src=${src} target=${target} class=rib] tail`;
+    expect(parseConflictHeadFence(buried)).toBeNull();
+  });
+
+  test("a fence-less legacy conflict, a non-merge reason, and a reason with no em-dash tail → parse absent", () => {
+    expect(
+      parseConflictHeadFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): foo.ts`,
+      ),
+    ).toBeNull();
+    expect(parseConflictHeadFence("confirm_timeout")).toBeNull();
+    // No em-dash → no stderr segment → null even if the head trails a well-formed marker.
+    expect(
+      parseConflictHeadFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b [conflict src=${src} target=${target} class=rib]`,
+      ),
+    ).toBeNull();
+  });
+
+  test("NON-COLLISION — conflict + pending fences parse side-by-side; pre-existing classification byte-stable", () => {
+    const conflict = reason(buildConflictHeadFence(src, target, "rib"));
+    const pending = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.2 into keeper/epic/fn-1 — ${buildPendingIntegrationTail(src, target)}`;
+    // Each family parses ONLY its own fence — never the other's.
+    expect(parseConflictHeadFence(conflict)).toEqual({
+      sourceHead: src,
+      targetHead: target,
+      sourceClass: "rib",
+    });
+    expect(parseConflictHeadFence(pending)).toBeNull();
+    expect(parsePendingIntegrationHeads(pending)).toEqual({
+      sourceHead: src,
+      baseHead: target,
+    });
+    expect(parsePendingIntegrationHeads(conflict)).toBeNull();
+    // parseMergeConflictReason still recovers the branches from the conflict reason (the
+    // fence lands in the stderr tail), and the board pill is unaffected — byte-stable.
+    expect(parseMergeConflictReason(conflict)).toEqual({
+      source: "keeper/epic/fn-1--fn-1.3",
+      base: "keeper/epic/fn-1--fn-1.4",
+      stderr: `CONFLICT (content): foo.ts ${buildConflictHeadFence(src, target, "rib")}`,
+    });
+    expect(classifyDispatchFailure(conflict)).toBe("merge-conflict");
+    // The conflict fence is NOT the pending class — it stays `unpinned` (a genuine conflict).
+    expect(classifyPendingIntegration(conflict)).toBe("unpinned");
   });
 });
 
