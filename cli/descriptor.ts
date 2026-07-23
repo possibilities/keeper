@@ -231,7 +231,31 @@ export const USAGE_FLAGS = [
     type: "string",
     summary: "Snapshot wait bound (unit required, e.g. 500ms, 2s)",
   },
+  {
+    name: "json",
+    type: "boolean",
+    default: false,
+    summary: "Emit the schema-v1 one-shot JSON envelope (rejects --watch)",
+  },
   FLAG_HELP,
+] as const satisfies readonly FlagDescriptor[];
+
+/** `keeper accounts inspect` flag surface — the shared Session selector trio
+ *  plus a `--json` alias kept for command-line symmetry with `accounts check`;
+ *  the read is JSON-only regardless (matches `session runtime`). */
+export const ACCOUNTS_INSPECT_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Shared Session reference (default: ambient auto-detect)",
+  },
+  {
+    name: "session-id",
+    type: "string",
+    summary: "Compatibility alias of --session",
+  },
+  FLAG_JSON_ALIAS,
 ] as const satisfies readonly FlagDescriptor[];
 
 export const DEAD_LETTER_FLAGS = [
@@ -817,6 +841,28 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: false,
     requires_tty: false,
     flags: USAGE_FLAGS,
+  },
+  {
+    name: "accounts",
+    summary: "Read-only Claude/Codex routing + Pi runtime diagnostics group",
+    visibility: "public",
+    mutates: false,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: [],
+    verbs: [
+      {
+        name: "inspect",
+        summary:
+          "Separate Claude launch, Codex launch-seed, and scoped Pi runtime routing (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: ACCOUNTS_INSPECT_FLAGS,
+      },
+    ],
   },
   {
     name: "frames",

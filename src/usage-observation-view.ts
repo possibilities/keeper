@@ -290,6 +290,93 @@ function unavailableSource(
   return { provider, status, detail: null, observedAtMs: null, accounts: [] };
 }
 
+// ── schema-v1 JSON serialization (`keeper usage --json`) ────────────────────
+//
+// The camelCase `UsageSnapshot` above is the internal display/poll view; the
+// JSON contract is a separate snake_case projection so a wire-field rename
+// never forces a render-path rename and vice versa.
+
+export interface UsageJsonMeter {
+  key: string;
+  label: string;
+  used_percent: number;
+  reset_at_ms: number | null;
+}
+
+export interface UsageJsonAccount {
+  id: string;
+  source_id: string;
+  status: UsageAccountStatus;
+  detail: string | null;
+  account_category: UsageAccountCategory | null;
+  capacity_multiplier: CapacityMultiplier | null;
+  measured_at_ms: number | null;
+  meters: UsageJsonMeter[];
+}
+
+export interface UsageJsonSource {
+  provider: UsageProvider;
+  status: UsageSourceStatus;
+  detail: string | null;
+  observed_at_ms: number | null;
+  accounts: UsageJsonAccount[];
+}
+
+export interface UsageJsonData {
+  generated_at_ms: number;
+  sources: {
+    claude: UsageJsonSource;
+    codex: UsageJsonSource;
+  };
+}
+
+function toJsonMeter(meter: UsageMeter): UsageJsonMeter {
+  return {
+    key: meter.key,
+    label: meter.label,
+    used_percent: meter.usedPercent,
+    reset_at_ms: meter.resetAtMs,
+  };
+}
+
+function toJsonAccount(account: UsageAccount): UsageJsonAccount {
+  return {
+    id: account.id,
+    source_id: account.sourceId,
+    status: account.status,
+    detail: account.detail,
+    account_category: account.accountCategory ?? null,
+    capacity_multiplier: account.capacityMultiplier ?? null,
+    measured_at_ms: account.measuredAtMs,
+    meters: account.meters.map(toJsonMeter),
+  };
+}
+
+function toJsonSource(source: UsageSource): UsageJsonSource {
+  return {
+    provider: source.provider,
+    status: source.status,
+    detail: source.detail,
+    observed_at_ms: source.observedAtMs,
+    accounts: source.accounts.map(toJsonAccount),
+  };
+}
+
+/** Project a {@link UsageSnapshot} to the `keeper usage --json` schema-v1
+ *  payload — every normalized meter, category/multiplier, source status,
+ *  observation time, and the display-only last-good measurement distinction
+ *  (an `unavailable` account still carrying `measured_at_ms` + `meters` from
+ *  its last successful read) all pass through untouched. */
+export function buildUsageJsonData(snapshot: UsageSnapshot): UsageJsonData {
+  return {
+    generated_at_ms: snapshot.loadedAtMs,
+    sources: {
+      claude: toJsonSource(snapshot.claude),
+      codex: toJsonSource(snapshot.codex),
+    },
+  };
+}
+
 export function loadUsageSnapshot(
   paths: UsageSnapshotPaths = resolveUsageSnapshotPaths(),
   nowMs: number = Date.now(),
