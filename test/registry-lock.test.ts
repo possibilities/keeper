@@ -12,6 +12,7 @@ import {
   resolveCommonDir,
   structuralLockPathFor,
   withCheckoutLock,
+  withPromotedCheckoutLock,
   withStructuralLock,
 } from "../src/registry-lock";
 
@@ -81,6 +82,27 @@ function fakeAcquire(
 
 const deriveWt = async () => WT_ADMIN;
 const freshLog = (): AcquireLog => ({ acquired: [], released: [] });
+
+/** A run for the promotion tests: `--git-common-dir` keyed by cwd (so the outer domain and a
+ *  promotion target can differ), `--git-dir` returns `gitDir` (the target's admin dir). */
+function promoRun(opts: {
+  commonByCwd?: Record<string, string>;
+  gitDir?: string;
+}): RegistryLockGitRunner {
+  return async (args, o) => {
+    if (args.includes("--git-common-dir")) {
+      return {
+        code: 0,
+        stdout: `${opts.commonByCwd?.[o.cwd] ?? COMMON}\n`,
+        stderr: "",
+      };
+    }
+    if (args.includes("--git-dir")) {
+      return { code: 0, stdout: `${opts.gitDir ?? COMMON}\n`, stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+}
 
 describe("registry-lock leaf", () => {
   test("resolveCommonDir: strict + canonical — non-zero / empty / non-absolute / multi-line / uncanonicalizable → null, else canonical", async () => {
@@ -493,5 +515,137 @@ describe("registry-lock leaf", () => {
     expect(isLockDeferred({ kind: "integrated" })).toBe(false);
     expect(isLockDeferred("ok")).toBe(false);
     expect(isLockDeferred(null)).toBe(false);
+  });
+
+  test("withPromotedCheckoutLock: a linked lane promotes under the held structural token — per acquired LAST, released BEFORE common (never releases common)", async () => {
+    const log = freshLog();
+    const acq = fakeAcquire(log);
+    const run = promoRun({ gitDir: WT_ADMIN });
+    const out = await withStructuralLock(
+      "/repo",
+      run,
+      acq,
+      async (st) =>
+        withPromotedCheckoutLock(
+          st,
+          "/repo",
+          run,
+          acq,
+          async (t) => t.worktreeLockPath,
+          idCanon,
+        ),
+      idCanon,
+    );
+    expect(out).toBe(WT_LOCK);
+    expect(log.acquired).toEqual([COMMON_LOCK, WT_LOCK]); // common (structural) then per (promotion)
+    expect(log.released).toEqual([WT_LOCK, COMMON_LOCK]); // per released by promotion BEFORE common by structural
+  });
+
+  test("withPromotedCheckoutLock: a main worktree (admin == common) self-elides — no second acquire", async () => {
+    const log = freshLog();
+    const acq = fakeAcquire(log);
+    const run = promoRun({ gitDir: COMMON }); // main: --git-dir == --git-common-dir
+    const out = await withStructuralLock(
+      "/repo",
+      run,
+      acq,
+      async (st) =>
+        withPromotedCheckoutLock(
+          st,
+          "/repo",
+          run,
+          acq,
+          async (t) => t.commonLockPath,
+          idCanon,
+        ),
+      idCanon,
+    );
+    expect(out).toBe(COMMON_LOCK);
+    expect(log.acquired).toEqual([COMMON_LOCK]); // no per acquire
+    expect(log.released).toEqual([COMMON_LOCK]);
+  });
+
+  test("withPromotedCheckoutLock: CROSS-DOMAIN admin (repo-B under a repo-A token) → defer, ZERO per acquire, common untouched", async () => {
+    const log = freshLog();
+    const acq = fakeAcquire(log);
+    const run = promoRun({
+      commonByCwd: { "/repo": COMMON, "/repo-b": "/repo-b/.git" },
+      gitDir: WT_ADMIN,
+    });
+    let promoted: unknown;
+    await withStructuralLock(
+      "/repo",
+      run,
+      acq,
+      async (st) => {
+        promoted = await withPromotedCheckoutLock(
+          st,
+          "/repo-b",
+          run,
+          acq,
+          async () => "ok",
+          idCanon,
+        );
+        return promoted;
+      },
+      idCanon,
+    );
+    expect(isLockDeferred(promoted)).toBe(true);
+    expect(log.acquired).toEqual([COMMON_LOCK]); // only the outer structural; ZERO per acquire
+    expect(log.released).toEqual([COMMON_LOCK]); // outer common released; promotion touched nothing
+  });
+
+  test("withPromotedCheckoutLock: an ALIASED same-domain target (common via an alias) promotes fine (canonical domain compare)", async () => {
+    const log = freshLog();
+    const acq = fakeAcquire(log);
+    const run = promoRun({
+      commonByCwd: { "/repo": COMMON, "/aliasedcwd": "/alias-common/.git" },
+      gitDir: WT_ADMIN,
+    });
+    const canon = fakeCanon({ "/alias-common/.git": COMMON });
+    const out = await withStructuralLock(
+      "/repo",
+      run,
+      acq,
+      async (st) =>
+        withPromotedCheckoutLock(
+          st,
+          "/aliasedcwd",
+          run,
+          acq,
+          async (t) => t.worktreeLockPath,
+          canon,
+        ),
+      canon,
+    );
+    expect(out).toBe(WT_LOCK); // domain matched canonically → promoted
+    expect(log.acquired).toEqual([COMMON_LOCK, WT_LOCK]);
+  });
+
+  test("withPromotedCheckoutLock: a per-worktree lock timeout → defer, common untouched (partial-add converges via retry)", async () => {
+    const log = freshLog();
+    const acq = fakeAcquire(log, { timeout: new Set([WT_LOCK]) });
+    const run = promoRun({ gitDir: WT_ADMIN });
+    let promoted: unknown;
+    await withStructuralLock(
+      "/repo",
+      run,
+      acq,
+      async (st) => {
+        promoted = await withPromotedCheckoutLock(
+          st,
+          "/repo",
+          run,
+          acq,
+          async () => "ok",
+          idCanon,
+        );
+        return promoted;
+      },
+      idCanon,
+    );
+    expect(isLockDeferred(promoted)).toBe(true);
+    expect(log.acquired).toEqual([COMMON_LOCK]); // per timed out; only the outer common taken
+    expect(log.released).toEqual([COMMON_LOCK]); // promotion held/released no per; outer common released
   });
 });

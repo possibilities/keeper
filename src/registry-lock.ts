@@ -160,6 +160,32 @@ export function structuralLockPathFor(commonDir: string): string {
   return join(commonDir, REGISTRY_LOCK_LEAF);
 }
 
+/**
+ * The TARGET checkout's git ADMIN dir — `git rev-parse --path-format=absolute --git-dir`,
+ * strict (non-zero / empty / non-absolute / multi-line → null). The promotion derives this
+ * ITSELF from the target cwd (never a caller-supplied admin dir), then {@link canonicalizeStrict}
+ * canonicalizes + revalidates it. NEVER throws.
+ */
+async function resolveGitDir(
+  cwd: string,
+  run: RegistryLockGitRunner,
+): Promise<string | null> {
+  let r: { code: number; stdout: string; stderr: string };
+  try {
+    r = await run(["rev-parse", "--path-format=absolute", "--git-dir"], {
+      cwd,
+      timeoutMs: REGISTRY_LOCK_GIT_TIMEOUT_MS,
+    });
+  } catch {
+    return null;
+  }
+  const dir = r.stdout.trim();
+  if (r.code !== 0 || dir === "" || !isAbsolute(dir) || dir.includes("\n")) {
+    return null;
+  }
+  return dir;
+}
+
 // ── Unforgeable capability tokens ──────────────────────────────────────────
 // The brands are NON-EXPORTED `unique symbol`s: external code cannot name them, so it cannot
 // STRUCTURALLY construct a token. Only the mint helpers below (the sole sanctioned producers)
@@ -169,29 +195,43 @@ declare const STRUCTURAL_BRAND: unique symbol;
 declare const CHECKOUT_BRAND: unique symbol;
 
 /** The STRUCTURAL capability — registry add/remove/prune. Unforgeable (non-exported brand);
- *  carries the common lock path only (a missing worktree has no per-worktree lock). */
+ *  carries the canonical common dir + its lock path (a missing worktree has no per-worktree
+ *  lock). `commonDir` is the canonical common dir the lock is held over, so a domain-bound
+ *  promotion ({@link withPromotedCheckoutLock}) can prove a target checkout is in THIS domain
+ *  with a direct canonical compare, never re-deriving the lock path. */
 export interface StructuralToken {
   readonly [STRUCTURAL_BRAND]: true;
+  readonly commonDir: string;
   readonly commonLockPath: string;
 }
 
 /** The CHECKOUT capability — checkout/ref effects on an EXISTING worktree. Unforgeable;
- *  carries BOTH the common and the per-worktree lock paths (both held when the callback runs). */
+ *  carries the canonical common dir + BOTH the common and per-worktree lock paths (both held
+ *  when the callback runs). */
 export interface CheckoutToken {
   readonly [CHECKOUT_BRAND]: true;
+  readonly commonDir: string;
   readonly commonLockPath: string;
   readonly worktreeLockPath: string;
 }
 
-function mintStructuralToken(commonLockPath: string): StructuralToken {
-  return { commonLockPath } as unknown as StructuralToken;
+function mintStructuralToken(
+  commonDir: string,
+  commonLockPath: string,
+): StructuralToken {
+  return { commonDir, commonLockPath } as unknown as StructuralToken;
 }
 
 function mintCheckoutToken(
+  commonDir: string,
   commonLockPath: string,
   worktreeLockPath: string,
 ): CheckoutToken {
-  return { commonLockPath, worktreeLockPath } as unknown as CheckoutToken;
+  return {
+    commonDir,
+    commonLockPath,
+    worktreeLockPath,
+  } as unknown as CheckoutToken;
 }
 
 /**
@@ -278,7 +318,7 @@ export async function withStructuralLock<R>(
   let bodyError: unknown;
   let threw = false;
   try {
-    result = await fn(mintStructuralToken(commonLockPath));
+    result = await fn(mintStructuralToken(commonDir, commonLockPath));
   } catch (e) {
     threw = true;
     bodyError = e;
@@ -359,7 +399,9 @@ export async function withCheckoutLock<R>(
       if (worktreeLockPath === commonLockPath) {
         // Same CANONICAL identity as common (main worktree, even via an alias): the common lock
         // already covers it — skip the self-blocking second acquire.
-        result = await fn(mintCheckoutToken(commonLockPath, worktreeLockPath));
+        result = await fn(
+          mintCheckoutToken(commonDir, commonLockPath, worktreeLockPath),
+        );
       } else {
         const perWorktree = await acquire(worktreeLockPath);
         if (perWorktree === null) {
@@ -367,7 +409,7 @@ export async function withCheckoutLock<R>(
         } else {
           held.push(perWorktree);
           result = await fn(
-            mintCheckoutToken(commonLockPath, worktreeLockPath),
+            mintCheckoutToken(commonDir, commonLockPath, worktreeLockPath),
           );
         }
       }
@@ -378,4 +420,70 @@ export async function withCheckoutLock<R>(
   }
   surfaceLockFailures(threw, bodyError, releaseReverse(held));
   return result as R | LockDeferred;
+}
+
+/**
+ * PROMOTE a held {@link StructuralToken} to a {@link CheckoutToken} scope over a TARGET checkout,
+ * WITHOUT re-acquiring or releasing common. The reattach HYBRID uses this: it holds common across
+ * the whole operation (add under structural; then promote for the resume / dep-link checkout
+ * effects). DOMAIN-BOUND: given the held token + the TARGET checkout cwd (a caller-supplied admin
+ * dir is NEVER trusted), it re-resolves+canonicalizes the common dir FROM cwd and requires
+ * `structuralToken.commonDir` === that canonical common — so a repo-B admin dir under a repo-A
+ * token is a DEFER with ZERO per acquire, common untouched. Then it derives+canonicalizes the
+ * admin dir FROM cwd, appends the leaf, and (if distinct from common) acquires ONLY the
+ * per-worktree lock LAST; a main worktree (canonical per == common) self-elides. Release drops
+ * ONLY the per lock (reverse) — NEVER common; the caller's structural scope owns common. Any
+ * domain mismatch / unresolvable identity / per-lock timeout → defer, common untouched.
+ */
+export async function withPromotedCheckoutLock<R>(
+  structuralToken: StructuralToken,
+  cwd: string,
+  run: RegistryLockGitRunner,
+  acquire: RegistryLockAcquirer,
+  fn: (token: CheckoutToken) => Promise<R>,
+  canonicalize: PathCanonicalizer = defaultCanonicalize,
+): Promise<R | LockDeferred> {
+  // DOMAIN CHECK: the target's canonical common dir MUST be the SAME domain the held token owns —
+  // never promote a foreign repo's checkout under this token.
+  const targetCommonDir = await resolveCommonDir(cwd, run, canonicalize);
+  if (
+    targetCommonDir === null ||
+    targetCommonDir !== structuralToken.commonDir
+  ) {
+    return { defer: "registry-lock: promotion domain mismatch / unresolved" };
+  }
+  // Derive + canonicalize the admin dir FROM cwd (never a caller-supplied path), then append the
+  // leaf — the canonical per-worktree identity, compared canonical-to-canonical for elision.
+  const adminDir = await resolveGitDir(cwd, run);
+  const canonAdminDir =
+    adminDir === null ? null : await canonicalizeStrict(adminDir, canonicalize);
+  if (canonAdminDir === null) {
+    return { defer: "registry-lock: promotion unresolved worktree identity" };
+  }
+  const worktreeLockPath = join(canonAdminDir, REGISTRY_LOCK_LEAF);
+  const token = mintCheckoutToken(
+    structuralToken.commonDir,
+    structuralToken.commonLockPath,
+    worktreeLockPath,
+  );
+  // Main worktree (canonical per == common): common already covers it — no second acquire.
+  if (worktreeLockPath === structuralToken.commonLockPath) {
+    return fn(token);
+  }
+  const perWorktree = await acquire(worktreeLockPath);
+  if (perWorktree === null) {
+    return { defer: "registry-lock: promotion per-worktree lock timeout" };
+  }
+  let result: R | undefined;
+  let bodyError: unknown;
+  let threw = false;
+  try {
+    result = await fn(token);
+  } catch (e) {
+    threw = true;
+    bodyError = e;
+  }
+  // Release ONLY the per-worktree lock (reverse) — the caller's structural scope owns common.
+  surfaceLockFailures(threw, bodyError, releaseReverse([perWorktree]));
+  return result as R;
 }
