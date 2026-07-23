@@ -47,6 +47,7 @@ import {
   MERGE_ESCALATION_REASON_TOKEN,
   PARKED_LAUNCH_REASON_PREFIX,
   PENDING_OWNER_INTEGRATION_TAIL,
+  parseMergeConflictReason,
   parsePendingIntegrationHeads,
   routeDispatchFailure,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
@@ -1275,6 +1276,69 @@ describe("pending-integration head fence", () => {
       ),
     ).toBeNull();
     expect(parsePendingIntegrationHeads("not a merge reason")).toBeNull();
+  });
+
+  test("the strict closed grammar fails closed on every deviation", () => {
+    const src = "a".repeat(40);
+    const base = "b".repeat(40);
+    const reason = (tail: string) =>
+      `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — ${PENDING_OWNER_INTEGRATION_TAIL} ${tail}`;
+    // The single, anchored, exactly-40-lowercase-hex marker parses.
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${src} base=${base}]`),
+      ),
+    ).toEqual({ sourceHead: src, baseHead: base });
+    // Absent marker → null (legacy / fail closed).
+    expect(parsePendingIntegrationHeads(reason(""))).toBeNull();
+    // Wrong sha shape (39 / 41 hex, uppercase) → null.
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${"a".repeat(39)} base=${base}]`),
+      ),
+    ).toBeNull();
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${"a".repeat(41)} base=${base}]`),
+      ),
+    ).toBeNull();
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${"A".repeat(40)} base=${base}]`),
+      ),
+    ).toBeNull();
+    // Trailing garbage after an otherwise-valid marker → null (not anchored).
+    expect(
+      parsePendingIntegrationHeads(
+        `${reason(`[expected src=${src} base=${base}]`)} trailing`,
+      ),
+    ).toBeNull();
+    // Duplicated / ambiguous marker → null.
+    expect(
+      parsePendingIntegrationHeads(
+        reason(
+          `[expected src=${src} base=${base}] [expected src=${base} base=${src}]`,
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  test("the fence marker cannot collide with the branch parse or the board pill kind", () => {
+    const src = "a".repeat(40);
+    const base = "b".repeat(40);
+    const pinned = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.2 into keeper/epic/fn-1 — ${buildPendingIntegrationTail(
+      src,
+      base,
+    )}`;
+    // parseMergeConflictReason still recovers the branches; the marker lands in the
+    // tail (stderr), never the branch parse.
+    expect(parseMergeConflictReason(pinned)).toEqual({
+      source: "keeper/epic/fn-1--fn-1.2",
+      base: "keeper/epic/fn-1",
+      stderr: buildPendingIntegrationTail(src, base),
+    });
+    // The board pill keys on the leading token, unaffected by the tail marker.
+    expect(classifyDispatchFailure(pinned)).toBe("merge-conflict");
   });
 });
 

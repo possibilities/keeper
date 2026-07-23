@@ -3295,6 +3295,154 @@ test("the reason-precedence guard is re-fold deterministic (rewind + re-drain pr
   );
 });
 
+// A legacy (pre-fence, unpinned) fan-in obligation carries the merge-conflict
+// leading token but no pins — still a merge incident, still protected.
+const LEGACY_MERGE_REASON =
+  "worktree-merge-conflict: merging keeper/epic/fn-legacy--fn-legacy.3 into " +
+  "keeper/epic/fn-legacy — pending owner integration";
+
+function incidentMarkers(verb: string, id: string) {
+  return db
+    .query(
+      `SELECT instance_event_id, human_notified_at, owner_redispatch_attempts,
+              claim_session_id, claimed_at
+         FROM dispatch_failures WHERE verb = ? AND id = ?`,
+    )
+    .get(verb, id) as {
+    instance_event_id: number | null;
+    human_notified_at: number | null;
+    owner_redispatch_attempts: number;
+    claim_session_id: string | null;
+    claimed_at: number | null;
+  } | null;
+}
+
+test("a legacy (unpinned) fan-in obligation is protected from a lower-class overwrite too", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-legacy.4",
+    LEGACY_MERGE_REASON,
+    "/lane",
+    1700,
+  );
+  drainAll();
+  dispatchFailedEvent(
+    "work",
+    "fn-legacy.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1750,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-legacy.4")?.reason).toBe(
+    LEGACY_MERGE_REASON,
+  );
+});
+
+test("a merge incident superseding a lower-class row mints a FRESH instance, dropping stale claim / page-once / reattachment", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-sup.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1700,
+  );
+  drainAll();
+  // A stale lower-class row that has accrued instance / claim / page-once /
+  // reattachment state (as a lifecycle-touched row would carry).
+  db.run(
+    `UPDATE dispatch_failures
+        SET instance_event_id = 111, human_notified_at = 222,
+            owner_redispatch_attempts = 2, claim_session_id = 'stale-sess',
+            claim_pid = 9, claim_start_time = 's', claimed_at = 333
+      WHERE verb = 'work' AND id = 'fn-sup.4'`,
+  );
+  const mergeEventId = dispatchFailedEvent(
+    "work",
+    "fn-sup.4",
+    PENDING_MERGE_REASON,
+    "/lane",
+    1750,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-sup.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+  expect(getDispatchFailure("work", "fn-sup.4")?.created_at).toBe(1750);
+  // NEW instance: the merge event's id, with the stale markers reset to defaults.
+  expect(incidentMarkers("work", "fn-sup.4")).toEqual({
+    instance_event_id: mergeEventId,
+    human_notified_at: null,
+    owner_redispatch_attempts: 0,
+    claim_session_id: null,
+    claimed_at: null,
+  });
+});
+
+test("pins are immutable per instance: a different-pinned re-emit never replaces the open heads; an identical re-emit is idempotent", () => {
+  const firstId = dispatchFailedEvent(
+    "work",
+    "fn-imm.4",
+    PENDING_MERGE_REASON,
+    "/lane",
+    1700,
+  );
+  drainAll();
+  expect(incidentMarkers("work", "fn-imm.4")?.instance_event_id).toBe(firstId);
+  // A re-emit with DIFFERENT pins (heads moved) must not replace the pinned heads.
+  const moved =
+    "worktree-merge-conflict: merging keeper/epic/fn-cascade--fn-cascade.3 into " +
+    `keeper/epic/fn-cascade — ${buildPendingIntegrationTail(
+      "e".repeat(40),
+      "f".repeat(40),
+    )}`;
+  dispatchFailedEvent("work", "fn-imm.4", moved, "/lane", 1750);
+  drainAll();
+  expect(getDispatchFailure("work", "fn-imm.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+  expect(incidentMarkers("work", "fn-imm.4")?.instance_event_id).toBe(firstId);
+  // An IDENTICAL re-emit (same pins) is an idempotent update, same instance.
+  dispatchFailedEvent("work", "fn-imm.4", PENDING_MERGE_REASON, "/lane", 1800);
+  drainAll();
+  expect(getDispatchFailure("work", "fn-imm.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+  expect(incidentMarkers("work", "fn-imm.4")?.instance_event_id).toBe(firstId);
+});
+
+test("the incident-instance precedence arms are re-fold deterministic", () => {
+  dispatchFailedEvent(
+    "work",
+    "fn-i2.4",
+    "slot-occupied: pane foreground still claude",
+    "/lane",
+    1700,
+  );
+  dispatchFailedEvent("work", "fn-i2.4", PENDING_MERGE_REASON, "/lane", 1750);
+  const moved =
+    "worktree-merge-conflict: merging keeper/epic/fn-cascade--fn-cascade.3 into " +
+    `keeper/epic/fn-cascade — ${buildPendingIntegrationTail(
+      "e".repeat(40),
+      "f".repeat(40),
+    )}`;
+  dispatchFailedEvent("work", "fn-i2.4", moved, "/lane", 1800);
+  drainAll();
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(after).toEqual(before);
+  expect(getDispatchFailure("work", "fn-i2.4")?.reason).toBe(
+    PENDING_MERGE_REASON,
+  );
+});
+
 test("DispatchCleared also deletes the pending_dispatches row so an operator clear immediately frees the slot (fn-870)", () => {
   // An operator clear (`keeper autopilot retry`) must free the launch-window slot
   // + per-root mutex immediately, not leave a stale pending until the TTL sweep.

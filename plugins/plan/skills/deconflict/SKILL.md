@@ -43,9 +43,12 @@ Pin these fields from the incident brief JSON:
 - `incident.conflict.repo_dir`
 - `incident.conflict.stderr`
 - `incident.conflict.expected_source_head` / `incident.conflict.expected_base_head`
-  — the durable head fence the producer pinned at incident mint (both non-null for
-  a pre-minted `pending owner integration` fast-forward request, both null for a
-  genuine content conflict)
+  — the durable head fence the producer pins at incident mint. A pre-minted
+  `pending owner integration` fan-in request carries BOTH as 40-hex object ids; a
+  genuine content conflict carries neither. A `pending owner integration` request
+  that carries NO valid pins is a legacy fence-less incident: FAIL CLOSED — decline
+  (`stale_base`) and stop, NEVER substitute live branch heads as the missing
+  authority and never spawn the deconflicter for it.
 - `epic_id` / `task_id` / `lineage` fields you need for close-out
 
 Then confirm the checkout state before spawn:
@@ -94,8 +97,8 @@ BRIEF_REF=deconflict::<ref>
     "source_branch": "<incident.conflict.source_branch>",
     "toplevel": "<git rev-parse --show-toplevel>",
     "expected_heads": {
-      "base_head": "<incident.conflict.expected_base_head, else the live git rev-parse <base_branch> for an unpinned genuine conflict>",
-      "source_head": "<incident.conflict.expected_source_head, else the live git rev-parse <source_branch> for an unpinned genuine conflict>"
+      "base_head": "<incident.conflict.expected_base_head; ONLY for a genuine content conflict (never a pending-owner-integration request) may you fall back to the live git rev-parse <base_branch>>",
+      "source_head": "<incident.conflict.expected_source_head; ONLY for a genuine content conflict (never a pending-owner-integration request) may you fall back to the live git rev-parse <source_branch>>"
     }
   }
 }

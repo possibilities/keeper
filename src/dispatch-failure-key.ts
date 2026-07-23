@@ -1075,19 +1075,29 @@ export function buildPendingIntegrationTail(
 /**
  * Extract the durable head fence a pinned pending-integration incident carries —
  * the `[expected src=<sha> base=<sha>]` suffix {@link buildPendingIntegrationTail}
- * appended. Returns null when the reason carries no fence (a genuine content
- * conflict, or an unpinned legacy pending row), so a caller degrades to its
- * non-fenced path rather than fabricating heads. Reads the whole reason so it is
- * indifferent to how {@link parseMergeConflictReason} splits it. Pure; NEVER
- * throws.
+ * appended. Enforces a STRICT CLOSED grammar (mirroring the sanctioned
+ * `[keeper-grant-verdict=…]` marker discipline — a consumer keys on the exact
+ * token, never salvaged from surrounding prose):
+ *   - EXACTLY ONE marker, ANCHORED at the very end of the reason (no trailing
+ *     garbage, no substring salvage from the middle);
+ *   - each sha EXACTLY 40 lowercase hex.
+ * ANY deviation — zero markers (a genuine content conflict or an unpinned legacy
+ * pending row), a duplicated marker, a malformed sha, or trailing text — FAILS
+ * CLOSED to null. A null caller MUST degrade to its fence-less arm, never fabricate
+ * or substitute live branch heads as the missing authority. Reads the whole reason
+ * so it is indifferent to how {@link parseMergeConflictReason} splits it. Pure;
+ * NEVER throws.
  */
 export function parsePendingIntegrationHeads(
   reason: string,
 ): { sourceHead: string; baseHead: string } | null {
-  const m = /\[expected src=([0-9a-f]{7,40}) base=([0-9a-f]{7,40})\]/.exec(
-    reason,
-  );
+  const m = /\[expected src=([0-9a-f]{40}) base=([0-9a-f]{40})\]$/.exec(reason);
   if (m == null || m[1] === undefined || m[2] === undefined) {
+    return null;
+  }
+  // Reject a duplicated / ambiguous marker: the opening token appears at most once.
+  const open = "[expected src=";
+  if (reason.indexOf(open) !== reason.lastIndexOf(open)) {
     return null;
   }
   return { sourceHead: m[1], baseHead: m[2] };
