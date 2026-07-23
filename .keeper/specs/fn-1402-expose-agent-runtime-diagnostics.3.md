@@ -68,5 +68,6 @@ New condition kinds and follow-up flags are additive. Existing durable rows, gen
 - [ ] Durable condition allowlists, protocol validation, worker cases, reducer round trips, CLI/help descriptors, and targeted tests remain exhaustive and green without a migration or new RPC.
 
 ## Done summary
-
+Added context-used-at-least and weekly-quota-at-most threshold awaits: a pure canonical percent module, a foreground out-of-band runtime slot (context binds the ambient exact-runtime leaf, weekly-quota freezes a route/meter/scope at arm), durable weekly-quota with frozen-route worker evaluation and a coalesced <30s idle re-eval, bounded --follow-up/--follow-up-file spill inputs redacted from the list surface, plus exhaustive protocol/RPC/reducer/help/test mirrors.
 ## Evidence
+- Commits: b8bab7402348356012b4741dcc714c1f3804df26
