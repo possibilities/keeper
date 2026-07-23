@@ -222,6 +222,30 @@ describe("registry-lock leaf", () => {
     expect(log.released).toEqual([COMMON_LOCK]); // release WAS attempted
   });
 
+  test("withStructuralLock: a throwing fn AND a throwing release AGGREGATE — the surfaced failure carries BOTH errors", async () => {
+    const log = freshLog();
+    let err: unknown;
+    try {
+      await withStructuralLock(
+        "/repo",
+        fakeRun(),
+        fakeAcquire(log, { throwRelease: new Set([COMMON_LOCK]) }),
+        async () => {
+          throw new Error("fn boom");
+        },
+        idCanon,
+      );
+    } catch (e) {
+      err = e;
+    }
+    // The caller observes an AggregateError through the PUBLIC wrapper after reverse-release
+    // completes, carrying BOTH the body error and the release error — a possibly-held flock is
+    // never masked by the fn failure, nor the fn failure by the release failure.
+    expect(err).toBeInstanceOf(AggregateError);
+    expect((err as AggregateError).errors).toHaveLength(2);
+    expect(log.released).toEqual([COMMON_LOCK]); // release attempted despite the fn throw
+  });
+
   test("withCheckoutLock: acquires common THEN per-worktree, releases per THEN common (reverse; no path before common)", async () => {
     const log = freshLog();
     let seenCommon: string | undefined;
