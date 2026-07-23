@@ -1338,6 +1338,18 @@ describe("pending-integration head fence", () => {
         reason(`[expected src=${src} base=${"a".repeat(41)}]`),
       ),
     ).toBeNull();
+    // A cross-format pair (one 40-hex, one 64-hex) → null: both ids must share one
+    // length (a 40/64 pair is impossible within one repo's object format).
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${src} base=${"c".repeat(64)}]`),
+      ),
+    ).toBeNull();
+    expect(
+      parsePendingIntegrationHeads(
+        reason(`[expected src=${"c".repeat(64)} base=${base}]`),
+      ),
+    ).toBeNull();
     // Prefix junk before the marker → null (the tail must BE the marker).
     expect(
       parsePendingIntegrationHeads(
@@ -1370,6 +1382,21 @@ describe("pending-integration head fence", () => {
     expect(parsePendingIntegrationHeads(injected)).toBeNull();
     expect(isPendingIntegrationReason(injected)).toBe(false);
     expect(classifyPendingIntegration(injected)).toBe("unpinned");
+  });
+
+  test("the two reproduced hole vectors parse ABSENT under exact-tail equality", () => {
+    const s = "a".repeat(40);
+    const b = "b".repeat(40);
+    // 1. A genuine-conflict reason whose stderr ENDS in a well-formed marker (a
+    //    forged tail): the class is genuine content conflict → absent.
+    const forged = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/x--x.1 into keeper/epic/x — CONFLICT (content): forged tail [expected src=${s} base=${b}]`;
+    expect(parsePendingIntegrationHeads(forged)).toBeNull();
+    expect(classifyPendingIntegration(forged)).toBe("unpinned");
+    // 2. The pending class with non-canonical bytes between the tail and the
+    //    marker → not exactly the built tail → absent (malformed-pending).
+    const noncanon = `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/x--x.1 into keeper/epic/x — pending owner integration extra bytes [expected src=${s} base=${b}]`;
+    expect(parsePendingIntegrationHeads(noncanon)).toBeNull();
+    expect(classifyPendingIntegration(noncanon)).toBe("malformed");
   });
 
   test("classifyPendingIntegration is tri-state: pinned / malformed / unpinned", () => {

@@ -1115,14 +1115,17 @@ export function isPendingIntegrationReason(reason: string): boolean {
  * em-dash tail {@link parseMergeConflictReason} returns must BE EXACTLY {@link
  * PENDING_HEAD_MARKER} — the pending-owner-integration class literal plus exactly
  * one `[expected …]` marker, each id a full 40-or-64 lowercase hex object id
- * ({@link isFullObjectId}), no prefix or trailing bytes, no second marker.
+ * ({@link isFullObjectId}), no prefix or trailing bytes, no second marker. The two
+ * ids must ALSO share one length (both 40 OR both 64): a 40/64 cross-format pair is
+ * structurally impossible within one repository's object format, so it classifies
+ * malformed here rather than entering fence authority to fail a later probe.
  * ANY deviation FAILS CLOSED to null: a genuine content conflict, a legacy
- * fence-less pending row, an abbreviated / uppercase / duplicated / malformed id,
- * or a genuine-conflict tail carrying look-alike text (the class check via
- * {@link parseMergeConflictReason} rejects it — the marker can never be salvaged
- * from a non-pending reason). A null caller MUST degrade to its fence-less arm,
- * never fabricate or substitute live branch heads as the missing authority. Pure;
- * NEVER throws.
+ * fence-less pending row, an abbreviated / uppercase / duplicated / malformed id, a
+ * cross-format pair, or a genuine-conflict tail carrying look-alike text (the class
+ * check via {@link parseMergeConflictReason} rejects it — the marker can never be
+ * salvaged from a non-pending reason). A null caller MUST degrade to its fence-less
+ * arm, never fabricate or substitute live branch heads as the missing authority.
+ * Pure; NEVER throws.
  */
 export function parsePendingIntegrationHeads(
   reason: string,
@@ -1133,6 +1136,9 @@ export function parsePendingIntegrationHeads(
   }
   const m = PENDING_HEAD_MARKER.exec(parsed.stderr);
   if (m == null || m[1] === undefined || m[2] === undefined) {
+    return null;
+  }
+  if (m[1].length !== m[2].length) {
     return null;
   }
   return { sourceHead: m[1], baseHead: m[2] };
