@@ -83,8 +83,7 @@ import {
   assignmentWorktreeReadiness,
   computeDeferredEpicIds,
   integratePinnedRib,
-  probeLaneIntegrationRegime,
-  recreateLaneOffBase,
+  type ProgressActorAuthority,
   runProgressActor,
   computeDeferredSiblingSources,
   computeDuplicateEpicNumberGroups,
@@ -332,6 +331,7 @@ import {
   boundedFields,
   dispatchClaimBlocksReplacement,
   dispatchTargetHasActivityCollision,
+  type ProgressActorWorkItem,
   WITHHOLD_DETAIL_MAX,
 } from "../src/reconcile-core";
 import { drain } from "../src/reducer";
@@ -23893,7 +23893,7 @@ test("computeDeferredSiblingSources: a DONE sibling rib PRESENT ∧ NOT an ances
     lanes: [CASCADE_BASE, CASCADE_RIB3],
     contained: [],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -23909,7 +23909,7 @@ test("computeDeferredSiblingSources: a DONE sibling rib PRESENT ∧ ancestor of 
     lanes: [CASCADE_BASE, CASCADE_RIB3],
     contained: [CASCADE_RIB3],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -23920,7 +23920,7 @@ test("computeDeferredSiblingSources: a DONE sibling rib PRESENT ∧ ancestor of 
 test("computeDeferredSiblingSources: a DEFINITIVELY ABSENT rib (enumeration ok, omits it) → NOT deferred (merged-and-torn-down), no ancestry probe", async () => {
   const epic = cascadeEpic({});
   const { run, calls } = siblingGit({ lanes: [CASCADE_BASE] }); // enum ok, .3's rib gone
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -23933,7 +23933,7 @@ test("computeDeferredSiblingSources: a DEFINITIVELY ABSENT rib (enumeration ok, 
 test("computeDeferredSiblingSources: an enumeration FAILURE → DEFERS (never read a failed enumeration as absent)", async () => {
   const epic = cascadeEpic({});
   const { run } = siblingGit({ enumError: true });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -23949,7 +23949,7 @@ test("computeDeferredSiblingSources: an ancestry TIMEOUT (124) on a present rib 
     lanes: [CASCADE_BASE, CASCADE_RIB3],
     ancestryTimeout: true,
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -23960,7 +23960,7 @@ test("computeDeferredSiblingSources: an ancestry TIMEOUT (124) on a present rib 
 test("computeDeferredSiblingSources: no DONE dependency-siblings → not in the map (and zero git spawns)", async () => {
   const epic = cascadeEpic({ t1: "open", t2: "open", t3: "open", t4: "open" });
   const { run, calls } = siblingGit({ lanes: [CASCADE_BASE, CASCADE_RIB3] });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24014,7 +24014,7 @@ test("computeDeferredSiblingSources: rider 2 — N existing-lane dependents in o
     }
     return { code: 0, stdout: "", stderr: "" };
   };
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24066,7 +24066,7 @@ test("computeDeferredSiblingSources: a dependent INHERITING a done sibling's own
     ],
     contained: [], // nothing is an ancestor of the epic base
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24080,7 +24080,7 @@ test("reconcile end-to-end: the sibling-source gate WITHHOLDS the .4-cascade dep
   const epic = cascadeEpic({});
   const map = classifyIdentity([epic]);
   // BEFORE integration: `.3`'s rib present, NOT an ancestor of the base `.4` forks off.
-  const before = await computeDeferredSiblingSources(
+  const { deferred: before } = await computeDeferredSiblingSources(
     [epic],
     map,
     siblingGit({ lanes: [CASCADE_BASE, CASCADE_RIB3], contained: [] }).run,
@@ -24105,7 +24105,7 @@ test("reconcile end-to-end: the sibling-source gate WITHHOLDS the .4-cascade dep
 
   // AFTER integration: `.3`'s rib is an ancestor of the base → the producer clears it,
   // so the gate no longer holds `.4` and it dispatches.
-  const after = await computeDeferredSiblingSources(
+  const { deferred: after } = await computeDeferredSiblingSources(
     [epic],
     map,
     siblingGit({ lanes: [CASCADE_BASE, CASCADE_RIB3], contained: [CASCADE_RIB3] })
@@ -24140,7 +24140,7 @@ test("computeDeferredSiblingSources: EXISTING assignment lane — a done rib in 
     lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_RIB3, CASCADE_BASE]], // rib3 in the base, NOT in rib4
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24164,7 +24164,7 @@ test("computeDeferredSiblingSources: EXISTING assignment lane — only the rib b
       [CASCADE_BASE, CASCADE_RIB4], // and the base (holding the torn-down .1/.2) too
     ],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24180,7 +24180,7 @@ test("computeDeferredSiblingSources: EXISTING lane whose branch CONTAINS the rib
     lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]], // the rib IS in the lane branch
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24200,7 +24200,7 @@ test("computeDeferredSiblingSources: EXISTING lane with rib contained AND a clea
       [CASCADE_BASE, CASCADE_RIB4],
     ],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24221,7 +24221,7 @@ test("computeDeferredSiblingSources: P0-A — a DONE sibling's rib TORN DOWN (in
     lanes: [CASCADE_BASE, CASCADE_RIB4], // every done rib torn down; base present, stale .4
     ancestorPairs: [], // the base is NOT an ancestor of the stale .4
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24237,7 +24237,7 @@ test("computeDeferredSiblingSources: P0-A — once the epic base (holding the to
     lanes: [CASCADE_BASE, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_BASE, CASCADE_RIB4]], // the actor merged the base into the lane
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24259,7 +24259,7 @@ test("computeDeferredSiblingSources: P0-A — rib torn down AND the epic base AL
     lanes: [CASCADE_RIB4], // .4's lane exists; every rib AND the epic base are gone
     ancestorPairs: [],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24281,7 +24281,7 @@ test("computeDeferredSiblingSources: rider — several absent done parents of on
     lanes: [CASCADE_BASE, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_BASE, CASCADE_RIB4]],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24304,7 +24304,7 @@ test("computeDeferredSiblingSources: EXISTING lane with an UNKNOWN/missing workt
     lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]], // even though the branch contains it
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24319,7 +24319,7 @@ test("computeDeferredSiblingSources: a done sibling's STATUS never satisfies the
   // Done status is not evidence; the gate defers on ancestry alone.
   const epic = cascadeEpic({}); // .1/.2/.3 done, .4 open
   const { run } = siblingGit({ lanes: [CASCADE_BASE, CASCADE_RIB3], contained: [] });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24381,7 +24381,7 @@ test("computeDeferredSiblingSources: a CLUSTERED multi-repo epic gates a depende
     lanes: ["keeper/epic/fn-2-multi", "keeper/epic/fn-2-multi--fn-2-multi.3"],
     ancestorPairs: [],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyMultiRepo([epic]),
     run,
@@ -24525,7 +24525,7 @@ test("computeDeferredSiblingSources: a readiness-blocked withhold NAMES the bloc
     lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
     ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]],
   });
-  const deferred = await computeDeferredSiblingSources(
+  const { deferred } = await computeDeferredSiblingSources(
     [epic],
     classifyIdentity([epic]),
     run,
@@ -24542,9 +24542,212 @@ test("computeDeferredSiblingSources: a readiness-blocked withhold NAMES the bloc
 });
 
 // ---------------------------------------------------------------------------
-// Parts-6 progress actor — fenced primitives (integratePinnedRib /
-// probeLaneIntegrationRegime / recreateLaneOffBase). Rule-driven git fakes; no
-// real git, worktree, lock, or fs. An unmatched call defaults to exit-0/empty.
+// computeDeferredSiblingSources — the TYPED WORK ITEMS the gate producer emits
+// alongside the display defer map (the shared gate↔actor seam).
+// ---------------------------------------------------------------------------
+
+/** A 5-task epic where `fn-1-foo.5` (pre-cut) forks off the DISTINCT rib `RIB3`, not the
+ *  epic base — the topology the pre-cut gate correction reasons over. */
+function distinctForkEpic(): Epic {
+  const mk = (n: number, deps: number[], phase: Task["worker_phase"]): Task =>
+    makeTask({
+      task_id: `fn-1-foo.${n}`,
+      epic_id: "fn-1-foo",
+      task_number: n,
+      worker_phase: phase,
+      depends_on: deps.map((d) => `fn-1-foo.${d}`),
+    });
+  return makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [
+      mk(1, [], "done"),
+      mk(2, [1], "done"),
+      mk(3, [1], "done"), // forks RIB3 (the fork source for .5)
+      mk(4, [3], "done"), // inherits RIB3; its own rib RIB4 is never cut / torn down
+      mk(5, [3, 4], "open"), // pre-cut, forks off RIB3
+    ],
+  });
+}
+
+test("computeDeferredSiblingSources: an EXISTING held lane (rib present, not yet an ancestor) → a `rib` work item targeting the lane's OWN branch", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    // absent .1/.2 contained via the base; the base is in the lane; RIB3 is NOT → RIB3 blocks.
+    ancestorPairs: [
+      [CASCADE_BASE, CASCADE_RIB4],
+      [CASCADE_BASE, CASCADE_RIB3],
+    ],
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.get("fn-1-foo.4")).toBe(CASCADE_RIB3);
+  const item = workItems.find((w) => w.taskId === "fn-1-foo.4");
+  expect(item?.sourceObligation).toBe("rib");
+  expect(item?.sourceBranch).toBe(CASCADE_RIB3);
+  expect(item?.targetBranch).toBe(CASCADE_RIB4);
+  expect(item?.existing).toBe(true);
+});
+
+test("computeDeferredSiblingSources: a REPAIR-NEEDED existing lane (worktree failed readiness) → a `reattach` work item on the lane branch", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]],
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    readinessStub({ kind: "unknown", detail: "assignment worktree absent" }),
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+  const item = workItems.find((w) => w.taskId === "fn-1-foo.4");
+  expect(item?.sourceObligation).toBe("reattach");
+  expect(item?.sourceBranch).toBe(CASCADE_RIB4); // the lane branch itself
+  expect(item?.targetBranch).toBe(CASCADE_RIB4);
+  expect(item?.existing).toBe(true);
+});
+
+test("computeDeferredSiblingSources: an EXISTING lane with a TORN-DOWN rib the base has not reached → a `canonical-base` work item", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB4], // every done rib torn down; base present, stale lane
+    ancestorPairs: [], // the base is NOT an ancestor of the stale lane
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+  const item = workItems.find((w) => w.taskId === "fn-1-foo.4");
+  expect(item?.sourceObligation).toBe("canonical-base");
+  expect(item?.sourceBranch).toBe(CASCADE_BASE);
+  expect(item?.targetBranch).toBe(CASCADE_RIB4);
+});
+
+test("computeDeferredSiblingSources: a fully synced EXISTING lane → NO work item (nothing to integrate)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [
+      [CASCADE_RIB3, CASCADE_RIB4],
+      [CASCADE_BASE, CASCADE_RIB4],
+    ],
+  });
+  const { workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(workItems.some((w) => w.taskId === "fn-1-foo.4")).toBe(false);
+});
+
+test("computeDeferredSiblingSources: a pure enumeration-UNKNOWN hold → NO work item (nothing resolved to act on)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({ enumError: true });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true); // held on the unknown enumeration
+  expect(workItems).toHaveLength(0); // JC1 boundary: no item on a pure enumeration-UNKNOWN
+});
+
+test("computeDeferredSiblingSources: PRE-CUT retro-fan-in — a held pre-cut dependent whose fork source is REGISTERED/ready → a `rib` item targeting the FORK SOURCE branch/path", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3], // .4's lane RIB4 is NOT cut → pre-cut
+    ancestorPairs: [], // RIB3 is not yet in the fork source (the base)
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.get("fn-1-foo.4")).toBe(CASCADE_RIB3);
+  const item = workItems.find((w) => w.taskId === "fn-1-foo.4");
+  expect(item?.sourceObligation).toBe("rib");
+  expect(item?.sourceBranch).toBe(CASCADE_RIB3);
+  // The item targets the FORK SOURCE (the base), NOT the dependent's future .4 lane.
+  expect(item?.targetBranch).toBe(CASCADE_BASE);
+  expect(item?.existing).toBe(true);
+});
+
+test("computeDeferredSiblingSources: PRE-CUT retro-fan-in — an UNIDENTIFIABLE/not-ready fork source → HELD but NO work item (defer to provision / the pending-integration owner)", async () => {
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3],
+    ancestorPairs: [],
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    readinessStub({ kind: "not-ready", detail: "dirty: M src/foo.ts" }),
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+  expect(workItems.some((w) => w.taskId === "fn-1-foo.4")).toBe(false);
+});
+
+test("computeDeferredSiblingSources: PRE-CUT gate correction — a torn-down sibling rib + a pre-cut dependent forking off a DISTINCT source missing the epic base → HELD (canonical-base), never cleared by mere absence", async () => {
+  const epic = distinctForkEpic();
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3], // RIB3 = the distinct fork source; .4's rib torn down
+    ancestorPairs: [], // the epic base is NOT an ancestor of the distinct fork source RIB3
+  });
+  const { deferred, workItems } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.5")).toBe(true);
+  const item = workItems.find((w) => w.taskId === "fn-1-foo.5");
+  expect(item?.sourceObligation).toBe("canonical-base");
+  expect(item?.sourceBranch).toBe(CASCADE_BASE);
+  expect(item?.targetBranch).toBe(CASCADE_RIB3); // the distinct fork source
+});
+
+test("computeDeferredSiblingSources: PRE-CUT gate correction — once the epic base reaches the distinct fork source → released", async () => {
+  const epic = distinctForkEpic();
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3],
+    ancestorPairs: [[CASCADE_BASE, CASCADE_RIB3]], // the base is now an ancestor of the fork source
+  });
+  const { deferred } = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.5")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Parts-6 progress actor fenced primitive — integratePinnedRib. Rule-driven git
+// fakes; no real git, worktree, lock, or fs. An unmatched call defaults to
+// exit-0/empty.
 // ---------------------------------------------------------------------------
 
 const ACTOR_TGT = "keeper/epic/fn-1-foo--fn-1-foo.4";
@@ -24603,9 +24806,16 @@ function pinnedGit(opts: PinnedGitOpts = {}): { run: FakeRun; calls: string[] } 
   let midMerge = false;
   let merged = false;
   const calls: string[] = [];
-  const run: FakeRun = async (a) => {
+  const run: FakeRun = async (a, o) => {
     calls.push(a.join(" "));
     const has = (t: string): boolean => a.includes(t);
+    // cwd-aware lock identity (resolveLockIdentity) — the flock's git-dir/common-dir.
+    if (a[0] === "rev-parse" && has("--git-common-dir")) {
+      return { code: 0, stdout: `${ACTOR_WT}/.git\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      return { code: 0, stdout: `${o?.cwd ?? ACTOR_WT}/.git\n`, stderr: "" };
+    }
     if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
       headReads += 1;
       const oid =
@@ -24625,6 +24835,12 @@ function pinnedGit(opts: PinnedGitOpts = {}): { run: FakeRun; calls: string[] } 
       return midMerge
         ? { code: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
+    }
+    if (
+      a[0] === "rev-parse" &&
+      (has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+    ) {
+      return { code: 1, stdout: "", stderr: "" }; // no non-merge in-progress state
     }
     if (a[0] === "worktree" && a[1] === "list") {
       if (opts.registrationAbsent) {
@@ -24826,413 +25042,90 @@ test("integratePinnedRib: target not ready under the lock → defer before mergi
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-interface RegimeGitOpts {
-  readyKind?: "ready" | "dirty" | "mid-merge" | "off-branch";
-  wip?: number | "error";
-  wipRaw?: string; // an EXACT rev-list stdout — for the strict-parse (non-count) arm
-  untracked?: string[];
-  untrackedError?: boolean;
-  incomingTree?: string[];
-  incomingTreeTimeout?: boolean;
-  incomingTreeError?: boolean; // a non-124 ls-tree failure — the fail-CLOSED arm
-}
-
-function regimeGit(opts: RegimeGitOpts = {}): { run: FakeRun } {
-  const readyKind = opts.readyKind ?? "ready";
-  const run: FakeRun = async (a) => {
-    const has = (t: string): boolean => a.includes(t);
-    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
-      return readyKind === "mid-merge"
-        ? { code: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" }
-        : { code: 1, stdout: "", stderr: "" };
-    }
-    if (a[0] === "status") {
-      return readyKind === "dirty"
-        ? { code: 0, stdout: " M src/foo.ts\n", stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
-      return {
-        code: 0,
-        stdout: readyKind === "off-branch" ? "some-other-branch\n" : `${ACTOR_TGT}\n`,
-        stderr: "",
-      };
-    }
-    if (a[0] === "rev-list" && has("--count")) {
-      if (opts.wipRaw !== undefined) {
-        return { code: 0, stdout: opts.wipRaw, stderr: "" };
-      }
-      return opts.wip === "error"
-        ? { code: 1, stdout: "", stderr: "" }
-        : { code: 0, stdout: `${opts.wip ?? 0}\n`, stderr: "" };
-    }
-    if (a[0] === "ls-files" && has("--others")) {
-      return opts.untrackedError
-        ? { code: 1, stdout: "", stderr: "" }
-        : { code: 0, stdout: (opts.untracked ?? []).join("\n"), stderr: "" };
-    }
-    if (a[0] === "ls-tree") {
-      if (opts.incomingTreeTimeout) {
-        return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
-      }
-      if (opts.incomingTreeError) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      return { code: 0, stdout: (opts.incomingTree ?? []).join("\n"), stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  return { run };
-}
-
-test("probeLaneIntegrationRegime: committed WIP + clean tree + no untracked → merge", async () => {
-  const { run } = regimeGit({ wip: 2, untracked: [] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("merge");
-});
-
-test("probeLaneIntegrationRegime: committed WIP + untracked DISJOINT from the incoming set → merge", async () => {
-  const { run } = regimeGit({ wip: 1, untracked: ["notes.txt"], incomingTree: ["src/foo.ts"] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("merge");
-});
-
-test("probeLaneIntegrationRegime: committed WIP + untracked OVERLAPPING the incoming set → defer (never clobber untracked)", async () => {
-  const { run } = regimeGit({ wip: 1, untracked: ["src/foo.ts"], incomingTree: ["src/foo.ts"] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("clobber");
-});
-
-test("probeLaneIntegrationRegime: committed WIP + untracked, incoming-tree read TIMED OUT → defer (fail-closed)", async () => {
-  const { run } = regimeGit({ wip: 1, untracked: ["notes.txt"], incomingTreeTimeout: true });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("cannot prove untracked-disjoint");
-});
-
-test("probeLaneIntegrationRegime: committed WIP + untracked, incoming-tree read FAILED (non-124) → defer, NEVER a fail-open merge", async () => {
-  const { run } = regimeGit({ wip: 1, untracked: ["notes.txt"], incomingTreeError: true });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("cannot prove untracked-disjoint");
-});
-
-test("probeLaneIntegrationRegime: no unique commits + fully clean → recreate", async () => {
-  const { run } = regimeGit({ wip: 0, untracked: [] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("recreate");
-});
-
-test("probeLaneIntegrationRegime: no unique commits but UNTRACKED files present → defer (recreate would destroy them)", async () => {
-  const { run } = regimeGit({ wip: 0, untracked: ["scratch.txt"] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("untracked");
-});
-
-test("probeLaneIntegrationRegime: tracked DIRT → defer (dirt/recovery owns it), both arms blocked", async () => {
-  const { run } = regimeGit({ readyKind: "dirty", wip: 3 });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("tracked dirt");
-});
-
-test("probeLaneIntegrationRegime: MID-MERGE residue → defer untouched", async () => {
-  const { run } = regimeGit({ readyKind: "mid-merge", wip: 3 });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("mid-merge");
-});
-
-test("probeLaneIntegrationRegime: OFF-BRANCH lane → defer", async () => {
-  const { run } = regimeGit({ readyKind: "off-branch", wip: 3 });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("off-branch");
-});
-
-test("probeLaneIntegrationRegime: an inconclusive unique-commit probe → defer", async () => {
-  const { run } = regimeGit({ wip: "error" });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("unique-commit probe inconclusive");
-});
-
-test("probeLaneIntegrationRegime: a GARBAGE unique-commit count ('0garbage') → defer, NEVER the destructive recreate arm", async () => {
-  // `Number.parseInt('0garbage')` is 0, which the old code read as no-WIP → recreate; the
-  // strict whole-output parse must reject it and DEFER instead.
-  const { run } = regimeGit({ wipRaw: "0garbage\n", untracked: [] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("non-count");
-});
-
-test("probeLaneIntegrationRegime: a NEGATIVE unique-commit count → defer (strict non-negative-integer parse)", async () => {
-  const { run } = regimeGit({ wipRaw: "-5\n", untracked: [] });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("non-count");
-});
-
-test("probeLaneIntegrationRegime: an inconclusive untracked probe → defer", async () => {
-  const { run } = regimeGit({ wip: 2, untrackedError: true });
-  const out = await probeLaneIntegrationRegime(ACTOR_WT, ACTOR_TGT, "keeper/epic/fn-1-foo", ACTOR_SRC_OID, run);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("untracked probe inconclusive");
-});
-
-const RECREATE_HEAD_OID = "9".repeat(40);
-const RECREATE_BASE = "keeper/epic/fn-1-foo";
-
-interface RecreateGitOpts {
-  removeExit?: number; // `worktree remove` exit (non-zero → dirty → defer)
-  pruneExit?: number; // ensure's `worktree prune` exit
-  addExit?: number; // ensure's `worktree add` exit
-  registrationBranch?: string; // the branch the lane is registered on under the lock (swap)
-  registrationAbsent?: boolean; // the lane path is not registered under the lock
-  commitArrived?: number; // rev-list count under the lock (a commit arrived post-pre-probe)
-  untrackedArrived?: string[]; // untracked files present under the lock
-  updateRefFails?: boolean; // the CAS branch delete refuses (branch moved after removal)
-  dirtyUnderLock?: boolean; // mergeReadiness reads dirty under the lock
-}
-
-function recreateGit(opts: RecreateGitOpts = {}): { run: FakeRun; calls: string[] } {
-  const calls: string[] = [];
-  let removed = false;
-  const run: FakeRun = async (a) => {
-    calls.push(a.join(" "));
-    const has = (t: string): boolean => a.includes(t);
-    if (a[0] === "worktree" && a[1] === "list") {
-      // Before removal the lane is registered; after, it is gone (so ensure re-adds).
-      if (removed || opts.registrationAbsent) {
-        return {
-          code: 0,
-          stdout: `worktree ${ACTOR_REPO}\nHEAD ${"0".repeat(40)}\nbranch refs/heads/main\n`,
-          stderr: "",
-        };
-      }
-      const br = opts.registrationBranch ?? `refs/heads/${ACTOR_TGT}`;
-      return {
-        code: 0,
-        stdout: `worktree ${ACTOR_REPO}\nbranch refs/heads/main\n\nworktree ${ACTOR_WT}\nbranch ${br}\n`,
-        stderr: "",
-      };
-    }
-    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (a[0] === "status") {
-      return opts.dirtyUnderLock
-        ? { code: 0, stdout: " M src/foo.ts\n", stderr: "" }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
-      return { code: 0, stdout: `${ACTOR_TGT}\n`, stderr: "" };
-    }
-    if (a[0] === "rev-list" && has("--count")) {
-      return { code: 0, stdout: `${opts.commitArrived ?? 0}\n`, stderr: "" };
-    }
-    if (a[0] === "ls-files" && has("--others")) {
-      return { code: 0, stdout: (opts.untrackedArrived ?? []).join("\n"), stderr: "" };
-    }
-    if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
-      return { code: 0, stdout: `${RECREATE_HEAD_OID}\n`, stderr: "" };
-    }
-    if (a[0] === "worktree" && a[1] === "remove") {
-      if ((opts.removeExit ?? 0) !== 0) {
-        return { code: opts.removeExit ?? 1, stdout: "", stderr: "contains modified or untracked files" };
-      }
-      removed = true;
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    if (a[0] === "update-ref" && a[1] === "-d") {
-      return opts.updateRefFails
-        ? { code: 1, stdout: "", stderr: "cannot lock ref refs/heads: is at <other>, not <expected>" }
-        : { code: 0, stdout: "", stderr: "" };
-    }
-    if (a[0] === "worktree" && a[1] === "prune") {
-      return { code: opts.pruneExit ?? 0, stdout: "", stderr: "" };
-    }
-    if (a[0] === "rev-parse" && has("--verify") && has(`refs/heads/${ACTOR_TGT}`)) {
-      // ensure's branch-exists probe — positively absent (CAS-deleted) so it re-creates.
-      return { code: 1, stdout: "", stderr: "" };
-    }
-    if (a[0] === "worktree" && a[1] === "add") {
-      return { code: opts.addExit ?? 0, stdout: "", stderr: opts.addExit ? "add failed" : "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  return { run, calls };
-}
-
-const noopDepLink = async (): Promise<void> => {};
-
-test("recreateLaneOffBase: clean re-prove + remove + CAS branch delete + re-cut off the fresh base → recreated", async () => {
-  const { run, calls } = recreateGit({});
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("recreated");
-  expect(calls.some((c) => c === `worktree remove ${ACTOR_WT}`)).toBe(true);
-  // The stale branch is deleted via a CAS `update-ref -d <ref> <expectedOid>`, NEVER `branch -D`.
-  expect(calls.some((c) => c === `update-ref -d refs/heads/${ACTOR_TGT} ${RECREATE_HEAD_OID}`)).toBe(true);
-  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false);
-  expect(calls.some((c) => c === `worktree add -b ${ACTOR_TGT} ${ACTOR_WT} ${RECREATE_BASE}`)).toBe(true);
-});
-
-test("recreateLaneOffBase: `worktree remove` refuses (raced dirty) → defer, NEVER a force-remove or a branch delete", async () => {
-  const { run, calls } = recreateGit({ removeExit: 1 });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("remove refused");
-  expect(
-    calls.some(
-      (c) =>
-        c.startsWith("worktree remove --force") ||
-        c.startsWith("worktree remove -f "),
-    ),
-  ).toBe(false);
-  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false); // never delete after a failed remove
-  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false);
-});
-
-test("recreateLaneOffBase: a COMMIT arrived after the pre-probe (unique count > 0 under lock) → defer, NEVER a removal", async () => {
-  const { run, calls } = recreateGit({ commitArrived: 2 });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("commit arrived after the pre-probe");
-  expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("recreateLaneOffBase: the lane path is registered on ANOTHER branch under the lock → defer, NEVER a removal", async () => {
-  const { run, calls } = recreateGit({ registrationBranch: "refs/heads/other" });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("registered on refs/heads/other");
-  expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("recreateLaneOffBase: UNTRACKED files arrived after the pre-probe → defer, NEVER a removal", async () => {
-  const { run, calls } = recreateGit({ untrackedArrived: ["scratch.txt"] });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("untracked files arrived");
-  expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("recreateLaneOffBase: the lane branch MOVED after removal (CAS delete refuses) → defer, NEVER a re-cut", async () => {
-  const { run, calls } = recreateGit({ updateRefFails: true });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("moved after removal");
-  expect(calls.some((c) => c === `worktree remove ${ACTOR_WT}`)).toBe(true); // the clean tree WAS removed (lossless)
-  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false); // but never re-cut over a moved branch
-  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false);
-});
-
-test("recreateLaneOffBase: an inconclusive re-cut (prune non-zero) → defer", async () => {
-  const { run } = recreateGit({ pruneExit: 1 });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("defer");
-});
-
-test("recreateLaneOffBase: a positively-failed `worktree add` → failed", async () => {
-  const { run } = recreateGit({ addExit: 1 });
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-  expect(out.kind).toBe("failed");
-});
-
-test("recreateLaneOffBase: a lock timeout → defer (no re-prove, no removal)", async () => {
-  const { run, calls } = recreateGit({});
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, nullLock);
-  expect(out.kind).toBe("defer");
-  if (out.kind === "defer") expect(out.reason).toContain("lock timeout");
-  expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
-});
-
-test("recreateLaneOffBase: a dep-link failure after a successful re-cut → failed", async () => {
-  const { run } = recreateGit({});
-  const boom = async (): Promise<void> => {
-    throw new Error("dep link boom");
-  };
-  const out = await recreateLaneOffBase(ACTOR_REPO, ACTOR_WT, ACTOR_TGT, RECREATE_BASE, run, boom, okLock);
-  expect(out.kind).toBe("failed");
-  if (out.kind === "failed") expect(out.reason).toContain("dep link boom");
-});
-
-test("recreateLaneOffBase: a `.claude`-only HUSK left after removal is swept before the re-cut → recreated", async () => {
-  const root = mkdtempSync(join(tmpdir(), "keeper-recreate-husk-"));
-  const laneDir = join(root, "lane");
-  mkdirSync(join(laneDir, ".claude"), { recursive: true });
-  writeFileSync(join(laneDir, ".claude", "session.json"), "{}");
-  try {
-    let removed = false;
-    const run: FakeRun = async (a) => {
-      const has = (t: string): boolean => a.includes(t);
-      if (a[0] === "worktree" && a[1] === "list") {
-        return removed
-          ? { code: 0, stdout: `worktree ${root}\nbranch refs/heads/main\n`, stderr: "" }
-          : {
-              code: 0,
-              stdout: `worktree ${root}\nbranch refs/heads/main\n\nworktree ${laneDir}\nbranch refs/heads/${ACTOR_TGT}\n`,
-              stderr: "",
-            };
-      }
-      if (a[0] === "rev-parse" && has("MERGE_HEAD")) return { code: 1, stdout: "", stderr: "" };
-      if (a[0] === "status") return { code: 0, stdout: "", stderr: "" };
-      if (a[0] === "rev-parse" && has("--abbrev-ref")) return { code: 0, stdout: `${ACTOR_TGT}\n`, stderr: "" };
-      if (a[0] === "rev-list" && has("--count")) return { code: 0, stdout: "0\n", stderr: "" };
-      if (a[0] === "ls-files" && has("--others")) return { code: 0, stdout: "", stderr: "" };
-      if (a[0] === "rev-parse" && has("HEAD^{commit}")) return { code: 0, stdout: `${RECREATE_HEAD_OID}\n`, stderr: "" };
-      if (a[0] === "worktree" && a[1] === "remove") {
-        removed = true;
-        return { code: 0, stdout: "", stderr: "" };
-      }
-      if (a[0] === "rev-parse" && has("--verify") && has(`refs/heads/${ACTOR_TGT}`)) {
-        return { code: 1, stdout: "", stderr: "" };
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    };
-    const out = await recreateLaneOffBase(root, laneDir, ACTOR_TGT, RECREATE_BASE, run, noopDepLink, okLock);
-    expect(out.kind).toBe("recreated");
-    expect(existsSync(laneDir)).toBe(false); // the residue-only husk was swept, not left to block the re-cut
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 // ---------------------------------------------------------------------------
-// runProgressActor — the orchestrator: held-target scan + liveness gates +
-// strategy dispatch. Drives the cascade `.4` shape (an existing stale lane) with a
-// rule-driven git; distinct oids for the pinned merge keep its ancestry operands
-// from colliding with the branch-name gate ancestry.
+// runProgressActor — the work-item consumer: per-item geometry CAS + liveness +
+// fresh-enum + obligation CAS + H7 authority recheck + effect-by-class. Integration
+// items route through integratePinnedRib; reattach items through reattachLaneWorktree
+// (the H8 fence). There is NO lane recreate / branch deletion anywhere — a removal-
+// list-error arm is therefore MOOT (no removal exists to fail). Distinct pinned oids
+// keep the fence ancestry from colliding with the branch-name gate ancestry.
 // ---------------------------------------------------------------------------
 
 const ACTOR_LANE_OID = "1".repeat(40);
 const ACTOR_RIB_OID = "2".repeat(40);
 const clearLiveness: LaneMaintenanceProbe = () => ({ kind: "clear" });
-const heldFour = new Set(["fn-1-foo.4"]);
+const clearAuthority = (): ProgressActorAuthority => "clear";
 
-interface ActorGitOpts {
-  baseHasRib?: boolean; // recreate eligibility: rib ⊆ the fork base (default true)
-  wip?: number; // rev-list base..lane (default 1 → merge)
-  untracked?: string[];
-  conflict?: boolean;
-  preCut?: boolean; // the lane branch is NOT enumerated (not yet cut)
-  ribInLane?: boolean; // the rib is ALREADY an ancestor of the lane branch
+/** Derive the geometry-resolved assignment for a node so a constructed work item names the
+ *  EXACT (branch, worktreePath) the actor's geometry CAS + fence probes will see. */
+function geomFor(
+  epic: Epic,
+  nodeId: string,
+): { repoDir: string; branch: string; worktreePath: string } {
+  const { byEpicId } = prepareWorktreeGeometry(
+    [epic],
+    classifyIdentity([epic]),
+    undefined,
+  );
+  const geom = byEpicId.get(epic.epic_id);
+  if (geom === undefined || geom.kind !== "ok") {
+    throw new Error("expected an `ok` geometry");
+  }
+  const asg = geom.plan.assignments.find((a) => a.nodeId === nodeId);
+  if (asg === undefined) throw new Error(`no assignment for ${nodeId}`);
+  return {
+    repoDir: geom.repoDir,
+    branch: asg.branch,
+    worktreePath: asg.worktreePath,
+  };
 }
 
+/** A work item for the held `fn-1-foo.4` lane (an EXISTING rib item by default). */
+function actorItem(
+  over: Partial<ProgressActorWorkItem> = {},
+  epic: Epic = cascadeEpic({}),
+): ProgressActorWorkItem {
+  const g = geomFor(epic, "fn-1-foo.4");
+  return {
+    epicId: "fn-1-foo",
+    repoDir: g.repoDir,
+    taskId: "fn-1-foo.4",
+    targetBranch: g.branch,
+    worktreePath: g.worktreePath,
+    existing: true,
+    sourceObligation: "rib",
+    sourceBranch: CASCADE_RIB3,
+    ...over,
+  };
+}
+
+interface ActorGitOpts {
+  ribTornDown?: boolean; // for-each-ref OMITS RIB3 (torn-down → canonical-base scenario)
+  laneBranchMissing?: boolean; // for-each-ref OMITS RIB4 (freshExisting mismatch)
+  baseAncestorOfLane?: boolean; // branch-name anc(BASE, RIB4) (default true)
+  ribAncestorOfLane?: boolean; // branch-name anc(RIB3, RIB4) (default false → RIB3 blocks)
+  conflict?: boolean; // the pinned merge conflicts (aborts cleanly)
+}
+
+/** A rule-driven git fake for an EXISTING (registered) integration lane. */
 function actorGit(opts: ActorGitOpts = {}): { run: FakeRun; calls: string[] } {
   let midMerge = false;
-  let removed = false;
   let mergedPinned = false;
   const calls: string[] = [];
   const run: FakeRun = async (a, o) => {
     calls.push(a.join(" "));
     const has = (t: string): boolean => a.includes(t);
     if (a[0] === "for-each-ref") {
-      const lanes = [CASCADE_BASE, CASCADE_RIB3];
-      if (!opts.preCut) lanes.push(CASCADE_RIB4);
+      const lanes = [CASCADE_BASE];
+      if (!opts.laneBranchMissing) lanes.push(CASCADE_RIB4);
+      if (!opts.ribTornDown) lanes.push(CASCADE_RIB3);
       return { code: 0, stdout: lanes.join("\n"), stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--git-common-dir")) {
+      return { code: 0, stdout: `${o?.cwd ?? "/wt"}/.git\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      return { code: 0, stdout: `${o?.cwd ?? "/wt"}/.git\n`, stderr: "" };
     }
     if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
       return { code: 0, stdout: `${ACTOR_LANE_OID}\n`, stderr: "" };
@@ -25240,13 +25133,19 @@ function actorGit(opts: ActorGitOpts = {}): { run: FakeRun; calls: string[] } {
     if (a[0] === "rev-parse" && has(`refs/heads/${CASCADE_RIB3}^{commit}`)) {
       return { code: 0, stdout: `${ACTOR_RIB_OID}\n`, stderr: "" };
     }
+    if (a[0] === "rev-parse" && has(`refs/heads/${CASCADE_BASE}^{commit}`)) {
+      return { code: 0, stdout: `${ACTOR_BASE_OID}\n`, stderr: "" };
+    }
     if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
       return midMerge
-        ? { code: 0, stdout: `${"3".repeat(40)}\n`, stderr: "" }
+        ? { code: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
     }
-    if (a[0] === "rev-parse" && has("--verify") && has(`refs/heads/${CASCADE_RIB4}`)) {
-      return { code: 1, stdout: "", stderr: "" }; // recreate's branch-exists → absent
+    if (
+      a[0] === "rev-parse" &&
+      (has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+    ) {
+      return { code: 1, stdout: "", stderr: "" };
     }
     if (a[0] === "status") {
       return { code: 0, stdout: "", stderr: "" };
@@ -25254,30 +25153,38 @@ function actorGit(opts: ActorGitOpts = {}): { run: FakeRun; calls: string[] } {
     if (a[0] === "rev-parse" && has("--abbrev-ref")) {
       return { code: 0, stdout: `${CASCADE_RIB4}\n`, stderr: "" };
     }
-    if (a[0] === "rev-list" && has("--count")) {
-      return { code: 0, stdout: `${opts.wip ?? 1}\n`, stderr: "" };
-    }
     if (a[0] === "ls-files" && has("--others")) {
-      return { code: 0, stdout: (opts.untracked ?? []).join("\n"), stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (a[0] === "ls-tree") {
       return { code: 0, stdout: "", stderr: "" };
     }
+    if (a[0] === "worktree" && a[1] === "list") {
+      const cwd = o?.cwd ?? "";
+      return {
+        code: 0,
+        stdout: `worktree /repo\nbranch refs/heads/main\n\nworktree ${cwd}\nbranch refs/heads/${CASCADE_RIB4}\n`,
+        stderr: "",
+      };
+    }
     if (a[0] === "merge-base" && a[1] === "--is-ancestor") {
       const anc = a[2];
       const desc = a[3];
+      if (anc === CASCADE_BASE && desc === CASCADE_RIB4) {
+        return { code: (opts.baseAncestorOfLane ?? true) ? 0 : 1, stdout: "", stderr: "" };
+      }
       if (anc === CASCADE_RIB3 && desc === CASCADE_RIB4) {
-        return { code: opts.ribInLane ? 0 : 1, stdout: "", stderr: "" };
+        return { code: (opts.ribAncestorOfLane ?? false) ? 0 : 1, stdout: "", stderr: "" };
       }
-      if (anc === CASCADE_RIB3) {
-        return { code: (opts.baseHasRib ?? true) ? 0 : 1, stdout: "", stderr: "" };
-      }
-      if (anc === ACTOR_RIB_OID && desc === "HEAD") {
-        // BEFORE the pinned merge the fence's under-lock no-op arm reads NOT-contained;
-        // AFTER it, the positive post-check reads contained.
+      if (desc === "HEAD") {
+        // the fence no-op arm reads NOT-contained BEFORE the merge, contained AFTER.
         return { code: mergedPinned ? 0 : 1, stdout: "", stderr: "" };
       }
-      return { code: 1, stdout: "", stderr: "" }; // oid diverge probes → NO
+      return { code: 1, stdout: "", stderr: "" }; // pinned-oid diverge probes → NO
+    }
+    if (a[0] === "merge" && a[1] === "--ff-only") {
+      mergedPinned = true;
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (a[0] === "merge" && a[1] === "--no-ff") {
       if (opts.conflict) {
@@ -25294,54 +25201,112 @@ function actorGit(opts: ActorGitOpts = {}): { run: FakeRun; calls: string[] } {
       midMerge = false;
       return { code: 0, stdout: "", stderr: "" };
     }
-    if (a[0] === "worktree" && a[1] === "list") {
-      const cwd = o?.cwd ?? "";
-      // Reading from the repo dir (ensure's re-add) or after the removal → the lane is gone;
-      // reading from the lane path (the fence / recreate registration re-prove) → registered.
-      if (cwd === "/repo" || removed) {
-        return { code: 0, stdout: "worktree /repo\nbranch refs/heads/main\n", stderr: "" };
-      }
-      return {
-        code: 0,
-        stdout: `worktree /repo\nbranch refs/heads/main\n\nworktree ${cwd}\nbranch refs/heads/${CASCADE_RIB4}\n`,
-        stderr: "",
-      };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, calls };
+}
+
+interface ReattachGitOpts {
+  registered?: boolean; // the lane path is ALREADY a registered worktree (mid-cycle-ready/dirty)
+  branchElsewhere?: boolean; // the branch is registered on ANOTHER worktree
+  branchAbsent?: boolean; // for-each-ref OMITS RIB4 (freshExisting mismatch)
+  addFails?: boolean; // `git worktree add` fails
+}
+
+/** A rule-driven git fake for a MISSING/unregistered reattach lane. */
+function reattachGit(
+  lanePath: string,
+  opts: ReattachGitOpts = {},
+): { run: FakeRun; calls: string[] } {
+  let added = false;
+  const oid = "7".repeat(40);
+  const calls: string[] = [];
+  const run: FakeRun = async (a, o) => {
+    calls.push(a.join(" "));
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "for-each-ref") {
+      const lanes = [CASCADE_BASE];
+      if (!opts.branchAbsent) lanes.push(CASCADE_RIB4);
+      return { code: 0, stdout: lanes.join("\n"), stderr: "" };
     }
-    if (a[0] === "worktree" && a[1] === "remove") {
-      removed = true;
+    if (a[0] === "rev-parse" && has("--git-common-dir")) {
+      return { code: 0, stdout: "/repo/.git\n", stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      return { code: 0, stdout: `${o?.cwd ?? "/repo"}/.git\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has(`refs/heads/${CASCADE_RIB4}^{commit}`)) {
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (
+      a[0] === "rev-parse" &&
+      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+    ) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (a[0] === "status") {
       return { code: 0, stdout: "", stderr: "" };
     }
-    return { code: 0, stdout: "", stderr: "" }; // prune / add / update-ref default ok
+    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
+      return { code: 0, stdout: `${CASCADE_RIB4}\n`, stderr: "" };
+    }
+    if (a[0] === "worktree" && a[1] === "list") {
+      const entries = ["worktree /repo\nbranch refs/heads/main"];
+      if (opts.branchElsewhere) {
+        entries.push(`worktree /other\nbranch refs/heads/${CASCADE_RIB4}`);
+      }
+      if (opts.registered || added) {
+        entries.push(`worktree ${lanePath}\nbranch refs/heads/${CASCADE_RIB4}`);
+      }
+      return { code: 0, stdout: `${entries.join("\n\n")}\n`, stderr: "" };
+    }
+    if (a[0] === "worktree" && a[1] === "add") {
+      if (opts.addFails) {
+        return {
+          code: 128,
+          stdout: "",
+          stderr: "fatal: could not create work tree dir",
+        };
+      }
+      added = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
   };
   return { run, calls };
 }
 
 async function driveActor(
-  epic: ReturnType<typeof cascadeEpic>,
-  opts: ActorGitOpts,
-  liveness: LaneMaintenanceProbe = clearLiveness,
-  hasActiveResolver: (epicId: string) => boolean = () => false,
-): Promise<{
-  out: Awaited<ReturnType<typeof runProgressActor>>;
-  calls: string[];
-}> {
-  const { run, calls } = actorGit(opts);
-  const out = await runProgressActor(
-    heldFour,
+  items: ProgressActorWorkItem[],
+  run: FakeRun,
+  over: {
+    epic?: Epic;
+    liveness?: LaneMaintenanceProbe;
+    hasActiveResolver?: (epicId: string) => boolean;
+    recheckAuthority?: (item: ProgressActorWorkItem) => ProgressActorAuthority;
+  } = {},
+): Promise<Awaited<ReturnType<typeof runProgressActor>>> {
+  const epic = over.epic ?? cascadeEpic({});
+  return runProgressActor(
+    items,
     [epic],
     classifyIdentity([epic]),
     undefined,
-    liveness,
-    hasActiveResolver,
+    over.liveness ?? clearLiveness,
+    over.hasActiveResolver ?? (() => false),
+    over.recheckAuthority ?? clearAuthority,
     run,
     okLock,
     async () => {},
   );
-  return { out, calls };
 }
 
-test("runProgressActor: an unclaimed EXISTING stale WIP lane → the rib is merged in (integrated), integratedAny set", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 2 });
+test("runProgressActor: an EXISTING lane `rib` item → the rib is integrated (integratedAny set)", async () => {
+  const { run, calls } = actorGit({});
+  const out = await driveActor([actorItem()], run);
   expect(out.resolved).toContain("fn-1-foo.4");
   expect(out.integratedAny).toBe(true);
   expect(out.escalations).toHaveLength(0);
@@ -25349,66 +25314,153 @@ test("runProgressActor: an unclaimed EXISTING stale WIP lane → the rib is merg
 });
 
 test("runProgressActor: a LIVE claim (lane-liveness defers) → the target is left UNTOUCHED", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 2 }, () => ({
-    kind: "defer",
-    reason: "live dispatch claim work::fn-1-foo.4 holds the lane",
-  }));
+  const { run, calls } = actorGit({});
+  const out = await driveActor([actorItem()], run, {
+    liveness: () => ({ kind: "defer", reason: "live dispatch claim holds the lane" }),
+  });
   expect(out.resolved).toHaveLength(0);
   expect(out.integratedAny).toBe(false);
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
 test("runProgressActor: an ACTIVE resolver → the target is left untouched", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 2 }, clearLiveness, () => true);
+  const { run, calls } = actorGit({});
+  const out = await driveActor([actorItem()], run, {
+    hasActiveResolver: () => true,
+  });
   expect(out.integratedAny).toBe(false);
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("runProgressActor: a content conflict → a work::<task> escalation, no destruction, integratedAny clear", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 2, conflict: true });
+test("runProgressActor: a content conflict → a work::<task> escalation carrying the PINNED sourceOid + sourceClass + targetOid, no destruction", async () => {
+  const { run, calls } = actorGit({ conflict: true });
+  const out = await driveActor([actorItem()], run);
   expect(out.resolved).toHaveLength(0);
   expect(out.integratedAny).toBe(false);
   expect(out.escalations).toHaveLength(1);
-  expect(out.escalations[0]?.taskId).toBe("fn-1-foo.4");
-  expect(out.escalations[0]?.reason).toContain("worktree-merge-conflict");
-  expect(calls.some((c) => c.startsWith("branch -D"))).toBe(false);
-});
-
-test("runProgressActor: a no-WIP lane whose fresh base HAS the rib → recreated off the base", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 0, baseHasRib: true });
-  expect(out.resolved).toContain("fn-1-foo.4");
-  expect(out.integratedAny).toBe(true);
-  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(true);
-});
-
-test("runProgressActor: a no-WIP lane whose fresh base LACKS the rib → skipped (no futile recreate)", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 0, baseHasRib: false });
-  expect(out.integratedAny).toBe(false);
-  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+  const e = out.escalations[0];
+  expect(e?.taskId).toBe("fn-1-foo.4");
+  expect(e?.reason).toContain("worktree-merge-conflict");
+  expect(e?.sourceOid).toBe(ACTOR_RIB_OID);
+  expect(e?.sourceClass).toBe("rib");
+  expect(e?.targetOid).toBe(ACTOR_LANE_OID);
+  expect(e?.conflictedFiles).toContain("src/foo.ts");
+  // NO branch deletion / lane recreate anywhere in the actor.
+  expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
   expect(calls.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
-test("runProgressActor: a PRE-CUT (not-yet-enumerated) lane → skipped (owned by provision / the pending-integration owner)", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 2, preCut: true });
+test("runProgressActor: steady-state ABSENT rib (torn down, base not yet in the lane) → the canonical-base arm is reached and integrated", async () => {
+  const { run, calls } = actorGit({ ribTornDown: true, baseAncestorOfLane: false });
+  const out = await driveActor([
+    actorItem({ sourceObligation: "canonical-base", sourceBranch: CASCADE_BASE }),
+  ], run);
+  expect(out.resolved).toContain("fn-1-foo.4");
+  expect(out.integratedAny).toBe(true);
+  expect(calls.some((c) => c.includes("--no-ff"))).toBe(true);
+});
+
+test("runProgressActor: the item's identity does NOT match the fresh geometry → zero mutation, zero git", async () => {
+  const { run, calls } = actorGit({});
+  const out = await driveActor(
+    [actorItem({ worktreePath: "/wt/not-in-geometry" })],
+    run,
+  );
+  expect(out.resolved).toHaveLength(0);
+  expect(out.integratedAny).toBe(false);
+  expect(calls).toHaveLength(0); // the pure geometry CAS defers before ANY git
+});
+
+test("runProgressActor: the fresh obligation DRIFTED from the item (the rib is now contained) → defer, never re-select", async () => {
+  const { run, calls } = actorGit({ ribAncestorOfLane: true });
+  const out = await driveActor([actorItem()], run);
+  expect(out.resolved).toHaveLength(0);
   expect(out.integratedAny).toBe(false);
   expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("runProgressActor: the rib is ALREADY in the lane branch (held only on readiness) → skipped (recreate could drop a present rib)", async () => {
-  const { out, calls } = await driveActor(cascadeEpic({}), { wip: 0, ribInLane: true });
-  expect(out.integratedAny).toBe(false);
-  expect(calls.some((c) => c.startsWith("worktree "))).toBe(false);
+test("runProgressActor: `existing` no longer matches the fresh enumeration (the lane branch vanished) → defer", async () => {
+  const { run, calls } = actorGit({ laneBranchMissing: true });
+  const out = await driveActor([actorItem()], run);
+  expect(out.resolved).toHaveLength(0);
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
 });
 
-test("runProgressActor: an empty held set → a no-op (zero git)", async () => {
+test("runProgressActor: H7 — a claimant appears between the cycle observation and the effect → zero mutation", async () => {
+  const { run, calls } = actorGit({});
+  const out = await driveActor([actorItem()], run, {
+    recheckAuthority: () => "held",
+  });
+  expect(out.integratedAny).toBe(false);
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("runProgressActor: H7 — authority is CLEAR at the effect boundary → proceed (integrated)", async () => {
+  const { run } = actorGit({});
+  const out = await driveActor([actorItem()], run, {
+    recheckAuthority: () => "clear",
+  });
+  expect(out.resolved).toContain("fn-1-foo.4");
+  expect(out.integratedAny).toBe(true);
+});
+
+test("runProgressActor: a `reattach` item → the H8 reattach fence reattaches the preserved lane (integratedAny), and NEVER triggers an integration merge", async () => {
+  const g = geomFor(cascadeEpic({}), "fn-1-foo.4");
+  const { run, calls } = reattachGit(g.worktreePath, {});
+  const out = await driveActor([
+    actorItem({ sourceObligation: "reattach", sourceBranch: g.branch }),
+  ], run);
+  expect(out.resolved).toContain("fn-1-foo.4");
+  expect(out.integratedAny).toBe(true);
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(true);
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("runProgressActor: a `reattach` item whose lane is a REGISTERED worktree again (mid-cycle-ready) → defer to the next gate cycle, no reattach", async () => {
+  const g = geomFor(cascadeEpic({}), "fn-1-foo.4");
+  const { run, calls } = reattachGit(g.worktreePath, { registered: true });
+  const out = await driveActor([
+    actorItem({ sourceObligation: "reattach", sourceBranch: g.branch }),
+  ], run);
+  expect(out.resolved).toHaveLength(0);
+  expect(out.integratedAny).toBe(false);
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("runProgressActor: a `reattach` candidacy NEGATIVE (the branch is registered elsewhere) → defer to recovery, no reattach", async () => {
+  const g = geomFor(cascadeEpic({}), "fn-1-foo.4");
+  const { run, calls } = reattachGit(g.worktreePath, { branchElsewhere: true });
+  const out = await driveActor([
+    actorItem({ sourceObligation: "reattach", sourceBranch: g.branch }),
+  ], run);
+  expect(out.resolved).toHaveLength(0);
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("runProgressActor: a `reattach` item whose `worktree add` fails → a work::<task> failure, the ref PRESERVED (no delete)", async () => {
+  const g = geomFor(cascadeEpic({}), "fn-1-foo.4");
+  const { run, calls } = reattachGit(g.worktreePath, { addFails: true });
+  const out = await driveActor([
+    actorItem({ sourceObligation: "reattach", sourceBranch: g.branch }),
+  ], run);
+  // a failed add is a DEFER inside the reattach fence (ref preserved, retry) — no failure row.
+  expect(out.resolved).toHaveLength(0);
+  expect(out.integratedAny).toBe(false);
+  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
+});
+
+test("runProgressActor: an empty work-item set → a no-op (zero git)", async () => {
   const { run, calls } = actorGit({});
   const out = await runProgressActor(
-    new Set(),
+    [],
     [cascadeEpic({})],
     classifyIdentity([cascadeEpic({})]),
     undefined,
     clearLiveness,
     () => false,
+    clearAuthority,
     run,
     okLock,
     async () => {},
@@ -25416,6 +25468,7 @@ test("runProgressActor: an empty held set → a no-op (zero git)", async () => {
   expect(out.integratedAny).toBe(false);
   expect(calls).toHaveLength(0);
 });
+
 
 // ---------------------------------------------------------------------------
 // logMergeGateDeferral — per-key coalesced console.error for a merge-gate

@@ -125,6 +125,33 @@ export interface BaseDriftEntry {
 }
 
 /**
+ * A typed progress-actor work item — the SHARED gate↔actor seam that replaces the parts-6
+ * actor's own independent held-target re-enumeration with the sibling-source gate's
+ * already-resolved decision. Producer-only (computed each cycle by the gate producer,
+ * carried on {@link ReconcileSnapshot.progressActorWorkItems}), consumed by the actor;
+ * NEVER read by the pure fold. Each item names the EXACT lane the actor mutates
+ * (`targetBranch` + `worktreePath` + `existing`) and its obligation class:
+ *  - `rib` / `canonical-base` — integrate a pinned source into the target so the gate
+ *    clears (`sourceBranch` is the blocking rib, or the epic base when a torn-down rib's
+ *    landed work is proven only via the canonical base);
+ *  - `reattach` — non-destructively reattach a preserved lane whose worktree is
+ *    missing/unregistered (`sourceBranch` is the lane branch itself).
+ * For a PRE-CUT retro-fan-in the `targetBranch`/`worktreePath` name the FORK SOURCE's
+ * registered checkout (never the dependent's future assignment path); `taskId` stays the
+ * HELD dependent whose gate the integration clears (the `work::<taskId>` rail key).
+ */
+export interface ProgressActorWorkItem {
+  epicId: string;
+  repoDir: string;
+  taskId: string;
+  targetBranch: string;
+  worktreePath: string;
+  existing: boolean;
+  sourceObligation: "rib" | "canonical-base" | "reattach";
+  sourceBranch: string;
+}
+
+/**
  * The two `keeper plan` verbs the reconciler dispatches: `work` for a `ready` task
  * row, `close` for a `ready` close row. The argv shape's single source of truth
  * is `cli/autopilot.ts`.
@@ -1293,6 +1320,14 @@ export interface ReconcileSnapshot {
    * a test snapshot may omit it (defaults to no deferral).
    */
   deferredSiblingSources?: ReadonlyMap<string, string>;
+  /**
+   * The typed progress-actor work items the gate producer resolved this cycle (the EXACT
+   * lanes to integrate a blocking done rib into, or reattach) — the SHARED gate↔actor seam.
+   * Producer-only, carried alongside {@link deferredSiblingSources}; the pure `reconcile`
+   * NEVER reads it (the parts-6 actor consumes it in the worker's recovery block). EMPTY
+   * whenever worktree mode is OFF. Optional so a test snapshot may omit it.
+   */
+  progressActorWorkItems?: readonly ProgressActorWorkItem[];
   /**
    * The durable MERGE-LANDED set — every `ok`-classified epic whose lane
    * `keeper/epic/<id>` is merged into LOCAL default (ancestor-of-default, or

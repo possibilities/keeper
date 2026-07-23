@@ -2302,14 +2302,137 @@ async function classifyMergeAttempt(
     : { kind: "merge-inconclusive", stderr: merged };
 }
 
+/** Tri-state presence of a git pseudo-ref (`MERGE_HEAD` / `CHERRY_PICK_HEAD` / …) — the
+ *  generalization of {@link probeMergeStateTri} that NEVER collapses a 124 SIGKILL or a git
+ *  error into "absent": `present` and `absent` (exit 1) are positive; anything else is
+ *  `inconclusive` (the caller must DEFER, never proceed on an unknown in-progress state). */
+async function probePseudoRefTri(
+  cwd: string,
+  run: GitRunner,
+  ref: string,
+): Promise<"present" | "absent" | "inconclusive"> {
+  const r = await run(["rev-parse", "--verify", "--quiet", ref], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (r.code === 0) {
+    return r.stdout.trim().length > 0 ? "present" : "inconclusive";
+  }
+  if (r.code === 1) {
+    return "absent";
+  }
+  return "inconclusive";
+}
+
+/** The in-progress pseudo-refs a mutation must never run over. */
+const IN_PROGRESS_PSEUDO_REFS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+] as const;
+
+/**
+ * STRICT worktree readiness for the actor-effect fence — unlike {@link mergeReadiness}
+ * (whose {@link verifyPseudoRef} collapses a timeout/error MERGE_HEAD to "absent", a
+ * FAIL-OPEN an effect must not trust), every in-progress pseudo-ref is probed TRI-STATE:
+ * a `present` one is a live merge/cherry-pick/revert → defer; an `inconclusive` one is
+ * UNKNOWN → defer (NEVER read as clean). Then a named non-merge in-progress state (the
+ * shared {@link nameForeignInProgress}), then a tracked-clean `status --untracked-files=no`
+ * (nonzero/timeout → defer), then on-branch. Returns `ready` only on positive proof of
+ * every axis. Bounded; never throws.
+ */
+async function strictWorktreeReadiness(
+  cwd: string,
+  expectedBranch: string,
+  run: GitRunner,
+  pathExists: PathProbe = defaultPathExists,
+): Promise<{ kind: "ready" } | { kind: "defer"; reason: string }> {
+  for (const ref of IN_PROGRESS_PSEUDO_REFS) {
+    const state = await probePseudoRefTri(cwd, run, ref);
+    if (state === "present") {
+      return { kind: "defer", reason: `${ref} in progress` };
+    }
+    if (state === "inconclusive") {
+      return { kind: "defer", reason: `${ref} probe inconclusive (UNKNOWN)` };
+    }
+  }
+  const foreign = await nameForeignInProgress(cwd, run, pathExists);
+  if (foreign !== null) {
+    return { kind: "defer", reason: `in-progress: ${foreign}` };
+  }
+  const status = await run(["status", "--porcelain", "--untracked-files=no"], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  const detail = (status.stdout + status.stderr).trim();
+  if (status.code !== 0 || detail.length > 0) {
+    return {
+      kind: "defer",
+      reason:
+        status.code !== 0
+          ? `status probe ${status.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `exit ${status.code}`}`
+          : `tracked dirt: ${detail.slice(0, 160)}`,
+    };
+  }
+  const head = await currentBranch(cwd, run);
+  if (head !== expectedBranch) {
+    return {
+      kind: "defer",
+      reason: `off-branch (HEAD=${head || "(unresolved)"})`,
+    };
+  }
+  return { kind: "ready" };
+}
+
+/** The stable git-dir / common-dir / commit-work-lock identity of a worktree, pinned at
+ *  lock acquisition and RE-DERIVED under the lock so a remove/re-add that moved the admin
+ *  dir can never leave a caller holding an obsolete lock while mutating the replacement.
+ *  `null` on any probe failure/empty (the caller DEFERS). */
+async function resolveLockIdentity(
+  cwd: string,
+  run: GitRunner,
+): Promise<{ gitDir: string; commonDir: string; lockPath: string } | null> {
+  const gitDirR = await run(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const commonR = await run(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const gitDir = gitDirR.stdout.trim();
+  const commonDir = commonR.stdout.trim();
+  if (
+    gitDirR.code !== 0 ||
+    commonR.code !== 0 ||
+    gitDir === "" ||
+    commonDir === ""
+  ) {
+    return null;
+  }
+  return {
+    gitDir: resolve(gitDir),
+    commonDir: resolve(commonDir),
+    lockPath: joinPath(resolve(gitDir), "keeper-commit-work.lock"),
+  };
+}
+
 /** The outcome of a fenced pinned-object merge into a target checkout — structurally the
- *  actor's rib-integration outcome, but OWNED here since the flock, the CAS, the fresh
- *  worktree-list registration, the readiness re-assert, the UNDER-LOCK no-op arm, the
- *  pinned merge, and the positive post-checks all live behind this one lock boundary. */
+ *  actor's rib-integration outcome, but OWNED here since the flock, the lock-identity CAS,
+ *  the HEAD + source CAS, the fresh registration, the strict readiness, the untracked-
+ *  collision probe, the UNDER-LOCK no-op arm, the pinned merge, and the positive post-checks
+ *  all live behind this one lock boundary. A `conflict` carries the exact PINNED source oid
+ *  and target-arrival oid so the incident receipt is minted from pins, never movable prose. */
 export type FencedMergeOutcome =
   | { kind: "integrated" }
   | { kind: "already-integrated" }
-  | { kind: "conflict"; conflictedFiles: string[]; stderr: string }
+  | {
+      kind: "conflict";
+      conflictedFiles: string[];
+      stderr: string;
+      sourceOid: string;
+      targetOid: string;
+    }
   | { kind: "defer"; reason: string };
 
 /**
@@ -2338,6 +2461,7 @@ export async function mergePinnedObjectFenced(
   worktreePath: string,
   opts: {
     sourceOid: string;
+    sourceBranch: string;
     expectedHeadOid: string;
     targetBranch: string;
     strategy: "ff" | "diverged";
@@ -2348,14 +2472,31 @@ export async function mergePinnedObjectFenced(
   const run = opts.run ?? gitExec;
   const acquire = opts.acquireLock ?? defaultLockAcquirer;
   try {
-    const lockPath = await commitWorkLockPath(worktreePath, run);
-    const lock = await acquire(lockPath);
+    // (1) Pin the lock identity at acquisition — the flock lives at the worktree's OWN git
+    //     dir, so a moved admin dir must be detectable under the lock. [H3]
+    const id0 = await resolveLockIdentity(worktreePath, run);
+    if (id0 === null) {
+      return { kind: "defer", reason: "lock identity unresolved" };
+    }
+    const lock = await acquire(id0.lockPath);
     if (lock === null) {
       return { kind: "defer", reason: "commit-work lock timeout" };
     }
     try {
-      // (2) CAS: HEAD still at the pinned snapshot — any movement between observation
-      //     and this fence → defer (never merge into a target that drifted).
+      // (2) LOCK-IDENTITY CAS: re-derive under the lock; a remove/re-add that moved the
+      //     admin dir leaves us holding an obsolete lock over a replacement → defer. [H3]
+      const id1 = await resolveLockIdentity(worktreePath, run);
+      if (
+        id1 === null ||
+        id1.gitDir !== id0.gitDir ||
+        id1.commonDir !== id0.commonDir
+      ) {
+        return {
+          kind: "defer",
+          reason: "lock/git-dir identity replaced under the fence",
+        };
+      }
+      // (3) HEAD CAS: still at the pinned snapshot — any drift → defer.
       const head = await run(
         [
           "rev-parse",
@@ -2369,9 +2510,23 @@ export async function mergePinnedObjectFenced(
       if (head.code !== 0 || head.stdout.trim() !== opts.expectedHeadOid) {
         return { kind: "defer", reason: "target head moved under the fence" };
       }
-      // (3) FRESH registration: the exact path is a registered worktree on the target
-      //     branch. A path-replacement / re-registration / teardown → defer, NEVER a
-      //     silent merge into a swapped tree (the actor's cycle memo is never trusted here).
+      // (4) SOURCE CAS: the pinned source branch STILL resolves to the pinned oid — so the
+      //     untracked-collision probe and the merge below provably use the SAME object. [H4a]
+      const src = await run(
+        [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          "--end-of-options",
+          `refs/heads/${opts.sourceBranch}^{commit}`,
+        ],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (src.code !== 0 || src.stdout.trim() !== opts.sourceOid) {
+        return { kind: "defer", reason: "source moved under the fence" };
+      }
+      // (5) FRESH registration: the exact path is a registered worktree on the target
+      //     branch (a swap / re-registration / teardown → defer, never a merge into it).
       const listed = await listWorktreesResult(worktreePath, run);
       if (listed.kind !== "ok") {
         return {
@@ -2392,17 +2547,60 @@ export async function mergePinnedObjectFenced(
           reason: `target worktree registered on ${entry.branch ?? "(detached)"}, expected ${opts.targetBranch}`,
         };
       }
-      // (4) Clean, on-branch, residue-free right before the merge.
-      const ready = await mergeReadiness(worktreePath, opts.targetBranch, run);
+      // (6) STRICT readiness — tri-state pseudo-refs (an UNKNOWN in-progress probe DEFERS,
+      //     never a fail-open clean). [H4b]
+      const ready = await strictWorktreeReadiness(
+        worktreePath,
+        opts.targetBranch,
+        run,
+      );
       if (ready.kind !== "ready") {
         return {
           kind: "defer",
-          reason: `target not ready under lock: ${ready.kind}`,
+          reason: `target not ready under lock: ${ready.reason}`,
         };
       }
-      // (5) NO-OP arm PROVEN under the lock: the pinned source already contained in HEAD.
-      //     exit 0 = ancestor (nothing to do), exit 1 = not yet, anything else = UNKNOWN
-      //     (never certify already-integrated on an inconclusive probe).
+      // (7) UNTRACKED-COLLISION on the PINNED source oid — fail-CLOSED disjointness proof:
+      //     a failed/timed-out incoming-tree read defers rather than risking a clobber. [H4a]
+      const untracked = await run(
+        ["ls-files", "--others", "--exclude-standard"],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (untracked.code !== 0) {
+        return {
+          kind: "defer",
+          reason: `untracked probe ${untracked.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `exit ${untracked.code}`} under lock`,
+        };
+      }
+      const untrackedSet = new Set(
+        untracked.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0),
+      );
+      if (untrackedSet.size > 0) {
+        const tree = await run(
+          ["ls-tree", "-r", "--name-only", opts.sourceOid],
+          { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+        );
+        if (tree.code !== 0) {
+          return {
+            kind: "defer",
+            reason: `incoming-tree read ${tree.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `failed (exit ${tree.code})`} — cannot prove untracked-disjoint`,
+          };
+        }
+        const overlap = tree.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((p) => p.length > 0 && untrackedSet.has(p));
+        if (overlap.length > 0) {
+          return {
+            kind: "defer",
+            reason: `untracked would be clobbered: ${overlap.join(", ").slice(0, 160)}`,
+          };
+        }
+      }
+      // (8) NO-OP arm PROVEN under the lock: the pinned source already an ancestor of HEAD.
       const contained = await run(
         ["merge-base", "--is-ancestor", opts.sourceOid, "HEAD"],
         { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
@@ -2416,9 +2614,9 @@ export async function mergePinnedObjectFenced(
           reason: "under-lock source-ancestry inconclusive",
         };
       }
-      // (6) Merge the PINNED OBJECT — ff refuses to synthesize a merge (a raced non-ff
-      //     fails cleanly), divergence takes a clean two-parent merge classified by the
-      //     module-private grammar.
+      // (9) Merge the PINNED OBJECT — ff refuses to synthesize a merge (a raced non-ff fails
+      //     cleanly), divergence takes a clean two-parent merge; a content conflict carries
+      //     the exact pins for the incident receipt. [H4c]
       if (opts.strategy === "ff") {
         const ff = await run(["merge", "--ff-only", opts.sourceOid], {
           cwd: worktreePath,
@@ -2445,6 +2643,8 @@ export async function mergePinnedObjectFenced(
               kind: "conflict",
               conflictedFiles: outcome.conflictedFiles,
               stderr: outcome.stderr,
+              sourceOid: opts.sourceOid,
+              targetOid: opts.expectedHeadOid,
             };
           default:
             return {
@@ -2453,8 +2653,8 @@ export async function mergePinnedObjectFenced(
             };
         }
       }
-      // (7) POSITIVE post-checks: the pinned source is now an ancestor of HEAD AND the
-      //     tree is clean + on-branch. Only then is the integration proven.
+      // (10) POSITIVE post-checks: the pinned source is now an ancestor of HEAD AND the tree
+      //      is clean + on-branch (strict). Only then is the integration proven.
       const post = await run(
         ["merge-base", "--is-ancestor", opts.sourceOid, "HEAD"],
         { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
@@ -2462,7 +2662,7 @@ export async function mergePinnedObjectFenced(
       if (post.code !== 0) {
         return { kind: "defer", reason: "post-merge source-ancestry unproven" };
       }
-      const postReady = await mergeReadiness(
+      const postReady = await strictWorktreeReadiness(
         worktreePath,
         opts.targetBranch,
         run,
@@ -2470,7 +2670,7 @@ export async function mergePinnedObjectFenced(
       if (postReady.kind !== "ready") {
         return {
           kind: "defer",
-          reason: `post-merge tree not clean: ${postReady.kind}`,
+          reason: `post-merge tree not clean: ${postReady.reason}`,
         };
       }
       return { kind: "integrated" };
@@ -2481,6 +2681,202 @@ export async function mergePinnedObjectFenced(
     return {
       kind: "defer",
       reason: `fenced merge threw: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/** The outcome of a non-destructive lane reattach. */
+export type ReattachOutcome =
+  | { kind: "reattached" }
+  | { kind: "defer"; reason: string }
+  | { kind: "failed"; reason: string };
+
+/**
+ * Non-destructively REATTACH a preserved lane branch's missing/unregistered checkout —
+ * the recreate-elimination replacement for a lane whose branch survives but whose worktree
+ * is gone. A missing checkout has NO trustworthy per-worktree lock yet, so this runs under
+ * a STABLE git-common-dir structural lock ({@link baseMergeLockPath}) keyed to the repo's
+ * shared ref store. Under the lock: PIN the preserved branch ref oid (never create/reset a
+ * ref); prove via tri-state enumeration that the branch is registered NOWHERE and the exact
+ * path is unregistered; prove the path is ABSENT or holds ONLY the content-gated keeper
+ * husk (foreign content → defer, never overwritten); CAS the ref did not move; `git worktree
+ * add <path> <branch>` for the EXISTING ref (never `-b`); then POSITIVELY prove exact
+ * registration/path/branch, HEAD == the preserved ref, a strict-clean residue-free tree, and
+ * the dep-link plant. A partial add / link failure CONVERGES on retry while PRESERVING the
+ * ref — this function NEVER removes, resets, or deletes a ref. Producer-only; NEVER throws.
+ */
+export async function reattachLaneWorktree(
+  repoDir: string,
+  laneDir: string,
+  laneBranch: string,
+  run: GitRunner = gitExec,
+  ensureDepLink: (
+    sourceCheckout: string,
+    worktreePath: string,
+  ) => Promise<void> = ensureWorktreeDepLink,
+  acquireLock: LockAcquirer = defaultLockAcquirer,
+): Promise<ReattachOutcome> {
+  const refSpec = `refs/heads/${laneBranch}^{commit}`;
+  try {
+    const lockPath = await baseMergeLockPath(repoDir, run);
+    const lock = await acquireLock(lockPath);
+    if (lock === null) {
+      return { kind: "defer", reason: "base-merge lock timeout" };
+    }
+    try {
+      // Pin the PRESERVED branch ref oid — a reattach never creates or resets a ref.
+      const refProbe = await run(
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", refSpec],
+        { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      const refOid = refProbe.stdout.trim();
+      if (refProbe.code !== 0 || refOid === "") {
+        return {
+          kind: "defer",
+          reason: `preserved lane ref unresolved (${refProbe.code === 1 ? "absent" : refProbe.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${refProbe.code}`})`,
+        };
+      }
+      // Tri-state enumeration: the branch is registered NOWHERE, and the path is unregistered.
+      const listed = await listWorktreesResult(repoDir, run);
+      if (listed.kind !== "ok") {
+        return {
+          kind: "defer",
+          reason: `worktree registration probe ${listed.kind}`,
+        };
+      }
+      if (listed.value.some((e) => e.branch === `refs/heads/${laneBranch}`)) {
+        return {
+          kind: "defer",
+          reason: "lane branch already registered elsewhere",
+        };
+      }
+      if (listed.value.some((e) => samePath(e.path, laneDir))) {
+        return { kind: "defer", reason: "lane path already registered" };
+      }
+      // Path state: ABSENT or a content-gated keeper husk only; foreign content → defer.
+      const root = resolve(laneDir);
+      let pathState: "absent" | "husk" | "foreign";
+      try {
+        const st = await lstat(root);
+        pathState = !st.isDirectory()
+          ? "foreign"
+          : (await isResidueOnlyDir(root, root, true))
+            ? "husk"
+            : "foreign";
+      } catch (err) {
+        if (isEnoent(err)) {
+          pathState = "absent";
+        } else {
+          throw err;
+        }
+      }
+      if (pathState === "foreign") {
+        return {
+          kind: "defer",
+          reason: "lane path holds foreign content — never overwritten",
+        };
+      }
+      if (pathState === "husk") {
+        await pruneWorktreeHusk(repoDir, laneDir, run);
+      }
+      // CAS: the preserved ref did not move under the lock.
+      const refAgain = await run(
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", refSpec],
+        { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (refAgain.code !== 0 || refAgain.stdout.trim() !== refOid) {
+        return {
+          kind: "defer",
+          reason: "lane ref moved under the reattach lock",
+        };
+      }
+      // Reattach the EXISTING ref (never `-b`).
+      const add = await run(["worktree", "add", laneDir, laneBranch], {
+        cwd: repoDir,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
+      if (add.code !== 0) {
+        return {
+          kind: "defer",
+          reason: `worktree add ${add.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `failed (exit ${add.code}): ${(add.stdout + add.stderr).trim().slice(0, 140)}`} — ref preserved, retry`,
+        };
+      }
+      // POSITIVE postconditions — any miss defers PRESERVING the ref (converge next cycle).
+      const post = await listWorktreesResult(repoDir, run);
+      if (
+        post.kind !== "ok" ||
+        !post.value.some(
+          (e) =>
+            samePath(e.path, laneDir) &&
+            e.branch === `refs/heads/${laneBranch}`,
+        )
+      ) {
+        return {
+          kind: "defer",
+          reason: "reattach registration unproven — ref preserved, retry",
+        };
+      }
+      const headAfter = await run(
+        [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          "--end-of-options",
+          "HEAD^{commit}",
+        ],
+        { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (headAfter.code !== 0 || headAfter.stdout.trim() !== refOid) {
+        return {
+          kind: "defer",
+          reason: "reattach HEAD != preserved ref — ref preserved, retry",
+        };
+      }
+      const ready = await strictWorktreeReadiness(laneDir, laneBranch, run);
+      if (ready.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `reattached tree not clean: ${ready.reason} — ref preserved, retry`,
+        };
+      }
+      try {
+        await ensureDepLink(repoDir, laneDir);
+      } catch {
+        return {
+          kind: "defer",
+          reason: "dep-link plant threw — ref preserved, retry",
+        };
+      }
+      // Positively prove the top-level plant when the source carries dependencies.
+      let sourceHasDeps = false;
+      try {
+        await lstat(resolve(repoDir, WORKTREE_DEP_LINK_NAME));
+        sourceHasDeps = true;
+      } catch (err) {
+        if (!isEnoent(err)) throw err;
+      }
+      if (sourceHasDeps) {
+        let planted: string | undefined;
+        try {
+          planted = await readlink(resolve(laneDir, WORKTREE_DEP_LINK_NAME));
+        } catch {
+          planted = undefined;
+        }
+        if (!isWorktreeDepPlant(repoDir, WORKTREE_DEP_LINK_NAME, planted)) {
+          return {
+            kind: "defer",
+            reason: "dep-link plant unproven — ref preserved, retry",
+          };
+        }
+      }
+      return { kind: "reattached" };
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    return {
+      kind: "failed",
+      reason: `reattach threw: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }

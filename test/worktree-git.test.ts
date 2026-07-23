@@ -64,6 +64,8 @@ import {
   pruneBaselineScratchWorktrees,
   pruneWorktreeHusk,
   pruneWorktrees,
+  type ReattachOutcome,
+  reattachLaneWorktree,
   remotePushFastForwardable,
   removeScratchWorktree,
   removeWorktree,
@@ -3703,6 +3705,7 @@ test("losslessPremergeClean: a failed restore → retry (never proceeds to merge
 
 const FENCE_WT = "/wt/fn-1-foo.4";
 const FENCE_TGT = "keeper/epic/fn-1-foo--fn-1-foo.4";
+const FENCE_SRC = "keeper/epic/fn-1-foo--fn-1-foo.3";
 const FENCE_HEAD_OID = "a".repeat(40);
 const FENCE_SRC_OID = "b".repeat(40);
 const nullFenceLock: LockAcquirer = () => null;
@@ -3713,20 +3716,38 @@ function fencedGit(
     registeredBranch?: string | null; // the branch the path is registered on (null = absent)
     containedBefore?: boolean; // the source is ALREADY an ancestor of HEAD (the no-op arm)
     ffRefused?: boolean;
+    conflict?: boolean; // a divergent merge conflicts (aborts cleanly)
+    gitDirReplaced?: boolean; // the lock-identity git-dir differs under the lock (id1 ≠ id0)
+    sourceMoved?: boolean; // the pinned source branch resolves to a DIFFERENT oid under the lock
+    // a pseudo-ref probe reads INCONCLUSIVE (exit 0 + empty) instead of positively-absent
+    pseudoRefInconclusive?: "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD";
   } = {},
 ): { run: GitRunner; calls: string[] } {
   let merged = false;
+  let midMerge = false;
+  let gitDirReads = 0;
   const calls: string[] = [];
   const run: GitRunner = async (a) => {
     calls.push(a.join(" "));
     const has = (t: string): boolean => a.includes(t);
-    if (a[0] === "rev-parse" && has("--git-dir")) {
+    // cwd-aware lock identity — the git-dir/common-dir the flock is pinned to. The SECOND
+    // git-dir read (id1, under the lock) diverges when `gitDirReplaced`, so the lock-
+    // identity CAS proves a moved admin dir.
+    if (a[0] === "rev-parse" && has("--git-common-dir")) {
       return {
         code: 0,
         stdout: `${FENCE_WT}/.git\n`,
         stderr: "",
         signal: null,
       };
+    }
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      gitDirReads += 1;
+      const dir =
+        opts.gitDirReplaced && gitDirReads === 2
+          ? `${FENCE_WT}/.git-moved`
+          : `${FENCE_WT}/.git`;
+      return { code: 0, stdout: `${dir}\n`, stderr: "", signal: null };
     }
     if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
       return {
@@ -3735,6 +3756,39 @@ function fencedGit(
         stderr: "",
         signal: null,
       };
+    }
+    // SOURCE CAS — the pinned source branch still resolves to the pinned oid (or a DIFFERENT
+    // one under `sourceMoved`).
+    if (a[0] === "rev-parse" && has(`refs/heads/${FENCE_SRC}^{commit}`)) {
+      return {
+        code: 0,
+        stdout: `${opts.sourceMoved ? "e".repeat(40) : FENCE_SRC_OID}\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    // Pseudo-refs (strict readiness + nameForeignInProgress): MERGE_HEAD flips present while
+    // a conflict is mid-abort; every pseudo-ref is otherwise positively-absent unless the
+    // test forces an INCONCLUSIVE (exit 0 + empty) probe.
+    if (
+      a[0] === "rev-parse" &&
+      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+    ) {
+      if (has("MERGE_HEAD") && midMerge) {
+        return {
+          code: 0,
+          stdout: `${"c".repeat(40)}\n`,
+          stderr: "",
+          signal: null,
+        };
+      }
+      if (
+        opts.pseudoRefInconclusive !== undefined &&
+        has(opts.pseudoRefInconclusive)
+      ) {
+        return { code: 0, stdout: "", stderr: "", signal: null };
+      }
+      return { code: 1, stdout: "", stderr: "", signal: null };
     }
     if (a[0] === "worktree" && a[1] === "list") {
       if (opts.registeredBranch === null) {
@@ -3753,14 +3807,17 @@ function fencedGit(
         signal: null,
       };
     }
-    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
-      return { code: 1, stdout: "", stderr: "", signal: null };
-    }
     if (a[0] === "status") {
       return { code: 0, stdout: "", stderr: "", signal: null };
     }
     if (a[0] === "rev-parse" && has("--abbrev-ref")) {
       return { code: 0, stdout: `${FENCE_TGT}\n`, stderr: "", signal: null };
+    }
+    if (a[0] === "ls-files" && has("--others")) {
+      return { code: 0, stdout: "", stderr: "", signal: null }; // no untracked
+    }
+    if (a[0] === "ls-tree") {
+      return { code: 0, stdout: "", stderr: "", signal: null };
     }
     if (a[0] === "merge-base" && a[1] === "--is-ancestor") {
       if (merged) return { code: 0, stdout: "", stderr: "", signal: null }; // post-check → contained
@@ -3784,7 +3841,23 @@ function fencedGit(
       return { code: 0, stdout: "", stderr: "", signal: null };
     }
     if (a[0] === "merge" && a[1] === "--no-ff") {
+      if (opts.conflict) {
+        midMerge = true;
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "CONFLICT (content)",
+          signal: null,
+        };
+      }
       merged = true;
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "diff" && has("--diff-filter=U")) {
+      return { code: 0, stdout: "src/foo.ts\n", stderr: "", signal: null };
+    }
+    if (a[0] === "merge" && a[1] === "--abort") {
+      midMerge = false;
       return { code: 0, stdout: "", stderr: "", signal: null };
     }
     return { code: 0, stdout: "", stderr: "", signal: null };
@@ -3796,6 +3869,7 @@ test("mergePinnedObjectFenced: a lock timeout → defer (no CAS, no merge)", asy
   const { run, calls } = fencedGit();
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "diverged",
@@ -3811,6 +3885,7 @@ test("mergePinnedObjectFenced: the source already contained (proven under the lo
   const { run, calls } = fencedGit({ containedBefore: true });
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "ff",
@@ -3825,6 +3900,7 @@ test("mergePinnedObjectFenced: strategy ff, source ahead → integrated via `mer
   const { run, calls } = fencedGit();
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "ff",
@@ -3841,6 +3917,7 @@ test("mergePinnedObjectFenced: strategy diverged → integrated via `merge --no-
   const { run, calls } = fencedGit();
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "diverged",
@@ -3857,6 +3934,7 @@ test("mergePinnedObjectFenced: the target HEAD moved under the fence (CAS) → d
   const { run, calls } = fencedGit({ headOid: "d".repeat(40) });
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "diverged",
@@ -3873,6 +3951,7 @@ test("mergePinnedObjectFenced: the path is re-registered on ANOTHER branch → d
   const { run, calls } = fencedGit({ registeredBranch: "refs/heads/other" });
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "diverged",
@@ -3889,6 +3968,7 @@ test("mergePinnedObjectFenced: the path is UNREGISTERED under the fence → defe
   const { run, calls } = fencedGit({ registeredBranch: null });
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "diverged",
@@ -3905,6 +3985,7 @@ test("mergePinnedObjectFenced: a fast-forward REFUSED (raced non-ff) → defer, 
   const { run, calls } = fencedGit({ ffRefused: true });
   const out = await mergePinnedObjectFenced(FENCE_WT, {
     sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
     expectedHeadOid: FENCE_HEAD_OID,
     targetBranch: FENCE_TGT,
     strategy: "ff",
@@ -3915,4 +3996,242 @@ test("mergePinnedObjectFenced: a fast-forward REFUSED (raced non-ff) → defer, 
   if (out.kind === "defer")
     expect(out.reason).toContain("fast-forward refused");
   expect(calls.some((c) => c.includes("--no-ff"))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the git-dir identity is REPLACED under the lock (remove/re-add moved the admin dir) → defer, no merge", async () => {
+  const { run, calls } = fencedGit({ gitDirReplaced: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("identity replaced under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the pinned source moves between the probe and the merge → source-CAS defer, no merge", async () => {
+  const { run, calls } = fencedGit({ sourceMoved: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("source moved under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: an INCONCLUSIVE in-progress pseudo-ref probe → defer (never a fail-open clean), no merge", async () => {
+  const { run, calls } = fencedGit({ pseudoRefInconclusive: "MERGE_HEAD" });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("inconclusive");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: a divergent CONTENT conflict → conflict carrying the EXACT pinned sourceOid + target-arrival targetOid (aborted cleanly)", async () => {
+  const { run, calls } = fencedGit({ conflict: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    sourceBranch: FENCE_SRC,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("conflict");
+  if (out.kind === "conflict") {
+    expect(out.sourceOid).toBe(FENCE_SRC_OID);
+    expect(out.targetOid).toBe(FENCE_HEAD_OID);
+    expect(out.conflictedFiles).toContain("src/foo.ts");
+  }
+  expect(calls.some((c) => c === "merge --abort")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// reattachLaneWorktree — the non-destructive reattach of a preserved lane branch
+// whose worktree went missing/unregistered. The recreate-elimination replacement:
+// it NEVER removes, resets, or deletes a ref. Rule-driven git fake; a real temp
+// repo dir + an ABSENT lane path back the fs path-state / dep-link probes.
+// ---------------------------------------------------------------------------
+
+const REATTACH_BRANCH = "keeper/epic/fn-1-foo--fn-1-foo.4";
+const REATTACH_REF_OID = "a".repeat(40);
+
+function reattachGit(
+  repoDir: string,
+  laneDir: string,
+  laneBranch: string,
+  opts: {
+    refAbsent?: boolean; // the preserved ref is unresolved → defer
+    refMoved?: boolean; // the ref moves under the reattach lock (CAS) → defer
+    branchRegisteredElsewhere?: boolean; // the branch is registered on ANOTHER worktree → defer
+    pathRegistered?: boolean; // the lane path is ALREADY a registered worktree → defer
+    addFails?: boolean; // `git worktree add` fails → defer, ref preserved, retry
+    postUnregistered?: boolean; // the post-add registration is unproven → defer
+  } = {},
+): { run: GitRunner; calls: string[] } {
+  let added = false;
+  let refReads = 0;
+  const calls: string[] = [];
+  const run: GitRunner = async (a, o) => {
+    calls.push(a.join(" "));
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "rev-parse" && has("--git-common-dir")) {
+      return { code: 0, stdout: `${repoDir}/.git\n`, stderr: "", signal: null };
+    }
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      return {
+        code: 0,
+        stdout: `${o?.cwd ?? repoDir}/.git\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "rev-parse" && has(`refs/heads/${laneBranch}^{commit}`)) {
+      refReads += 1;
+      if (opts.refAbsent)
+        return { code: 1, stdout: "", stderr: "", signal: null };
+      const oid =
+        opts.refMoved && refReads === 2 ? "f".repeat(40) : REATTACH_REF_OID;
+      return { code: 0, stdout: `${oid}\n`, stderr: "", signal: null };
+    }
+    if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
+      return {
+        code: 0,
+        stdout: `${REATTACH_REF_OID}\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (
+      a[0] === "rev-parse" &&
+      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+    ) {
+      return { code: 1, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "status") {
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
+      return { code: 0, stdout: `${laneBranch}\n`, stderr: "", signal: null };
+    }
+    if (a[0] === "worktree" && a[1] === "list") {
+      const entries = ["worktree /repo\nbranch refs/heads/main"];
+      if (opts.branchRegisteredElsewhere) {
+        entries.push(`worktree /other\nbranch refs/heads/${laneBranch}`);
+      }
+      if (opts.pathRegistered || (added && !opts.postUnregistered)) {
+        entries.push(`worktree ${laneDir}\nbranch refs/heads/${laneBranch}`);
+      }
+      return {
+        code: 0,
+        stdout: `${entries.join("\n\n")}\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "worktree" && a[1] === "add") {
+      if (opts.addFails) {
+        return {
+          code: 128,
+          stdout: "",
+          stderr: "fatal: could not create work tree dir",
+          signal: null,
+        };
+      }
+      added = true;
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    return { code: 0, stdout: "", stderr: "", signal: null };
+  };
+  return { run, calls };
+}
+
+/** Run reattachLaneWorktree against a real temp repo dir + an ABSENT lane path. */
+async function driveReattach(
+  opts: Parameters<typeof reattachGit>[3] = {},
+): Promise<{ out: ReattachOutcome; calls: string[] }> {
+  const repoDir = mkdtempSync(join(tmpdir(), "keeper-reattach-"));
+  const laneDir = join(repoDir, "lane-absent"); // never created → path state "absent"
+  try {
+    const { run, calls } = reattachGit(repoDir, laneDir, REATTACH_BRANCH, opts);
+    const out = await reattachLaneWorktree(
+      repoDir,
+      laneDir,
+      REATTACH_BRANCH,
+      run,
+      async () => {}, // ensureDepLink noop
+      okLock,
+    );
+    return { out, calls };
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+  }
+}
+
+test("reattachLaneWorktree: a preserved branch + ABSENT checkout, branch registered nowhere → reattached (worktree add for the EXISTING ref, never `-b`)", async () => {
+  const { out, calls } = await driveReattach();
+  expect(out.kind).toBe("reattached");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(true);
+  expect(
+    calls.some((c) => c.startsWith("worktree add") && c.includes("-b")),
+  ).toBe(false);
+  // NEVER a ref delete / branch delete — a reattach preserves the ref.
+  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
+});
+
+test("reattachLaneWorktree: the preserved lane ref is unresolved → defer (never creates a ref)", async () => {
+  const { out, calls } = await driveReattach({ refAbsent: true });
+  expect(out.kind).toBe("defer");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("reattachLaneWorktree: the branch is already registered on ANOTHER worktree → defer to recovery (never overwritten)", async () => {
+  const { out, calls } = await driveReattach({
+    branchRegisteredElsewhere: true,
+  });
+  expect(out.kind).toBe("defer");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("reattachLaneWorktree: the lane PATH is already a registered worktree (mid-cycle-ready) → defer, no add", async () => {
+  const { out, calls } = await driveReattach({ pathRegistered: true });
+  expect(out.kind).toBe("defer");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("reattachLaneWorktree: the ref MOVES under the reattach lock (CAS) → defer, no add", async () => {
+  const { out, calls } = await driveReattach({ refMoved: true });
+  expect(out.kind).toBe("defer");
+  expect(calls.some((c) => c.startsWith("worktree add"))).toBe(false);
+});
+
+test("reattachLaneWorktree: a `worktree add` failure → defer, the ref is PRESERVED (no delete), converge on retry", async () => {
+  const { out, calls } = await driveReattach({ addFails: true });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("ref preserved");
+  expect(calls.some((c) => c.startsWith("update-ref -d"))).toBe(false);
+  expect(calls.some((c) => c.startsWith("branch -"))).toBe(false);
 });

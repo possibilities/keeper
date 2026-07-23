@@ -203,6 +203,7 @@ import {
   type LaneMergedEntry,
   nextIncidentOwnerAttachmentMarker,
   type PlannedLaunch,
+  type ProgressActorWorkItem,
   parentBranchFor,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
@@ -296,6 +297,7 @@ import {
   probeLosslesslyCleanableUntracked as gitProbeLosslesslyCleanableUntracked,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
   pruneWorktrees as gitPruneWorktrees,
+  reattachLaneWorktree as gitReattachLaneWorktree,
   remotePushFastForwardable as gitRemotePushFastForwardable,
   removeWorktree as gitRemoveWorktree,
   resolveDefaultBranch as gitResolveDefaultBranch,
@@ -2061,19 +2063,21 @@ export interface WorktreeDriver {
     }[]
   >;
   /**
-   * The parts-6 PROGRESS ACTOR (producer-only, once per cycle): integrate a blocking done
-   * sibling's rib into each sibling-source-gate HELD dependent's EXISTING stale lane so the
-   * gate clears — the deadlock the target-selection seam introduces. Runs the shared
-   * {@link runProgressActor} with the driver's own `run` + commit-work lock. Optional so
-   * existing driver fakes stay byte-compatible.
+   * The parts-6 PROGRESS ACTOR (producer-only, once per cycle): effect the gate producer's
+   * typed {@link ProgressActorWorkItem}s — integrate a blocking done sibling's pinned source
+   * into the resolved target, or reattach a preserved lane — so the sibling-source gate
+   * clears. Runs the shared {@link runProgressActor} with the driver's own `run` + commit-
+   * work lock; the caller injects the H7 fresh-authority recheck. Optional so existing
+   * driver fakes stay byte-compatible.
    */
   progressActor?(
-    heldTaskIds: ReadonlySet<string>,
+    workItems: readonly ProgressActorWorkItem[],
     epics: readonly Epic[],
     worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
     worktreesRoot: string | undefined,
     laneLiveness: LaneMaintenanceProbe | undefined,
     hasActiveResolver: (epicId: string) => boolean,
+    recheckAuthority: (item: ProgressActorWorkItem) => ProgressActorAuthority,
   ): Promise<ProgressActorOutcome>;
 }
 
@@ -5327,6 +5331,64 @@ export async function resolveTaskTarget(
   };
 }
 
+/** The first UNMET sibling-source obligation for a dependent's target base, or `contained`.
+ *  `rib` = a present rib not yet an ancestor (merge THAT rib); `canonical-base` = a torn-down
+ *  rib whose landed work is provable only via the epic base (merge the base); both carry the
+ *  blocking parent's `rib` name for the operator display the gate already renders. */
+export type BlockingObligation =
+  | { kind: "rib"; rib: string; sourceBranch: string }
+  | { kind: "canonical-base"; rib: string; sourceBranch: string }
+  | { kind: "contained" };
+
+/**
+ * The SHARED containment classifier BOTH the sibling-source gate and the parts-6 progress
+ * actor consume — the FIRST done-sibling rib the resolved target base does not yet contain,
+ * and HOW to integrate it — so neither re-derives the other's decision. Preserves the gate's
+ * exact per-parent containment test:
+ *  - rib PRESENT ∧ NOT an ancestor of the target (or an inconclusive/errored ancestry probe,
+ *    which `ribAncestorOfTarget` collapses to `false`) → a `rib` obligation;
+ *  - rib DEFINITIVELY ABSENT (torn down) → contained-by-teardown is proven ONLY relative to
+ *    the CANONICAL epic base: a PRE-CUT lane forking off the epic base ITSELF stands (absence
+ *    is teardown), else the epic base must be PRESENT ∧ an ancestor of the target — the
+ *    pre-cut-off-a-DISTINCT-fork-source AND the existing-lane cases BOTH require that positive
+ *    proof (an absent/UNKNOWN base HOLDS) → an unproven teardown yields a `canonical-base`
+ *    obligation (integrate the base, which absorbed the rib);
+ *  - every done rib contained → `contained`.
+ * The FIRST blocking obligation wins. `laneSet` MUST be `ok` (the caller defers otherwise).
+ * The two ancestry probes are injected so the caller shares its per-cycle memos. NEVER throws.
+ */
+async function firstBlockingObligation(
+  doneParents: readonly Task[],
+  epicId: string,
+  laneSet: { ok: true; branches: ReadonlySet<string> },
+  target: { targetBranch: string; existing: boolean },
+  epicBase: string,
+  ribAncestorOfTarget: (rib: string, targetBranch: string) => Promise<boolean>,
+  epicBaseAncestorOfTarget: (
+    epicBaseBranch: string,
+    targetBranch: string,
+  ) => Promise<boolean>,
+): Promise<BlockingObligation> {
+  for (const parent of doneParents) {
+    const rib = ribBranchFor(epicId, parent.task_id);
+    if (!laneSet.branches.has(rib)) {
+      const contained =
+        (!target.existing && target.targetBranch === epicBase) ||
+        (laneSet.branches.has(epicBase) &&
+          (await epicBaseAncestorOfTarget(epicBase, target.targetBranch)));
+      if (!contained) {
+        return { kind: "canonical-base", rib, sourceBranch: epicBase };
+      }
+    } else {
+      const contained = await ribAncestorOfTarget(rib, target.targetBranch);
+      if (!contained) {
+        return { kind: "rib", rib, sourceBranch: rib };
+      }
+    }
+  }
+  return { kind: "contained" };
+}
+
 /**
  * Compute the EPHEMERAL intra-epic sibling-source defer map, keyed PER task id: a
  * NON-DONE dependent task → the blocking reason. That reason ALWAYS names a DONE
@@ -5374,8 +5436,15 @@ export async function computeDeferredSiblingSources(
     worktreePath: string,
     branch: string,
   ) => Promise<AssignmentWorktreeReadiness>,
-): Promise<Map<string, string>> {
+): Promise<{
+  deferred: Map<string, string>;
+  workItems: ProgressActorWorkItem[];
+}> {
   const deferred = new Map<string, string>();
+  // The typed progress-actor work items — the SHARED gate↔actor seam. Producer-only; the
+  // pure fold never reads them. Emitted alongside each hold so the actor mutates the EXACT
+  // lane the gate resolved, with zero re-enumeration.
+  const workItems: ProgressActorWorkItem[] = [];
 
   // Per-repo memo so N dependents in one repo enumerate lanes ONCE. A throwing probe
   // degrades to the conservative value (`{ ok: false }` enumeration → DEFER), never out
@@ -5528,63 +5597,100 @@ export async function computeDeferredSiblingSources(
           if (target.kind === "repair-needed") {
             // An existing lane whose worktree failed readiness — HOLD naming the rib +
             // readiness reason (the actor consumes the SAME repair-needed value; the gate
-            // never clears on branch content while the worktree is not ready).
+            // never clears on branch content while the worktree is not ready). Every
+            // repair-needed hold emits a REATTACH work item: the actor + the reattach fence
+            // (H8) prove fresh POSITIVE missing/unregistered/stale-admin candidacy and DEFER
+            // every non-candidate (dirty/off-branch/mid-op/foreign/registered-elsewhere/
+            // UNKNOWN) to recovery ownership; a mid-cycle-ready lane defers to the next gate.
             deferred.set(
               dependent.task_id,
               `${firstRib()} (assignment-worktree-${target.readiness.kind}: ${target.readiness.detail})`,
             );
+            workItems.push({
+              epicId: epic.epic_id,
+              repoDir,
+              taskId: dependent.task_id,
+              targetBranch: target.targetBranch,
+              worktreePath: target.worktreePath,
+              existing: true,
+              sourceObligation: "reattach",
+              sourceBranch: target.targetBranch,
+            });
             continue;
           }
-          for (const parent of doneParents) {
-            const rib = ribBranchFor(epic.epic_id, parent.task_id);
-            let contained: boolean;
-            if (!laneSet.ok) {
-              contained = false; // defensive — resolveTaskTarget already deferred
-            } else if (!laneSet.branches.has(rib)) {
-              // P0-A: an ABSENT rib is contained-by-teardown ONLY relative to the CANONICAL
-              // fan-in sink (the epic base), NEVER an arbitrary already-cut dependent branch.
-              // For an EXISTING lane require POSITIVE evidence: the epic base (which absorbed
-              // the torn-down rib) must be PRESENT AND an ancestor of THAT lane. A present base
-              // not-ancestor/errored → HOLD; and the epic base ALSO ABSENT is NOT proof the
-              // surviving lane contains the source (it may be a fresh-epoch transition, a
-              // partial teardown, or inconsistent state) → HOLD until a fresh base is
-              // provisioned and integrated. A PRE-CUT lane forks off the canonical base
-              // region, so the teardown proof stands (absent → contained).
-              if (target.existing) {
-                contained =
-                  laneSet.branches.has(epicBase) &&
-                  (await epicBaseAncestorOfTarget(
-                    repoDir,
-                    epicBase,
-                    target.targetBranch,
-                  ));
-              } else {
-                contained = true;
-              }
-            } else {
-              // Present: contained IFF an ancestor of the RESOLVED target base.
-              // `gitIsAncestorOf` → false covers not-ancestor AND an errored probe.
-              contained = await gitIsAncestorOf(
-                repoDir,
-                rib,
-                target.targetBranch,
-                run,
+          // target.kind === "target". Classify the FIRST unmet obligation via the SHARED
+          // helper (the P0-A canonical-base teardown proof + the pre-cut gate correction:
+          // an absent rib is teardown-contained relative ONLY to the canonical epic base, so
+          // a pre-cut lane forking off a DISTINCT source must positively prove the base
+          // reaches that source, else HOLD).
+          if (!laneSet.ok) {
+            continue; // defensive — resolveTaskTarget already deferred
+          }
+          const obligation = await firstBlockingObligation(
+            doneParents,
+            epic.epic_id,
+            laneSet,
+            { targetBranch: target.targetBranch, existing: target.existing },
+            epicBase,
+            (rib, tgt) => gitIsAncestorOf(repoDir, rib, tgt, run),
+            (base, tgt) => epicBaseAncestorOfTarget(repoDir, base, tgt),
+          );
+          if (obligation.kind === "contained") {
+            continue;
+          }
+          // A blocking obligation. Name the blocking parent's rib for the operator display
+          // (the gate's established naming), regardless of the integration source.
+          deferred.set(dependent.task_id, obligation.rib);
+          if (target.existing) {
+            // An EXISTING dependent lane — integrate the pinned source into its OWN checkout.
+            workItems.push({
+              epicId: epic.epic_id,
+              repoDir,
+              taskId: dependent.task_id,
+              targetBranch: target.targetBranch,
+              worktreePath: target.worktreePath,
+              existing: true,
+              sourceObligation: obligation.kind,
+              sourceBranch: obligation.sourceBranch,
+            });
+          } else {
+            // PRE-CUT retro-fan-in: the dependent's lane is not cut, so integrate into the
+            // FORK SOURCE's checkout — but ONLY when it is a positively registered/ready
+            // lane (an unidentifiable or not-ready fork source → NO item: provision / the
+            // pending-integration owner clears it). The item targets THAT fork-source
+            // branch/path, never the dependent's future assignment path.
+            const forkAssignment = plan.assignments.find(
+              (a) => !a.isCloseSink && a.branch === target.targetBranch,
+            );
+            if (forkAssignment !== undefined) {
+              const forkReady = await effectiveReadiness(
+                forkAssignment.worktreePath,
+                forkAssignment.branch,
               );
-            }
-            if (!contained) {
-              deferred.set(dependent.task_id, rib);
-              break; // first blocking rib wins — the dependent is held regardless of rest
+              if (forkReady.kind === "ready") {
+                workItems.push({
+                  epicId: epic.epic_id,
+                  repoDir,
+                  taskId: dependent.task_id,
+                  targetBranch: forkAssignment.branch,
+                  worktreePath: forkAssignment.worktreePath,
+                  existing: true,
+                  sourceObligation: obligation.kind,
+                  sourceBranch: obligation.sourceBranch,
+                });
+              }
             }
           }
         } catch {
           // A probe threw — DEFER this dependent conservatively (an inconclusive probe
-          // must never proceed: a stale fork is permanent). Names the first done rib.
+          // must never proceed: a stale fork is permanent). Names the first done rib. NO
+          // work item: nothing was positively resolved to act on.
           deferred.set(dependent.task_id, firstRib());
         }
       }
     }
   }
-  return deferred;
+  return { deferred, workItems };
 }
 
 /**
@@ -9401,20 +9507,22 @@ export function createWorktreeDriver(
       );
     },
     progressActor(
-      heldTaskIds,
+      workItems,
       epics,
       worktreeRepoByEpicId,
       worktreesRoot,
       laneLiveness,
       hasActiveResolver,
+      recheckAuthority,
     ) {
       return runProgressActor(
-        heldTaskIds,
+        workItems,
         epics,
         worktreeRepoByEpicId,
         worktreesRoot,
         laneLiveness,
         hasActiveResolver,
+        recheckAuthority,
         run,
         acquireLock,
       );
@@ -12520,8 +12628,15 @@ export type RibIntegrationOutcome =
    *  at the effect boundary, never on a pre-lock read: a positive no-op. */
   | { kind: "already-integrated" }
   /** A GENUINE content conflict — the merge was aborted cleanly (the target's exact
-   *  arrival state + its committed WIP restored); route it to a fan-in incident. */
-  | { kind: "conflict"; conflictedFiles: string[]; stderr: string }
+   *  arrival state + its committed WIP restored); route it to a fan-in incident, whose
+   *  receipt is minted from the exact PINNED `sourceOid` + target-arrival `targetOid`. */
+  | {
+      kind: "conflict";
+      conflictedFiles: string[];
+      stderr: string;
+      sourceOid: string;
+      targetOid: string;
+    }
   /** Inconclusive / raced / locked / structural — retry next cycle, no mutation stuck. */
   | { kind: "defer"; reason: string };
 
@@ -12574,6 +12689,7 @@ export async function integratePinnedRib(
       run,
     );
     let sourceOid: string;
+    let sourceBranchUsed = sourceBranch;
     if (rib.kind === "oid") {
       sourceOid = rib.oid;
     } else if (rib.kind === "absent") {
@@ -12589,6 +12705,7 @@ export async function integratePinnedRib(
         };
       }
       sourceOid = base.oid;
+      sourceBranchUsed = epicBaseBranch;
     } else {
       return { kind: "defer", reason: `source ref unresolved (${rib.detail})` };
     }
@@ -12620,6 +12737,7 @@ export async function integratePinnedRib(
     //     positive post-checks.
     return gitMergePinnedObjectFenced(dir, {
       sourceOid,
+      sourceBranch: sourceBranchUsed,
       expectedHeadOid: targetOid,
       targetBranch,
       strategy,
@@ -12631,343 +12749,6 @@ export async function integratePinnedRib(
   }
 }
 
-/** The regime a held dependent LANE is in for integrating a rib — the destructive-edge
- *  gate keyed on COMMITTED WIP vs UNCOMMITTED dirt (the two are different regimes). */
-export type LaneIntegrationRegime =
-  /** Clean tracked tree, on-branch, no residue, AND unique committed WIP → the rib may be
-   *  MERGED into the lane (the only mutation path for a WIP lane); benign untracked files
-   *  are permitted only when proven disjoint from the incoming object. */
-  | { kind: "merge" }
-  /** No unique commits AND fully clean (tracked + NO untracked) + residue-free + on-branch
-   *  → the lane may be RECREATED off the fresh base (removal destroys nothing). */
-  | { kind: "recreate" }
-  /** Any uncommitted/staged/untracked-overlapping/in-progress residue, or an inconclusive
-   *  probe → DEFER to the dead-writer sweep / dirt-recovery ownership; never mutate. */
-  | { kind: "defer"; reason: string };
-
-/**
- * Classify a held dependent LANE's integration regime, honoring the committed-WIP vs
- * uncommitted-dirt split (they are DIFFERENT regimes, and only committed WIP earns the
- * merge path). `mergeReadiness` (which reads `--untracked-files=no`) establishes tracked
- * cleanliness + on-branch + residue-freedom; a positive `dirty`/`mid-merge`/`off-branch`
- * DEFERS to dirt/recovery ownership. Then:
- *  - unique COMMITS present (rev-list `base..lane` non-empty) → `merge`, but benign
- *    UNTRACKED files are allowed ONLY when the incoming object's path set is provably
- *    DISJOINT from them (the established would-clobber probe); overlap or UNKNOWN clobber
- *    evidence DEFERS (never risk overwriting untracked work);
- *  - NO unique commits → `recreate`, but ANY untracked file blocks it UNCONDITIONALLY
- *    (removal could destroy untracked data);
- *  - any inconclusive probe → DEFER.
- * Producer-only reads; NEVER throws. The no-owner/no-resolver/no-claim gate is the
- * orchestrator's, NOT this probe's.
- */
-export async function probeLaneIntegrationRegime(
-  laneDir: string,
-  laneBranch: string,
-  forkBaseBranch: string,
-  incomingSourceOid: string,
-  run: WorktreeGitRunner = gitExec,
-): Promise<LaneIntegrationRegime> {
-  try {
-    const ready = await gitMergeReadiness(laneDir, laneBranch, run);
-    if (ready.kind === "mid-merge") {
-      return {
-        kind: "defer",
-        reason: `mid-merge residue (MERGE_HEAD=${ready.mergeHead}) — dirt/recovery owns it`,
-      };
-    }
-    if (ready.kind === "off-branch") {
-      return { kind: "defer", reason: `off-branch (HEAD=${ready.head})` };
-    }
-    if (ready.kind === "dirty") {
-      return {
-        kind: "defer",
-        reason: `tracked dirt / in-progress residue: ${ready.detail}`,
-      };
-    }
-    if (ready.kind !== "ready") {
-      return { kind: "defer", reason: `lane not ready: ${ready.kind}` };
-    }
-    // Unique committed WIP: commits on the lane not in its fork base.
-    const wip = await run(
-      [
-        "rev-list",
-        "--count",
-        `refs/heads/${forkBaseBranch}..refs/heads/${laneBranch}`,
-      ],
-      { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-    );
-    if (wip.code !== 0) {
-      return {
-        kind: "defer",
-        reason: `unique-commit probe inconclusive (${wip.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${wip.code}`})`,
-      };
-    }
-    // STRICT whole-output parse: `Number.parseInt` would read "0garbage" as 0 (→ the
-    // DESTRUCTIVE recreate arm) and "-5" as a negative; only an exact non-negative integer
-    // is a count, anything else DEFERS.
-    const wipStr = wip.stdout.trim();
-    if (!/^(0|[1-9][0-9]*)$/.test(wipStr)) {
-      return {
-        kind: "defer",
-        reason: `unique-commit probe returned a non-count (${JSON.stringify(wipStr.slice(0, 40))})`,
-      };
-    }
-    const wipCount = Number.parseInt(wipStr, 10);
-    // Untracked set (mergeReadiness ignored these; they gate BOTH arms differently).
-    const untrackedR = await run(
-      ["ls-files", "--others", "--exclude-standard"],
-      {
-        cwd: laneDir,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      },
-    );
-    if (untrackedR.code !== 0) {
-      return {
-        kind: "defer",
-        reason: `untracked probe inconclusive (${untrackedR.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${untrackedR.code}`})`,
-      };
-    }
-    const untracked = untrackedR.stdout
-      .split("\n")
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0);
-
-    if (wipCount > 0) {
-      // COMMITTED WIP → the MERGE arm.
-      if (untracked.length === 0) {
-        return { kind: "merge" };
-      }
-      // Benign untracked files are permitted ONLY when PROVABLY disjoint from the incoming
-      // object's tree. A STRICT direct probe (`ls-tree` of the pinned incoming oid): a
-      // failed / timed-out read fail-CLOSES to defer — it cannot prove disjointness, so it
-      // must never fall through to a merge that could clobber untracked work.
-      const incomingR = await run(
-        ["ls-tree", "-r", "--name-only", incomingSourceOid],
-        { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-      );
-      if (incomingR.code !== 0) {
-        return {
-          kind: "defer",
-          reason: `incoming-tree read ${incomingR.code === GIT_SPAWN_TIMEOUT_CODE ? "timed out" : `failed (exit ${incomingR.code})`} — cannot prove untracked-disjoint`,
-        };
-      }
-      const incomingSet = new Set(
-        incomingR.stdout
-          .split("\n")
-          .map((p) => p.trim())
-          .filter((p) => p.length > 0),
-      );
-      const overlap = untracked.filter((p) => incomingSet.has(p));
-      if (overlap.length > 0) {
-        return {
-          kind: "defer",
-          reason: `untracked would be clobbered by the merge: ${overlap.join(", ").slice(0, 160)}`,
-        };
-      }
-      return { kind: "merge" };
-    }
-    // NO committed WIP → the RECREATE arm — any untracked file blocks it unconditionally.
-    if (untracked.length > 0) {
-      return {
-        kind: "defer",
-        reason: `untracked files present — recreate would destroy them: ${untracked.join(", ").slice(0, 160)}`,
-      };
-    }
-    return { kind: "recreate" };
-  } catch (err) {
-    return { kind: "defer", reason: `regime probe threw: ${errMsg(err)}` };
-  }
-}
-
-/** The outcome of recreating a clean, no-WIP dependent lane off its fresh base. */
-export type LaneRecreateOutcome =
-  | { kind: "recreated" }
-  | { kind: "defer"; reason: string }
-  | { kind: "failed"; reason: string };
-
-/**
- * Recreate a clean, no-committed-WIP dependent lane off its FRESH base — the non-
- * destructive path for a stale lane that carries nothing to preserve. The caller's
- * {@link probeLaneIntegrationRegime} → `recreate` verdict is PRE-lock evidence; this
- * re-proves the FULL eligibility set UNDER the commit-work flock, IMMEDIATELY before the
- * destructive removal, so a commit / dirt / registration swap that arrived after the pre-
- * probe ABORTS with ZERO mutation:
- *  1. flock (a timeout → defer, never a freeze);
- *  2. FRESH registration — the exact path is a registered worktree on `laneBranch`;
- *  3. {@link gitMergeReadiness} clean + on-branch + residue-free;
- *  4. STRICT unique-commit re-count == 0 (a commit that arrived after the pre-probe → defer,
- *     NEVER recreate over WIP) and untracked ABSENT (recreate would destroy them);
- *  5. capture the lane HEAD oid, remove the worktree WITHOUT force (a raced dirty tree
- *     REFUSES → defer), content-gated `.claude`-husk sweep of the leftover dir;
- *  6. CAS branch delete (`git update-ref -d refs/heads/<lane> <capturedOid>`) — a branch
- *     that moved between capture and delete REFUSES → defer, NEVER a `-D` that loses commits;
- *  7. re-cut the lane off the FRESH base (`ensureWorktree` creates the branch AT the base)
- *     and restore its dep link; the ok registration is the POSTCONDITION proof.
- * Producer-only; NEVER throws.
- */
-export async function recreateLaneOffBase(
-  repoDir: string,
-  laneDir: string,
-  laneBranch: string,
-  freshBaseBranch: string,
-  run: WorktreeGitRunner = gitExec,
-  ensureDepLink: (
-    sourceCheckout: string,
-    worktreePath: string,
-  ) => Promise<void> = gitEnsureWorktreeDepLink,
-  acquireLock?: LockAcquirer,
-): Promise<LaneRecreateOutcome> {
-  try {
-    const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
-    const lockPath = await gitCommitWorkLockPath(laneDir, run);
-    const lock = await acquire(lockPath);
-    if (lock === null) {
-      return { kind: "defer", reason: "commit-work lock timeout" };
-    }
-    try {
-      // (2) FRESH registration re-prove — the exact path is a registered worktree on the
-      //     lane branch (a swap / re-registration between the pre-probe and here → defer).
-      const listed = await gitListWorktreesResult(laneDir, run);
-      if (listed.kind !== "ok") {
-        return {
-          kind: "defer",
-          reason: `worktree registration probe ${listed.kind} under lock`,
-        };
-      }
-      const entry = listed.value.find(
-        (e) =>
-          stripTrailingSlashPath(e.path) === stripTrailingSlashPath(laneDir),
-      );
-      if (entry === undefined || entry.branch !== `refs/heads/${laneBranch}`) {
-        return {
-          kind: "defer",
-          reason:
-            entry === undefined
-              ? "lane registration absent under lock"
-              : `lane registered on ${entry.branch ?? "(detached)"}, expected ${laneBranch}`,
-        };
-      }
-      // (3) Clean, on-branch, residue-free.
-      const ready = await gitMergeReadiness(laneDir, laneBranch, run);
-      if (ready.kind !== "ready") {
-        return {
-          kind: "defer",
-          reason: `lane not clean under lock: ${ready.kind}`,
-        };
-      }
-      // (4) STRICT unique-commit re-count — a commit arrived after the pre-probe → defer,
-      //     NEVER recreate over committed WIP.
-      const wip = await run(
-        [
-          "rev-list",
-          "--count",
-          `refs/heads/${freshBaseBranch}..refs/heads/${laneBranch}`,
-        ],
-        { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-      );
-      if (wip.code !== 0) {
-        return {
-          kind: "defer",
-          reason: `unique-commit re-probe inconclusive under lock (${wip.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${wip.code}`})`,
-        };
-      }
-      const wipStr = wip.stdout.trim();
-      if (!/^(0|[1-9][0-9]*)$/.test(wipStr)) {
-        return {
-          kind: "defer",
-          reason: `unique-commit re-probe returned a non-count (${JSON.stringify(wipStr.slice(0, 40))})`,
-        };
-      }
-      if (wipStr !== "0") {
-        return {
-          kind: "defer",
-          reason: `commit arrived after the pre-probe (${wipStr} unique) — never recreate over WIP`,
-        };
-      }
-      // Untracked ABSENT — a recreate removes the tree, so any untracked file would be lost.
-      const untracked = await run(
-        ["ls-files", "--others", "--exclude-standard"],
-        { cwd: laneDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-      );
-      if (untracked.code !== 0) {
-        return {
-          kind: "defer",
-          reason: `untracked re-probe inconclusive under lock (${untracked.code === GIT_SPAWN_TIMEOUT_CODE ? "timeout" : `exit ${untracked.code}`})`,
-        };
-      }
-      if (untracked.stdout.split("\n").some((l) => l.trim().length > 0)) {
-        return {
-          kind: "defer",
-          reason:
-            "untracked files arrived after the pre-probe — never recreate over them",
-        };
-      }
-      // (5) Capture the lane HEAD for the CAS delete, then remove WITHOUT force.
-      const laneHead = await revParseOid(laneDir, "HEAD^{commit}", run);
-      if (laneHead.kind !== "oid") {
-        return {
-          kind: "defer",
-          reason: `lane head unresolved under lock (${laneHead.kind === "absent" ? "absent" : laneHead.detail})`,
-        };
-      }
-      const laneHeadOid = laneHead.oid;
-      const removed = await gitRemoveWorktree(repoDir, laneDir, run);
-      if (removed.kind === "dirty") {
-        return {
-          kind: "defer",
-          reason: `worktree remove refused (raced dirty): ${removed.stderr.slice(0, 160)}`,
-        };
-      }
-      // Content-gated husk sweep — a residue-only `.claude` dir git can leave behind.
-      // Best-effort: teardown already succeeded, so a sweep hiccup is not a failure.
-      try {
-        await gitPruneWorktreeHusk(repoDir, laneDir, run);
-      } catch {
-        // swallow — the husk sweep never gates the recreate.
-      }
-      // (6) CAS branch delete — refuse (defer) if the branch moved after the capture, so a
-      //     racing commit can never be force-deleted.
-      const del = await run(
-        ["update-ref", "-d", `refs/heads/${laneBranch}`, laneHeadOid],
-        { cwd: repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
-      );
-      if (del.code !== 0) {
-        return {
-          kind: "defer",
-          reason: `lane branch moved after removal (CAS delete refused): ${(del.stdout + del.stderr).trim().slice(0, 160)}`,
-        };
-      }
-      // (7) Re-cut off the FRESH base and restore the dep link.
-      const ensured = await gitEnsureWorktreeResult(
-        repoDir,
-        laneDir,
-        laneBranch,
-        freshBaseBranch,
-        run,
-      );
-      if (ensured.kind === "timeout" || ensured.kind === "inconclusive") {
-        return {
-          kind: "defer",
-          reason: `could not re-cut ${laneBranch} off ${freshBaseBranch}${ensured.kind === "inconclusive" ? ` — ${ensured.detail}` : " (timeout)"}`,
-        };
-      }
-      if (ensured.kind === "error") {
-        return {
-          kind: "failed",
-          reason: `lane recreate failed: ${ensured.detail}`,
-        };
-      }
-      await ensureDepLink(repoDir, laneDir);
-      return { kind: "recreated" };
-    } finally {
-      lock.release();
-    }
-  } catch (err) {
-    return { kind: "failed", reason: `lane recreate threw: ${errMsg(err)}` };
-  }
-}
-
 /** A transient progress-actor failure (a positively-failed recreate) surfaced as a
  *  visible `work::<taskId>` `dispatch_failures` row — distinct from the SILENT defers. */
 export interface ProgressActorFailure {
@@ -12976,13 +12757,18 @@ export interface ProgressActorFailure {
   dir: string | null;
 }
 
-/** A genuine content conflict integrating a rib into a held lane — routed to a
- *  `work::<taskId>` `worktree-merge-conflict` fan-in incident (no destruction). */
+/** A genuine content conflict integrating a pinned source into a held lane — routed to a
+ *  `work::<taskId>` `worktree-merge-conflict` fan-in incident (no destruction). The receipt
+ *  is minted from the EXACT PINNED `sourceOid` (+ its `sourceClass`) and target-arrival
+ *  `targetOid`, never movable-branch prose, so a later ref move can never mis-attribute it. */
 export interface ProgressActorEscalation {
   taskId: string;
   reason: string;
   dir: string | null;
   conflictedFiles: string[];
+  sourceOid: string;
+  sourceClass: "rib" | "canonical-base";
+  targetOid: string;
 }
 
 /** The parts-6 progress actor's per-cycle result — fed the SAME resolved / failures /
@@ -12995,35 +12781,50 @@ export interface ProgressActorOutcome {
   integratedAny: boolean;
 }
 
+/** The H7 FRESH-AUTHORITY recheck verdict, read LIVE at the effect boundary (never the cycle
+ *  snapshot): `clear` = no live claimant → proceed; `held` = a claimant appeared → zero
+ *  mutation; `unknown` = inconclusive / instance-drift → zero mutation (fail closed). */
+export type ProgressActorAuthority = "clear" | "held" | "unknown";
+
 /**
- * The parts-6 PROGRESS ACTOR: scan the sibling-source-gate's HELD dependents INDEPENDENTLY
- * of the launch list and integrate a blocking DONE sibling's rib into the dependent's
- * EXISTING stale lane — the deadlock the target-selection seam introduces, since nothing
- * else integrates a rib into an existing lane. Producer-only git side effects under the
- * commit-work flock; NEVER throws.
+ * The parts-6 PROGRESS ACTOR: consume the gate producer's typed
+ * {@link ProgressActorWorkItem}s and effect each — integrate a blocking DONE sibling's
+ * pinned source into the target the gate already resolved, or non-destructively REATTACH a
+ * preserved lane whose worktree is missing/unregistered — so the sibling-source gate clears
+ * the deadlock the target-selection seam introduces. Producer-only git side effects under
+ * the commit-work flock (integration) or a stable structural lock (reattach); NEVER throws.
+ * There is NO branch deletion / lane recreate anywhere — a preserved ref is only ever
+ * reattached, never dropped.
  *
- * Per held dependent, on the SAME {@link prepareWorktreeGeometry} the gate + dispatch
- * consume: a LIVE resolver / owner / claim (incl. a stopped-but-unreleased claim, via the
- * shared {@link LaneMaintenanceProbe}) leaves the target UNTOUCHED. Only an EXISTING lane
- * (positively enumerated) whose branch is missing a done rib is acted on — a pre-cut lane
- * is the pending-integration owner's / provision's, never the actor's. The strategy, keyed
- * on {@link probeLaneIntegrationRegime}:
- *  - COMMITTED WIP → {@link integratePinnedRib} merges the rib into the lane (a conflict
- *    aborts cleanly and escalates a `work::<taskId>` incident, the branch + WIP retained);
- *  - NO WIP + fully clean → {@link recreateLaneOffBase} re-cuts the lane off its fresh
- *    fork base, but ONLY when that base ALREADY contains the rib (else a recreate would be
- *    futile churn or drop the rib — defer to the base's own integration first);
- *  - any dirt / residue / inconclusive probe → DEFER silently (retry next cycle).
- * A successful integration sets `integratedAny` so the caller nudges the reconciler to
- * re-evaluate the gate immediately (the git progress bumps no `data_version`).
+ * Per item, a fence of re-observations between the cycle snapshot and the effect (each miss
+ * DEFERS with zero mutation):
+ *  1. PURE geometry CAS — the item's `targetBranch`+`worktreePath` still name a real
+ *     assignment in the same {@link prepareWorktreeGeometry} the gate + dispatch consume;
+ *  2. CYCLE liveness — a live resolver / owner / claim (incl. a stopped-but-unreleased claim
+ *     via the shared {@link LaneMaintenanceProbe}) leaves the target UNTOUCHED;
+ *  3. FRESH lane enumeration — `existing` still matches the item's;
+ *  4. OBLIGATION CAS — a `reattach` item's target must STILL be unregistered (a mid-cycle-
+ *     ready lane defers to the next gate cycle); an integration item's FRESH
+ *     {@link firstBlockingObligation} must still key to the item's obligation (never re-
+ *     select a different source);
+ *  5. H7 FRESH-AUTHORITY recheck (LIVE claim/resolver state, not the snapshot) — a claimant
+ *     that appeared between observation and effect → zero mutation; only `clear` proceeds;
+ *  6. EFFECT — `reattach` → {@link reattachLaneWorktree} (the H8 fence, which proves fresh
+ *     POSITIVE missing/unregistered/husk candidacy and defers every non-candidate); `rib` /
+ *     `canonical-base` → {@link integratePinnedRib} (a conflict aborts cleanly and escalates
+ *     a `work::<taskId>` incident minted from the exact pinned oids, the ref retained).
+ * Every positive outcome arms `integratedAny` so the caller nudges the reconciler to re-
+ * evaluate immediately (the git progress bumps no `data_version`); the actor NEVER self-
+ * certifies release — the gate re-evaluates on real ancestry next cycle.
  */
 export async function runProgressActor(
-  heldTaskIds: ReadonlySet<string>,
+  workItems: readonly ProgressActorWorkItem[],
   epics: readonly Epic[],
   worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
   worktreesRoot: string | undefined,
   laneLiveness: LaneMaintenanceProbe | undefined,
   hasActiveResolver: (epicId: string) => boolean,
+  recheckAuthority: (item: ProgressActorWorkItem) => ProgressActorAuthority,
   run: WorktreeGitRunner = gitExec,
   acquireLock?: LockAcquirer,
   ensureDepLink: (
@@ -13035,7 +12836,7 @@ export async function runProgressActor(
   const failures: ProgressActorFailure[] = [];
   const escalations: ProgressActorEscalation[] = [];
   let integratedAny = false;
-  if (heldTaskIds.size === 0) {
+  if (workItems.length === 0) {
     return { resolved, failures, escalations, integratedAny };
   }
 
@@ -13057,11 +12858,18 @@ export async function runProgressActor(
     return value;
   };
 
+  // (1) PURE geometry CAS index — the item's (epicId, targetBranch, worktreePath) must still
+  //     name a real assignment in the SAME geometry the gate + dispatch consume. Built once.
   const { byEpicId } = prepareWorktreeGeometry(
     epics,
     worktreeRepoByEpicId,
     worktreesRoot,
   );
+  const epicById = new Map(epics.map((e) => [e.epic_id, e]));
+  const geomByKey = new Map<
+    string,
+    { assignment: WorktreeAssignment; repoDir: string }
+  >();
   for (const epic of epics) {
     const geom = byEpicId.get(epic.epic_id);
     if (geom === undefined) {
@@ -13079,132 +12887,166 @@ export async function runProgressActor(
     } else {
       continue;
     }
-
-    const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
     for (const { repoDir, plan } of lanes) {
       for (const assignment of plan.assignments) {
-        if (assignment.isCloseSink || !heldTaskIds.has(assignment.nodeId)) {
+        if (assignment.isCloseSink) {
           continue;
         }
-        const dependent = taskById.get(assignment.nodeId);
-        if (dependent === undefined) {
-          continue;
+        const key = `${epic.epic_id}\0${assignment.branch}\0${assignment.worktreePath}`;
+        if (!geomByKey.has(key)) {
+          geomByKey.set(key, { assignment, repoDir });
         }
-        const doneParents = dependent.depends_on
-          .map((depId) => taskById.get(depId))
-          .filter(
-            (p): p is Task => p !== undefined && p.worker_phase === "done",
-          );
-        if (doneParents.length === 0) {
-          continue;
-        }
-        // LIVENESS GATES — a live resolver, owner, or claim (incl. a stopped-but-
-        // unreleased dispatch claim, which the shared lane-liveness probe DEFERS on until
-        // its release is folded) leaves the target UNTOUCHED.
-        if (hasActiveResolver(epic.epic_id)) {
-          continue;
-        }
+      }
+    }
+  }
+
+  for (const item of workItems) {
+    try {
+      // (1) Geometry CAS.
+      const geom = geomByKey.get(
+        `${item.epicId}\0${item.targetBranch}\0${item.worktreePath}`,
+      );
+      if (geom === undefined) {
+        continue; // the item's lane no longer maps to a real assignment → defer
+      }
+      const { assignment, repoDir } = geom;
+      const epic = epicById.get(item.epicId);
+      if (epic === undefined) {
+        continue;
+      }
+      // (2) CYCLE liveness gate — a live resolver / owner / claim on the target leaves it
+      //     UNTOUCHED (the shared lane-liveness probe defers on a stopped-but-unreleased
+      //     claim until its release is folded).
+      if (hasActiveResolver(item.epicId)) {
+        continue;
+      }
+      if (
+        laneLiveness !== undefined &&
+        laneLiveness({
+          path: item.worktreePath,
+          epicId: item.epicId,
+          taskId: item.taskId,
+        }).kind === "defer"
+      ) {
+        continue;
+      }
+      // (3) FRESH lane enumeration — `existing` must still match.
+      const laneSet = await enumerateLanes(repoDir);
+      if (!laneSet.ok) {
+        continue; // enumeration unknown → defer
+      }
+      if (laneSet.branches.has(assignment.branch) !== item.existing) {
+        continue; // the lane appeared / vanished under the actor → defer
+      }
+
+      if (item.sourceObligation === "reattach") {
+        // (4) REATTACH registration CAS — the lane path must STILL be unregistered. A path
+        //     that is a registered worktree again (recovered / mid-cycle-ready, or a dirty
+        //     registered lane recovery owns) defers to the NEXT gate cycle. Only an
+        //     unregistered (or inconclusive-then-fenced) path proceeds to the H8 fence, which
+        //     proves fresh POSITIVE missing/unregistered/husk candidacy and defers every
+        //     non-candidate (foreign/registered-elsewhere/UNKNOWN) to recovery ownership.
+        const reg = await gitListWorktreesResult(item.worktreePath, run);
         if (
-          laneLiveness !== undefined &&
-          laneLiveness({
-            path: assignment.worktreePath,
-            epicId: epic.epic_id,
-            taskId: assignment.nodeId,
-          }).kind === "defer"
+          reg.kind === "ok" &&
+          reg.value.some(
+            (e) =>
+              stripTrailingSlashPath(e.path) ===
+              stripTrailingSlashPath(item.worktreePath),
+          )
         ) {
           continue;
         }
-        try {
-          const laneSet = await enumerateLanes(repoDir);
-          if (!laneSet.ok || !laneSet.branches.has(assignment.branch)) {
-            // Enumeration unknown, or a pre-cut lane (owned by the pending-integration
-            // owner / provision, never the actor) → leave held.
-            continue;
-          }
-          const forkBase = parentBranchFor(assignment, plan, epic.tasks);
-          // The FIRST done rib the lane branch does not yet contain — the edge to integrate.
-          let blockingRib: string | null = null;
-          for (const parent of doneParents) {
-            const rib = ribBranchFor(epic.epic_id, parent.task_id);
-            if (!laneSet.branches.has(rib)) {
-              continue; // definitively absent → merged-and-torn-down (contained)
-            }
-            if (
-              !(await gitIsAncestorOf(repoDir, rib, assignment.branch, run))
-            ) {
-              blockingRib = rib;
-              break;
-            }
-          }
-          if (blockingRib === null) {
-            // Every done rib is already in the lane branch; the hold is on worktree
-            // readiness (dirt / registration), owned by the dead-writer / dirt-recovery
-            // sweep — recreating off the base could DROP a rib the branch already carries.
-            continue;
-          }
-          const regime = await probeLaneIntegrationRegime(
-            assignment.worktreePath,
-            assignment.branch,
-            forkBase,
-            blockingRib,
-            run,
-          );
-          if (regime.kind === "merge") {
-            const out = await integratePinnedRib(
-              assignment.worktreePath,
-              assignment.branch,
-              blockingRib,
-              baseBranchFor(epic.epic_id),
-              run,
-              acquireLock,
-            );
-            if (
-              out.kind === "integrated" ||
-              out.kind === "already-integrated"
-            ) {
-              resolved.push(assignment.nodeId);
-              integratedAny = true;
-            } else if (out.kind === "conflict") {
-              escalations.push({
-                taskId: assignment.nodeId,
-                reason: `worktree-merge-conflict: integrating ${blockingRib} into ${assignment.branch} — ${out.stderr.slice(0, 200)}`,
-                dir: assignment.worktreePath,
-                conflictedFiles: out.conflictedFiles,
-              });
-            }
-            // out.kind === "defer" → silent retry next cycle.
-          } else if (regime.kind === "recreate") {
-            // Recreate re-cuts the lane off its fork base, so that base MUST already
-            // contain the rib — else a recreate is futile churn (or would drop the rib).
-            if (!(await gitIsAncestorOf(repoDir, blockingRib, forkBase, run))) {
-              continue;
-            }
-            const out = await recreateLaneOffBase(
-              repoDir,
-              assignment.worktreePath,
-              assignment.branch,
-              forkBase,
-              run,
-              ensureDepLink,
-              acquireLock,
-            );
-            if (out.kind === "recreated") {
-              resolved.push(assignment.nodeId);
-              integratedAny = true;
-            } else if (out.kind === "failed") {
-              failures.push({
-                taskId: assignment.nodeId,
-                reason: out.reason,
-                dir: assignment.worktreePath,
-              });
-            }
-            // out.kind === "defer" → silent retry next cycle.
-          }
-          // regime.kind === "defer" → silent retry next cycle.
-        } catch {
-          // A probe threw — leave the dependent held; the gate re-evaluates next cycle.
+        // (5) H7 fresh-authority recheck immediately before the effect.
+        if (recheckAuthority(item) !== "clear") {
+          continue;
         }
+        // (6) EFFECT — the H8 reattach fence.
+        const out = await gitReattachLaneWorktree(
+          repoDir,
+          item.worktreePath,
+          assignment.branch,
+          run,
+          ensureDepLink,
+          acquireLock ?? defaultCommitWorkLockAcquirer,
+        );
+        if (out.kind === "reattached") {
+          resolved.push(item.taskId);
+          integratedAny = true;
+        } else if (out.kind === "failed") {
+          failures.push({
+            taskId: item.taskId,
+            reason: out.reason,
+            dir: item.worktreePath,
+          });
+        }
+        // out.kind === "defer" → silent retry next cycle.
+        continue;
       }
+
+      // (4) INTEGRATION obligation CAS — re-classify the dependent's FRESH obligation and
+      //     require it still key to THIS item's (never re-select a different source). The
+      //     dependent's done parents drive the classification; the resolved target base is
+      //     the item's own (its lane, or the retro fork source).
+      const dependent = epic.tasks.find((t) => t.task_id === item.taskId);
+      if (dependent === undefined) {
+        continue;
+      }
+      const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+      const doneParents = dependent.depends_on
+        .map((depId) => taskById.get(depId))
+        .filter((p): p is Task => p !== undefined && p.worker_phase === "done");
+      if (doneParents.length === 0) {
+        continue;
+      }
+      const epicBase = baseBranchFor(item.epicId);
+      const fresh = await firstBlockingObligation(
+        doneParents,
+        item.epicId,
+        laneSet,
+        { targetBranch: item.targetBranch, existing: item.existing },
+        epicBase,
+        (rib, tgt) => gitIsAncestorOf(repoDir, rib, tgt, run),
+        (base, tgt) => gitIsAncestorOf(repoDir, base, tgt, run),
+      );
+      if (
+        fresh.kind !== item.sourceObligation ||
+        fresh.sourceBranch !== item.sourceBranch
+      ) {
+        continue; // the obligation drifted / cleared → defer, never re-select
+      }
+      // (5) H7 fresh-authority recheck immediately before the effect.
+      if (recheckAuthority(item) !== "clear") {
+        continue;
+      }
+      // (6) EFFECT — integrate the pinned source through the commit-work fence. An
+      //     unregistered / dirty target defers inside the fence (the gate re-emits a reattach
+      //     item / dirt-recovery owns it); a conflict escalates minted from the exact pins.
+      const out = await integratePinnedRib(
+        item.worktreePath,
+        item.targetBranch,
+        item.sourceBranch,
+        epicBase,
+        run,
+        acquireLock,
+      );
+      if (out.kind === "integrated" || out.kind === "already-integrated") {
+        resolved.push(item.taskId);
+        integratedAny = true;
+      } else if (out.kind === "conflict") {
+        escalations.push({
+          taskId: item.taskId,
+          reason: `worktree-merge-conflict: ${item.sourceObligation} ${out.sourceOid} into ${item.targetBranch} (${out.targetOid}) — ${out.stderr.slice(0, 160)}`,
+          dir: item.worktreePath,
+          conflictedFiles: out.conflictedFiles,
+          sourceOid: out.sourceOid,
+          sourceClass: item.sourceObligation,
+          targetOid: out.targetOid,
+        });
+      }
+      // out.kind === "defer" → silent retry next cycle.
+    } catch {
+      // A probe threw — leave the item unhandled; the gate re-evaluates next cycle.
     }
   }
   return { resolved, failures, escalations, integratedAny };
@@ -14839,9 +14681,15 @@ export async function loadReconcileSnapshot(
   // `worktreesRoot` — like its sibling producers here. Gated on `worktreeMode` so an OFF
   // cycle adds ZERO git spawns (empty map = a byte-identical no-op). NEVER throws (every
   // probe degrades to DEFER).
-  const deferredSiblingSources = worktreeMode
+  const {
+    deferred: deferredSiblingSources,
+    workItems: progressActorWorkItems,
+  } = worktreeMode
     ? await computeDeferredSiblingSources(epics, worktreeRepoByEpicId)
-    : new Map<string, string>();
+    : {
+        deferred: new Map<string, string>(),
+        workItems: [] as ProgressActorWorkItem[],
+      };
 
   // The durable MERGE-LANDED set — purely observational (drives no dispatch arm),
   // computed here so the worker can emit the `lane_merged` projection each cycle.
@@ -15049,6 +14897,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     deferredSiblingSources,
+    progressActorWorkItems,
     landedLaneEntries,
     closeRecoveryEligibleIds,
     baseDriftEntries,
@@ -16197,24 +16046,42 @@ function main(): void {
             // reconcile nudge, since its external git progress bumps no data_version.
             if (
               deps.worktree.progressActor !== undefined &&
-              (snapshot.deferredSiblingSources?.size ?? 0) > 0
+              (snapshot.progressActorWorkItems?.length ?? 0) > 0
             ) {
+              const hasActiveResolver = (epicId: string): boolean => {
+                for (const key of snapshot.claimedIncidentKeys ?? []) {
+                  if (
+                    key === dispatchKey("close", epicId) ||
+                    key.startsWith(`work::${epicId}.`)
+                  ) {
+                    return true;
+                  }
+                }
+                return false;
+              };
               const actor = await deps.worktree.progressActor(
-                new Set(snapshot.deferredSiblingSources?.keys() ?? []),
+                snapshot.progressActorWorkItems ?? [],
                 snapshot.epics,
                 snapshot.worktreeRepoByEpicId,
                 snapshot.worktreesRoot,
                 laneMaintenanceProbe,
-                (epicId) => {
-                  for (const key of snapshot.claimedIncidentKeys ?? []) {
-                    if (
-                      key === dispatchKey("close", epicId) ||
-                      key.startsWith(`work::${epicId}.`)
-                    ) {
-                      return true;
-                    }
+                hasActiveResolver,
+                // H7 FRESH-AUTHORITY recheck — re-observe the LIVE liveness/resolver state at
+                // the effect boundary (the lane-liveness probe reads live pane state; the
+                // resolver check reads the claimed-incident keys), never a stale cycle
+                // decision. A live claimant on the item's lane, or an active resolver on its
+                // epic, HOLDS it (zero mutation); else `clear` proceeds.
+                (item) => {
+                  if (hasActiveResolver(item.epicId)) {
+                    return "held";
                   }
-                  return false;
+                  return laneMaintenanceProbe({
+                    path: item.worktreePath,
+                    epicId: item.epicId,
+                    taskId: item.taskId,
+                  }).kind === "defer"
+                    ? "held"
+                    : "clear";
                 },
               );
               for (const f of actor.failures) {
