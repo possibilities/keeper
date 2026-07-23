@@ -1531,6 +1531,16 @@ export interface ConfirmRunningDeps {
    */
   nudgeVanishedSweep?(): void;
   /**
+   * Arm an IMMEDIATE reconcile re-tick after the parts-6 progress actor made external git
+   * progress (a rib integrated into a held lane). That progress bumps NO PRAGMA
+   * data_version, so the level-triggered `watchLoop` would not re-evaluate the sibling-
+   * source gate until an unrelated future event — this re-arms the coalesced waker so the
+   * next cycle runs promptly and the now-cleared dependent dispatches. Payload-free;
+   * OPTIONAL — a no-op when absent (a fake-deps test never needs the arm), so the dispatch
+   * path is byte-identical without it.
+   */
+  nudgeReconcileSoon?(): void;
+  /**
    * Emit the FULL current worktree-disabled set to main (fn-1013) for the
    * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
    * the synthetic `WorktreeRepoStatus` event. Called once per cycle with the
@@ -2049,6 +2059,21 @@ export interface WorktreeDriver {
       result: OriginContainmentResult;
     }[]
   >;
+  /**
+   * The parts-6 PROGRESS ACTOR (producer-only, once per cycle): integrate a blocking done
+   * sibling's rib into each sibling-source-gate HELD dependent's EXISTING stale lane so the
+   * gate clears — the deadlock the target-selection seam introduces. Runs the shared
+   * {@link runProgressActor} with the driver's own `run` + commit-work lock. Optional so
+   * existing driver fakes stay byte-compatible.
+   */
+  progressActor?(
+    heldTaskIds: ReadonlySet<string>,
+    epics: readonly Epic[],
+    worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+    worktreesRoot: string | undefined,
+    laneLiveness: LaneMaintenanceProbe | undefined,
+    hasActiveResolver: (epicId: string) => boolean,
+  ): Promise<ProgressActorOutcome>;
 }
 
 /** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
@@ -9270,6 +9295,25 @@ export function createWorktreeDriver(
         scheduleSuiteRetry,
       );
     },
+    progressActor(
+      heldTaskIds,
+      epics,
+      worktreeRepoByEpicId,
+      worktreesRoot,
+      laneLiveness,
+      hasActiveResolver,
+    ) {
+      return runProgressActor(
+        heldTaskIds,
+        epics,
+        worktreeRepoByEpicId,
+        worktreesRoot,
+        laneLiveness,
+        hasActiveResolver,
+        run,
+        acquireLock,
+      );
+    },
     async reconcileOrigin(repos) {
       const outcomes: {
         dir: string;
@@ -12748,6 +12792,246 @@ export async function recreateLaneOffBase(
   }
 }
 
+/** A transient progress-actor failure (a positively-failed recreate) surfaced as a
+ *  visible `work::<taskId>` `dispatch_failures` row — distinct from the SILENT defers. */
+export interface ProgressActorFailure {
+  taskId: string;
+  reason: string;
+  dir: string | null;
+}
+
+/** A genuine content conflict integrating a rib into a held lane — routed to a
+ *  `work::<taskId>` `worktree-merge-conflict` fan-in incident (no destruction). */
+export interface ProgressActorEscalation {
+  taskId: string;
+  reason: string;
+  dir: string | null;
+  conflictedFiles: string[];
+}
+
+/** The parts-6 progress actor's per-cycle result — fed the SAME resolved / failures /
+ *  escalations rails recover uses, plus `integratedAny` so the caller arms the liveness
+ *  nudge (external git progress may not bump PRAGMA data_version). */
+export interface ProgressActorOutcome {
+  resolved: string[];
+  failures: ProgressActorFailure[];
+  escalations: ProgressActorEscalation[];
+  integratedAny: boolean;
+}
+
+/**
+ * The parts-6 PROGRESS ACTOR: scan the sibling-source-gate's HELD dependents INDEPENDENTLY
+ * of the launch list and integrate a blocking DONE sibling's rib into the dependent's
+ * EXISTING stale lane — the deadlock the target-selection seam introduces, since nothing
+ * else integrates a rib into an existing lane. Producer-only git side effects under the
+ * commit-work flock; NEVER throws.
+ *
+ * Per held dependent, on the SAME {@link prepareWorktreeGeometry} the gate + dispatch
+ * consume: a LIVE resolver / owner / claim (incl. a stopped-but-unreleased claim, via the
+ * shared {@link LaneMaintenanceProbe}) leaves the target UNTOUCHED. Only an EXISTING lane
+ * (positively enumerated) whose branch is missing a done rib is acted on — a pre-cut lane
+ * is the pending-integration owner's / provision's, never the actor's. The strategy, keyed
+ * on {@link probeLaneIntegrationRegime}:
+ *  - COMMITTED WIP → {@link integratePinnedRib} merges the rib into the lane (a conflict
+ *    aborts cleanly and escalates a `work::<taskId>` incident, the branch + WIP retained);
+ *  - NO WIP + fully clean → {@link recreateLaneOffBase} re-cuts the lane off its fresh
+ *    fork base, but ONLY when that base ALREADY contains the rib (else a recreate would be
+ *    futile churn or drop the rib — defer to the base's own integration first);
+ *  - any dirt / residue / inconclusive probe → DEFER silently (retry next cycle).
+ * A successful integration sets `integratedAny` so the caller nudges the reconciler to
+ * re-evaluate the gate immediately (the git progress bumps no `data_version`).
+ */
+export async function runProgressActor(
+  heldTaskIds: ReadonlySet<string>,
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  worktreesRoot: string | undefined,
+  laneLiveness: LaneMaintenanceProbe | undefined,
+  hasActiveResolver: (epicId: string) => boolean,
+  run: WorktreeGitRunner = gitExec,
+  acquireLock?: LockAcquirer,
+  ensureDepLink: (
+    sourceCheckout: string,
+    worktreePath: string,
+  ) => Promise<void> = gitEnsureWorktreeDepLink,
+): Promise<ProgressActorOutcome> {
+  const resolved: string[] = [];
+  const failures: ProgressActorFailure[] = [];
+  const escalations: ProgressActorEscalation[] = [];
+  let integratedAny = false;
+  if (heldTaskIds.size === 0) {
+    return { resolved, failures, escalations, integratedAny };
+  }
+
+  const laneSetByRepo = new Map<string, EpicLaneBranchSet>();
+  const enumerateLanes = async (
+    repoDir: string,
+  ): Promise<EpicLaneBranchSet> => {
+    const hit = laneSetByRepo.get(repoDir);
+    if (hit !== undefined) {
+      return hit;
+    }
+    let value: EpicLaneBranchSet;
+    try {
+      value = await gitEnumerateEpicLaneBranches(repoDir, run);
+    } catch {
+      value = { ok: false };
+    }
+    laneSetByRepo.set(repoDir, value);
+    return value;
+  };
+
+  const { byEpicId } = prepareWorktreeGeometry(
+    epics,
+    worktreeRepoByEpicId,
+    worktreesRoot,
+  );
+  for (const epic of epics) {
+    const geom = byEpicId.get(epic.epic_id);
+    if (geom === undefined) {
+      continue;
+    }
+    const lanes: Array<{ repoDir: string; plan: WorktreePlan }> = [];
+    if (geom.kind === "ok") {
+      lanes.push({ repoDir: geom.repoDir, plan: geom.plan });
+    } else if (geom.kind === "clustered") {
+      for (const g of geom.groups) {
+        if (g.mode === "worktree" && g.plan !== undefined) {
+          lanes.push({ repoDir: g.repoDir, plan: g.plan });
+        }
+      }
+    } else {
+      continue;
+    }
+
+    const taskById = new Map(epic.tasks.map((t) => [t.task_id, t]));
+    for (const { repoDir, plan } of lanes) {
+      for (const assignment of plan.assignments) {
+        if (assignment.isCloseSink || !heldTaskIds.has(assignment.nodeId)) {
+          continue;
+        }
+        const dependent = taskById.get(assignment.nodeId);
+        if (dependent === undefined) {
+          continue;
+        }
+        const doneParents = dependent.depends_on
+          .map((depId) => taskById.get(depId))
+          .filter(
+            (p): p is Task => p !== undefined && p.worker_phase === "done",
+          );
+        if (doneParents.length === 0) {
+          continue;
+        }
+        // LIVENESS GATES — a live resolver, owner, or claim (incl. a stopped-but-
+        // unreleased dispatch claim, which the shared lane-liveness probe DEFERS on until
+        // its release is folded) leaves the target UNTOUCHED.
+        if (hasActiveResolver(epic.epic_id)) {
+          continue;
+        }
+        if (
+          laneLiveness !== undefined &&
+          laneLiveness({
+            path: assignment.worktreePath,
+            epicId: epic.epic_id,
+            taskId: assignment.nodeId,
+          }).kind === "defer"
+        ) {
+          continue;
+        }
+        try {
+          const laneSet = await enumerateLanes(repoDir);
+          if (!laneSet.ok || !laneSet.branches.has(assignment.branch)) {
+            // Enumeration unknown, or a pre-cut lane (owned by the pending-integration
+            // owner / provision, never the actor) → leave held.
+            continue;
+          }
+          const forkBase = parentBranchFor(assignment, plan, epic.tasks);
+          // The FIRST done rib the lane branch does not yet contain — the edge to integrate.
+          let blockingRib: string | null = null;
+          for (const parent of doneParents) {
+            const rib = ribBranchFor(epic.epic_id, parent.task_id);
+            if (!laneSet.branches.has(rib)) {
+              continue; // definitively absent → merged-and-torn-down (contained)
+            }
+            if (
+              !(await gitIsAncestorOf(repoDir, rib, assignment.branch, run))
+            ) {
+              blockingRib = rib;
+              break;
+            }
+          }
+          if (blockingRib === null) {
+            // Every done rib is already in the lane branch; the hold is on worktree
+            // readiness (dirt / registration), owned by the dead-writer / dirt-recovery
+            // sweep — recreating off the base could DROP a rib the branch already carries.
+            continue;
+          }
+          const regime = await probeLaneIntegrationRegime(
+            assignment.worktreePath,
+            assignment.branch,
+            forkBase,
+            blockingRib,
+            run,
+          );
+          if (regime.kind === "merge") {
+            const out = await integratePinnedRib(
+              assignment.worktreePath,
+              assignment.branch,
+              blockingRib,
+              run,
+              acquireLock,
+            );
+            if (
+              out.kind === "integrated" ||
+              out.kind === "already-integrated"
+            ) {
+              resolved.push(assignment.nodeId);
+              integratedAny = true;
+            } else if (out.kind === "conflict") {
+              escalations.push({
+                taskId: assignment.nodeId,
+                reason: `worktree-merge-conflict: integrating ${blockingRib} into ${assignment.branch} — ${out.stderr.slice(0, 200)}`,
+                dir: assignment.worktreePath,
+                conflictedFiles: out.conflictedFiles,
+              });
+            }
+            // out.kind === "defer" → silent retry next cycle.
+          } else if (regime.kind === "recreate") {
+            // Recreate re-cuts the lane off its fork base, so that base MUST already
+            // contain the rib — else a recreate is futile churn (or would drop the rib).
+            if (!(await gitIsAncestorOf(repoDir, blockingRib, forkBase, run))) {
+              continue;
+            }
+            const out = await recreateLaneOffBase(
+              repoDir,
+              assignment.worktreePath,
+              assignment.branch,
+              forkBase,
+              run,
+              ensureDepLink,
+            );
+            if (out.kind === "recreated") {
+              resolved.push(assignment.nodeId);
+              integratedAny = true;
+            } else if (out.kind === "failed") {
+              failures.push({
+                taskId: assignment.nodeId,
+                reason: out.reason,
+                dir: assignment.worktreePath,
+              });
+            }
+            // out.kind === "defer" → silent retry next cycle.
+          }
+          // regime.kind === "defer" → silent retry next cycle.
+        } catch {
+          // A probe threw — leave the dependent held; the gate re-evaluates next cycle.
+        }
+      }
+    }
+  }
+  return { resolved, failures, escalations, integratedAny };
+}
+
 // ---------------------------------------------------------------------------
 // Tip-triggered baseline producer (fn-1203)
 // ---------------------------------------------------------------------------
@@ -14929,6 +15213,11 @@ function main(): void {
     }
   };
 
+  // Set by the parts-6 progress actor's `nudgeReconcileSoon` when it integrated a rib
+  // (external git progress that bumps NO data_version) — the driveCycle finally arms an
+  // immediate re-tick so the now-cleared sibling-source gate is re-evaluated at once.
+  let progressActorNudged = false;
+
   // Side-effect deps for the reconcile + confirm cycle. Reads run on the
   // worker's OWN read-only connection; the worker NEVER writes the DB —
   // a DispatchFailed is described to main via `postMessage` (main is the
@@ -14995,6 +15284,13 @@ function main(): void {
       parentPort?.postMessage({
         kind: "nudge-vanished-sweep",
       } satisfies VanishedSweepNudgeMessage);
+    },
+    nudgeReconcileSoon: () => {
+      // The progress actor made external git progress (a rib integrated into a held
+      // lane) that bumps NO data_version, so `watchLoop` would not re-evaluate the
+      // sibling-source gate on its own. Flag an immediate re-tick; the driveCycle finally
+      // arms the coalesced waker at `now` so the next cycle runs promptly.
+      progressActorNudged = true;
     },
     // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
     // changes, so a stable board mints zero `WorktreeRepoStatus` events. The
@@ -15713,6 +16009,60 @@ function main(): void {
                 ),
               );
             }
+            // Parts-6 progress actor: integrate a blocking done rib into each sibling-
+            // source-gate HELD dependent's EXISTING stale lane so the gate clears — the
+            // deadlock the target-selection seam introduces. Producer-only git under the
+            // commit-work flock; a live resolver / owner / claim (via the shared lane-
+            // liveness probe) leaves the target UNTOUCHED. Failures + conflicts feed the
+            // SAME dispatch_failures rail recover uses (transient `work::<taskId>` rows /
+            // `worktree-merge-conflict` incidents); a successful integration arms the
+            // reconcile nudge, since its external git progress bumps no data_version.
+            if (
+              deps.worktree.progressActor !== undefined &&
+              (snapshot.deferredSiblingSources?.size ?? 0) > 0
+            ) {
+              const actor = await deps.worktree.progressActor(
+                new Set(snapshot.deferredSiblingSources?.keys() ?? []),
+                snapshot.epics,
+                snapshot.worktreeRepoByEpicId,
+                snapshot.worktreesRoot,
+                laneMaintenanceProbe,
+                (epicId) => {
+                  for (const key of snapshot.claimedIncidentKeys ?? []) {
+                    if (
+                      key === dispatchKey("close", epicId) ||
+                      key.startsWith(`work::${epicId}.`)
+                    ) {
+                      return true;
+                    }
+                  }
+                  return false;
+                },
+              );
+              for (const f of actor.failures) {
+                deps.emitDispatchFailed({
+                  verb: "work",
+                  id: f.taskId,
+                  reason: f.reason,
+                  dir: f.dir,
+                  conflictedFiles: null,
+                  ts: deps.now(),
+                });
+              }
+              for (const e of actor.escalations) {
+                deps.emitDispatchFailed({
+                  verb: "work",
+                  id: e.taskId,
+                  reason: e.reason,
+                  dir: e.dir,
+                  conflictedFiles: e.conflictedFiles,
+                  ts: deps.now(),
+                });
+              }
+              if (actor.integratedAny) {
+                deps.nudgeReconcileSoon?.();
+              }
+            }
           } catch (err) {
             console.error(
               "[autopilot-worker] worktree recovery threw (non-fatal):",
@@ -16410,6 +16760,13 @@ function main(): void {
       console.error("[autopilot-worker] reconcile cycle threw:", err);
     } finally {
       cycleRunning = false;
+      // A parts-6 progress-actor integration this cycle made external git progress that
+      // bumps NO data_version — force an IMMEDIATE re-tick so the now-cleared sibling-
+      // source gate re-evaluates at once (the next cycle re-derives the real slot edge).
+      if (progressActorNudged) {
+        progressActorNudged = false;
+        latestSlotArm = { at: wakeClock.now() };
+      }
       // Re-arm both coalesced wakes from THIS cycle's THREE-STATE intent: a definite deadline
       // arms the edge, a positive no-candidate disarms, and an UNTRUSTWORTHY cycle (a throw
       // leaves the per-iteration `unknown`, a degraded probe `continue`d to it) preserves the
