@@ -15,25 +15,27 @@
  * registry mutation on the domain can interleave. This is the domain H7's lane reservation
  * and the actor's effect both consume, making the check→spawn gap non-existent.
  *
- * ## Two capabilities (opaque tokens)
- * A caller cannot MINT a token — only {@link withStructuralLock} / {@link withCheckoutLock}
- * hand one to their callback while the lock(s) are held. A lock-free CORE that REQUIRES a
- * token in its signature therefore proves, by construction, that the lock is held when it
- * runs — the "cores are not exported for external call" discipline the inventory conversion
- * enforces:
+ * ## Two capabilities (unforgeable tokens)
+ * A caller cannot STRUCTURALLY construct a token — the brand is a NON-EXPORTED `unique symbol`
+ * that external code cannot name, so only this module's mint helpers produce one. A lock-free
+ * CORE that requires a token in its signature therefore proves, by construction, that the lock
+ * is held when it runs — the "cores are not exported for external call" discipline the
+ * inventory conversion enforces:
  *   - {@link StructuralToken} — registry add/remove/prune. A MISSING worktree (a reattach
  *     `worktree add`, whose per-worktree admin dir does not exist yet) takes structural ONLY.
  *   - {@link CheckoutToken} — checkout/ref effects on an EXISTING worktree. Adds the
  *     per-worktree lock: acquire common FIRST, derive+pin the per-worktree identity UNDER
  *     common, THEN acquire the per-worktree lock LAST.
  *
- * ## Global lock order (codified)
+ * ## Global lock order + release discipline
  * trunk-lease (OUTER, owned by the caller — never acquired here) → common structural →
  * per-worktree (LAST). A single global order makes a lock-order cycle impossible. Release
- * unwinds in strict reverse via nested try/finally, so a throwing second acquire OR a
- * throwing release still frees the common lock.
+ * unwinds in strict REVERSE, attempting EVERY held lock even if one throws, then AGGREGATES
+ * and PROPAGATES any release failure — a possibly-held flock is an operational failure, never
+ * a green effect swallowed under a successful body.
  */
 
+import { realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
 /** The bounded git-op deadline the common-dir resolution runs under, so an unresolvable or
@@ -65,15 +67,35 @@ export type RegistryLockGitRunner = (
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 /**
- * The STRICTLY-RESOLVED common git dir — `git rev-parse --path-format=absolute
- * --git-common-dir`, resolved absolute. STRICT, NO FALLBACK: a non-zero exit, an empty read,
- * or a non-absolute result yields `null` and the caller DEFERS — the leaf NEVER guesses a
- * bare `.git`, because a wrong common dir would serialize the wrong domain (or none). Async,
- * preserving the no-sync-main rule. NEVER throws (a thrown runner is caught → `null`).
+ * Canonicalize an absolute path across symlink / path aliases, or `null` when the path cannot
+ * be canonicalized (symlink loop, ENOENT, ambiguous). Injected so the pure-`run` fence fakes
+ * exercise the leaf without a real fs; production uses {@link defaultCanonicalize} (a real
+ * `realpath`). Canonical identity is load-bearing: two callers reaching the SAME common dir via
+ * different aliases must serialize on ONE lock, so a potentially-aliased raw string is never
+ * trusted as the lock domain.
+ */
+export type PathCanonicalizer = (path: string) => Promise<string | null>;
+
+const defaultCanonicalize: PathCanonicalizer = async (p) => {
+  try {
+    return await realpath(p);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The STRICTLY-RESOLVED, CANONICAL common git dir — `git rev-parse --path-format=absolute
+ * --git-common-dir`, normalized, then canonicalized across symlink aliases via `canonicalize`.
+ * STRICT, NO FALLBACK: a non-zero exit, an empty / multi-line (ambiguous) read, a non-absolute
+ * result, or a path that cannot be canonicalized yields `null` and the caller DEFERS — the leaf
+ * NEVER guesses a bare `.git`, and never serializes on a potentially-aliased string. Async,
+ * preserving the no-sync-main rule. NEVER throws (a thrown runner / canonicalizer → `null`).
  */
 export async function resolveCommonDir(
   cwd: string,
   run: RegistryLockGitRunner,
+  canonicalize: PathCanonicalizer = defaultCanonicalize,
 ): Promise<string | null> {
   let r: { code: number; stdout: string; stderr: string };
   try {
@@ -85,36 +107,55 @@ export async function resolveCommonDir(
     return null;
   }
   const dir = r.stdout.trim();
-  if (r.code !== 0 || dir === "" || !isAbsolute(dir)) {
+  // Reject ambiguous resolver output — a non-zero exit, an empty read, a non-absolute path,
+  // or MULTIPLE non-empty lines (never serialize on a guessed one of several).
+  if (r.code !== 0 || dir === "" || !isAbsolute(dir) || dir.includes("\n")) {
     return null;
   }
-  return resolve(dir);
+  try {
+    return await canonicalize(resolve(dir));
+  } catch {
+    return null;
+  }
 }
 
-/** The common-domain structural lock path under a strictly-resolved common dir. */
+/** The common-domain structural lock path under a strictly-resolved, canonical common dir. */
 export function structuralLockPathFor(commonDir: string): string {
   return join(commonDir, REGISTRY_LOCK_LEAF);
 }
 
-/**
- * The STRUCTURAL capability — registry add/remove/prune. Opaque: the private `__t` brand
- * cannot be produced outside this module, so a core requiring it proves the common lock is
- * held. Carries the common lock path only (a missing worktree has no per-worktree lock).
- */
+// ── Unforgeable capability tokens ──────────────────────────────────────────
+// The brands are NON-EXPORTED `unique symbol`s: external code cannot name them, so it cannot
+// STRUCTURALLY construct a token. Only the mint helpers below (the sole sanctioned producers)
+// cast into the branded type, under a held lock.
+
+declare const STRUCTURAL_BRAND: unique symbol;
+declare const CHECKOUT_BRAND: unique symbol;
+
+/** The STRUCTURAL capability — registry add/remove/prune. Unforgeable (non-exported brand);
+ *  carries the common lock path only (a missing worktree has no per-worktree lock). */
 export interface StructuralToken {
-  readonly __t: "structural";
+  readonly [STRUCTURAL_BRAND]: true;
   readonly commonLockPath: string;
 }
 
-/**
- * The CHECKOUT capability — checkout/ref effects on an EXISTING worktree. Carries BOTH the
- * common and the per-worktree lock paths (both held when the callback runs). Opaque brand,
- * as {@link StructuralToken}.
- */
+/** The CHECKOUT capability — checkout/ref effects on an EXISTING worktree. Unforgeable;
+ *  carries BOTH the common and the per-worktree lock paths (both held when the callback runs). */
 export interface CheckoutToken {
-  readonly __t: "checkout";
+  readonly [CHECKOUT_BRAND]: true;
   readonly commonLockPath: string;
   readonly worktreeLockPath: string;
+}
+
+function mintStructuralToken(commonLockPath: string): StructuralToken {
+  return { commonLockPath } as unknown as StructuralToken;
+}
+
+function mintCheckoutToken(
+  commonLockPath: string,
+  worktreeLockPath: string,
+): CheckoutToken {
+  return { commonLockPath, worktreeLockPath } as unknown as CheckoutToken;
 }
 
 /**
@@ -138,20 +179,57 @@ export function isLockDeferred(x: unknown): x is LockDeferred {
   );
 }
 
+// ── Release discipline ─────────────────────────────────────────────────────
+
+/** Release every handle in REVERSE (release-order) sequence, attempting EACH even if one
+ *  throws; returns the collected release errors (empty when all released cleanly). */
+function releaseReverse(handles: readonly { release(): void }[]): unknown[] {
+  const errors: unknown[] = [];
+  for (let i = handles.length - 1; i >= 0; i--) {
+    try {
+      handles[i].release();
+    } catch (e) {
+      errors.push(e);
+    }
+  }
+  return errors;
+}
+
+/** After releasing, surface any failure: a release error (a possibly-held flock) is ALWAYS
+ *  thrown — aggregated with the body error when the body also threw — so a stuck lock is never
+ *  swallowed under a green result. No-op only when nothing threw. */
+function surfaceLockFailures(
+  bodyThrew: boolean,
+  bodyError: unknown,
+  releaseErrors: unknown[],
+): void {
+  if (releaseErrors.length > 0) {
+    throw new AggregateError(
+      bodyThrew ? [bodyError, ...releaseErrors] : releaseErrors,
+      `registry-lock: ${releaseErrors.length} lock release(s) failed — a flock may still be held`,
+    );
+  }
+  if (bodyThrew) {
+    throw bodyError;
+  }
+}
+
 /**
  * Run `fn` holding the COMMON structural lock — the capability for registry add/remove/prune
- * and a MISSING-worktree add (no per-worktree lock exists to take). Order: resolve the common
- * dir (strict; null → defer), acquire the common lock (timeout → defer), run `fn(token)`, then
- * release the common lock in a `finally` so a throwing `fn` still frees it. Returns `fn`'s
- * result, or a {@link LockDeferred}. NEVER acquires a per-worktree lock.
+ * and a MISSING-worktree add (no per-worktree lock exists to take). Order: resolve+canonicalize
+ * the common dir (strict; null → defer), acquire the common lock (timeout → defer), run
+ * `fn(token)`, then release common — surfacing a release failure as an operational error, never
+ * swallowing it. Returns `fn`'s result, or a {@link LockDeferred}. NEVER acquires a per-worktree
+ * lock.
  */
 export async function withStructuralLock<R>(
   cwd: string,
   run: RegistryLockGitRunner,
   acquire: RegistryLockAcquirer,
   fn: (token: StructuralToken) => Promise<R>,
+  canonicalize: PathCanonicalizer = defaultCanonicalize,
 ): Promise<R | LockDeferred> {
-  const commonDir = await resolveCommonDir(cwd, run);
+  const commonDir = await resolveCommonDir(cwd, run, canonicalize);
   if (commonDir === null) {
     return { defer: "registry-lock: unresolved common dir" };
   }
@@ -160,22 +238,26 @@ export async function withStructuralLock<R>(
   if (common === null) {
     return { defer: "registry-lock: common lock timeout" };
   }
+  let result: R | undefined;
+  let bodyError: unknown;
+  let threw = false;
   try {
-    return await fn({ __t: "structural", commonLockPath });
-  } finally {
-    try {
-      common.release();
-    } catch {
-      // A throwing release cannot un-free the lock for the next holder; swallow.
-    }
+    result = await fn(mintStructuralToken(commonLockPath));
+  } catch (e) {
+    threw = true;
+    bodyError = e;
   }
+  surfaceLockFailures(threw, bodyError, releaseReverse([common]));
+  return result as R;
 }
 
 /**
  * Derive the per-worktree lock path for an EXISTING worktree UNDER the already-held common
- * lock — so the identity is pinned against a concurrent remove/re-add. Returns `null` on any
- * unresolvable identity (the caller DEFERS). Injected so the pure-`run` fence fakes exercise
- * the checkout path without a real admin dir.
+ * lock — so the identity is pinned against a concurrent remove/re-add. MUST return a CANONICAL
+ * path (symlink/alias-collapsed), so the same-path self-lock elision compares canonical
+ * identities, never potentially-aliased strings. Returns `null` on any unresolvable identity
+ * (the caller DEFERS). Injected so the pure-`run` fence fakes exercise the checkout path
+ * without a real admin dir.
  */
 export type WorktreeLockPathDeriver = (
   cwd: string,
@@ -185,15 +267,16 @@ export type WorktreeLockPathDeriver = (
 /**
  * Run `fn` holding the common structural lock AND the per-worktree lock — the capability for
  * checkout/ref effects on an EXISTING worktree. FIXED ORDER (global order codified):
- *   1. resolve common dir (strict; null → defer); acquire COMMON (timeout → defer);
- *   2. UNDER common, derive the per-worktree identity via `deriveIdentity` (null → defer);
+ *   1. resolve+canonicalize common dir (strict; null → defer); acquire COMMON (timeout → defer);
+ *   2. UNDER common, derive the CANONICAL per-worktree identity via `deriveIdentity` (null → defer);
  *   3. acquire the PER-WORKTREE lock LAST (timeout → defer);
  *   4. run `fn(token)`.
- * Release unwinds in strict REVERSE via NESTED try/finally, so a throwing per-worktree acquire
- * OR a throwing release still frees the common lock. When the per-worktree path COINCIDES with
- * the common path (a main worktree, whose `--git-dir` == `--git-common-dir`) the second acquire
- * is SKIPPED — a second flock on the same path from a distinct fd would self-block the process
- * against its own held lock. Returns `fn`'s result, or a {@link LockDeferred}.
+ * Release unwinds in strict REVERSE (per-worktree then common), attempting EVERY held lock even
+ * if one throws, then AGGREGATES + PROPAGATES any release failure. When the CANONICAL
+ * per-worktree path COINCIDES with the common path (a main worktree, whose `--git-dir` ==
+ * `--git-common-dir`) the second acquire is SKIPPED — a second flock on the same path from a
+ * distinct fd would self-block the process against its own held lock. Returns `fn`'s result, or
+ * a {@link LockDeferred}.
  */
 export async function withCheckoutLock<R>(
   cwd: string,
@@ -201,8 +284,9 @@ export async function withCheckoutLock<R>(
   acquire: RegistryLockAcquirer,
   deriveIdentity: WorktreeLockPathDeriver,
   fn: (token: CheckoutToken) => Promise<R>,
+  canonicalize: PathCanonicalizer = defaultCanonicalize,
 ): Promise<R | LockDeferred> {
-  const commonDir = await resolveCommonDir(cwd, run);
+  const commonDir = await resolveCommonDir(cwd, run, canonicalize);
   if (commonDir === null) {
     return { defer: "registry-lock: unresolved common dir" };
   }
@@ -211,37 +295,32 @@ export async function withCheckoutLock<R>(
   if (common === null) {
     return { defer: "registry-lock: common lock timeout" };
   }
+  // From here common is HELD; every exit path releases it through `held` (reverse-order,
+  // aggregated). The per-worktree handle joins `held` only after a successful acquire.
+  const held: { release(): void }[] = [common];
+  let result: R | LockDeferred | undefined;
+  let bodyError: unknown;
+  let threw = false;
   try {
-    // Per-worktree identity is derived UNDER common, so a concurrent remove/re-add cannot
-    // race the identity out from under the lock.
     const worktreeLockPath = await deriveIdentity(cwd, run);
     if (worktreeLockPath === null) {
-      return { defer: "registry-lock: unresolved worktree identity" };
-    }
-    // Same-path coincidence (main worktree): the common lock already covers it.
-    if (worktreeLockPath === commonLockPath) {
-      return await fn({ __t: "checkout", commonLockPath, worktreeLockPath });
-    }
-    // A throwing per-worktree acquire must still release common — the outer finally owns it,
-    // so we do NOT catch here; the throw propagates up through the outer finally.
-    const perWorktree = await acquire(worktreeLockPath);
-    if (perWorktree === null) {
-      return { defer: "registry-lock: per-worktree lock timeout" };
-    }
-    try {
-      return await fn({ __t: "checkout", commonLockPath, worktreeLockPath });
-    } finally {
-      try {
-        perWorktree.release();
-      } catch {
-        // A throwing per-worktree release still lets the outer finally free common.
+      result = { defer: "registry-lock: unresolved worktree identity" };
+    } else if (worktreeLockPath === commonLockPath) {
+      // Same CANONICAL identity as common (main worktree): the common lock already covers it.
+      result = await fn(mintCheckoutToken(commonLockPath, worktreeLockPath));
+    } else {
+      const perWorktree = await acquire(worktreeLockPath);
+      if (perWorktree === null) {
+        result = { defer: "registry-lock: per-worktree lock timeout" };
+      } else {
+        held.push(perWorktree);
+        result = await fn(mintCheckoutToken(commonLockPath, worktreeLockPath));
       }
     }
-  } finally {
-    try {
-      common.release();
-    } catch {
-      // Swallow: a throwing common release cannot un-free the lock for the next holder.
-    }
+  } catch (e) {
+    threw = true;
+    bodyError = e;
   }
+  surfaceLockFailures(threw, bodyError, releaseReverse(held));
+  return result as R | LockDeferred;
 }
