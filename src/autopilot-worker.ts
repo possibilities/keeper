@@ -5419,6 +5419,32 @@ export async function computeDeferredSiblingSources(
     return value;
   };
 
+  // Rider (ancestry twin of the once/repo registration list): memoize the epic-base →
+  // target-branch ancestry verdict ONCE per resolved target per cycle. Several absent done
+  // parents of the same dependent repeat the IDENTICAL epicBase→targetBranch probe when the
+  // base IS contained (the loop does not break). `gitIsAncestorOf` collapses an UNKNOWN /
+  // errored probe to `false`, so a cached miss stays a HOLD for the whole cycle.
+  const epicBaseAncestryMemo = new Map<string, boolean>();
+  const epicBaseAncestorOfTarget = async (
+    repoDir: string,
+    epicBaseBranch: string,
+    targetBranch: string,
+  ): Promise<boolean> => {
+    const key = JSON.stringify([repoDir, epicBaseBranch, targetBranch]);
+    const hit = epicBaseAncestryMemo.get(key);
+    if (hit !== undefined) {
+      return hit;
+    }
+    const value = await gitIsAncestorOf(
+      repoDir,
+      epicBaseBranch,
+      targetBranch,
+      run,
+    );
+    epicBaseAncestryMemo.set(key, value);
+    return value;
+  };
+
   // The SAME geometry dispatch consumes — one derivation, no drift. Pure (no git/fs):
   // resolution already happened in `worktreeRepoByEpicId`.
   const { byEpicId } = prepareWorktreeGeometry(
@@ -5517,20 +5543,21 @@ export async function computeDeferredSiblingSources(
             } else if (!laneSet.branches.has(rib)) {
               // P0-A: an ABSENT rib is contained-by-teardown ONLY relative to the CANONICAL
               // fan-in sink (the epic base), NEVER an arbitrary already-cut dependent branch.
-              // For an EXISTING lane, prove the epic base (which absorbed the torn-down rib)
-              // is an ancestor of THAT lane; a present base not-ancestor/errored → NOT
-              // contained (HOLD). Epic base also gone → the whole epic merged → contained.
-              // A PRE-CUT lane forks off the canonical base region, so the teardown proof
-              // stands (absent → contained).
+              // For an EXISTING lane require POSITIVE evidence: the epic base (which absorbed
+              // the torn-down rib) must be PRESENT AND an ancestor of THAT lane. A present base
+              // not-ancestor/errored → HOLD; and the epic base ALSO ABSENT is NOT proof the
+              // surviving lane contains the source (it may be a fresh-epoch transition, a
+              // partial teardown, or inconsistent state) → HOLD until a fresh base is
+              // provisioned and integrated. A PRE-CUT lane forks off the canonical base
+              // region, so the teardown proof stands (absent → contained).
               if (target.existing) {
-                contained = laneSet.branches.has(epicBase)
-                  ? await gitIsAncestorOf(
-                      repoDir,
-                      epicBase,
-                      target.targetBranch,
-                      run,
-                    )
-                  : true;
+                contained =
+                  laneSet.branches.has(epicBase) &&
+                  (await epicBaseAncestorOfTarget(
+                    repoDir,
+                    epicBase,
+                    target.targetBranch,
+                  ));
               } else {
                 contained = true;
               }

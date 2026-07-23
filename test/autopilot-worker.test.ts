@@ -24247,6 +24247,57 @@ test("computeDeferredSiblingSources: P0-A — once the epic base (holding the to
   expect(deferred.has("fn-1-foo.4")).toBe(false);
 });
 
+test("computeDeferredSiblingSources: P0-A — rib torn down AND the epic base ALSO absent + a clean/synced EXISTING lane → MUST HOLD (base absence is not containment)", async () => {
+  // A fresh-epoch / partial-teardown state: every rib AND the canonical epic base are absent
+  // from the lane set, yet .4's lane survives, clean and READY. Base absence is NOT proof the
+  // surviving lane already contains the torn-down source — the old "whole epic merged →
+  // contained" shortcut is unsound for a non-done/reopened dependent whose lane persists. The
+  // dependent HOLDS until a fresh base is provisioned and integrated. Pre-cut targets keep the
+  // teardown-proof semantics (covered separately).
+  const epic = cascadeEpic({});
+  const { run, calls } = existingLaneGit({
+    lanes: [CASCADE_RIB4], // .4's lane exists; every rib AND the epic base are gone
+    ancestorPairs: [],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(true);
+  // An absent epic base short-circuits (no positive evidence exists to probe for).
+  expect(calls.some((c) => argvStartsWith(c.args, "merge-base"))).toBe(false);
+});
+
+test("computeDeferredSiblingSources: rider — several absent done parents of one target reuse ONE memoized epicBase→target ancestry probe", async () => {
+  // .4 depends on three DONE siblings whose ribs are ALL torn down; the epic base IS present
+  // and an ancestor of .4's lane, so every absent parent is contained and the loop never
+  // breaks. Without the memo that fires the IDENTICAL epicBase→lane ancestry subprocess three
+  // times; with it, exactly once.
+  const epic = cascadeEpic({});
+  const { run, calls } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_BASE, CASCADE_RIB4]],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    ALWAYS_READY,
+  );
+  expect(deferred.has("fn-1-foo.4")).toBe(false);
+  const baseAncestryProbes = calls.filter(
+    (c) =>
+      argvStartsWith(c.args, "merge-base", "--is-ancestor") &&
+      c.args[2] === CASCADE_BASE &&
+      c.args[3] === CASCADE_RIB4,
+  );
+  expect(baseAncestryProbes.length).toBe(1);
+});
+
 test("computeDeferredSiblingSources: EXISTING lane with an UNKNOWN/missing worktree → DEFERS (never clears on branch evidence alone)", async () => {
   const epic = cascadeEpic({});
   const { run } = existingLaneGit({
