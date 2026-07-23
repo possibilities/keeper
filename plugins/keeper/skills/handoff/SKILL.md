@@ -159,8 +159,10 @@ Flags:
 
 On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
 keeperd dispatcher resolves the target session internally; the CLI does not echo
-it. The keeperd dispatcher mints a durable pre-launch marker and launches
-the handoff-ee — a daemon restart mid-dispatch never double-launches.
+it. The keeperd dispatcher writes a durable `HandoffDispatching` marker before
+launch and launches only after that marker is confirmed as the current dispatch
+owner. After restart, a bound `handoff::<slug>` `SessionStart` wins; an unbound
+`dispatching` row is retried only after its lease becomes stale.
 
 ## Captured handoff — fire, then wait
 
