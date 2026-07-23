@@ -66,7 +66,7 @@
  * last `connected` lifecycle event).
  */
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -105,6 +105,20 @@ import type {
   DurableAwaitCondition,
   DurableAwaitConditionSpec,
 } from "../src/protocol";
+import {
+  buildWeeklyQuotaCondition,
+  type ContextEvidence,
+  type ContextVerdict,
+  evaluateContextThreshold,
+  evaluateWeeklyQuotaThreshold,
+  type FrozenWeeklyRoute,
+  parseThresholdPercent,
+  readContextEvidence,
+  readWeeklyQuotaEvidence,
+  resolveWeeklyRoute,
+  type WeeklyQuotaEvidence,
+  type WeeklyQuotaVerdict,
+} from "../src/quota-threshold";
 import type { GiveUpPolicy } from "../src/readiness-client";
 import {
   type ConnectFactory,
@@ -172,10 +186,23 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      occupancy sticky never trips them). since:<signature> anchors
                      against a signature a prior met printed: a still-present,
                      already-triaged signal holds; a genuinely new one fires
+  context-used-at-least <percent>
+                     the ambient session's exact-runtime context usage is at or
+                     above <percent> ([0,100], inclusive). Foreground-only: a
+                     --durable expression containing it refuses before arm; a
+                     terminal runtime subject fails reason=target-ended exit 4
+  weekly-quota-at-most <percent> [route]
+                     the frozen route's weekly Capacity meter is at or below
+                     <percent> ([0,100], inclusive). Foreground or --durable.
+                     route (default route:current) freezes the meter at arm:
+                     route:current, route:claude:<id>, route:codex:<alias>[:<scope>]
 
 Flags:
   --durable              Persist a server-evaluable wait and return immediately;
                          keeperd fires its fresh follow-up when it is met
+  --follow-up <text>     Durable only: the EXACT follow-up prompt to fire
+  --follow-up-file <p>   Durable only: read the follow-up prompt from a file
+                         (mutually exclusive with --follow-up)
   --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3
   --connect-timeout <dur>  Bounded reach-server deadline → reason=unreachable
                          exit 1. Default off = reconnect forever
@@ -360,7 +387,20 @@ export type ConditionSegment =
   // fn-1150 needs-human conditions — the six per-signal tokens plus the umbrella.
   // Board-family (read the whole board off the readiness snapshot), no id, each
   // carrying an OPTIONAL `since:<signature>` anti-spin anchor (mirrors `changed`).
-  | { condition: NeedsHumanSignal; since?: string };
+  | { condition: NeedsHumanSignal; since?: string }
+  // out-of-band runtime thresholds. Neither reads a server projection:
+  // `context-used-at-least` binds the ambient exact-runtime leaf (foreground
+  // only), `weekly-quota-at-most` freezes a route and watches its Capacity
+  // meter (foreground or durable). `frozen` is filled at arm time (in `main`)
+  // by resolving the route token; the parsed segment carries only the token.
+  | { condition: "context-used-at-least"; threshold: number; raw: string }
+  | {
+      condition: "weekly-quota-at-most";
+      threshold: number;
+      routeToken: string;
+      raw: string;
+      frozen?: FrozenWeeklyRoute;
+    };
 
 export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
@@ -404,6 +444,14 @@ export interface ParsedArgs {
   probe: boolean;
   /** Persist this server-evaluable wait and return instead of blocking. */
   durable?: boolean;
+  /**
+   * the exact durable follow-up prompt (`--follow-up`) or the path to
+   * read it from (`--follow-up-file`). Mutually exclusive; durable-only. The
+   * resolved content rides the existing bounded spill seam. Absent = the
+   * generic re-orient handoff (unchanged compatibility).
+   */
+  followUp?: string;
+  followUpFile?: string;
 }
 
 /**
@@ -514,6 +562,22 @@ const EXIT_USAGE = 2;
 
 /** Default `--heartbeat` cadence (task 2) when the flag is omitted: on, ~60s. */
 const DEFAULT_HEARTBEAT_MS = 60_000;
+
+/**
+ * the bounded foreground re-eval cadence for the out-of-band runtime
+ * family. The exact-runtime leaf and the Capacity sidecar change without any
+ * keeper.db commit, so a `context-used-at-least` / `weekly-quota-at-most`
+ * foreground wait re-reads them on this low-cost cadence rather than a tight
+ * spin. Overridable via `deps.runtimeReevalMs` under test.
+ */
+const RUNTIME_REEVAL_MS = 2_000;
+
+/**
+ * the bounded ceiling for a durable `--follow-up` / `--follow-up-file`
+ * document. Over-bounds refuses the arm rather than spilling an unbounded
+ * prompt through the durable seam.
+ */
+const MAX_FOLLOW_UP_BYTES = 128 * 1024;
 
 /**
  * `--probe`'s additive terminal code (task 3, registered in `cli/keeper.ts`'s
@@ -826,10 +890,78 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
         condition: condRaw,
         ...(since === undefined ? {} : { since }),
       });
+    } else if (condRaw === "context-used-at-least") {
+      // `context-used-at-least <percent>` — foreground-only ambient
+      // exact-runtime threshold. Exactly one inclusive `[0,100]` percent.
+      if (rest.length !== 1) {
+        return {
+          ok: false,
+          message: `condition 'context-used-at-least' takes exactly one percent (got ${rest.length})`,
+        };
+      }
+      const parsedPercent = parseThresholdPercent(rest[0] ?? "");
+      if (!parsedPercent.ok) {
+        return {
+          ok: false,
+          message: `condition 'context-used-at-least' ${parsedPercent.message}`,
+          exitCode: EXIT_USAGE,
+        };
+      }
+      const dupKey = `context-used-at-least:${parsedPercent.value}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: "context-used-at-least",
+        threshold: parsedPercent.value,
+        raw: `context-used-at-least ${rest[0] ?? ""}`,
+      });
+    } else if (condRaw === "weekly-quota-at-most") {
+      // `weekly-quota-at-most <percent> [route-token]` — foreground or
+      // durable. The percent is inclusive `[0,100]`; the optional route token
+      // (default `route:current`) is SHAPE-validated here and FROZEN at arm.
+      if (rest.length < 1 || rest.length > 2) {
+        return {
+          ok: false,
+          message: `condition 'weekly-quota-at-most' takes a percent and an optional route token (got ${rest.length})`,
+        };
+      }
+      const parsedPercent = parseThresholdPercent(rest[0] ?? "");
+      if (!parsedPercent.ok) {
+        return {
+          ok: false,
+          message: `condition 'weekly-quota-at-most' ${parsedPercent.message}`,
+          exitCode: EXIT_USAGE,
+        };
+      }
+      const routeToken = rest.length === 2 ? (rest[1] ?? "") : "route:current";
+      if (
+        routeToken !== "route:current" &&
+        !routeToken.startsWith("route:claude:") &&
+        !routeToken.startsWith("route:codex:")
+      ) {
+        return {
+          ok: false,
+          message: `condition 'weekly-quota-at-most' route token '${routeToken}' must be route:current, route:claude:<id>, or route:codex:<alias>[:<scope>]`,
+          exitCode: EXIT_USAGE,
+        };
+      }
+      const dupKey = `weekly-quota-at-most:${parsedPercent.value}:${routeToken}`;
+      if (seen.has(dupKey)) {
+        return { ok: false, message: `duplicate condition '${dupKey}'` };
+      }
+      seen.add(dupKey);
+      segments.push({
+        condition: "weekly-quota-at-most",
+        threshold: parsedPercent.value,
+        routeToken,
+        raw: `weekly-quota-at-most ${rest[0] ?? ""}`,
+      });
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed, landed, dead-letter, block-escalation, parked-question, stuck-dispatch, finalize-non-ff, instant-death-wall, needs-human)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running, drained, changed, epic-added, epic-removed, landed, dead-letter, block-escalation, parked-question, stuck-dispatch, finalize-non-ff, instant-death-wall, needs-human, context-used-at-least, weekly-quota-at-most)`,
       };
     }
   }
@@ -916,6 +1048,34 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     connectTimeoutMs = parsed.ms;
   }
 
+  // `--follow-up` / `--follow-up-file` are mutually exclusive and only
+  // meaningful for a durable await (a foreground await never fires a follow-up).
+  const followUpRaw =
+    typeof values["follow-up"] === "string"
+      ? (values["follow-up"] as string)
+      : undefined;
+  const followUpFileRaw =
+    typeof values["follow-up-file"] === "string"
+      ? (values["follow-up-file"] as string)
+      : undefined;
+  if (followUpRaw !== undefined && followUpFileRaw !== undefined) {
+    return {
+      ok: false,
+      message: "--follow-up and --follow-up-file are mutually exclusive",
+      exitCode: EXIT_USAGE,
+    };
+  }
+  if (
+    (followUpRaw !== undefined || followUpFileRaw !== undefined) &&
+    values.durable !== true
+  ) {
+    return {
+      ok: false,
+      message: "--follow-up / --follow-up-file require --durable",
+      exitCode: EXIT_USAGE,
+    };
+  }
+
   const sock =
     typeof values.sock === "string"
       ? (values.sock as string)
@@ -977,6 +1137,10 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       heartbeatMs,
       probe: values.probe === true,
       durable: values.durable === true,
+      ...(followUpRaw !== undefined ? { followUp: followUpRaw } : {}),
+      ...(followUpFileRaw !== undefined
+        ? { followUpFile: followUpFileRaw }
+        : {}),
     },
   };
 }
@@ -1035,6 +1199,25 @@ export interface RunDeps {
    * — that one carries no give-up policy.
    */
   now?: () => number;
+  /**
+   * read the ambient exact-runtime context evidence for a
+   * `context-used-at-least` slot. Production reads the runtime leaf; tests
+   * inject a fixture. Called on every runtime re-eval so an out-of-band leaf
+   * change is observed without any keeper.db commit.
+   */
+  readContextEvidence?: (ownSessionId: string | null) => ContextEvidence;
+  /**
+   * read the frozen route's weekly Capacity meter for a
+   * `weekly-quota-at-most` slot. Production reads the Capacity sidecars; tests
+   * inject a fixture. Called on every runtime re-eval.
+   */
+  readWeeklyEvidence?: (frozen: FrozenWeeklyRoute) => WeeklyQuotaEvidence;
+  /**
+   * the bounded runtime re-eval cadence (ms). Production sets a low-
+   * cost default; tests set their own. Only consulted when a runtime slot is
+   * present.
+   */
+  runtimeReevalMs?: number;
 }
 
 /**
@@ -1167,12 +1350,39 @@ interface BoardSlotState {
   baselineSignature: string | null;
 }
 
+/**
+ * Per-runtime-slot mutable state. The out-of-band family:
+ * `context-used-at-least` reads the ambient exact-runtime leaf,
+ * `weekly-quota-at-most` reads the frozen route's Capacity meter — neither
+ * off a server projection, so the slot latches `met` from a bounded re-eval
+ * timer rather than a subscription frame. `frozen` is null for context and
+ * the arm-time-frozen route for weekly-quota.
+ */
+interface RuntimeSlotState {
+  readonly kind: "context-used-at-least" | "weekly-quota-at-most";
+  readonly threshold: number;
+  readonly raw: string;
+  readonly frozen: FrozenWeeklyRoute | null;
+  met: boolean;
+  lastEval: AwaitState | null;
+  lastVerdictPhrase: string | null;
+}
+
 type SlotState =
   | PlanSlotState
   | GitJobSlotState
   | MonitorSlotState
   | ServerUpSlotState
-  | BoardSlotState;
+  | BoardSlotState
+  | RuntimeSlotState;
+
+/** Narrow a slot to a {@link RuntimeSlotState} (the out-of-band family). */
+function isRuntimeSlot(slot: SlotState): slot is RuntimeSlotState {
+  return (
+    slot.kind === "context-used-at-least" ||
+    slot.kind === "weekly-quota-at-most"
+  );
+}
 
 /**
  * Narrow a slot to a {@link BoardSlotState} — the whole-board family (`drained` /
@@ -1294,6 +1504,14 @@ export async function runAwait(
   const hasNeedsHuman = args.segments.some((s) =>
     isNeedsHumanCondition(s.condition),
   );
+  // the out-of-band runtime family reads no server projection — it
+  // opens NO subscription and is driven by a bounded re-eval timer + one
+  // synchronous first eval at arm.
+  const hasRuntime = args.segments.some(
+    (s) =>
+      s.condition === "context-used-at-least" ||
+      s.condition === "weekly-quota-at-most",
+  );
   const hasBoard =
     args.segments.some(
       (s) =>
@@ -1408,6 +1626,23 @@ export async function runAwait(
         baselineSignature: null,
       };
     }
+    if (
+      seg.condition === "context-used-at-least" ||
+      seg.condition === "weekly-quota-at-most"
+    ) {
+      return {
+        kind: seg.condition,
+        threshold: seg.threshold,
+        raw: seg.raw,
+        frozen:
+          seg.condition === "weekly-quota-at-most"
+            ? (seg.frozen ?? null)
+            : null,
+        met: false,
+        lastEval: null,
+        lastVerdictPhrase: null,
+      };
+    }
     return {
       kind: seg.condition,
       met: false,
@@ -1452,12 +1687,17 @@ export async function runAwait(
     // `allPainted()` AND so `server-up`'s single slot only `met`s once the
     // daemon is actually serving.
     serverUp: !openServerUp,
+    // the out-of-band runtime family paints from its own first
+    // synchronous read (flipped alongside the re-eval timer arm), never a
+    // subscription frame. `true` when no runtime slot is present.
+    runtime: !hasRuntime,
   };
   const allPainted = (): boolean =>
     paintGate.readiness &&
     paintGate.git &&
     paintGate.jobs &&
-    paintGate.serverUp;
+    paintGate.serverUp &&
+    paintGate.runtime;
 
   const state: RunnerState = {
     terminating: false,
@@ -1494,6 +1734,11 @@ export async function runAwait(
   // armed line); cleared in `cleanupSubscriptions` so it never leaks past a
   // terminal or SIGTERM.
   let heartbeatHandle: unknown = null;
+  // the out-of-band runtime re-eval timer, self-rescheduling like the
+  // dwell/heartbeat timers. Re-reads the exact-runtime leaf / Capacity sidecar
+  // on a bounded cadence so an out-of-band change is observed with no keeper.db
+  // commit; cleared in `cleanupSubscriptions`.
+  let runtimeHandle: unknown = null;
   let unregisterSignals: (() => void) | null = null;
 
   // Wall-clock accessor for the `complete`-dwell confirmation. Injected under
@@ -1513,6 +1758,10 @@ export async function runAwait(
     if (heartbeatHandle !== null) {
       deps.clearTimer(heartbeatHandle);
       heartbeatHandle = null;
+    }
+    if (runtimeHandle !== null) {
+      deps.clearTimer(runtimeHandle);
+      runtimeHandle = null;
     }
     for (const h of [readinessHandle, gitHandle, jobsHandle]) {
       if (h !== null) {
@@ -1568,6 +1817,9 @@ export async function runAwait(
     }
     if (slot.kind === "monitor-running") {
       return `monitor-running ${slot.raw}`;
+    }
+    if (isRuntimeSlot(slot)) {
+      return slot.raw;
     }
     if (
       (slot.kind === "epic-added" ||
@@ -2288,6 +2540,96 @@ export async function runAwait(
     }, COMPLETE_DWELL_MS);
   };
 
+  // PII-free detail phrase for a runtime slot's line render — the raw
+  // canonical percent (when decidable) plus the bounded reason code. Never any
+  // prompt text, credential, provider error, or private path.
+  const contextDetail = (verdict: ContextVerdict, threshold: number): string =>
+    verdict.used_percent !== null
+      ? `context ${verdict.used_percent}% (>=${threshold}): ${verdict.reason}`
+      : `context ${verdict.reason}`;
+  const weeklyDetail = (
+    verdict: WeeklyQuotaVerdict,
+    threshold: number,
+  ): string =>
+    verdict.used_percent !== null
+      ? `weekly ${verdict.used_percent}% (<=${threshold}): ${verdict.reason}`
+      : `weekly ${verdict.reason}`;
+
+  // synchronously evaluate one out-of-band runtime slot off its
+  // injected reader (production reads the leaf / Capacity sidecar). `ended`
+  // marks a bounded target-ended terminal (context only); every other
+  // not-yet-decidable reading stays `waiting`, never a false zero.
+  const runtimeNow = (): number => Math.floor(deps.now?.() ?? Date.now());
+  const evalRuntimeSlot = (
+    slot: RuntimeSlotState,
+  ): { result: AwaitState; ended: boolean } => {
+    if (slot.kind === "context-used-at-least") {
+      const evidence: ContextEvidence = (
+        deps.readContextEvidence ??
+        ((id: string | null) => readContextEvidence(id, { now: runtimeNow }))
+      )(deps.ownSessionId);
+      const verdict = evaluateContextThreshold(evidence, slot.threshold);
+      return {
+        result: {
+          kind: verdict.met ? "met" : "waiting",
+          detail: contextDetail(verdict, slot.threshold),
+        },
+        ended: verdict.ended,
+      };
+    }
+    if (slot.frozen === null) {
+      return {
+        result: { kind: "waiting", detail: "weekly-quota route unresolved" },
+        ended: false,
+      };
+    }
+    const frozen = slot.frozen;
+    const evidence: WeeklyQuotaEvidence = (
+      deps.readWeeklyEvidence ??
+      ((f: FrozenWeeklyRoute) => readWeeklyQuotaEvidence(f, runtimeNow()))
+    )(frozen);
+    const verdict = evaluateWeeklyQuotaThreshold(evidence, slot.threshold);
+    return {
+      result: {
+        kind: verdict.met ? "met" : "waiting",
+        detail: weeklyDetail(verdict, slot.threshold),
+      },
+      ended: false,
+    };
+  };
+
+  // a context runtime subject reached a terminal state — a bounded
+  // target-ended failure (exit 4, the deleted/ended family). Not retryable by
+  // re-arming (a fresh session has a fresh context window).
+  const emitRuntimeTargetEnded = (slot: RuntimeSlotState): void => {
+    const base: Record<string, string> = {
+      reason: "target-ended",
+      condition: slot.kind,
+      retryable: "false",
+    };
+    if (!single) {
+      base.from = slotLabel(slot);
+    }
+    emitTerminal("failed", 4, base);
+  };
+
+  // arm the bounded runtime re-eval timer (idempotent while pending,
+  // self-rescheduling until a terminal). Each tick re-reads the out-of-band
+  // leaf / Capacity sidecar and re-runs the active evaluator so a change that
+  // never advances keeper.db is still observed.
+  const runtimeReevalMs = deps.runtimeReevalMs ?? RUNTIME_REEVAL_MS;
+  const ensureRuntimeTimer = (): void => {
+    if (!hasRuntime || runtimeHandle !== null || state.terminating) {
+      return;
+    }
+    runtimeHandle = deps.setTimer(() => {
+      runtimeHandle = null;
+      paintGate.runtime = true;
+      void evaluateActive();
+      ensureRuntimeTimer();
+    }, runtimeReevalMs);
+  };
+
   const evaluate = async (): Promise<void> => {
     if (state.terminating) {
       return;
@@ -2407,6 +2749,19 @@ export async function runAwait(
         }
         const result = evalBoardSlot(slot, latestReadiness);
         slot.lastEval = result;
+        logProgress(slot, result);
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (isRuntimeSlot(slot)) {
+        // out-of-band runtime slot: read the injected leaf / Capacity
+        // reader synchronously. A context target-ended is a bounded terminal
+        // (exit 4) that pre-empts everything, mirroring a deleted plan target.
+        const { result, ended } = evalRuntimeSlot(slot);
+        slot.lastEval = result;
+        if (ended) {
+          emitRuntimeTargetEnded(slot);
+          return;
+        }
         logProgress(slot, result);
         slot.met = result.kind === "met";
         evals[i] = result;
@@ -2693,6 +3048,18 @@ export async function runAwait(
         }
         const result = evalBoardSlot(slot, latestReadiness);
         slot.lastEval = result;
+        slot.met = result.kind === "met";
+        evals[i] = result;
+      } else if (isRuntimeSlot(slot)) {
+        // same synchronous read as the wait path. A context
+        // target-ended is a distinct terminal (exit 4) under --probe, never
+        // folded into does-not-hold (mirrors not-found/ambiguous).
+        const { result, ended } = evalRuntimeSlot(slot);
+        slot.lastEval = result;
+        if (ended) {
+          emitRuntimeTargetEnded(slot);
+          return;
+        }
         slot.met = result.kind === "met";
         evals[i] = result;
       }
@@ -3080,6 +3447,17 @@ export async function runAwait(
     });
   }
 
+  // the out-of-band runtime family opens NO subscription. Paint it,
+  // fire ONE synchronous first eval (so `--probe` / an already-true threshold /
+  // arming all resolve without waiting a tick), and arm the bounded re-eval
+  // timer. When ANDed with a subscription condition, `evaluateActive` still
+  // gates on `allPainted()` until that stream first-paints.
+  if (hasRuntime && !state.terminating) {
+    paintGate.runtime = true;
+    ensureRuntimeTimer();
+    void evaluateActive();
+  }
+
   return state.result;
 }
 
@@ -3138,10 +3516,23 @@ function durableConditionSpec(
     "finalize-non-ff",
     "instant-death-wall",
     "needs-human",
+    // weekly-quota is durable (its frozen route rides the spec).
+    // `context-used-at-least` is deliberately ABSENT — durable context refuses.
+    "weekly-quota-at-most",
   ]);
   const out: DurableAwaitCondition[] = [];
   for (const segment of segments) {
     if (!supported.has(segment.condition)) return null;
+    if (segment.condition === "weekly-quota-at-most") {
+      // the route was frozen in `main` (arm time). An unresolved
+      // route means routing was unavailable — refuse the durable arm.
+      const frozen = segment.frozen;
+      if (frozen === undefined) return null;
+      out.push({
+        ...buildWeeklyQuotaCondition(segment.threshold, frozen),
+      } as DurableAwaitCondition);
+      continue;
+    }
     if (
       "target" in segment &&
       typeof segment.target === "object" &&
@@ -3173,9 +3564,28 @@ function durableConditionSpec(
   return out;
 }
 
+/**
+ * A `--follow-up` document may carry an arbitrary caller prompt. The durable
+ * list surface reports its PRESENCE, never its content — the raw text stays
+ * out of every diagnostic path. Each row's `follow_up` becomes a bounded
+ * `has_follow_up` boolean.
+ */
+export function redactAwaitListRows(rows: readonly unknown[]): unknown[] {
+  return rows.map((row) => {
+    if (row !== null && typeof row === "object" && "follow_up" in row) {
+      const { follow_up, ...rest } = row as Record<string, unknown>;
+      return {
+        ...rest,
+        has_follow_up: typeof follow_up === "string" && follow_up.length > 0,
+      };
+    }
+    return row;
+  });
+}
+
 async function listDurableAwaits(sock: string): Promise<void> {
   const rows = await queryCollection(sock, "awaits");
-  process.stdout.write(`${JSON.stringify(rows)}\n`);
+  process.stdout.write(`${JSON.stringify(redactAwaitListRows(rows))}\n`);
 }
 
 const CANCEL_HELP = `keeper await cancel <await-id> [--force]
@@ -3288,7 +3698,40 @@ export async function main(argv: string[]): Promise<void> {
   const gitRoot = needsRoot ? resolveCwdGitRoot() : null;
   const ownSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? null;
 
+  // freeze every weekly-quota route ONCE, at arm time (side-effect
+  // read of the current routing inspectors), and attach it to its segment for
+  // both the foreground and durable paths. Absent authoritative current
+  // routing refuses the arm rather than silently retargeting later.
+  for (const segment of parsed.args.segments) {
+    if (segment.condition !== "weekly-quota-at-most") {
+      continue;
+    }
+    const resolved = resolveWeeklyRoute(segment.routeToken, ownSessionId);
+    if (!resolved.ok) {
+      process.stdout.write(
+        eventLine(parsed.args.json, "failed", {
+          reason: "route-unresolved",
+          condition: "weekly-quota-at-most",
+          detail: resolved.reason,
+        }),
+      );
+      process.exit(1);
+    }
+    segment.frozen = resolved.frozen;
+  }
+
   if (parsed.args.durable) {
+    // a durable expression containing a foreground-only context
+    // segment refuses before arming (its follow-up runs in a fresh session
+    // with a different context window).
+    if (
+      parsed.args.segments.some((s) => s.condition === "context-used-at-least")
+    ) {
+      process.stderr.write(
+        "keeper await: 'context-used-at-least' is foreground-only and cannot be made --durable\n",
+      );
+      process.exit(EXIT_USAGE);
+    }
     const conditionSpec = durableConditionSpec(
       parsed.args.segments,
       gitRoot,
@@ -3300,17 +3743,36 @@ export async function main(argv: string[]): Promise<void> {
       );
       process.exit(EXIT_USAGE);
     }
+    // the follow-up document rides the existing bounded spill seam.
+    // `--follow-up` / `--follow-up-file` supply the EXACT prompt; omitting both
+    // keeps the generic re-orient handoff (unchanged compatibility). A failed
+    // file read or an over-bounds document refuses the arm and writes nothing.
+    let followUpBody: string;
+    if (parsed.args.followUp !== undefined) {
+      followUpBody = parsed.args.followUp;
+    } else if (parsed.args.followUpFile !== undefined) {
+      try {
+        followUpBody = readFileSync(parsed.args.followUpFile, "utf8");
+      } catch (err) {
+        process.stderr.write(
+          `keeper await: cannot read --follow-up-file: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exit(1);
+      }
+    } else {
+      followUpBody = `A durable keeper await has fired. Re-orient on the board and continue the requested follow-up. Conditions: ${JSON.stringify(conditionSpec)}.`;
+    }
+    if (Buffer.byteLength(followUpBody, "utf8") > MAX_FOLLOW_UP_BYTES) {
+      process.stderr.write(
+        `keeper await: follow-up document exceeds ${MAX_FOLLOW_UP_BYTES} bytes\n`,
+      );
+      process.exit(1);
+    }
     const rpcId = crypto.randomUUID();
     const spillDir = resolveAwaitSpillDir();
     mkdirSync(spillDir, { recursive: true });
     const docPath = join(spillDir, `${rpcId}.txt`);
-    // The fresh session gets an explicit durable-await handoff, never a pointer
-    // to the arming session which may already be gone.
-    writeFileSync(
-      docPath,
-      `A durable keeper await has fired. Re-orient on the board and continue the requested follow-up. Conditions: ${JSON.stringify(conditionSpec)}.`,
-      "utf8",
-    );
+    writeFileSync(docPath, followUpBody, "utf8");
     const { session } = resolveSession({ sessionFlag: undefined });
     try {
       const response = await roundTrip(
@@ -3339,6 +3801,9 @@ export async function main(argv: string[]): Promise<void> {
       process.stdout.write(`${JSON.stringify(response.value)}\n`);
       return;
     } catch (err) {
+      // never leave a half-armed spill artifact (which may carry the
+      // follow-up prompt) behind on a failed arm.
+      rmSync(docPath, { force: true });
       process.stderr.write(
         `keeper await: ${err instanceof Error ? err.message : String(err)}\n`,
       );

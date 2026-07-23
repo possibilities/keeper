@@ -55,6 +55,8 @@ the literal `and` token.
 | `epic-removed <id>` | "when fn-X leaves the board / is done or deleted." **One id, edge-triggered.** | `epic-removed fn-…` |
 | `changed [since:R]` | "ping me when anything on the board moves" — an epic appears/leaves, a verdict flips, or autopilot config changes. **Edge-triggered;** optional `since:<hash>` anchors against a prior `changed` baseline so you can detect movement since a known point. | `changed` / `changed since:<hash>` |
 | `<needs-human> [since:S]` | "ping me when there's a dead letter / block escalation / parked question / stuck dispatch / finalize non-ff jam / instant-death wall" (one signal), or "ping me on any needs-human signal" (the umbrella). **No id.** Six per-signal tokens — `dead-letter`, `block-escalation`, `parked-question`, `stuck-dispatch`, `finalize-non-ff`, `instant-death-wall` — plus the umbrella `needs-human` (any of them). **Level-triggered presence:** `stuck-dispatch`/`finalize-non-ff`/`instant-death-wall` and the umbrella fire on the operator-jam class only — a self-clearing occupancy sticky never trips them. That jam class includes the shared-checkout dirty/desync hygiene rows (daemon-paged once each; cleared ONLY when their producer sees the checkout reconciled, never over the retry wire). Optional `since:<signature>` anti-spin anchor: a still-present, already-triaged signal whose signature matches the anchor HOLDS, a genuinely new signal (signature moved) FIRES. | `needs-human` / `dead-letter` / `stuck-dispatch since:<sig>` |
+| `context-used-at-least <percent>` | "wait until MY context is at least N% used" — a same-Session foreground pause point (e.g. "compact soon"). **No id, inclusive `[0,100]`.** Binds the ambient exact-runtime leaf of THIS Session; **foreground-only** — a `--durable` expression containing it refuses to arm. See *Threshold awaits* below. | `context-used-at-least 80` |
+| `weekly-quota-at-most <percent> [route]` | "wait until the weekly quota on <route> drops to N% or below" — a capacity-clearing pause point, foreground or durable. **No id, inclusive `[0,100]`.** `route` (default `route:current`) is resolved ONCE at arm time and frozen — `route:current`, `route:claude:<id>`, or `route:codex:<alias>[:<scope>]`. See *Threshold awaits* below. | `weekly-quota-at-most 20 route:current` |
 
 | Field | How to derive | Example |
 |---|---|---|
@@ -73,6 +75,8 @@ The vocabulary overlaps on purpose — pick by what "done" means to the caller:
 | …in-flight dispatched work has drained, on a paused board (no new dispatches will start) | `drained --scope inflight` | Ignores ready-but-undispatched rows — pair with a paused autopilot, not a playing one |
 | …the WHOLE board — every session, including hand-started/adopted/external ones — is at rest | `drained --scope board` | The strict prior gate; the one `--scope` a strict consumer (e.g. the watch wedge alarm) must ask for explicitly |
 | …a condition holds RIGHT NOW, without blocking (a pre-flight sanity check, a CI gate) | any condition + `--probe` | See *One-shot check* below — evaluates once and exits, never wired through Monitor |
+| …THIS session's own context has filled up (a compact-soon pause point) | `context-used-at-least <percent>` | Foreground-only — the ambient session's own exact-runtime leaf; refuses `--durable` because a fresh follow-up session has a fresh context window |
+| …a route's weekly Capacity meter has cleared enough to launch more work | `weekly-quota-at-most <percent> [route]` | Foreground or durable; freezes one concrete route at arm time rather than re-targeting whichever route is current when it fires |
 
 **The `and` grammar.** When the user names more than one condition,
 join them with the literal `and` token:
@@ -104,10 +108,11 @@ full orient step run `keeper prompt render engineering/orient`.
 This pre-check applies **only to `complete` / `started` / `unblocked`** (and
 optionally `epic-removed` / `landed`, whose epic id you can verify exists
 today). The other conditions — `git-clean`, `agents-idle`, `server-up`,
-`monitor-running`, `drained`, `epic-added`, `changed`, and the six per-signal
-needs-human tokens plus the umbrella `needs-human` — have **no pre-check**
-(they read live projections, or deliberately wait for something not present
-yet); skip straight to step 2.
+`monitor-running`, `drained`, `epic-added`, `changed`, the six per-signal
+needs-human tokens plus the umbrella `needs-human`, and the two threshold
+conditions `context-used-at-least` / `weekly-quota-at-most` — have **no
+pre-check** (they read live projections, out-of-band runtime evidence, or
+deliberately wait for something not present yet); skip straight to step 2.
 
 **`monitor-running` self-refuses at arm time.** If the selector matches no
 running monitor in this session, `keeper await` emits `failed reason=no-match`
@@ -214,6 +219,12 @@ aggregate:
 [keeper-await] armed condition=<git-clean|agents-idle|server-up> state=<…>
 [keeper-await] met condition=<git-clean|agents-idle|server-up> detail=<…>
 
+# single threshold condition (context-used-at-least / weekly-quota-at-most;
+# state/detail carries the raw canonical percent plus a bounded reason when
+# decidable — never a false zero for unavailable evidence)
+[keeper-await] armed condition=<context-used-at-least|weekly-quota-at-most> state=<…>
+[keeper-await] met condition=<context-used-at-least|weekly-quota-at-most> detail=<…>
+
 # single monitor-running condition (carries the selector)
 [keeper-await] armed condition=monitor-running selector=<…> state=<…>
 [keeper-await] met condition=monitor-running selector=<…> detail=<…>
@@ -290,6 +301,8 @@ Reasons + exit codes:
 | `failed reason=connect …` | 1 | A terminal query-SHAPE error keeperd rejected — a malformed/unrecoverable query (e.g. `bad_frame` / `unknown_collection`). NOT a capacity condition: a `max_connections` cap reject is transient and rides the reconnect loop (it never surfaces here). | Tell the user the query was rejected; the wait can't proceed. |
 | `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`** (or implicitly under `--probe`, which always carries a bounded deadline). keeperd stayed unreachable past that deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=` and `retryable=true`. **Reconnect-forever is the default for every condition** — a plain await with no `--connect-timeout` NEVER emits this, it just keeps reconnecting; `server-up` is the one condition permanently barred from opting out (see the `server-up` row above). | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
+| `failed reason=target-ended condition=context-used-at-least …` | 4 | The ambient Session that `context-used-at-least` was bound to reached a terminal state before the threshold was met. | Tell the user the session ended; re-arm fresh against the NEW session if the pause point is still wanted — a fresh session has a fresh context window, so this wait itself is not retryable. |
+| `failed reason=route-unresolved condition=weekly-quota-at-most …` | 1 | At arm time, `weekly-quota-at-most` could not resolve and freeze an authoritative current route for the given token (no matching/eligible route right now). | Tell the user routing was unavailable; re-arm once `keeper accounts inspect --json` / `keeper agent accounts check --json` shows a resolvable route for that token. |
 | `failed reason=timeout …` | 3 | Your own `--timeout` deadline hit. Carries `retryable=true` — the caller's budget ran out, not a verdict on the condition. | Tell the user it timed out; ask whether to extend or re-arm. |
 | `failed reason=signal signal=<SIGTERM\|SIGINT> …` | 10 | An external signal killed the wait — Monitor's `timeout_ms` kill, or an operator kill. Names the signal and carries `retryable=false` — not the caller's own budget, so a mass-reap is never mistaken for self-deadlines. | Tell the user the wait was killed externally (e.g. Monitor's deadline); ask whether to re-arm or extend the deadline. |
 | `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. Carries `retryable=false` — an operator jam, not self-clearing. | Tell the user the target is stuck; surface the verdict. |
@@ -331,6 +344,41 @@ shell command, run it via Bash.
 On any `failed`, surface the terminal line to the user verbatim and ask
 how they want to proceed — do NOT silently run the follow-up.
 
+## Threshold awaits — context and weekly quota
+
+`context-used-at-least <percent>` and `weekly-quota-at-most <percent>
+[route]` are runtime thresholds: neither reads a server projection. Both take
+an inclusive raw canonical percent in `[0,100]` (`50`, `50.5`, `0`, and `100`
+all parse; a sign, scientific notation, or an out-of-range value is a usage
+error) and compare the RAW measured percent against it directly — never
+rounded or renormalized first.
+
+- **`context-used-at-least P`** binds the AMBIENT session's own exact-runtime
+  leaf and fires once its context usage is at or above `P`. It is
+  **foreground-only** — a `--durable` expression containing it refuses to
+  arm (usage error, exit 2), because a fresh follow-up session would start
+  with a fresh context window, not the arming session's. If the runtime
+  subject reaches a terminal state (the Session ended) before the threshold
+  is met, the wait fails `reason=target-ended` exit 4 rather than hanging;
+  see the reasons table above.
+- **`weekly-quota-at-most P [route]`** watches a route's weekly Capacity
+  meter and fires once it is at or below `P`. It works foreground OR
+  `--durable`. `route` (default `route:current`) is **resolved once and
+  frozen at arm time** — `route:current`, `route:claude:<id>`, or
+  `route:codex:<alias>[:<scope>]` — and the wait watches THAT concrete
+  route's meter for its whole life; a later routing decision never
+  retargets it. If no authoritative current route resolves for the token
+  at arm time, the arm itself refuses: `failed reason=route-unresolved`
+  exit 1 (see the reasons table above) — confirm a resolvable route with
+  `keeper accounts inspect --json` / `keeper agent accounts check --json`
+  before re-arming.
+
+Both conditions treat missing, stale, or unresolved evidence as `waiting`,
+never as a false zero or a false "met" — the same partial-data discipline
+`keeper session runtime` / `keeper usage --json` / `keeper accounts inspect`
+use (see `docs/agent-surface-contracts.md`). Neither condition has a Step 1
+board pre-check (there is no plan id to verify); skip straight to Step 2.
+
 ## Durable awaits (`--durable`) — a spawned session, not a self-wake
 
 `keeper await <condition…> --durable` persists a server-evaluable wait and
@@ -346,9 +394,24 @@ condition holds — wire the Monitor per Step 2 instead: each fired durable
 await costs a full worker spawn, and the spawn acts on its own rather than
 waking you.
 
+`keeper plan done` on the spawned follow-up session marks launch ACCEPTED,
+never that the requested work is complete — the fresh session still has to
+do the work and close it out itself; a durable await's `met` only proves the
+condition held and the follow-up session launched.
+
+**An explicit follow-up document.** By default the spawned session gets a
+generic re-orient-and-continue prompt naming the fired condition(s). Give it
+the EXACT prompt instead with `--follow-up <text>` or `--follow-up-file
+<path>` (mutually exclusive; a failed file read or an over-bounds document
+refuses the arm and writes nothing). Always pass one of these when the
+follow-up matters — a vague generic re-orient is a worse outcome than an
+explicit instruction. The document's raw text never rides `keeper await
+list`; each row reports only a bounded `has_follow_up` boolean, never its
+content.
+
 **Inspect and cancel.** `keeper await list` prints the durable-await rows as
-JSON (`await_id`, condition, status). To retire a still-`waiting` await before
-it fires:
+JSON (`await_id`, condition, status, `has_follow_up`). To retire a
+still-`waiting` await before it fires:
 
 ```
 keeper await cancel <await-id>          # the arming session cancels its own
@@ -435,6 +498,29 @@ keeper await complete fn-12-add-oauth.3 --probe # "is this task done+idle right 
 3. On `[keeper-await] met conditions=git-clean and agents-idle count=2`
    → run the commit.
 
+### Wait for context to fill, then compact (threshold, foreground)
+
+> User: "Let me know when my context hits 80% so I can compact."
+
+1. No pre-check — `context-used-at-least` has no off-board state. Skip step 1.
+2. `Monitor({ command: "keeper await context-used-at-least 80",
+   description: "wait for context >=80% then suggest compacting",
+   persistent: true })`.
+3. On `met` → tell the user and offer to compact. Never `--durable` this one.
+
+### Wait for weekly quota to clear, then launch follow-up work (threshold, durable)
+
+> User: "Once the weekly quota on my current route drops under 20%, kick
+> off the next planning round."
+
+1. No pre-check — `weekly-quota-at-most` has no off-board state. Skip step 1.
+2. `keeper await weekly-quota-at-most 20 route:current --durable
+   --follow-up "Re-orient on the board and start the next planning round
+   for fn-N."` — returns immediately; keeperd fires a fresh session when met.
+3. Nothing to listen for in THIS session — the spawned session owns the
+   follow-up. Use `keeper await list` to confirm it's armed
+   (`has_follow_up: true`).
+
 ## What NOT to do
 
 - Do not wire a plan Monitor without the Step 1 board pre-check — a doomed
@@ -444,3 +530,7 @@ keeper await complete fn-12-add-oauth.3 --probe # "is this task done+idle right 
   root; `server-up` is daemon-scoped).
 - Do not invent ids. If the user gives a slug-less reference ("the
   promotion epic") and you can't disambiguate, ask.
+- Do not make `context-used-at-least` `--durable` — it refuses to arm; wire
+  a foreground Monitor instead (Step 2).
+- Do not treat a durable follow-up session's `keeper plan done` as proof the
+  requested work finished — it proves launch acceptance only.

@@ -1398,7 +1398,14 @@ test("AWAIT_NOT_CANCELLABLE_MESSAGE reveals nothing about which refusal case fir
 
 test("request_await rejects unknown and session-local condition kinds loudly", async () => {
   const { bridge, state } = autopilotStubBridge({});
-  for (const condition of ["monitor-running", "server-up", "unknown-kind"]) {
+  // `context-used-at-least` is foreground-only, so it must NOT be a
+  // server-evaluable durable kind (alongside the pre-existing session-locals).
+  for (const condition of [
+    "monitor-running",
+    "server-up",
+    "unknown-kind",
+    "context-used-at-least",
+  ]) {
     const promise = requestAwaitHandler(
       {
         ...validAwaitRequest,
@@ -1410,6 +1417,31 @@ test("request_await rejects unknown and session-local condition kinds loudly", a
     expect(promise).rejects.toThrow(/allowed kinds: complete, unblocked/);
   }
   expect(state.requestAwaitCalls).toEqual([]);
+});
+
+test("request_await accepts a weekly-quota-at-most frozen-route condition", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const spec = [
+    {
+      condition: "weekly-quota-at-most",
+      threshold: 80,
+      provider: "claude",
+      route: "acct-1",
+      weekly_meter: "week",
+      quota_scope: null,
+      resolved_at_ms: 1_700_000_000_000,
+    },
+  ];
+  const result = await requestAwaitHandler(
+    { ...validAwaitRequest, condition_spec: spec },
+    bridge,
+  );
+  expect(result).toMatchObject({ ok: true, op: "request" });
+  // The frozen route rides through to main opaquely (validated at evaluation).
+  expect(
+    (state.requestAwaitCalls[0] as { condition_spec?: unknown } | undefined)
+      ?.condition_spec,
+  ).toEqual(spec);
 });
 
 test("request_await rejects unknown top-level payload keys for both variants", async () => {

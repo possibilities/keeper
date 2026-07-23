@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
 /**
- * `keeper session <state|files|events|summary>` — the session-scoped read group.
- * Each verb maps to its own leaf main (`cli/{session-state,show-session-files,
- * show-session-events,session-summary}.ts`). The leaves share Session-reference
+ * `keeper session <state|runtime|files|events|summary>` — the session-scoped read group.
+ * Each verb maps to its own leaf main (`cli/{session-state,session-runtime,
+ * show-session-files,show-session-events,session-summary}.ts`). The leaves share Session-reference
  * resolution while retaining their established success payloads.
  *
  * The leaf mains are lazy-imported ONLY on the dispatch path, so group `--help`
@@ -57,6 +57,10 @@ const SUBVERBS: Record<string, Subverb> = {
   state: {
     summary: "Current session git context + on-hook files (JSON)",
     run: async (rest) => (await import("./session-state")).main(rest),
+  },
+  runtime: {
+    summary: "Exact runtime telemetry + proven scoped route (JSON)",
+    run: async (rest) => (await import("./session-runtime")).main(rest),
   },
   files: {
     summary: "Session's on-hook dirty files grouped by repo (JSON)",

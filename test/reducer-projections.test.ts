@@ -10282,6 +10282,36 @@ test("malformed AwaitRequested is a safe no-op while the Cursor advances", () =>
   expect(getCursor()).toBe(malformedId);
 });
 
+test("AwaitRequested folds a weekly-quota-at-most frozen route opaquely", () => {
+  const spec = [
+    {
+      condition: "weekly-quota-at-most",
+      threshold: 80,
+      provider: "codex",
+      route: "alpha",
+      weekly_meter: "week",
+      quota_scope: "generic",
+      resolved_at_ms: 1_700_000_000_000,
+    },
+  ];
+  const eventId = awaitRequestedEvent("await-weekly", {
+    condition_spec: spec,
+    follow_up: "resume once quota frees",
+    timeout_at: null,
+  });
+  drainAll();
+  // The frozen route round-trips byte-identically through the projection — the
+  // reducer stores the spec opaquely (no schema step, no per-kind fold).
+  expect(getAwaits()).toMatchObject([
+    {
+      await_id: "await-weekly",
+      condition_spec: JSON.stringify(spec),
+      status: "waiting",
+      last_event_id: eventId,
+    },
+  ]);
+});
+
 test("Durable awaits Re-fold byte-identically", () => {
   awaitRequestedEvent("await-a");
   awaitRequestedEvent("await-b", {

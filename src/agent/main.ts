@@ -855,7 +855,11 @@ export function productionCodexPoolLaunchContext(
   }
 }
 
-function productionCodexSessionInspection(
+/** The Codex launch-seed inspector: activation mode, companion extension
+ *  health, and pool capacity for a FRESH Codex launch, independent of any
+ *  particular session. Exported so `keeper accounts inspect` reuses the exact
+ *  same seam as `keeper agent accounts check` (shared-seam compatibility). */
+export function productionCodexSessionInspection(
   env: NodeJS.ProcessEnv,
 ): CodexSessionRoutingInspection {
   const companion = resolvePiCodexPoolExtension();

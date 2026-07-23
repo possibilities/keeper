@@ -14,6 +14,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { main as accountsMain } from "../cli/accounts";
 import {
   buildParseOptions,
   NATIVE_COMMANDS,
@@ -76,6 +77,7 @@ function makeHarness(): Harness {
       git: mkHandler("git"),
       autopilot: mkHandler("autopilot"),
       usage: mkHandler("usage"),
+      accounts: mkHandler("accounts"),
       frames: mkHandler("frames"),
       dash: mkHandler("dash"),
       status: mkHandler("status"),
@@ -266,12 +268,27 @@ describe("cli/keeper dispatch", () => {
       "snapshot",
       "watch",
       "timeout",
+      "json",
       "help",
     ]);
     expect(
       buildHelpIndex().subcommands.map((command) => command.name),
     ).toContain("usage");
     expect(USAGE).toContain("  usage");
+  });
+
+  test("await descriptor + help document the threshold conditions", async () => {
+    const { HELP: AWAIT_HELP } = await import("../cli/await");
+    const descriptor = NATIVE_COMMANDS.find(
+      (command) => command.name === "await",
+    );
+    const flagNames = descriptor?.flags.map((flag) => flag.name) ?? [];
+    expect(flagNames).toContain("follow-up");
+    expect(flagNames).toContain("follow-up-file");
+    // The new conditions are documented in the operator help.
+    expect(AWAIT_HELP).toContain("context-used-at-least");
+    expect(AWAIT_HELP).toContain("weekly-quota-at-most");
+    expect(AWAIT_HELP).toContain("--follow-up");
   });
 
   for (const retired of ["search-history", "find-file-history"] as const) {
@@ -331,6 +348,7 @@ describe("cli/keeper dispatch", () => {
     // Session reads and the process-only termination control are published.
     expect(SUBCOMMAND_META.session.verbs).toEqual([
       "state",
+      "runtime",
       "files",
       "events",
       "summary",
@@ -585,7 +603,7 @@ describe("cli/session group dispatcher", () => {
     const r = await runSession([]);
     expect(r.code).toBeNull();
     expect(r.out).toContain(
-      "keeper session <state|files|events|summary|terminate|release>",
+      "keeper session <state|runtime|files|events|summary|terminate|release>",
     );
     expect(r.err).toBe("");
   });
@@ -595,6 +613,7 @@ describe("cli/session group dispatcher", () => {
     expect(r.code).toBeNull();
     for (const verb of [
       "state",
+      "runtime",
       "files",
       "events",
       "summary",
@@ -610,6 +629,9 @@ describe("cli/session group dispatcher", () => {
     // routed to that exact leaf (and that the leaf help cites no retired name).
     expect((await runSession(["state", "--help"])).out).toContain(
       "keeper session state",
+    );
+    expect((await runSession(["runtime", "--help"])).out).toContain(
+      "keeper session runtime",
     );
     expect((await runSession(["files", "--help"])).out).toContain(
       "keeper session files",
@@ -630,6 +652,74 @@ describe("cli/session group dispatcher", () => {
 
   test("an unknown subverb is an argument fault (exit 2)", async () => {
     const r = await runSession(["bogus"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("unknown verb 'bogus'");
+  });
+});
+
+describe("cli/accounts group dispatcher", () => {
+  interface Captured {
+    out: string;
+    err: string;
+    code: number | null;
+  }
+
+  /** Run accountsMain with process stdout/stderr/exit captured. `exit` throws so
+   *  a never-returning arg-fault branch unwinds to a captured code. */
+  async function runAccounts(argv: string[]): Promise<Captured> {
+    const out: string[] = [];
+    const err: string[] = [];
+    let code: number | null = null;
+    const orig = {
+      stdout: process.stdout.write,
+      stderr: process.stderr.write,
+      exit: process.exit,
+    };
+    process.stdout.write = ((s: string | Uint8Array) => {
+      out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((s: string | Uint8Array) => {
+      err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stderr.write;
+    process.exit = ((c?: number) => {
+      code = c ?? 0;
+      throw new ExitError(c ?? 0);
+    }) as typeof process.exit;
+    try {
+      await accountsMain(argv);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      process.stdout.write = orig.stdout;
+      process.stderr.write = orig.stderr;
+      process.exit = orig.exit;
+    }
+    return { out: out.join(""), err: err.join(""), code };
+  }
+
+  test("bare `keeper accounts` prints pure group help, no exit", async () => {
+    const r = await runAccounts([]);
+    expect(r.code).toBeNull();
+    expect(r.out).toContain("keeper accounts <inspect>");
+    expect(r.err).toBe("");
+  });
+
+  test("`keeper accounts --help` lists every verb, no exit", async () => {
+    const r = await runAccounts(["--help"]);
+    expect(r.code).toBeNull();
+    expect(r.out).toContain("inspect");
+  });
+
+  test("`inspect --help` reaches the leaf and renders leaf-specific help, no exit", async () => {
+    const r = await runAccounts(["inspect", "--help"]);
+    expect(r.code).toBeNull();
+    expect(r.out).toContain("keeper accounts inspect");
+  });
+
+  test("an unknown subverb is an argument fault (exit 2)", async () => {
+    const r = await runAccounts(["bogus"]);
     expect(r.code).toBe(2);
     expect(r.err).toContain("unknown verb 'bogus'");
   });

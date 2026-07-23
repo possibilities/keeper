@@ -7,7 +7,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +25,7 @@ import {
   sanitizeSessionToken,
   main as sinkMain,
 } from "../cli/statusline-sink";
+import { readExactRuntimeObservation } from "../src/session-runtime.ts";
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "statusline-sink-"));
@@ -119,19 +126,41 @@ describe("statusline-sink — coalesced atomic write", () => {
     expect(leaf.model_display).toBe("Opus");
   });
 
-  test("unchanged render does NOT rewrite (coalesce — no event-log churn)", () => {
+  test("within-bucket movement updates exact runtime without rewriting the coalesced leaf", () => {
     const dir = tmpDir();
-    expect(runSink(payload(), dir, 1).wrote).toBe(true);
-    // Same {model, effort, bucket} + a sub-bucket % drift → no rewrite.
+    const runtimeDir = join(dir, "exact");
+    expect(runSink(payload(), dir, 1, runtimeDir).wrote).toBe(true);
     expect(
-      runSink(payload({ context_window: { used_percentage: 43.9 } }), dir, 2)
-        .wrote,
+      runSink(
+        payload({
+          context_window: {
+            used_percentage: 43.9,
+            total_input_tokens: 87_000,
+            context_window_size: 200_000,
+          },
+        }),
+        dir,
+        2,
+        runtimeDir,
+      ).wrote,
     ).toBe(false);
-    // The leaf still carries the FIRST write's updated_at (never rewritten).
-    const leaf = JSON.parse(
+
+    const coalesced = JSON.parse(
       readFileSync(join(dir, "sess-abc.json"), "utf8"),
     ) as StatuslineLeaf;
-    expect(leaf.updated_at).toBe(1);
+    expect(coalesced.updated_at).toBe(1);
+    expect(coalesced.context_used_percentage).toBe(42.5);
+    expect(coalesced.context_input_tokens).toBe(85_000);
+
+    const exact = readExactRuntimeObservation("sess-abc", runtimeDir);
+    expect(exact?.observed_at_ms).toBe(2);
+    expect(exact?.context_used_percentage).toBe(43.9);
+    expect(exact?.context_input_tokens).toBe(87_000);
+    const expectedLeaf =
+      "33a386c9464a4538527687ee331d081db7d7448137f25db6fd13b1d8d1053a71.json";
+    expect(readdirSync(runtimeDir)).toEqual([expectedLeaf]);
+    expect(statSync(runtimeDir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(runtimeDir, expectedLeaf)).mode & 0o777).toBe(0o600);
   });
 
   test("crossing a context bucket rewrites", () => {

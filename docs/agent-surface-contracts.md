@@ -70,3 +70,42 @@ The activity object is optional and informational. A missing stable Keeper ident
 ## Panel-start idempotency
 
 `keeper agent panel start` is idempotent by slug. Re-issuing the same slug and prompt reconciles the durable run: it reuses terminal legs, leaves running legs in place, and relaunches legs without a result. It never re-fans-out an already-admitted request. A colliding prompt or member set fails with exit `2`.
+
+## Runtime, Usage, and routing diagnostics
+
+Three independent, side-effect-free, schema-v1 read surfaces answer distinct questions and version independently — a consumer of one tolerates unknown fields and unknown enum values on any of them rather than failing closed on an addition. None reserves capacity, refreshes an observer, or opens a writable connection.
+
+- **`keeper session runtime [<session-reference>]`** — exact current-runtime telemetry for one Session: what model/effort/context it is actually running right now, and (for Pi) its current route.
+- **`keeper usage --json`** — every normalized Claude/Codex Capacity meter as display data: category, multiplier, source status, and the last-good measurement. It is never routing authority — `keeper session runtime` and `keeper accounts inspect` are the routing-relevant reads.
+- **`keeper accounts inspect [<session-reference>] --json`** — separate Claude launch-routing and Codex launch-seed routing blocks, plus a proven Pi runtime-route block. `keeper agent accounts check --json` remains a compatible, unmigrated read of the same underlying inspectors; `accounts inspect` is the preferred agent path because it keeps the three provenance classes apart instead of folding them into one block.
+
+### Timestamps and provenance
+
+Each surface separates *when the underlying value was measured* from *when this response was generated*, and never overloads one field for both:
+
+- `keeper session runtime`'s `data.observed_at_ms` is the exact leaf's own measurement time (`null` when no exact sample exists — the coalesced-fallback or fully-unavailable case); `data.generated_at_ms` is always this response's own build time. `data.freshness` (`current` / `stale` / `unknown` / `unavailable`) derives from comparing the two, not from `observed_at_ms` alone.
+- `data.source` (`exact` / `coalesced` / `unavailable`) records which telemetry class answered: an exact out-of-band Harness sample, a fallback read of the coalesced `jobs` projection row, or neither.
+- `data.route.provenance` distinguishes an **actual proven route** (`scoped_actual` — a fresh scoped observation for this exact Session, after selection or retry) from an **initial launch hint** (`launch_hint` — the alias the Session launched with, not yet confirmed) from `unavailable`. Treat `launch_hint` as "would launch with," never as "is currently routed through" — only `scoped_actual` proves the actual route. `keeper accounts inspect`'s `pi_runtime.status` mirrors this: `proven` only for a fresh scoped observation of the exact Session asked about; `unavailable` for a Pi Session with no observation yet; `not_pi` / `session_unresolved` / `no_session` for every case where no Pi route claim is possible at all.
+- `keeper usage --json`'s `data.sources.{claude,codex}.observed_at_ms` is the whole-snapshot source freshness; each `accounts[].measured_at_ms` is that account's own last measurement, independently — an `unavailable` account may still carry a `measured_at_ms` and populated `meters` from its last successful read (the display-only last-good measurement), clearly separated from a live `ok` read by `status`.
+- `keeper accounts inspect --json`'s `data.generated_at_ms` is this response's build time; each block's own inspector carries its own internal freshness fields (unchanged from `keeper agent accounts check --json`).
+
+### Partial-data semantics
+
+No surface presents unavailable evidence as zero, false, or "not routed." Every measured field lives behind an explicit status/availability enum, and the caller branches on that enum before trusting the value:
+
+- `keeper session runtime`: `model.status` / `effort.status` / `context.status` are each `available` / `partial` / `unavailable`; a `null` numeric or text field under a non-`available` status is the honest absence, not a real zero. `data.source: "unavailable"` means neither an exact sample nor a coalesced row exists yet — normal for a Session's first moments.
+- `keeper usage --json`: a `missing` / `invalid` / `stale` / `unhealthy` source, or a `stale` / `exhausted` / `unavailable` / `issue` account, still emits its shape with `detail` naming the bounded reason; meters are omitted only when never observed, never zeroed.
+- `keeper accounts inspect --json`: `pi_runtime.reason` carries a bounded code (the same `trackedSessionProblem` code family `keeper session runtime` and `keeper history` use) whenever `status` is not `proven`; `claude_launch` / `codex_launch` degrade exactly as `keeper agent accounts check --json` already does.
+- The two threshold await conditions (`context-used-at-least`, `weekly-quota-at-most`; see `plugins/keeper/skills/await/SKILL.md`) apply the identical rule at the predicate layer: missing, stale, or unresolved evidence evaluates to `waiting`, never a false `met` and never a false failure — except a `weekly-quota-at-most` route that cannot be resolved AT ARM TIME, which refuses the arm outright (`reason=route-unresolved`) rather than silently waiting on an undefined target.
+
+### Safe-field boundaries
+
+Every field on all three surfaces, and on the threshold await's `armed`/`met`/`failed` lines, is drawn from an explicit allowlist: identifiers (job id, native session id, agent id), enums, raw percentages, byte counts, and timestamps. None ever carries a prompt fragment, a credential, a raw provider error string, or a private filesystem path. A route alias is a stable opaque managed-route id or Codex alias, never an account email or token. This is exercised the same way the Answer envelope and Agent Bus surfaces are — secret canaries checked across stdout, stderr, and error paths.
+
+### Frozen route vs live routing
+
+`keeper accounts inspect`'s `claude_launch` and `codex_launch` blocks report the route the NEXT launch would choose right now — informational, and free to change on the next call as capacity shifts. A `weekly-quota-at-most` await's frozen route is a durably different thing: resolved once at arm time from the same inspectors and then pinned for the wait's entire life, so a later routing change never retargets an already-armed wait. Never treat one as a substitute for the other: use `accounts inspect` to ask "what would route now," and a frozen-route await to ask "notify me when THIS ONE route clears."
+
+### Launch-accepted vs work-completed
+
+A durable await's `met` line, and the fresh follow-up Session it dispatches, prove only that the condition held and a session launched — this is **launch acceptance**, not work completion. That follow-up Session's own eventual `keeper plan done` (if its follow-up is plan work) marks its own task done; it says nothing about whether the ORIGINAL requested follow-up succeeded beyond having been launched. A caller that needs proof of completion, not just of launch, awaits the follow-up Session's own terminal state separately (e.g. `keeper await complete <id>` against whatever the follow-up itself minted) rather than treating the durable await's `met` as that proof.

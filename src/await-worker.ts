@@ -29,6 +29,14 @@ import {
   DURABLE_AWAIT_CONDITION_KINDS,
   type DurableAwaitCondition,
 } from "./protocol";
+import {
+  evaluateWeeklyQuotaThreshold,
+  type FrozenWeeklyRoute,
+  frozenRouteOf,
+  parseWeeklyQuotaCondition,
+  readWeeklyQuotaEvidence,
+  type WeeklyQuotaEvidence,
+} from "./quota-threshold";
 import { computeReadiness } from "./readiness";
 import { computeLandedEpicIds } from "./readiness-client";
 import { loadReadinessInputs } from "./readiness-inputs";
@@ -36,6 +44,15 @@ import type { GitStatus } from "./types";
 import { watchLoop } from "./wake-worker";
 
 const DEFAULT_POLL_MS = 1_000;
+/**
+ * the coalesced durable idle re-evaluation cadence. A weekly-quota
+ * await re-reads its frozen route's Capacity sidecar out-of-band — a change
+ * there never advances keeper.db — so the worker's `watchLoop` also fires an
+ * idle wake at least this often (safely under 30s). Coalesced by construction:
+ * a `data_version` change resets the idle clock, so a fresh commit and an
+ * overdue idle tick never both wake in one loop turn.
+ */
+export const DURABLE_IDLE_REEVAL_MS = 29_000;
 export const AWAIT_LEASE_TTL_MS = 180_000;
 export const AWAIT_FIRING_ACK_TIMEOUT_MS = 10_000;
 export const NEVER_BOUND_AWAIT_THRESHOLD = 3;
@@ -265,10 +282,25 @@ function asNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/**
+ * injectable weekly-quota evidence + clock so a durable weekly-quota
+ * await evaluates from fixtures under test without touching real Capacity
+ * sidecars. Production leaves both unset (validated sidecar readers + the
+ * producer wall-clock — this is a producer path, never a fold).
+ */
+export interface DurableEvalDeps {
+  nowMs?: number;
+  readWeeklyEvidence?: (
+    frozen: FrozenWeeklyRoute,
+    nowMs: number,
+  ) => WeeklyQuotaEvidence;
+}
+
 /** Evaluate the complete server-evaluable condition vocabulary from one DB snapshot. */
 export function evaluateDurableAwaitConditions(
   db: Database,
   raw: string,
+  evalDeps: DurableEvalDeps = {},
 ): "met" | "waiting" | "unknown" {
   let spec: unknown;
   try {
@@ -420,6 +452,22 @@ export function evaluateDurableAwaitConditions(
         if (target === null) return "unknown";
         state = landedState(target, landed);
         break;
+      case "weekly-quota-at-most": {
+        const parsed = parseWeeklyQuotaCondition(
+          condition as unknown as Record<string, unknown>,
+        );
+        if (parsed === null) return "unknown";
+        const nowMs = evalDeps.nowMs ?? Date.now();
+        const evidence = (
+          evalDeps.readWeeklyEvidence ?? readWeeklyQuotaEvidence
+        )(frozenRouteOf(parsed), nowMs);
+        const verdict = evaluateWeeklyQuotaThreshold(
+          evidence,
+          parsed.threshold,
+        );
+        state = verdict.met ? { kind: "met" } : { kind: "waiting" };
+        break;
+      }
       default: {
         const since = condition.since;
         if (since !== undefined && typeof since !== "string") return "unknown";
@@ -602,6 +650,9 @@ function main(): void {
     () => void driveCycle(),
     () => shutdown,
     data.pollMs ?? DEFAULT_POLL_MS,
+    // a coalesced idle wake so a weekly-quota await re-evaluates its
+    // frozen route's out-of-band Capacity sidecar even on a DB-quiet board.
+    DURABLE_IDLE_REEVAL_MS,
   )
     .then(() => {
       try {

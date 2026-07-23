@@ -231,7 +231,31 @@ export const USAGE_FLAGS = [
     type: "string",
     summary: "Snapshot wait bound (unit required, e.g. 500ms, 2s)",
   },
+  {
+    name: "json",
+    type: "boolean",
+    default: false,
+    summary: "Emit the schema-v1 one-shot JSON envelope (rejects --watch)",
+  },
   FLAG_HELP,
+] as const satisfies readonly FlagDescriptor[];
+
+/** `keeper accounts inspect` flag surface — the shared Session selector trio
+ *  plus a `--json` alias kept for command-line symmetry with `accounts check`;
+ *  the read is JSON-only regardless (matches `session runtime`). */
+export const ACCOUNTS_INSPECT_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Shared Session reference (default: ambient auto-detect)",
+  },
+  {
+    name: "session-id",
+    type: "string",
+    summary: "Compatibility alias of --session",
+  },
+  FLAG_JSON_ALIAS,
 ] as const satisfies readonly FlagDescriptor[];
 
 export const DEAD_LETTER_FLAGS = [
@@ -819,6 +843,28 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     flags: USAGE_FLAGS,
   },
   {
+    name: "accounts",
+    summary: "Read-only Claude/Codex routing + Pi runtime diagnostics group",
+    visibility: "public",
+    mutates: false,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: [],
+    verbs: [
+      {
+        name: "inspect",
+        summary:
+          "Separate Claude launch, Codex launch-seed, and scoped Pi runtime routing (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: ACCOUNTS_INSPECT_FLAGS,
+      },
+    ],
+  },
+  {
     name: "frames",
     summary:
       "Agent frame stream: bounded NDJSON envelopes per rendered viewer frame (one process per --view)",
@@ -944,7 +990,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["human", "json"],
     exit_codes: {
       "3": "own-deadline timeout",
-      "4": "watched target was deleted",
+      "4": "watched target was deleted, or a context runtime subject ended",
       "5": "stuck verdict (only under --fail-on-stuck)",
       "9": "--probe: evaluated cleanly, condition does not hold",
       "10": "external SIGTERM/SIGINT (e.g. Monitor's kill timeout), distinct from the own-deadline timeout",
@@ -957,6 +1003,18 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         type: "boolean",
         summary:
           "Persist the await and return immediately; keeperd fires a fresh follow-up",
+      },
+      {
+        name: "follow-up",
+        type: "string",
+        summary:
+          "Durable only: the exact follow-up prompt to fire (mutually exclusive with --follow-up-file)",
+      },
+      {
+        name: "follow-up-file",
+        type: "string",
+        summary:
+          "Durable only: read the follow-up prompt from a file (mutually exclusive with --follow-up)",
       },
       {
         name: "timeout",
@@ -1205,7 +1263,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    // The four job-backed reads share the Session catalog selector contract.
+    // The job-backed reads share the Session catalog selector contract.
     // Their established `--session-id` spelling remains a compatibility alias
     // that enters the same resolver and has no id-only path.
     name: "session",
@@ -1240,6 +1298,28 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             name: "log-count",
             type: "string",
             summary: "Recent-commit count to include (positive int)",
+          },
+        ],
+      },
+      {
+        name: "runtime",
+        summary: "Exact runtime telemetry + proven scoped route (JSON)",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference (default: ambient auto-detect)",
+          },
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Compatibility alias of --session",
           },
         ],
       },

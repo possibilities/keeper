@@ -43,6 +43,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  publishExactStatuslineRuntime,
+  resolveSessionRuntimeDir,
+} from "../src/session-runtime.ts";
 
 /** Context-fill hysteresis bucket width (%). A render whose `used_percentage`
  *  stays inside the same 5% band does not rewrite the leaf — the churn guard. */
@@ -201,10 +205,20 @@ function readLeaf(path: string): StatuslineLeaf | null {
  * throws — any write failure degrades to `{wrote:false}` so the caller stays
  * exit-0.
  */
-export function runSink(raw: string, dir: string, now: number): SinkResult {
+export function runSink(
+  raw: string,
+  dir: string,
+  now: number,
+  runtimeDir = `${dir}-runtime`,
+): SinkResult {
   const leaf = parseStatuslinePayload(raw, now);
   if (leaf === null) {
     return { wrote: false, path: null };
+  }
+  try {
+    publishExactStatuslineRuntime(raw, runtimeDir, now);
+  } catch {
+    // Exact diagnostics are advisory and never affect the coalesced producer.
   }
   const token = sanitizeSessionToken(leaf.session_id);
   const path = join(dir, `${token}.json`);
@@ -259,7 +273,12 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   try {
-    runSink(raw, resolveStatuslineDir(), Date.now());
+    runSink(
+      raw,
+      resolveStatuslineDir(),
+      Date.now(),
+      resolveSessionRuntimeDir(),
+    );
   } catch {
     // Belt-and-suspenders: runSink already swallows its own failures.
   }

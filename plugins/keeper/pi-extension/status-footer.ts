@@ -1,6 +1,7 @@
 import { type ChildProcess, execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { piLaunchRouteHint } from "../../../src/session-runtime.ts";
 
 const CONTEXT_GLYPH = "\uf295";
 const LANE_GLYPH = "⑂";
@@ -28,6 +29,7 @@ export interface PiFooterContext {
   cwd: string;
   mode?: string;
   model?: { id?: string; name?: string; contextWindow?: number };
+  sessionManager?: { getSessionId(): string };
   getContextUsage?():
     | {
         tokens: number | null;
@@ -309,6 +311,15 @@ export function buildPiTelemetryPayload(
   version: string,
 ): string {
   const usage = ctx.getContextUsage?.();
+  let nativeSessionId: string | null = null;
+  try {
+    const candidate = ctx.sessionManager?.getSessionId().trim() ?? "";
+    if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate)) {
+      nativeSessionId = candidate;
+    }
+  } catch {
+    nativeSessionId = null;
+  }
   return JSON.stringify({
     session_id: jobId,
     context_window: {
@@ -324,6 +335,18 @@ export function buildPiTelemetryPayload(
       display_name: ctx.model?.name ?? ctx.model?.id ?? null,
     },
     effort: { level: effort || null },
+    keeper_runtime: {
+      schema_version: 1,
+      subject: {
+        scope: nativeSessionId === null ? "job" : "session",
+        harness: "pi",
+        job_id: jobId,
+        native_session_id: nativeSessionId,
+        agent_id: null,
+      },
+      effort_axis: "thinking",
+      route_hint: piLaunchRouteHint(),
+    },
   });
 }
 
@@ -427,7 +450,10 @@ export function installPiStatusFooter(
                 network: (process.env.ANTHROPIC_BASE_URL ?? "").startsWith(
                   "http://127.0.0.1:",
                 ),
-                account: resolvePiAccountLabel(),
+                account: (() => {
+                  const hint = resolvePiAccountLabel();
+                  return hint === "" ? "" : `hint:${hint}`;
+                })(),
               },
               theme,
               width,

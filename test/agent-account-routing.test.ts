@@ -10,6 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type {
+  AccountsInspectMainDeps,
+  AccountsPiRuntimeData,
+} from "../cli/accounts";
+import { inspectMain } from "../cli/accounts";
+import type { EnvelopeSink } from "../cli/envelope";
 import { writeObservationSidecar } from "../src/account-observation";
 import type { RouteResolution, RouteSelection } from "../src/account-router";
 import {
@@ -24,6 +30,13 @@ import {
   CODEX_GENERIC_QUOTA_SCOPE,
   CODEX_SPARK_QUOTA_SCOPE,
 } from "../src/codex-quota-scope";
+import { buildSessionCatalog } from "../src/history/catalog";
+import type {
+  KeeperJobAlias,
+  NativeSessionArtifact,
+  SessionCatalog,
+} from "../src/history/model";
+import type { RuntimeTarget } from "../src/session-runtime";
 import {
   expectExit,
   makeHarness,
@@ -1606,5 +1619,330 @@ describe("keeper agent accounts check", () => {
     expect(rendered).toContain("activation=active-degraded");
     expect(rendered).toContain("DEGRADED single-alias operation");
     expect(rendered).toContain("NOT balanced");
+  });
+});
+
+describe("keeper accounts inspect", () => {
+  const PI_JOB_ID = "job-pi-inspect-1";
+  const PI_NATIVE_ID = "pi-inspect-1";
+  const CLAUDE_JOB_ID = "job-claude-inspect-1";
+  const CLAUDE_NATIVE_ID = "claude-inspect-1";
+
+  function artifact(
+    harness: "claude" | "pi",
+    nativeId: string,
+    title: string,
+  ): NativeSessionArtifact {
+    return {
+      harness,
+      nativeId,
+      path: `/history/${nativeId}.jsonl`,
+      project: "/work/accounts-inspect",
+      currentTitle: title,
+      titleHistory: [title],
+      titleHistoryComplete: true,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:01:00.000Z",
+      bytes: 10,
+    };
+  }
+
+  function job(
+    harness: "claude" | "pi",
+    jobId: string,
+    nativeId: string,
+    title: string,
+  ): KeeperJobAlias {
+    return {
+      jobId,
+      harness,
+      nativeId,
+      transcriptPath: null,
+      project: "/work/accounts-inspect",
+      currentTitle: title,
+      titleHistory: [title],
+      state: "working",
+      createdAtMs: 1_000,
+      updatedAtMs: 1_500,
+      pid: 42,
+      startTime: "start-42",
+    };
+  }
+
+  function catalog(): SessionCatalog {
+    return buildSessionCatalog(
+      [
+        artifact("pi", PI_NATIVE_ID, "Pi inspect session"),
+        artifact("claude", CLAUDE_NATIVE_ID, "Claude inspect session"),
+      ],
+      [
+        job("pi", PI_JOB_ID, PI_NATIVE_ID, "Pi inspect session"),
+        job(
+          "claude",
+          CLAUDE_JOB_ID,
+          CLAUDE_NATIVE_ID,
+          "Claude inspect session",
+        ),
+      ],
+    );
+  }
+
+  function captureSink(): {
+    sink: EnvelopeSink;
+    json: () => Record<string, unknown>;
+    code: () => number | null;
+  } {
+    let text = "";
+    let code: number | null = null;
+    return {
+      sink: {
+        writeStdout(value) {
+          text += value;
+        },
+        exit(value): never {
+          code = value;
+          return undefined as never;
+        },
+      },
+      json: () => JSON.parse(text) as Record<string, unknown>,
+      code: () => code,
+    };
+  }
+
+  const claudeLaunchFixture = {
+    model_scope: null,
+    health: "ok" as const,
+    observed_at_ms: 1000,
+    age_ms: 42,
+    fresh: true,
+    enabled: true,
+    error: null,
+    would_choose: {
+      id: "claude-swap:2",
+      kind: "managed" as const,
+      slot: 2,
+      reason: "selected",
+    },
+    candidates: [],
+    fable_focus: {
+      configured: false,
+      state: "off" as const,
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off" as const,
+      reason: "policy-off" as const,
+      diagnostic: "none",
+    },
+    non_fable_focus: {
+      configured: false,
+      state: "off" as const,
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off" as const,
+      reason: "policy-off" as const,
+      diagnostic: "none",
+    },
+  };
+
+  const codexLaunchFixture = {
+    activation: { mode: "native" as const, problem_code: null },
+    companion: { health: "ready" as const, problem_code: null },
+    capacity: {
+      provider: "openai-codex" as const,
+      health: "unavailable" as const,
+      config_binding: null,
+      observed_at_ms: null,
+      fresh: false,
+      quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+      verdict: {
+        kind: "native-fallback" as const,
+        provider: "openai-codex" as const,
+        reason: "pool-unavailable" as const,
+        warning:
+          "[keeper-codex-pool] pool-unavailable; using native openai-codex" as const,
+      },
+      candidates: [],
+    },
+  };
+
+  async function runInspect(
+    argv: string[],
+    overrides: Partial<AccountsInspectMainDeps> = {},
+  ): Promise<{ body: Record<string, unknown>; code: number | null }> {
+    let claudeCalls = 0;
+    let codexCalls = 0;
+    const captured = captureSink();
+    await inspectMain(
+      argv,
+      {
+        catalog: catalog(),
+        env: {},
+        now: () => 5_000,
+        runtimeDir: "/unused/runtime",
+        inspectClaudeLaunchFn: () => {
+          claudeCalls += 1;
+          return claudeLaunchFixture;
+        },
+        inspectCodexLaunchFn: () => {
+          codexCalls += 1;
+          return codexLaunchFixture;
+        },
+        readRouteFn: () => {
+          throw new Error(
+            "readRouteFn must not be called without a resolved Session",
+          );
+        },
+        ...overrides,
+      },
+      captured.sink,
+    );
+    expect(claudeCalls).toBe(1);
+    expect(codexCalls).toBe(1);
+    return { body: captured.json(), code: captured.code() };
+  }
+
+  test("no reference and no ambient identity reports no_session, never a route dump", async () => {
+    const { body, code } = await runInspect([]);
+    expect(code).toBe(0);
+    expect(body.ok).toBe(true);
+    expect(body.data).toMatchObject({
+      generated_at_ms: 5_000,
+      claude_launch: claudeLaunchFixture,
+      codex_launch: codexLaunchFixture,
+      pi_runtime: {
+        status: "no_session",
+        job_id: null,
+        reason: null,
+        quota_scope: null,
+        state: null,
+        alias: null,
+        observed_at_ms: null,
+      },
+    });
+  });
+
+  test("an unresolvable explicit reference reports a bounded reason, not a whole-command failure", async () => {
+    const { body, code } = await runInspect(["does-not-exist"]);
+    expect(code).toBe(0);
+    expect(body.ok).toBe(true);
+    const piRuntime = (body.data as { pi_runtime: AccountsPiRuntimeData })
+      .pi_runtime;
+    expect(piRuntime.status).toBe("session_unresolved");
+    expect(piRuntime.reason).toBe("session_not_found");
+    expect(piRuntime.job_id).toBeNull();
+  });
+
+  test("a resolved Claude Session reports not_pi without probing the Pi route store", async () => {
+    const { body, code } = await runInspect(["Claude inspect session"]);
+    expect(code).toBe(0);
+    const piRuntime = (body.data as { pi_runtime: AccountsPiRuntimeData })
+      .pi_runtime;
+    expect(piRuntime).toEqual({
+      status: "not_pi",
+      job_id: CLAUDE_JOB_ID,
+      reason: null,
+      quota_scope: null,
+      state: null,
+      alias: null,
+      observed_at_ms: null,
+    });
+  });
+
+  test("a resolved Pi Session with no fresh route observation reports unavailable", async () => {
+    const { body, code } = await runInspect(["Pi inspect session"], {
+      readRouteFn: () => null,
+    });
+    expect(code).toBe(0);
+    const piRuntime = (body.data as { pi_runtime: AccountsPiRuntimeData })
+      .pi_runtime;
+    expect(piRuntime).toEqual({
+      status: "unavailable",
+      job_id: PI_JOB_ID,
+      reason: null,
+      quota_scope: null,
+      state: null,
+      alias: null,
+      observed_at_ms: null,
+    });
+  });
+
+  test("a resolved Pi Session with a fresh route observation reports the exact proven route", async () => {
+    const seenTargets: RuntimeTarget[] = [];
+    const { body, code } = await runInspect(["Pi inspect session"], {
+      readRouteFn: (target) => {
+        seenTargets.push(target);
+        return {
+          schema_version: 1,
+          subject_scope: "session",
+          job_id: PI_JOB_ID,
+          native_session_id: PI_NATIVE_ID,
+          agent_id: null,
+          quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+          state: "selected",
+          alias: "keeper-codex-b",
+          observed_at_ms: 4_950,
+        };
+      },
+    });
+    expect(code).toBe(0);
+    const piRuntime = (body.data as { pi_runtime: AccountsPiRuntimeData })
+      .pi_runtime;
+    expect(piRuntime).toEqual({
+      status: "proven",
+      job_id: PI_JOB_ID,
+      reason: null,
+      quota_scope: CODEX_GENERIC_QUOTA_SCOPE,
+      state: "selected",
+      alias: "keeper-codex-b",
+      observed_at_ms: 4_950,
+    });
+    expect(seenTargets).toEqual([
+      {
+        jobId: PI_JOB_ID,
+        harness: "pi",
+        nativeSessionId: PI_NATIVE_ID,
+      },
+    ]);
+  });
+
+  test("ambient identity selects the Session when no explicit reference is given", async () => {
+    const { body, code } = await runInspect([], {
+      env: { KEEPER_JOB_ID: PI_JOB_ID },
+      readRouteFn: () => null,
+    });
+    expect(code).toBe(0);
+    const piRuntime = (body.data as { pi_runtime: AccountsPiRuntimeData })
+      .pi_runtime;
+    expect(piRuntime.status).toBe("unavailable");
+    expect(piRuntime.job_id).toBe(PI_JOB_ID);
+  });
+
+  test("repeated inspections are idempotent — no reservation, pressure, or affinity drift", async () => {
+    const first = await runInspect(["Pi inspect session"], {
+      readRouteFn: () => null,
+    });
+    const second = await runInspect(["Pi inspect session"], {
+      readRouteFn: () => null,
+    });
+    expect(first.body.data).toEqual(second.body.data);
+  });
+
+  test("--help renders leaf help without touching any inspector seam", async () => {
+    let claudeCalls = 0;
+    const captured = captureSink();
+    await inspectMain(
+      ["--help"],
+      {
+        inspectClaudeLaunchFn: () => {
+          claudeCalls += 1;
+          return claudeLaunchFixture;
+        },
+      },
+      captured.sink,
+    );
+    expect(claudeCalls).toBe(0);
+    expect(captured.code()).toBeNull();
   });
 });

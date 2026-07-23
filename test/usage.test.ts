@@ -2,6 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { EnvelopeSink } from "../cli/envelope";
+import {
+  runUsageJson,
+  USAGE_JSON_SCHEMA_VERSION,
+  main as usageMain,
+} from "../cli/usage";
 import {
   type Observation,
   writeObservationSidecar,
@@ -20,6 +26,7 @@ import {
   CODEX_SPARK_QUOTA_SCOPE,
 } from "../src/codex-quota-scope";
 import {
+  buildUsageJsonData,
   createUsagePoller,
   loadUsageSnapshot,
   renderUsageLines,
@@ -356,5 +363,215 @@ describe("usage observation view", () => {
     poller.dispose();
     expect(cleared).toEqual([3]);
     expect(timers.size).toBe(0);
+  });
+});
+
+describe("usage --json schema-v1 data", () => {
+  test("preserves every normalized meter, category/multiplier, and the display-only last-good measurement", () => {
+    const target = paths();
+    writeHealthySidecars(target);
+    const data = buildUsageJsonData(loadUsageSnapshot(target, NOW));
+
+    // Hand-computed against the claudeObservation()/codexObservation() fixture
+    // literals above — never re-derived through buildUsageJsonData itself.
+    expect(data).toEqual({
+      generated_at_ms: NOW,
+      sources: {
+        claude: {
+          provider: "claude",
+          status: "ok",
+          detail: null,
+          observed_at_ms: NOW,
+          accounts: [
+            {
+              id: "Claude 1",
+              source_id: "claude-swap:1",
+              status: "unavailable",
+              detail: null,
+              account_category: "pro",
+              capacity_multiplier: 1,
+              measured_at_ms: NOW - 85 * 60_000,
+              meters: [
+                {
+                  key: "session",
+                  label: "session",
+                  used_percent: 25,
+                  reset_at_ms: NOW + 2 * 60 * 60_000,
+                },
+                {
+                  key: "week",
+                  label: "weekly",
+                  used_percent: 50,
+                  reset_at_ms: NOW + 24 * 60 * 60_000,
+                },
+              ],
+            },
+            {
+              id: "Claude 2",
+              source_id: "claude-swap:2",
+              status: "ok",
+              detail: null,
+              account_category: "max",
+              capacity_multiplier: 20,
+              measured_at_ms: NOW,
+              meters: [
+                {
+                  key: "session",
+                  label: "session",
+                  used_percent: 21,
+                  reset_at_ms: NOW + 4 * 60 * 60_000,
+                },
+                {
+                  key: "week",
+                  label: "weekly",
+                  used_percent: 44,
+                  reset_at_ms: NOW + 2 * 24 * 60 * 60_000,
+                },
+                {
+                  key: "model:Fable",
+                  label: "Fable",
+                  used_percent: 65,
+                  reset_at_ms: NOW + 2 * 24 * 60 * 60_000,
+                },
+              ],
+            },
+          ],
+        },
+        codex: {
+          provider: "codex",
+          status: "ok",
+          detail: null,
+          observed_at_ms: NOW,
+          accounts: [
+            {
+              id: "Codex 1",
+              source_id: "keeper-codex-a",
+              status: "ok",
+              detail: null,
+              account_category: "pro",
+              capacity_multiplier: null,
+              measured_at_ms: null,
+              meters: [
+                {
+                  key: "week",
+                  label: "weekly",
+                  used_percent: 38,
+                  reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
+                },
+                {
+                  key: "meter:95e633c373a9cdcf6cdc5e63:primary",
+                  label: "GPT-5.3-Codex-Spark",
+                  used_percent: 5,
+                  reset_at_ms: NOW + 3 * 24 * 60 * 60_000,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  test("missing sources are explicit partial data, never zero or a failure", () => {
+    const target = paths();
+    const data = buildUsageJsonData(loadUsageSnapshot(target, NOW));
+    expect(data.sources.claude).toEqual({
+      provider: "claude",
+      status: "missing",
+      detail: null,
+      observed_at_ms: null,
+      accounts: [],
+    });
+    expect(data.sources.codex).toEqual({
+      provider: "codex",
+      status: "missing",
+      detail: null,
+      observed_at_ms: null,
+      accounts: [],
+    });
+  });
+});
+
+describe("cli/usage runUsageJson", () => {
+  function captureSink(): {
+    sink: EnvelopeSink;
+    json: () => Record<string, unknown>;
+    code: () => number | null;
+  } {
+    let text = "";
+    let code: number | null = null;
+    return {
+      sink: {
+        writeStdout(value) {
+          text += value;
+        },
+        exit(value): never {
+          code = value;
+          return undefined as never;
+        },
+      },
+      json: () => JSON.parse(text) as Record<string, unknown>,
+      code: () => code,
+    };
+  }
+
+  test("emits the schema-v1 envelope from the current sidecar snapshot", () => {
+    const target = paths();
+    writeHealthySidecars(target);
+    const captured = captureSink();
+    runUsageJson({ paths: target, nowMs: () => NOW, sink: captured.sink });
+    expect(captured.code()).toBe(0);
+    const body = captured.json();
+    expect(body.schema_version).toBe(USAGE_JSON_SCHEMA_VERSION);
+    expect(body.ok).toBe(true);
+    expect(body.error).toBeNull();
+    expect(
+      (body.data as { sources: { claude: { status: string } } }).sources.claude
+        .status,
+    ).toBe("ok");
+    expect((body.data as { generated_at_ms: number }).generated_at_ms).toBe(
+      NOW,
+    );
+  });
+});
+
+describe("cli/usage main() --json arg handling", () => {
+  class ExitError extends Error {
+    readonly code: number;
+    constructor(code: number) {
+      super(`exit ${code}`);
+      this.code = code;
+    }
+  }
+
+  async function runMain(
+    argv: string[],
+  ): Promise<{ err: string; code: number | null }> {
+    const err: string[] = [];
+    let code: number | null = null;
+    const orig = { stderr: process.stderr.write, exit: process.exit };
+    process.stderr.write = ((s: string | Uint8Array) => {
+      err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+      return true;
+    }) as typeof process.stderr.write;
+    process.exit = ((c?: number) => {
+      code = c ?? 0;
+      throw new ExitError(c ?? 0);
+    }) as typeof process.exit;
+    try {
+      await usageMain(argv);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      process.stderr.write = orig.stderr;
+      process.exit = orig.exit;
+    }
+    return { err: err.join(""), code };
+  }
+
+  test("--json and --watch are mutually exclusive (exit 2, never loads a snapshot)", async () => {
+    const r = await runMain(["--json", "--watch"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("--json and --watch are mutually exclusive");
   });
 });
