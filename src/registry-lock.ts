@@ -85,6 +85,29 @@ const defaultCanonicalize: PathCanonicalizer = async (p) => {
 };
 
 /**
+ * Canonicalize `path`, then REVALIDATE the canonicalizer's OUTPUT — not only its input: a
+ * throwing / null / non-absolute / multi-line (ambiguous) result yields `null` so the caller
+ * DEFERS, never degrading to a raw-string compare. The single strict canonicalization seam both
+ * the common-dir resolution AND the per-worktree identity route through, so no path trusts an
+ * un-revalidated canonical output.
+ */
+async function canonicalizeStrict(
+  path: string,
+  canonicalize: PathCanonicalizer,
+): Promise<string | null> {
+  let out: string | null;
+  try {
+    out = await canonicalize(path);
+  } catch {
+    return null;
+  }
+  if (out === null || !isAbsolute(out) || out.includes("\n")) {
+    return null;
+  }
+  return out;
+}
+
+/**
  * The STRICTLY-RESOLVED, CANONICAL common git dir — `git rev-parse --path-format=absolute
  * --git-common-dir`, normalized, then canonicalized across symlink aliases via `canonicalize`.
  * STRICT, NO FALLBACK: a non-zero exit, an empty / multi-line (ambiguous) read, a non-absolute
@@ -112,11 +135,9 @@ export async function resolveCommonDir(
   if (r.code !== 0 || dir === "" || !isAbsolute(dir) || dir.includes("\n")) {
     return null;
   }
-  try {
-    return await canonicalize(resolve(dir));
-  } catch {
-    return null;
-  }
+  // Canonicalize AND revalidate the output — an ambiguous / uncanonicalizable canonical result
+  // rejects (defer), never a raw-string fallback.
+  return canonicalizeStrict(resolve(dir), canonicalize);
 }
 
 /** The common-domain structural lock path under a strictly-resolved, canonical common dir. */
@@ -252,14 +273,16 @@ export async function withStructuralLock<R>(
 }
 
 /**
- * Derive the per-worktree lock path for an EXISTING worktree UNDER the already-held common
- * lock — so the identity is pinned against a concurrent remove/re-add. MUST return a CANONICAL
- * path (symlink/alias-collapsed), so the same-path self-lock elision compares canonical
- * identities, never potentially-aliased strings. Returns `null` on any unresolvable identity
- * (the caller DEFERS). Injected so the pure-`run` fence fakes exercise the checkout path
- * without a real admin dir.
+ * Derive the EXISTING worktree's ADMIN/GIT DIRECTORY (NOT a lock-file path) UNDER the
+ * already-held common lock — so the identity is pinned against a concurrent remove/re-add.
+ * Returns the git admin dir (`--git-dir`), which {@link withCheckoutLock} then canonicalizes
+ * itself (via the SAME injected canonicalizer) and appends {@link REGISTRY_LOCK_LEAF} to — so
+ * the deriver never has to realpath a lock leaf that may not exist yet, and the leaf owns the
+ * canonical-to-canonical comparison. Returns `null` on any unresolvable identity (the caller
+ * DEFERS). Injected so the pure-`run` fence fakes exercise the checkout path without a real
+ * admin dir.
  */
-export type WorktreeLockPathDeriver = (
+export type WorktreeAdminDirDeriver = (
   cwd: string,
   run: RegistryLockGitRunner,
 ) => Promise<string | null>;
@@ -268,21 +291,24 @@ export type WorktreeLockPathDeriver = (
  * Run `fn` holding the common structural lock AND the per-worktree lock — the capability for
  * checkout/ref effects on an EXISTING worktree. FIXED ORDER (global order codified):
  *   1. resolve+canonicalize common dir (strict; null → defer); acquire COMMON (timeout → defer);
- *   2. UNDER common, derive the CANONICAL per-worktree identity via `deriveIdentity` (null → defer);
+ *   2. UNDER common, derive the worktree ADMIN dir, CANONICALIZE it here (same injected
+ *      canonicalizer, output revalidated absolute/single-line/non-null; else defer), then append
+ *      {@link REGISTRY_LOCK_LEAF} — the leaf owns the canonical per-worktree identity, never
+ *      trusting the deriver's raw string;
  *   3. acquire the PER-WORKTREE lock LAST (timeout → defer);
  *   4. run `fn(token)`.
  * Release unwinds in strict REVERSE (per-worktree then common), attempting EVERY held lock even
  * if one throws, then AGGREGATES + PROPAGATES any release failure. When the CANONICAL
- * per-worktree path COINCIDES with the common path (a main worktree, whose `--git-dir` ==
- * `--git-common-dir`) the second acquire is SKIPPED — a second flock on the same path from a
- * distinct fd would self-block the process against its own held lock. Returns `fn`'s result, or
- * a {@link LockDeferred}.
+ * per-worktree lock path COINCIDES with the CANONICAL common lock path (a main worktree, whose
+ * `--git-dir` == `--git-common-dir`, even reached via an alias) the second acquire is SKIPPED —
+ * a second flock on the same path from a distinct fd would self-block the process against its own
+ * held lock. Returns `fn`'s result, or a {@link LockDeferred}.
  */
 export async function withCheckoutLock<R>(
   cwd: string,
   run: RegistryLockGitRunner,
   acquire: RegistryLockAcquirer,
-  deriveIdentity: WorktreeLockPathDeriver,
+  deriveAdminDir: WorktreeAdminDirDeriver,
   fn: (token: CheckoutToken) => Promise<R>,
   canonicalize: PathCanonicalizer = defaultCanonicalize,
 ): Promise<R | LockDeferred> {
@@ -302,19 +328,33 @@ export async function withCheckoutLock<R>(
   let bodyError: unknown;
   let threw = false;
   try {
-    const worktreeLockPath = await deriveIdentity(cwd, run);
-    if (worktreeLockPath === null) {
+    const adminDir = await deriveAdminDir(cwd, run);
+    // Canonicalize the DERIVED admin dir HERE (never trusting the deriver's raw string), then
+    // append the lock leaf — so an aliased admin dir collapses to ONE per-worktree lock and the
+    // self-lock elision compares canonical-to-canonical. An unresolvable / ambiguous canonical
+    // identity → defer WHILE the finally releases common.
+    const canonAdminDir =
+      adminDir === null
+        ? null
+        : await canonicalizeStrict(adminDir, canonicalize);
+    if (canonAdminDir === null) {
       result = { defer: "registry-lock: unresolved worktree identity" };
-    } else if (worktreeLockPath === commonLockPath) {
-      // Same CANONICAL identity as common (main worktree): the common lock already covers it.
-      result = await fn(mintCheckoutToken(commonLockPath, worktreeLockPath));
     } else {
-      const perWorktree = await acquire(worktreeLockPath);
-      if (perWorktree === null) {
-        result = { defer: "registry-lock: per-worktree lock timeout" };
-      } else {
-        held.push(perWorktree);
+      const worktreeLockPath = join(canonAdminDir, REGISTRY_LOCK_LEAF);
+      if (worktreeLockPath === commonLockPath) {
+        // Same CANONICAL identity as common (main worktree, even via an alias): the common lock
+        // already covers it — skip the self-blocking second acquire.
         result = await fn(mintCheckoutToken(commonLockPath, worktreeLockPath));
+      } else {
+        const perWorktree = await acquire(worktreeLockPath);
+        if (perWorktree === null) {
+          result = { defer: "registry-lock: per-worktree lock timeout" };
+        } else {
+          held.push(perWorktree);
+          result = await fn(
+            mintCheckoutToken(commonLockPath, worktreeLockPath),
+          );
+        }
       }
     }
   } catch (e) {

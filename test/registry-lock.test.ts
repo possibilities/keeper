@@ -17,7 +17,10 @@ import {
 
 const COMMON = "/repo/.git";
 const COMMON_LOCK = `${COMMON}/keeper-commit-work.lock`;
-const WT_LOCK = "/repo/.git/worktrees/lane/keeper-commit-work.lock";
+// The deriver returns the worktree ADMIN dir; the leaf canonicalizes it and appends the lock
+// leaf, so the per-worktree lock is join(canonical admin dir, leaf).
+const WT_ADMIN = "/repo/.git/worktrees/lane";
+const WT_LOCK = `${WT_ADMIN}/keeper-commit-work.lock`;
 
 /** The injected canonicalizer for the fake paths (which do not exist on disk): identity, plus
  *  an optional alias map so a symlink/alias test can prove two aliases collapse to one lock. */
@@ -76,7 +79,7 @@ function fakeAcquire(
   };
 }
 
-const deriveWt = async () => WT_LOCK;
+const deriveWt = async () => WT_ADMIN;
 const freshLog = (): AcquireLog => ({ acquired: [], released: [] });
 
 describe("registry-lock leaf", () => {
@@ -269,19 +272,97 @@ describe("registry-lock leaf", () => {
     expect(log.released).toEqual([WT_LOCK, COMMON_LOCK]); // reverse
   });
 
-  test("withCheckoutLock: per-worktree CANONICAL path == common path (main worktree) → no second acquire", async () => {
+  test("withCheckoutLock: a main worktree admin dir == common dir → self-lock elision, no second acquire", async () => {
     const log = freshLog();
     const r = await withCheckoutLock(
       "/repo",
       fakeRun(),
       fakeAcquire(log),
-      async () => COMMON_LOCK, // the canonical worktree identity equals common
+      async () => COMMON, // main worktree: the admin dir IS the common dir
       async () => "ok" as const,
       idCanon,
     );
     expect(r).toBe("ok");
+    expect(log.acquired).toEqual([COMMON_LOCK]); // second acquire skipped
+    expect(log.released).toEqual([COMMON_LOCK]);
+  });
+
+  test("withCheckoutLock: an ALIASED main admin dir collapses to common → self-lock elision (canonical-to-canonical)", async () => {
+    const log = freshLog();
+    // The deriver returns an ALIAS of the main admin dir; the leaf canonicalizes it to the
+    // common dir, so join(canonical admin, leaf) == the canonical common lock → skip the second
+    // acquire. A raw-string compare would have taken two flocks for one domain.
+    const canon = fakeCanon({ "/alias-main/.git": COMMON });
+    const r = await withCheckoutLock(
+      "/repo",
+      fakeRun(),
+      fakeAcquire(log),
+      async () => "/alias-main/.git",
+      async () => "ok" as const,
+      canon,
+    );
+    expect(r).toBe("ok");
     expect(log.acquired).toEqual([COMMON_LOCK]);
     expect(log.released).toEqual([COMMON_LOCK]);
+  });
+
+  test("withCheckoutLock: two ALIASES of ONE linked admin dir acquire the IDENTICAL per-worktree lock", async () => {
+    const canon = fakeCanon({
+      "/alias-lane-a": WT_ADMIN,
+      "/alias-lane-b": WT_ADMIN,
+    });
+    const logA = freshLog();
+    await withCheckoutLock(
+      "/repo",
+      fakeRun(),
+      fakeAcquire(logA),
+      async () => "/alias-lane-a",
+      async () => "ok" as const,
+      canon,
+    );
+    const logB = freshLog();
+    await withCheckoutLock(
+      "/repo",
+      fakeRun(),
+      fakeAcquire(logB),
+      async () => "/alias-lane-b",
+      async () => "ok" as const,
+      canon,
+    );
+    // Both aliases canonicalize to WT_ADMIN → the SAME per-worktree lock, so two callers reaching
+    // one linked worktree via different aliases serialize on ONE flock.
+    expect(logA.acquired).toEqual([COMMON_LOCK, WT_LOCK]);
+    expect(logB.acquired).toEqual([COMMON_LOCK, WT_LOCK]);
+  });
+
+  test("withCheckoutLock: null / relative / multi-line / throwing canonicalization of the admin dir → defer, common released", async () => {
+    const adminFailures: Array<() => Promise<string | null>> = [
+      async () => "", // empty → not absolute
+      async () => "relative/dir", // non-absolute output
+      async () => "/a/dir\n/b/dir", // ambiguous multi-line output
+      async () => null, // uncanonicalizable
+      async () => {
+        throw new Error("realpath boom"); // throwing canonicalizer
+      },
+    ];
+    for (const adminFail of adminFailures) {
+      const log = freshLog();
+      // The COMMON dir canonicalizes fine (identity); ONLY the ADMIN-dir canonicalization fails,
+      // so common is acquired but the per-worktree identity is unresolvable → defer.
+      const canon: PathCanonicalizer = async (p) =>
+        p === COMMON ? COMMON : adminFail();
+      const r = await withCheckoutLock(
+        "/repo",
+        fakeRun(),
+        fakeAcquire(log),
+        deriveWt,
+        async () => "ok",
+        canon,
+      );
+      expect(isLockDeferred(r)).toBe(true);
+      expect(log.acquired).toEqual([COMMON_LOCK]); // no per-worktree acquire
+      expect(log.released).toEqual([COMMON_LOCK]); // common released on the defer
+    }
   });
 
   test("withCheckoutLock: unresolved worktree identity → defer, common released, no per-worktree acquire", async () => {
