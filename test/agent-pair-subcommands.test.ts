@@ -700,8 +700,12 @@ describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Ride
     stopTimeoutMs: 60_000,
   });
 
-  test("findLastMessage returns a NONTERMINAL turn's text — the 3ed9 hazard", () => {
-    // The exact minimal shape 3ed9's window-gone arm consumed as completed/exit 0.
+  test("findLastMessage is PERMISSIVE — it surfaces interim text so a timeout keeps a bounded partial", () => {
+    // findLastMessage deliberately returns text from ANY assistant turn (a timeout
+    // must surface the in-progress partial). That permissiveness is why a TEXTLESS
+    // terminal stop is NOT adjudicated a fabricated `completed` on this alone — the
+    // load-bearing guard is upstream: window-gone yields `partner_died` (never a
+    // re-scan), and a real terminal answer overrides interim text where one exists.
     const path = join(tempDir(), "interim.jsonl");
     writeFileSync(path, `${interimTurn()}\n`);
     expect(findLastMessage("claude", path)).toEqual({
@@ -709,6 +713,13 @@ describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Ride
       text: "interim, not terminal",
       found: true,
     });
+    // A real end_turn answer overrides the interim text.
+    const answered = join(tempDir(), "answered.jsonl");
+    writeFileSync(
+      answered,
+      `${interimTurn()}\n${realStop("the real answer")}\n`,
+    );
+    expect(findLastMessage("claude", answered).text).toBe("the real answer");
   });
 
   test("(i) interim text + no stop + window gone → windowGone, NOT a completion", async () => {
@@ -734,7 +745,11 @@ describe("recovery requires an ACTUAL stop, never interim text (Blocker 2 + Ride
     if (outcome.ok) expect(outcome.stop.message).toBe("final answer");
   });
 
-  test("(iii) terminal but TEXTLESS stop → ok with null message (maps to no_message)", async () => {
+  test("(iii) a terminal but TEXTLESS stop is DETECTED (watcher fact: ok, stop.message null)", async () => {
+    // This is a WATCHER-level fact only — the stop is real and carries no text.
+    // It does NOT by itself imply an envelope `no_message`: capture's textless-
+    // stop fallback re-reads the transcript (see the run-capture rider tests for
+    // the actual envelope mapping).
     const path = join(tempDir(), "textless.jsonl");
     writeFileSync(path, `${interimTurn()}\n${textlessStop()}\n`);
     const outcome = await waitForTranscriptStop({
@@ -924,6 +939,108 @@ describe("probe argv is gated by the single tmux-command authority (Blocker 3)",
     });
     expect(probeCalls).toBe(0);
     expect(result).toMatchObject({ ok: false, reason: "timeout" });
+  });
+
+  test("a NON-STRING token in run.json tmux.command rejects the whole array (Blocker 4)", async () => {
+    const stateDir = tempDir();
+    // Filtering non-strings would collapse this to a valid-looking probe; the
+    // parser must reject the ENTIRE array instead.
+    writeRunJson(stateDir, "tmux-mixed", {
+      id: "tmux-mixed",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "never-appears",
+      startedAtMs: 0,
+      tmux: {
+        command: ["/opt/homebrew/bin/tmux", null, "-L", "wrapped"],
+        windowId: "@1",
+      },
+    });
+    const resolution = resolveHandle({
+      rest: ["tmux-mixed"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    expect(resolution.handle.tmuxWindowProbeCommand).toBeUndefined();
+  });
+
+  test("duplicate / both socket pairs are producer-impossible → rejected (Blocker 4)", () => {
+    // Launch parsing makes -L/-S mutually exclusive: zero or ONE pair only.
+    expect(
+      isTmuxKillWindowCommand([
+        "/usr/bin/tmux",
+        "-L",
+        "a",
+        "-S",
+        "b",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBe(false);
+    expect(
+      windowPresenceProbeCommand([
+        "/usr/bin/tmux",
+        "-L",
+        "a",
+        "-L",
+        "b",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBeNull();
+    // Exactly one socket pair is still accepted.
+    expect(
+      isTmuxKillWindowCommand([
+        "/usr/bin/tmux",
+        "-S",
+        "/tmp/s.sock",
+        "kill-window",
+        "-t",
+        "@1",
+      ]),
+    ).toBe(true);
+  });
+});
+
+describe("--budget threads a durable cumulative ceiling (Blocker 2)", () => {
+  test("resolveHandle parses --budget into totalBudgetMs alongside the persisted startedAtMs", () => {
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-b", {
+      id: "tmux-b",
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "sess-b",
+      startedAtMs: 1_700_000_000_000,
+    });
+    const resolution = resolveHandle({
+      rest: ["tmux-b", "--stop-timeout", "60s", "--budget", "10m"],
+      cwd: "/work/proj",
+      stateDir,
+    });
+    expect(resolution.ok).toBe(true);
+    if (!resolution.ok) return;
+    // The durable launch instant comes from run.json (survives a cold restart);
+    // the cumulative ceiling comes from --budget.
+    expect(resolution.handle.startedAtMs).toBe(1_700_000_000_000);
+    expect(resolution.handle.totalBudgetMs).toBe(600_000);
+    expect(resolution.handle.stopTimeoutMs).toBe(60_000);
+  });
+
+  test("--budget requires a value and rejects a bad duration", () => {
+    const stateDir = tempDir();
+    expect(
+      resolveHandle({ rest: ["h", "--budget"], cwd: "/w", stateDir }),
+    ).toEqual({ ok: false, error: "--budget requires a value" });
+    const bad = resolveHandle({
+      rest: ["h", "--budget", "nope"],
+      cwd: "/w",
+      stateDir,
+    });
+    expect(bad.ok).toBe(false);
   });
 });
 

@@ -179,14 +179,17 @@ export function isTmuxKillWindowCommand(command: unknown): command is string[] {
   if (!/(?:^|\/)tmux$/.test(command[0] as string)) {
     return false;
   }
+  // Launch parsing makes `-L`/`-S` MUTUALLY EXCLUSIVE, so the only producible
+  // socket shape is ZERO or ONE pair — never repeated or both. Accepting `*`
+  // pairs would bless producer-impossible argv the launcher can never emit.
   const socketArgs = command.slice(1, -3);
-  if (socketArgs.length % 2 !== 0) {
+  if (socketArgs.length !== 0 && socketArgs.length !== 2) {
     return false;
   }
   if (
-    !socketArgs.every(
-      (token, index) => index % 2 === 1 || token === "-L" || token === "-S",
-    )
+    socketArgs.length === 2 &&
+    socketArgs[0] !== "-L" &&
+    socketArgs[0] !== "-S"
   ) {
     return false;
   }
@@ -439,7 +442,8 @@ function isPiUserPrompt(obj: Record<string, unknown>): boolean {
  * Extract the readable assistant text from a single transcript line, or null
  * when the line is not a text-bearing assistant message. Mirrors the per-backend
  * stop shapes but is permissive: it pulls text from ANY assistant turn, not only
- * a terminal one, so a fallback scan can find the latest text.
+ * a terminal one, so a fallback scan can find the latest text (including a bounded
+ * partial from an in-progress tool_use turn recovered on a timeout).
  */
 function assistantMessageText(
   agent: AgentKind,

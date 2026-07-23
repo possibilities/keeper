@@ -68,7 +68,7 @@ import {
   type RunControlOwner,
   type TmuxTeardownCommandResult,
 } from "../agent/run-capture";
-import { defaultTmuxCommandRunner } from "../agent/tmux-launch";
+import { defaultTmuxCommandRunner, resolveTmuxBin } from "../agent/tmux-launch";
 import {
   formatTriple,
   parseTriple,
@@ -379,6 +379,9 @@ export interface PanelDeps {
     command: string[],
     timeoutMs?: number,
   ) => TmuxTeardownCommandResult;
+  /** The CURRENT trusted tmux binary bound as argv0 for any teardown spawn, so a
+   *  renamed argv0 persisted in a control artifact is never executed. */
+  tmuxBin?: string;
 }
 
 /** Discriminated member-resolution result. */
@@ -1842,6 +1845,7 @@ async function reconcileCleanupManifest(args: {
   const settled = new Set<string>();
   const hardFailures = new Set<string>();
   const runTmuxCommand = deps.runTmuxCommand ?? defaultTmuxCommandRunner;
+  const trustedTmuxBin = deps.tmuxBin ?? resolveTmuxBin(process.env);
 
   const ownedLivePid = (target: PanelCleanupTarget): number | null => {
     const pidfile = target.attempt.pidfile;
@@ -1891,6 +1895,7 @@ async function reconcileCleanupManifest(args: {
         writeArtifact: (path, artifact: RunControlArtifact) =>
           writeFileAtomic(dirname(path), path, `${JSON.stringify(artifact)}\n`),
         runTmuxCommand,
+        trustedTmuxBin,
         timeoutMs:
           args.cleanupMs > 0
             ? Math.max(1, deadline - deps.now())

@@ -166,6 +166,9 @@ function makeDeps(opts: {
     bootEpochMs: opts.bootEpochMs ?? (() => TEST_BOOT_EPOCH_MS),
     readStartTime: opts.readStartTime ?? (() => null),
     lock: opts.lock,
+    // The trusted binary matches the control fixtures' argv0 (`/opt/tmux`), so the
+    // effect-boundary rebind is a no-op and the exact-command assertions hold.
+    tmuxBin: "/opt/tmux",
     runTmuxCommand:
       opts.runTmuxCommand ??
       ((command) => {

@@ -28,7 +28,7 @@ import { join } from "node:path";
 import type { PresetCatalog } from "../src/agent/config";
 import { splitSubcommand } from "../src/agent/dispatch";
 import { launchToResolvedHandle } from "../src/agent/launch-handle";
-import { main } from "../src/agent/main";
+import { main, probeTmuxWindowPresence } from "../src/agent/main";
 import type {
   ResolvedHandle,
   ShowLastMessageResult,
@@ -55,6 +55,7 @@ import {
   type RunControlOwner,
   type RunLaunchResult,
   runCaptureExitCode,
+  withTrustedTmuxBin,
 } from "../src/agent/run-capture";
 import * as tmuxLaunch from "../src/agent/tmux-launch";
 import { findLastMessage } from "../src/agent/transcript-watch";
@@ -939,6 +940,259 @@ describe("tmux window presence classifier (Blocker 4 — socket-gone stderr)", (
   });
 });
 
+describe("cumulative budget is a producer clock (Blocker 2)", () => {
+  const runHandle = (over: Partial<ResolvedHandle> = {}): ResolvedHandle => ({
+    ...handle(),
+    startedAtMs: 1_000, // durable launch instant, as persisted in run.json
+    ...over,
+  });
+
+  test("launch-age ≥ budget → BLOCKS deterministically WITHOUT waiting", async () => {
+    let waits = 0;
+    const { envelope, exitCode, budgetExhausted, timeoutLiveness } =
+      await captureFromHandle(
+        {
+          waitForStop: async () => {
+            waits++;
+            return { ok: true, transcriptPath: "/t.jsonl", stop: STOP };
+          },
+          showLastMessage: async () => ({
+            ok: true,
+            transcriptPath: "/t.jsonl",
+            text: "x",
+            found: true,
+          }),
+          // now is 1_000 (launch) + 600_000 budget + 1 → launch-age past budget.
+          now: () => 1_000 + 600_000 + 1,
+        },
+        VERB_DEPS,
+        {
+          handle: runHandle({ totalBudgetMs: 600_000 }),
+          handleId: "tmux-budget",
+          agent: "claude",
+          startMs: 1_000 + 600_000 + 1,
+        },
+      );
+    expect(waits).toBe(0); // the primitive never granted a chunk
+    expect(envelope.outcome).toBe("timed_out");
+    expect(budgetExhausted).toBe(true);
+    expect(timeoutLiveness).toBe("unknown");
+    // elapsed_seconds is the DURABLE launch-age (≥ budget), not a per-call value.
+    expect(envelope.elapsed_seconds).toBe(600);
+    expect(exitCode).toBe(4);
+  });
+
+  test("COLD wrapper: a fresh capture over the SAME persisted startedAtMs blocks identically", async () => {
+    // Simulate a restarted wrapper: only the durable startedAtMs (from run.json)
+    // survives — no prior-wait memory. A fresh capture must still BLOCK.
+    let waits = 0;
+    const coldCapture = () =>
+      captureFromHandle(
+        {
+          waitForStop: async () => {
+            waits++;
+            return { ok: false, reason: "timeout", error: "t" };
+          },
+          showLastMessage: async () => ({
+            ok: false,
+            reason: "timeout",
+            error: "t",
+          }),
+          now: () => 1_000 + 600_001,
+        },
+        VERB_DEPS,
+        {
+          handle: runHandle({ totalBudgetMs: 600_000 }),
+          handleId: "tmux-cold",
+          agent: "claude",
+          startMs: 1_000 + 600_001, // per-call clock reset to "now" — irrelevant
+        },
+      );
+    const first = await coldCapture();
+    expect(first.budgetExhausted).toBe(true);
+    // A second (still-cold) invocation blocks the same way — no second chunk.
+    const second = await coldCapture();
+    expect(second.budgetExhausted).toBe(true);
+    expect(waits).toBe(0);
+  });
+
+  test("launch-age UNDER budget → caps the single wait to the remaining budget", async () => {
+    let seenTimeout: number | null = null;
+    await captureFromHandle(
+      {
+        waitForStop: async (h: ResolvedHandle) => {
+          seenTimeout = h.stopTimeoutMs;
+          return { ok: false, reason: "timeout", error: "t" };
+        },
+        showLastMessage: async () => ({
+          ok: false,
+          reason: "timeout",
+          error: "t",
+        }),
+        now: () => 1_000 + 590_000, // 10s of the 600s budget remain
+      },
+      VERB_DEPS,
+      {
+        handle: runHandle({ totalBudgetMs: 600_000, stopTimeoutMs: 120_000 }),
+        handleId: "tmux-cap",
+        agent: "claude",
+        startMs: 1_000 + 590_000,
+      },
+    );
+    // The 120s chunk is capped to the 10s of budget that remains.
+    expect(seenTimeout as number | null).toBe(10_000);
+  });
+
+  test("no --budget → no cumulative block, per-call elapsed for a direct-path handle", async () => {
+    let waits = 0;
+    const { envelope, budgetExhausted } = await captureFromHandle(
+      {
+        waitForStop: async () => {
+          waits++;
+          return { ok: false, reason: "timeout", error: "t" };
+        },
+        showLastMessage: async () => ({
+          ok: false,
+          reason: "timeout",
+          error: "t",
+        }),
+        now: () => 5_000,
+      },
+      VERB_DEPS,
+      // startedAtMs 0 (direct path) → per-call elapsed, no budget ceiling.
+      { handle: handle(), handleId: "tmux-nb", agent: "claude", startMs: 0 },
+    );
+    expect(waits).toBe(1);
+    expect(budgetExhausted).toBeUndefined();
+    expect(envelope.elapsed_seconds).toBe(5);
+  });
+});
+
+describe("claude textless-stop recovery — documented behavior (Blocker 2 rider)", () => {
+  // Real re-scan: show-last-message is backed by the ACTUAL findLastMessage over a
+  // real transcript, so these assert the ENVELOPE outcome, not just a fake seam.
+  const realShow =
+    (path: string) =>
+    async (h: ResolvedHandle): Promise<ShowLastMessageResult> => {
+      const last = findLastMessage("claude", h.transcriptPath ?? path);
+      return {
+        ok: true,
+        transcriptPath: h.transcriptPath ?? path,
+        text: last.text,
+        found: last.found,
+      };
+    };
+  const textlessStopWait = (path: string) => ({
+    ok: true as const,
+    transcriptPath: path,
+    stop: {
+      agent: "claude" as const,
+      eventType: "stop_hook_summary",
+      reason: "stop",
+      timestamp: null,
+      message: null,
+    },
+  });
+  const interimTurn = JSON.stringify({
+    type: "assistant",
+    message: {
+      role: "assistant",
+      stop_reason: "tool_use",
+      content: [{ type: "text", text: "interim, not terminal" }],
+    },
+  });
+  const textlessStop = JSON.stringify({
+    type: "system",
+    subtype: "stop_hook_summary",
+    stopReason: "stop",
+  });
+
+  test("a textless structural stop re-scans and recovers a REAL end_turn answer → completed", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "rc-answered-")), "t.jsonl");
+    const endTurn = JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: "the real answer" }],
+      },
+    });
+    // Structural stop follows a text-bearing end_turn: the re-scan recovers it.
+    writeFileSync(path, `${interimTurn}\n${endTurn}\n${textlessStop}\n`);
+    const { envelope } = await captureFromHandle(
+      {
+        waitForStop: async () => textlessStopWait(path),
+        showLastMessage: realShow(path),
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-ans", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.outcome).toBe("completed");
+    expect(envelope.message).toBe("the real answer");
+  });
+
+  test("interim-only + textless stop: the permissive re-scan DOES surface interim text (corrected claim)", async () => {
+    // Correcting the earlier over-claim: at the ENVELOPE level this fixture maps
+    // to `completed` carrying interim text, because `findLastMessage` is
+    // deliberately permissive (a timeout must keep the in-progress partial) and a
+    // textless structural stop falls back to that re-scan (the same test-h
+    // contract that recovers a real answer above). The load-bearing guard against
+    // a DEAD leg fabricating success is NOT here — it is the window-gone path,
+    // which returns `partner_died` and mines NO message (see the window_gone test).
+    const path = join(mkdtempSync(join(tmpdir(), "rc-textless-")), "t.jsonl");
+    writeFileSync(path, `${interimTurn}\n${textlessStop}\n`);
+    const { envelope } = await captureFromHandle(
+      {
+        waitForStop: async () => textlessStopWait(path),
+        showLastMessage: realShow(path),
+        now: () => 0,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-tl", agent: "claude", startMs: 0 },
+    );
+    expect(envelope.outcome).toBe("completed");
+    expect(envelope.message).toBe("interim, not terminal");
+  });
+});
+
+describe("the probe binary is bound to trusted authority (Blocker 3, run.json path)", () => {
+  test("withTrustedTmuxBin swaps a renamed argv0 for the trusted binary", () => {
+    expect(
+      withTrustedTmuxBin("/usr/bin/tmux", [
+        "/tmp/evil/tmux",
+        "list-panes",
+        "-t",
+        "@1",
+        "-F",
+        "#{window_id}",
+      ]),
+    ).toEqual([
+      "/usr/bin/tmux",
+      "list-panes",
+      "-t",
+      "@1",
+      "-F",
+      "#{window_id}",
+    ]);
+  });
+
+  test("probeTmuxWindowPresence NEVER executes the persisted argv0 (renamed binary)", () => {
+    let ran: string[] | null = null;
+    const result = probeTmuxWindowPresence(
+      (command) => {
+        ran = command;
+        return { exitCode: 0, stdout: "@1", stderr: "" };
+      },
+      "/usr/bin/tmux",
+      ["/tmp/evil/tmux", "list-panes", "-t", "@1", "-F", "#{window_id}"],
+    );
+    expect(result).toBe("present");
+    expect((ran as string[] | null)?.[0]).toBe("/usr/bin/tmux");
+    expect((ran as string[] | null)?.[0]).not.toBe("/tmp/evil/tmux");
+  });
+});
+
 describe("captureLivePartnerResponse — delivery and cleanup", () => {
   const liveArgs = {
     handle: {
@@ -1314,6 +1568,7 @@ describe("run control — exact, idempotent cancellation", () => {
             tmuxCalls += 1;
             return { exitCode: 0, stdout: "", stderr: "" };
           },
+          trustedTmuxBin: "/opt/tmux",
         }),
       ).toEqual({ kind: "malformed_control" });
       expect(tmuxCalls).toBe(0);
@@ -1322,14 +1577,55 @@ describe("run control — exact, idempotent cancellation", () => {
 
   test("exact teardown is single-shot and preserves the socket-qualified target", () => {
     const calls: string[][] = [];
-    const teardown = createExactRunTeardown(EXACT_KILL, (command) => {
-      calls.push(command);
-      return { exitCode: 0, stdout: "", stderr: "" };
-    });
+    const teardown = createExactRunTeardown(
+      EXACT_KILL,
+      (command) => {
+        calls.push(command);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      // Trusted binary === the argv0 already recorded, so the socket args + window
+      // target survive unchanged.
+      EXACT_KILL[0] as string,
+    );
 
     expect(teardown()).toEqual({ kind: "torn_down" });
     expect(teardown()).toEqual({ kind: "torn_down" });
     expect(calls).toEqual([EXACT_KILL]);
+  });
+
+  test("exact teardown binds argv0 to the TRUSTED binary, never the persisted one", () => {
+    // A control artifact whose argv0 was renamed to an arbitrary binary still
+    // basenames to `tmux` (so the shape validator passes) — but the spawn must
+    // use the trusted binary, never `/tmp/evil/tmux`.
+    const evilKill = [
+      "/tmp/evil/tmux",
+      "-S",
+      "/tmp/keeper-owned.sock",
+      "kill-window",
+      "-t",
+      "@77",
+    ];
+    const calls: string[][] = [];
+    const teardown = createExactRunTeardown(
+      evilKill,
+      (command) => {
+        calls.push(command);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      "/usr/bin/tmux",
+    );
+    expect(teardown()).toEqual({ kind: "torn_down" });
+    expect(calls).toEqual([
+      [
+        "/usr/bin/tmux",
+        "-S",
+        "/tmp/keeper-owned.sock",
+        "kill-window",
+        "-t",
+        "@77",
+      ],
+    ]);
+    expect(calls[0]?.[0]).not.toBe("/tmp/evil/tmux");
   });
 
   test("owned cancellation rejects malformed and mismatched controls before tmux", () => {
@@ -1344,6 +1640,7 @@ describe("run control — exact, idempotent cancellation", () => {
         calls += 1;
         return { exitCode: 0, stdout: "", stderr: "" };
       },
+      trustedTmuxBin: "/opt/tmux",
     };
     expect(
       cancelOwnedRunFromControlArtifact({
@@ -1380,6 +1677,7 @@ describe("run control — exact, idempotent cancellation", () => {
       writeArtifact: (_path: string, next: RunControlArtifact) => {
         artifact = next;
       },
+      trustedTmuxBin: "/opt/tmux",
     };
 
     const mismatch = cancelRunFromControlArtifact({

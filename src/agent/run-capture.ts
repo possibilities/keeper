@@ -29,6 +29,7 @@ import type {
   WaitForStopResult,
 } from "./pair-subcommands";
 import {
+  DEFAULT_STOP_TIMEOUT_MS,
   isTmuxKillWindowCommand,
   type WindowLiveness,
 } from "./transcript-watch";
@@ -190,8 +191,26 @@ export function classifyTmuxWindowPresence(result: {
 }
 
 /**
+ * Bind a persisted, structurally-validated tmux argv to the CURRENT trusted
+ * binary at the effect boundary. The shape validator proves `[tmux, …socket,
+ * verb, -t, @id]`, but a basename of `tmux` is NOT executable identity — a
+ * renamed `/tmp/evil/tmux` in run.json/control.json passes the shape check. So
+ * argv0 for the actual spawn is ALWAYS `trustedTmuxBin` (resolved this process),
+ * never the persisted filename; the persisted socket args + window target ride
+ * as inert data. Pure — exported for the never-executes-the-renamed-binary tests.
+ */
+export function withTrustedTmuxBin(
+  trustedTmuxBin: string,
+  command: readonly string[],
+): string[] {
+  return [trustedTmuxBin, ...command.slice(1)];
+}
+
+/**
  * Make exact tmux teardown single-shot. The first resolved result is cached, so
  * converging completion/cancellation paths can safely invoke the same closure.
+ * The spawn's argv0 is bound to `trustedTmuxBin` — the persisted argv0 (from a
+ * control artifact) is never executed because of its filename.
  */
 export function createExactRunTeardown(
   killWindowCommand: readonly string[],
@@ -199,6 +218,7 @@ export function createExactRunTeardown(
     command: string[],
     timeoutMs?: number,
   ) => TmuxTeardownCommandResult,
+  trustedTmuxBin: string,
   timeoutMs = 5_000,
 ): () => ExactTeardownResult {
   let resolved: ExactTeardownResult | null = null;
@@ -207,7 +227,10 @@ export function createExactRunTeardown(
       return resolved;
     }
     try {
-      const result = runTmuxCommand([...killWindowCommand], timeoutMs);
+      const result = runTmuxCommand(
+        withTrustedTmuxBin(trustedTmuxBin, killWindowCommand),
+        timeoutMs,
+      );
       resolved =
         result.exitCode === 0
           ? { kind: "torn_down" }
@@ -266,6 +289,7 @@ function cancelValidatedRunControl(args: {
     command: string[],
     timeoutMs?: number,
   ) => TmuxTeardownCommandResult;
+  trustedTmuxBin: string;
   timeoutMs?: number;
 }): CancelRunResult {
   if (args.artifact.status === "terminal") {
@@ -278,6 +302,7 @@ function cancelValidatedRunControl(args: {
   const teardown = createExactRunTeardown(
     args.artifact.kill_window_command,
     args.runTmuxCommand,
+    args.trustedTmuxBin,
     args.timeoutMs,
   )();
   if (teardown.kind === "unresolved_teardown_error") {
@@ -298,6 +323,7 @@ export function cancelRunFromControlArtifact(args: {
     command: string[],
     timeoutMs?: number,
   ) => TmuxTeardownCommandResult;
+  trustedTmuxBin: string;
   timeoutMs?: number;
 }): CancelRunResult {
   const artifact = args.readArtifact(args.path);
@@ -322,6 +348,7 @@ export function cancelOwnedRunFromControlArtifact(args: {
     command: string[],
     timeoutMs?: number,
   ) => TmuxTeardownCommandResult;
+  trustedTmuxBin: string;
   timeoutMs?: number;
 }): CancelRunResult {
   const artifact = args.readArtifact(args.path);
@@ -377,6 +404,14 @@ export interface RunCaptureResult {
    * of the nine-key wire envelope, so the schema is unchanged.
    */
   timeoutLiveness?: PartnerLiveness;
+  /**
+   * Set on a `timed_out` outcome that the CUMULATIVE budget forced: the leg's
+   * launch-age (durable, from the persisted launch instant) crossed the total
+   * budget, so the wait held the handle and returned WITHOUT granting another
+   * chunk. The durable cumulative clock is `elapsed_seconds` (launch-age); this
+   * flag only steers the CLI's guidance (never part of the nine-key envelope).
+   */
+  budgetExhausted?: boolean;
 }
 
 const OUTCOME_EXIT_CODE: Record<RunCaptureOutcome, number> = {
@@ -873,9 +908,58 @@ export async function captureFromHandle(
 ): Promise<RunCaptureResult> {
   const { handle, handleId, agent, startMs } = args;
   const baseResume = handle.sessionId;
-  const elapsed = (): number => roundTenths((deps.now() - startMs) / 1000);
+  // A run-handle carries the DURABLE launch instant (`startedAtMs`, persisted in
+  // run.json), so elapsed reports launch-age — a cumulative clock that survives
+  // the per-call `startMs` reset AND a cold wrapper restart. `agent run` spans
+  // the whole run (its `startMs` precedes the launch → the min is `startMs`); a
+  // direct-path handle (no launch instant) reports per-call.
+  const referenceMs =
+    handle.startedAtMs > 0 ? Math.min(startMs, handle.startedAtMs) : startMs;
+  const elapsed = (): number => roundTenths((deps.now() - referenceMs) / 1000);
 
-  const wait = await deps.waitForStop(handle, verbDeps);
+  // Producer-clock cumulative budget: once the leg's launch-age crosses the
+  // caller-supplied total budget, the wait BLOCKS deterministically and holds
+  // the handle — no per-call chunk timing and no wrapper counting can extend it,
+  // and a cold wrapper reading the same run.json blocks identically. A per-call
+  // clock could not see cumulative age, which is why the prose cap failed live.
+  const launchAgeMs =
+    handle.totalBudgetMs != null && handle.startedAtMs > 0
+      ? deps.now() - handle.startedAtMs
+      : null;
+  if (
+    handle.totalBudgetMs != null &&
+    launchAgeMs !== null &&
+    launchAgeMs >= handle.totalBudgetMs
+  ) {
+    return {
+      ...buildRunCaptureEnvelope({
+        outcome: "timed_out",
+        agent,
+        handle: handleId,
+        resumeTarget: baseResume,
+        elapsedSeconds: elapsed(),
+      }),
+      timeoutLiveness: "unknown",
+      budgetExhausted: true,
+    };
+  }
+  // Cap a single wait so it can never extend PAST the durable deadline, even if
+  // the caller passes a chunk larger than the remaining budget.
+  const waitHandle =
+    handle.totalBudgetMs != null && launchAgeMs !== null
+      ? {
+          ...handle,
+          stopTimeoutMs: Math.max(
+            1,
+            Math.min(
+              handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS,
+              handle.totalBudgetMs - launchAgeMs,
+            ),
+          ),
+        }
+      : handle;
+
+  const wait = await deps.waitForStop(waitHandle, verbDeps);
   if (!wait.ok) {
     // Confirmed leg death, both spellings: a folded-terminal lifecycle
     // (`partner_died`) or a positively-gone tmux window (`window_gone`). The wait
@@ -951,10 +1035,12 @@ export async function captureFromHandle(
   // back to the text the stop event itself carried rather than losing the run.
   const transcriptPath = show.ok ? show.transcriptPath : wait.transcriptPath;
   // For claude, the gated wait stop is the BLESSED settled turn: prefer its own
-  // message so a later human-resume turn's whole-file re-scan cannot displace
-  // the answer. Only a structural claude stop (null text) falls back to the
-  // re-scan. Pi keeps the re-scan-first preference (its stop text is a subset
-  // of what show-last-message resolves).
+  // message so a later human-resume turn's whole-file re-scan cannot displace the
+  // answer. Only a structural claude stop (null text) falls back to the re-scan —
+  // and that re-scan (show-last-message → findLastMessage) NEVER surfaces a
+  // NON-terminal tool_use turn's interim text, so a structural end with no real
+  // answer resolves to `no_message`, never a mined completion. Pi keeps the
+  // re-scan-first preference (its stop text is a subset of show-last-message's).
   let message: string | null;
   let messageFound: boolean;
   if (agent === "claude" && wait.stop.message !== null) {

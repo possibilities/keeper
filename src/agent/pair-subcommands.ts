@@ -47,6 +47,15 @@ export interface ResolvedHandle {
    */
   stopTimeoutMs: number | null;
   /**
+   * Caller-supplied TOTAL leg budget in ms (`--budget`), the cumulative ceiling
+   * measured from the DURABLE launch instant {@link startedAtMs} — NOT the
+   * per-call chunk {@link stopTimeoutMs}. Once launch-age crosses it the capture
+   * BLOCKS deterministically (a producer clock, not a wrapper counting chunks),
+   * so a fresh or cold-restarted wait over a long-running leg cannot grant
+   * another full budget. Absent = no cumulative ceiling (legacy behavior).
+   */
+  totalBudgetMs?: number | null;
+  /**
    * Resume marker threaded into transcript discovery. Claude/Pi stay
    * strict-pinned; a resumed Pi wait anchors on a structural stop-count watermark instead, since pi
    * re-stamps its copied history with resume-time timestamps. Absent/false = fresh
@@ -91,6 +100,7 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
   let handleArg: string | null = null;
   let agentOverride: AgentKind | null = null;
   let stopTimeoutMs: number | null = null;
+  let totalBudgetMs: number | null = null;
 
   for (let i = 0; i < args.rest.length; i++) {
     const arg = args.rest[i] as string;
@@ -142,6 +152,28 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
       stopTimeoutMs = parsed.ms;
       continue;
     }
+    if (arg === "--budget") {
+      const value = args.rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--budget requires a value" };
+      }
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--budget ${parsed.message}` };
+      }
+      totalBudgetMs = parsed.ms;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--budget=")) {
+      const value = arg.slice("--budget=".length);
+      const parsed = parseDuration(value);
+      if (!parsed.ok) {
+        return { ok: false, error: `--budget ${parsed.message}` };
+      }
+      totalBudgetMs = parsed.ms;
+      continue;
+    }
     if (handleArg === null) {
       handleArg = arg;
       continue;
@@ -169,11 +201,18 @@ export function resolveHandle(args: ResolveHandleArgs): HandleResolution {
         startedAtMs: 0,
         transcriptPath: handleArg,
         stopTimeoutMs,
+        ...(totalBudgetMs !== null ? { totalBudgetMs } : {}),
       },
     };
   }
 
-  return resolveRunId(handleArg, args.stateDir, agentOverride, stopTimeoutMs);
+  return resolveRunId(
+    handleArg,
+    args.stateDir,
+    agentOverride,
+    stopTimeoutMs,
+    totalBudgetMs,
+  );
 }
 
 function resolveRunId(
@@ -181,6 +220,7 @@ function resolveRunId(
   stateDir: string,
   agentOverride: AgentKind | null,
   stopTimeoutMs: number | null,
+  totalBudgetMs: number | null,
 ): HandleResolution {
   const runJsonPath = join(stateDir, "tmux-runs", runId, "run.json");
   if (!existsSync(runJsonPath)) {
@@ -220,6 +260,7 @@ function resolveRunId(
         typeof parsed.startedAtMs === "number" ? parsed.startedAtMs : 0,
       transcriptPath: null,
       stopTimeoutMs,
+      ...(totalBudgetMs !== null ? { totalBudgetMs } : {}),
       ...(tmuxWindowProbeCommand !== null ? { tmuxWindowProbeCommand } : {}),
       ...(typeof parsed.lifecycleJobId === "string"
         ? { lifecycleJobId: parsed.lifecycleJobId }
@@ -255,17 +296,23 @@ function tmuxWindowProbeCommandFromRunJson(
     return null;
   }
   const block = tmux as Record<string, unknown>;
-  const command = Array.isArray(block.command)
-    ? block.command.filter(
-        (token): token is string => typeof token === "string",
-      )
-    : [];
+  // REJECT the whole array on any non-string token — filtering non-strings would
+  // silently splice a hole shut (e.g. `[tmux, null, "-L", "wrapped"]` collapsing
+  // to a valid-looking probe), turning malformed metadata into an executable
+  // argv. A single bad token means no probe.
+  const rawCommand = block.command;
+  if (
+    !Array.isArray(rawCommand) ||
+    !rawCommand.every((token) => typeof token === "string")
+  ) {
+    return null;
+  }
   const windowId = typeof block.windowId === "string" ? block.windowId : null;
-  if (command.length === 0 || windowId === null) {
+  if (rawCommand.length === 0 || windowId === null) {
     return null;
   }
   return windowPresenceProbeCommand([
-    ...command,
+    ...(rawCommand as string[]),
     "kill-window",
     "-t",
     windowId,
@@ -299,10 +346,10 @@ export type WaitForStopResult =
       error: string;
       reason?: "timeout" | "ambiguous" | "partner_died" | "window_gone";
       terminal?: PartnerLifecycleTerminal;
-      /** Set when the transcript path DID resolve and only the stop wait timed
-       *  out (or the window went positively gone while the path was known) — the
-       *  caller reads that known path once to recover a final message instead of
-       *  re-running path discovery on a second budget. */
+      /** The resolved transcript path, carried on a `timeout` (the caller reads
+       *  it once for the bounded partial) or on `window_gone`/`partner_died`
+       *  (diagnostic only — a boundary-qualified stop would have returned `ok`,
+       *  so no terminal message is recoverable and none is mined). */
       transcriptPath?: string;
       /** Set on a `timeout` reason: the Partner liveness re-probed at the
        *  observation deadline, so the caller's guidance separates a positively-
@@ -383,9 +430,9 @@ export async function runWaitForStop(
         transcriptPath,
       };
     }
-    // The window went positively gone while the transcript path is KNOWN: carry
-    // it so the caller recovers the leg's final message from that path (a leg
-    // that stopped as its waiter missed the stop) instead of burning the budget.
+    // The window went positively gone with no boundary-qualified stop (the wait
+    // already did the final stop re-read; a real stop would have returned `ok`).
+    // Carry the known path for diagnostics only — no final message is recovered.
     if ("windowGone" in outcome) {
       return windowGoneFailure(transcriptPath);
     }
@@ -569,11 +616,11 @@ function transcriptPathFailure(reason: "timeout" | "ambiguous"): {
   };
 }
 
-/** The positive-gone terminal: the launch's tmux window is absent. When the
- *  transcript path resolved before the window vanished it rides along so the
- *  caller recovers a final message from it; otherwise no message is
- *  recoverable. Distinct from `timeout` — the target is confirmed gone, not
- *  merely unobserved. */
+/** The positive-gone terminal: the launch's tmux window is absent AND the wait's
+ *  final stop re-read found no boundary-qualified stop. The known transcript path
+ *  rides only as diagnostic detail — no terminal message is recoverable, so the
+ *  caller emits `partner_died` and never mines interim text. Distinct from
+ *  `timeout` — the target is confirmed gone, not merely unobserved. */
 function windowGoneFailure(transcriptPath?: string): {
   ok: false;
   error: string;

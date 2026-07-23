@@ -254,6 +254,7 @@ import {
   type RunCaptureEnvelope,
   type RunCaptureResult,
   type RunControlArtifact,
+  withTrustedTmuxBin,
 } from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
@@ -1687,7 +1688,9 @@ function makeVerbDeps(deps: MainDeps): VerbDeps {
     homeDir: deps.transcriptHomeDir,
     probePartnerLifecycle: deps.probePartnerLifecycleFn,
     probeWindowPresence: (command) =>
-      Promise.resolve(probeTmuxWindowPresence(deps.runTmuxCommandFn, command)),
+      Promise.resolve(
+        probeTmuxWindowPresence(deps.runTmuxCommandFn, deps.tmuxBin, command),
+      ),
   };
 }
 
@@ -1697,13 +1700,17 @@ function makeVerbDeps(deps: MainDeps): VerbDeps {
  *  socket stderr → absent; a timeout sentinel, connection-refused, or any other
  *  failure → unknown). A throwing runner (tmux missing) is unknown, never a false
  *  absence. */
-function probeTmuxWindowPresence(
+export function probeTmuxWindowPresence(
   run: TmuxCommandRunner,
+  trustedTmuxBin: string,
   command: string[],
 ): WindowLiveness {
   try {
     return classifyTmuxWindowPresence(
-      run(command, TMUX_WINDOW_PROBE_TIMEOUT_MS),
+      run(
+        withTrustedTmuxBin(trustedTmuxBin, command),
+        TMUX_WINDOW_PROBE_TIMEOUT_MS,
+      ),
     );
   } catch {
     return "unknown";
@@ -2009,6 +2016,19 @@ function emitTimeoutGuidance(deps: MainDeps, result: RunCaptureResult): void {
     env.elapsed_seconds !== null ? ` after ${env.elapsed_seconds}s` : "";
   const partner =
     env.agent !== null ? `${displayAgent(env.agent)} Partner` : "Partner";
+  if (result.budgetExhausted) {
+    // The leg's launch-age crossed the cumulative budget: HOLD the handle and
+    // escalate — never grant another chunk. `elapsed_seconds` is the durable
+    // launch-age the wrapper compares against its total budget.
+    const job = env.resume_target !== null ? ` (job ${env.resume_target})` : "";
+    deps.writeErr(
+      `agent: cumulative budget exhausted — the ${partner}${job} has run ` +
+        `${elapsed.trim() || "past the total budget"} since launch without ` +
+        `stopping. The handle is HELD (not reaped); do not re-wait — escalate ` +
+        `BLOCKED for the parent to adjudicate.\n`,
+    );
+    return;
+  }
   if (result.timeoutLiveness === "live") {
     const job = env.resume_target !== null ? ` (job ${env.resume_target})` : "";
     deps.writeErr(
@@ -2040,7 +2060,11 @@ function reapThunk(
   if (!requested || killWindowCommand === null) {
     return undefined;
   }
-  return createExactRunTeardown(killWindowCommand, deps.runTmuxCommandFn);
+  return createExactRunTeardown(
+    killWindowCommand,
+    deps.runTmuxCommandFn,
+    deps.tmuxBin,
+  );
 }
 
 /**
