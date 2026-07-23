@@ -284,6 +284,7 @@ import {
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
+  listWorktreesResult as gitListWorktreesResult,
   losslessPremergeClean as gitLosslessPremergeClean,
   measureBaseDrift as gitMeasureBaseDrift,
   mergeBranchInto as gitMergeBranchInto,
@@ -5122,13 +5123,22 @@ export type AssignmentWorktreeReadiness =
   | { kind: "unknown"; detail: string };
 
 /**
- * Probe one dependent's EXISTING assignment worktree for dispatch readiness, reusing
- * the shared {@link mergeReadiness} primitive (so a symbolic-ref advance that left the
- * index/worktree trailing surfaces as `dirty`, never a false ready). An ABSENT worktree
- * dir or an inconclusive/thrown probe is `unknown` (held, deferred to the actor — never
- * cleared on branch content alone); a positively dirty / off-branch / mid-merge tree is
- * `not-ready`. Producer-only reads; NEVER throws. Shared by the gate and the parts-6
- * progress actor so both apply the identical two-part (ancestry ∧ readiness) test.
+ * Probe one dependent's EXISTING assignment worktree for dispatch readiness in TWO
+ * bounded steps. FIRST, REGISTRATION: the dir must be a REGISTERED linked worktree
+ * (`git worktree list --porcelain`, via the shared tri-state {@link listWorktreesResult})
+ * whose exact normalized path is checked out on `branch` — a ready-LOOKING directory that
+ * is not a registered worktree, or is registered on a different branch, must NEVER pass,
+ * because the B-sharpened daemon redispatch probe bypasses provision, so nothing
+ * downstream catches an unregistered / mis-branched dir. A timed-out / inconclusive list
+ * is `unknown` (transient, held); a successful list omitting this path, or carrying it on
+ * another branch, is a POSITIVELY-observed `not-ready` (the actor may recreate the lane).
+ * SECOND, TREE STATE: reuse the shared {@link mergeReadiness} primitive (so a symbolic-ref
+ * advance that left the index/worktree trailing surfaces as `dirty`, never a false ready).
+ * An ABSENT worktree dir or an inconclusive/thrown probe is `unknown` (held, deferred to
+ * the actor — never cleared on branch content alone); a positively dirty / off-branch /
+ * mid-merge tree is `not-ready`. Producer-only reads; NEVER throws. Shared by the gate and
+ * the parts-6 progress actor so both apply the identical (registration ∧ ancestry ∧
+ * readiness) test.
  */
 export async function assignmentWorktreeReadiness(
   worktreePath: string,
@@ -5144,6 +5154,35 @@ export async function assignmentWorktreeReadiness(
   }
   if (!present) {
     return { kind: "unknown", detail: "assignment worktree absent" };
+  }
+  // Registration gate — a present dir is not enough; it must be a REGISTERED linked
+  // worktree on `branch`. Absent/mismatch → `not-ready` (positively observed); a
+  // timeout / inconclusive list → `unknown` (transient). Both route to the caller's
+  // defer, so a ready-looking-but-unregistered lane is never dispatched into.
+  const listed = await gitListWorktreesResult(worktreePath, run);
+  if (listed.kind !== "ok") {
+    const detail =
+      listed.kind === "timeout" ? "git worktree list timed out" : listed.detail;
+    return {
+      kind: "unknown",
+      detail: `worktree registration probe ${listed.kind}: ${detail}`,
+    };
+  }
+  const entry = listed.value.find(
+    (e) =>
+      stripTrailingSlashPath(e.path) === stripTrailingSlashPath(worktreePath),
+  );
+  if (entry === undefined) {
+    return {
+      kind: "not-ready",
+      detail: `unregistered: ${worktreePath} is not a registered linked worktree`,
+    };
+  }
+  if (entry.branch === null || shortBranchName(entry.branch) !== branch) {
+    return {
+      kind: "not-ready",
+      detail: `registration branch mismatch: registered on ${entry.branch ?? "detached"}, expected ${branch}`,
+    };
   }
   try {
     const r = await gitMergeReadiness(worktreePath, branch, run);
@@ -5243,9 +5282,12 @@ export async function resolveTaskTarget(
 
 /**
  * Compute the EPHEMERAL intra-epic sibling-source defer map, keyed PER task id: a
- * NON-DONE dependent task → the blocking reason (a DONE dependency-sibling rib
- * `keeper/epic/<id>--<sib>`, or an enumeration/worktree-readiness reason) that holds its
- * dispatch. A dependent's lane must not be cut — nor an already-cut lane dispatched into
+ * NON-DONE dependent task → the blocking reason. That reason ALWAYS names a DONE
+ * dependency-sibling rib `keeper/epic/<id>--<sib>`: a not-yet-ancestor rib names itself
+ * bare; a target-readiness / enumeration defer names the first done rib WITH the readiness
+ * reason appended (`<rib> (<reason>)`), so the operator rail always names the unmet source
+ * edge even when the immediate blocker is the target worktree. A dependent's lane must not
+ * be cut — nor an already-cut lane dispatched into
  * — until every DONE dependency-sibling's rib is an ancestor of the base its lane
  * ACTUALLY SEES ({@link resolveTaskTarget}: its own already-cut branch, else the
  * {@link parentBranchFor} fork source) AND that base's worktree is ready. Else the lane
@@ -5367,7 +5409,15 @@ export async function computeDeferredSiblingSources(
             readiness,
           );
           if (target.kind === "defer") {
-            deferred.set(dependent.task_id, target.reason);
+            // Visibility rider: when target READINESS (not a not-yet-ancestor rib) is the
+            // immediate blocker, STILL name a blocking rib so the operator rail always
+            // names the unmet source edge — rib + readiness reason together. Every done
+            // sibling's rib is unmet until the held lane is ready, so the first stands in.
+            const firstRib = ribBranchFor(
+              epic.epic_id,
+              doneParents[0]?.task_id ?? "",
+            );
+            deferred.set(dependent.task_id, `${firstRib} (${target.reason})`);
             continue;
           }
           for (const parent of doneParents) {

@@ -80,6 +80,7 @@ import {
   computeBaseDriftEntries,
   computeCloseRecoveryEligibleIds,
   type AssignmentWorktreeReadiness,
+  assignmentWorktreeReadiness,
   computeDeferredEpicIds,
   computeDeferredSiblingSources,
   computeDuplicateEpicNumberGroups,
@@ -24232,6 +24233,156 @@ test("computeDeferredSiblingSources: a CLUSTERED multi-repo epic gates a depende
   expect(deferred.get("fn-2-multi.4")).toBe(
     "keeper/epic/fn-2-multi--fn-2-multi.3",
   );
+});
+
+// ---------------------------------------------------------------------------
+// assignmentWorktreeReadiness — the REGISTRATION half: a present dir must be a
+// registered linked worktree on the expected branch before any tree evidence counts.
+// The B-sharpened daemon redispatch probe bypasses provision, so a ready-looking-but-
+// unregistered dir would otherwise dispatch into a bad lane with nothing downstream to
+// catch it. An unmatched fake-git call defaults to exit-0/empty, which yields an absent
+// MERGE_HEAD + clean status; the two rules below supply the porcelain list + the HEAD
+// branch a clean registered lane needs.
+// ---------------------------------------------------------------------------
+
+const READINESS_WT = "/wt/fn-1-foo.4";
+const READINESS_BRANCH = "keeper/epic/fn-1-foo--fn-1-foo.4";
+
+/** One `git worktree list --porcelain` entry: an absolute path on a full ref. */
+function porcelainWorktree(path: string, branch: string): string {
+  return `worktree ${path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/${branch}\n`;
+}
+
+/** A fake git runner for a REGISTERED assignment worktree: a porcelain list carrying
+ *  `path` on `branch`, and a matching abbrev-ref HEAD so the tree probe reads on-branch.
+ *  Every other mergeReadiness probe falls through to the clean exit-0 default. */
+function registeredReadinessGit(opts: {
+  listedPath?: string;
+  listedBranch?: string;
+  listExit?: number;
+  listStderr?: string;
+}): ReturnType<typeof fakeAsyncGit> {
+  const rules: FakeGitRule[] = [];
+  rules.push({
+    when: (a) => argvStartsWith(a, "worktree", "list"),
+    result:
+      opts.listExit !== undefined
+        ? { exitCode: opts.listExit, stderr: opts.listStderr ?? "" }
+        : {
+            exitCode: 0,
+            stdout: porcelainWorktree(
+              opts.listedPath ?? READINESS_WT,
+              opts.listedBranch ?? READINESS_BRANCH,
+            ),
+          },
+  });
+  rules.push({
+    when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
+    result: { exitCode: 0, stdout: READINESS_BRANCH },
+  });
+  return fakeAsyncGit(rules);
+}
+
+test("assignmentWorktreeReadiness: a REGISTERED path on the expected branch with a clean tree → ready (released)", async () => {
+  const { run } = registeredReadinessGit({});
+  const verdict = await assignmentWorktreeReadiness(
+    READINESS_WT,
+    READINESS_BRANCH,
+    run,
+    () => true,
+  );
+  expect(verdict.kind).toBe("ready");
+});
+
+test("assignmentWorktreeReadiness: a ready-LOOKING dir OMITTED from registration → not-ready (HELD, never dispatched into)", async () => {
+  // The list is a valid, non-empty enumeration that does NOT carry our path — a
+  // positively-observed unregistered dir. The tree would read clean, but registration
+  // fails first, so the lane is held (the actor may recreate it).
+  const { run } = registeredReadinessGit({
+    listedPath: "/wt/some-other-lane",
+    listedBranch: "keeper/epic/fn-1-foo--fn-1-foo.9",
+  });
+  const verdict = await assignmentWorktreeReadiness(
+    READINESS_WT,
+    READINESS_BRANCH,
+    run,
+    () => true,
+  );
+  expect(verdict.kind).toBe("not-ready");
+  expect(verdict.kind === "not-ready" && verdict.detail).toContain(
+    "unregistered",
+  );
+});
+
+test("assignmentWorktreeReadiness: the path is registered on a DIFFERENT branch → not-ready (registration branch mismatch)", async () => {
+  const { run } = registeredReadinessGit({
+    listedBranch: "keeper/epic/fn-1-foo--fn-1-foo.OTHER",
+  });
+  const verdict = await assignmentWorktreeReadiness(
+    READINESS_WT,
+    READINESS_BRANCH,
+    run,
+    () => true,
+  );
+  expect(verdict.kind).toBe("not-ready");
+  expect(verdict.kind === "not-ready" && verdict.detail).toContain("mismatch");
+});
+
+test("assignmentWorktreeReadiness: an INCONCLUSIVE worktree-list probe → unknown (transient, held — never cleared on tree evidence)", async () => {
+  const { run } = registeredReadinessGit({
+    listExit: 128,
+    listStderr: "fatal: not a git repository",
+  });
+  const verdict = await assignmentWorktreeReadiness(
+    READINESS_WT,
+    READINESS_BRANCH,
+    run,
+    () => true,
+  );
+  expect(verdict.kind).toBe("unknown");
+  expect(verdict.kind === "unknown" && verdict.detail).toContain(
+    "registration probe inconclusive",
+  );
+});
+
+test("assignmentWorktreeReadiness: a TIMED-OUT worktree-list probe → unknown", async () => {
+  const { run } = registeredReadinessGit({ listExit: GIT_SPAWN_TIMEOUT_CODE });
+  const verdict = await assignmentWorktreeReadiness(
+    READINESS_WT,
+    READINESS_BRANCH,
+    run,
+    () => true,
+  );
+  expect(verdict.kind).toBe("unknown");
+  expect(verdict.kind === "unknown" && verdict.detail).toContain(
+    "registration probe timeout",
+  );
+});
+
+test("computeDeferredSiblingSources: a readiness-blocked withhold NAMES the blocking rib alongside the reason (visibility rider)", async () => {
+  // The lane branch CONTAINS the rib, but the worktree is not-ready — the immediate
+  // blocker is target readiness, not a not-yet-ancestor rib. The withhold detail must
+  // STILL name the unmet source edge (the done sibling's rib) so the operator rail is
+  // never blind to which edge is unintegrated.
+  const epic = cascadeEpic({});
+  const { run } = existingLaneGit({
+    lanes: [CASCADE_BASE, CASCADE_RIB3, CASCADE_RIB4],
+    ancestorPairs: [[CASCADE_RIB3, CASCADE_RIB4]],
+  });
+  const deferred = await computeDeferredSiblingSources(
+    [epic],
+    classifyIdentity([epic]),
+    run,
+    undefined,
+    readinessStub({ kind: "not-ready", detail: "dirty: M src/foo.ts" }),
+  );
+  const reason = deferred.get("fn-1-foo.4");
+  expect(reason).toBeDefined();
+  // A done sibling's rib is still named (the first done dependency stands in for the
+  // unmet source edge while readiness holds the whole lane), WITH the readiness reason.
+  expect(reason).toContain("keeper/epic/fn-1-foo--fn-1-foo.1");
+  expect(reason).toContain("assignment-worktree-not-ready");
+  expect(reason).toContain("dirty: M src/foo.ts");
 });
 
 // ---------------------------------------------------------------------------
