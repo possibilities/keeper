@@ -2376,28 +2376,51 @@ async function probePseudoRefTri(
   return "inconclusive";
 }
 
-/** The in-progress pseudo-refs a mutation must never run over. */
+/** The in-progress pseudo-refs a mutation must never run over. MERGE_AUTOSTASH is INCLUDED:
+ *  a stash left mounted by an interrupted merge/rebase (or NOT restored after a `merge
+ *  --abort`) is residue the effect fence must defer on, exactly like MERGE_HEAD. */
 const IN_PROGRESS_PSEUDO_REFS = [
   "MERGE_HEAD",
+  "MERGE_AUTOSTASH",
   "CHERRY_PICK_HEAD",
   "REVERT_HEAD",
 ] as const;
 
+/** A TRI-STATE on-disk path probe for the STRICT readiness fence — distinguishes a genuinely
+ *  ABSENT path (ENOENT) from an UNREADABLE one (any other error): the fail-open
+ *  {@link PathProbe} collapses BOTH to `false`, so a permission/IO error on a `rebase-merge`
+ *  dir would read as "no rebase in progress" and let a mutation run over it. Injectable so the
+ *  fast tier drives the unknown arm. */
+export type PathProbeTri = (
+  path: string,
+) => Promise<"present" | "absent" | "unknown">;
+
+const defaultPathProbeTri: PathProbeTri = async (p) => {
+  try {
+    await lstat(p);
+    return "present";
+  } catch (err) {
+    return isEnoent(err) ? "absent" : "unknown";
+  }
+};
+
 /**
- * STRICT worktree readiness for the actor-effect fence — unlike {@link mergeReadiness}
- * (whose {@link verifyPseudoRef} collapses a timeout/error MERGE_HEAD to "absent", a
- * FAIL-OPEN an effect must not trust), every in-progress pseudo-ref is probed TRI-STATE:
- * a `present` one is a live merge/cherry-pick/revert → defer; an `inconclusive` one is
- * UNKNOWN → defer (NEVER read as clean). Then a named non-merge in-progress state (the
- * shared {@link nameForeignInProgress}), then a tracked-clean `status --untracked-files=no`
- * (nonzero/timeout → defer), then on-branch. Returns `ready` only on positive proof of
- * every axis. Bounded; never throws.
+ * STRICT worktree readiness for the actor-effect fence (exported for direct fence testing) —
+ * unlike {@link mergeReadiness} (whose {@link verifyPseudoRef} collapses a timeout/error to
+ * "absent", a FAIL-OPEN an effect must not trust), every in-progress pseudo-ref (MERGE_HEAD,
+ * MERGE_AUTOSTASH, CHERRY_PICK_HEAD, REVERT_HEAD) is probed TRI-STATE: a `present` one is a
+ * live/residual merge/rebase/cherry-pick/revert → defer; an `inconclusive` one is UNKNOWN →
+ * defer (NEVER read as clean). Then the on-disk non-merge in-progress states (rebase-merge /
+ * rebase-apply / stale index.lock) via a TRI-STATE probe — an UNREADABLE probe is UNKNOWN →
+ * defer, never collapsed to absent. Then a tracked-clean `status --untracked-files=no`
+ * (nonzero/timeout → defer), then on-branch. Returns `ready` only on positive proof of every
+ * axis. Bounded; never throws.
  */
-async function strictWorktreeReadiness(
+export async function strictWorktreeReadiness(
   cwd: string,
   expectedBranch: string,
   run: GitRunner,
-  pathExists: PathProbe = defaultPathExists,
+  pathProbeTri: PathProbeTri = defaultPathProbeTri,
 ): Promise<{ kind: "ready" } | { kind: "defer"; reason: string }> {
   for (const ref of IN_PROGRESS_PSEUDO_REFS) {
     const state = await probePseudoRefTri(cwd, run, ref);
@@ -2408,9 +2431,34 @@ async function strictWorktreeReadiness(
       return { kind: "defer", reason: `${ref} probe inconclusive (UNKNOWN)` };
     }
   }
-  const foreign = await nameForeignInProgress(cwd, run, pathExists);
-  if (foreign !== null) {
-    return { kind: "defer", reason: `in-progress: ${foreign}` };
+  // On-disk non-merge in-progress states, TRI-STATE: an UNREADABLE probe defers rather than
+  // collapse to "not in progress" (the fail-open the shared `nameForeignInProgress` has).
+  const gitDirR = await run(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  const gitDir = gitDirR.code === 0 ? gitDirR.stdout.trim() : "";
+  if (gitDirR.code !== 0 || gitDir.length === 0) {
+    return {
+      kind: "defer",
+      reason: "git-dir probe inconclusive under the fence",
+    };
+  }
+  for (const [name, rel] of [
+    ["rebase in progress (rebase-merge)", "rebase-merge"],
+    ["rebase in progress (rebase-apply)", "rebase-apply"],
+    ["stale index.lock present", "index.lock"],
+  ] as const) {
+    const state = await pathProbeTri(joinPath(gitDir, rel));
+    if (state === "present") {
+      return { kind: "defer", reason: `in-progress: ${name}` };
+    }
+    if (state === "unknown") {
+      return {
+        kind: "defer",
+        reason: `in-progress probe inconclusive (UNKNOWN): ${rel}`,
+      };
+    }
   }
   const status = await run(["status", "--porcelain", "--untracked-files=no"], {
     cwd,

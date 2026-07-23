@@ -60,6 +60,7 @@ import {
   mergeBranchInto,
   mergePinnedObjectFenced,
   mergeReadiness,
+  type PathProbeTri,
   parseWorktreeList,
   provisionScratchWorktree,
   pruneBaselineScratchWorktrees,
@@ -73,6 +74,7 @@ import {
   resolveDefaultBranch,
   resolveDefaultBranchPure,
   sharedCheckoutDirtSnapshotId,
+  strictWorktreeReadiness,
   WORKTREE_DEP_LINK_NAME,
   type WorktreeEntry,
   worktreeDepLinkTarget,
@@ -3790,7 +3792,10 @@ function fencedGit(
     // test forces an INCONCLUSIVE (exit 0 + empty) probe.
     if (
       a[0] === "rev-parse" &&
-      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+      (has("MERGE_HEAD") ||
+        has("MERGE_AUTOSTASH") ||
+        has("CHERRY_PICK_HEAD") ||
+        has("REVERT_HEAD"))
     ) {
       if (has("MERGE_HEAD") && midMerge) {
         return {
@@ -4207,6 +4212,70 @@ test("mergePinnedObjectFenced: a clean abort that leaves HEAD off the target-arr
   if (out.kind === "defer") expect(out.reason).toContain("target-arrival oid");
 });
 
+// A minimal `run` for strictWorktreeReadiness: every in-progress pseudo-ref probed absent
+// EXCEPT the one named `present`; git-dir resolves; status clean; on the expected branch.
+function strictRun(present?: string): GitRunner {
+  return (async (a: string[]) => {
+    if (a[0] === "rev-parse" && a.includes("--git-dir")) {
+      return { code: 0, stdout: "/wt/.git\n", stderr: "", signal: null };
+    }
+    if (
+      a[0] === "rev-parse" &&
+      (a.includes("MERGE_HEAD") ||
+        a.includes("MERGE_AUTOSTASH") ||
+        a.includes("CHERRY_PICK_HEAD") ||
+        a.includes("REVERT_HEAD"))
+    ) {
+      const ref = [
+        "MERGE_HEAD",
+        "MERGE_AUTOSTASH",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+      ].find((r) => a.includes(r));
+      return ref === present
+        ? { code: 0, stdout: `${"e".repeat(40)}\n`, stderr: "", signal: null }
+        : { code: 1, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "status") {
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "rev-parse" && a.includes("--abbrev-ref")) {
+      return { code: 0, stdout: "the-branch\n", stderr: "", signal: null };
+    }
+    return { code: 0, stdout: "", stderr: "", signal: null };
+  }) as unknown as GitRunner;
+}
+
+test("strictWorktreeReadiness: a present MERGE_AUTOSTASH → defer (residue the abort proof must never read as clean) [lock #12]", async () => {
+  const out = await strictWorktreeReadiness(
+    "/wt",
+    "the-branch",
+    strictRun("MERGE_AUTOSTASH"),
+  );
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("MERGE_AUTOSTASH");
+});
+
+test("strictWorktreeReadiness: an UNREADABLE on-disk in-progress probe → defer, never collapsed to absent [lock #12]", async () => {
+  // A non-ENOENT lstat error on `rebase-merge` is UNKNOWN — the tri-state probe defers rather
+  // than the fail-open PathProbe's collapse-to-absent (which would read a rebasing tree clean).
+  const unknownRebase: PathProbeTri = async (p) =>
+    p.endsWith("rebase-merge") ? "unknown" : "absent";
+  const out = await strictWorktreeReadiness(
+    "/wt",
+    "the-branch",
+    strictRun(),
+    unknownRebase,
+  );
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("UNKNOWN");
+});
+
+test("strictWorktreeReadiness: all pseudo-refs absent + clean + on-branch → ready", async () => {
+  const out = await strictWorktreeReadiness("/wt", "the-branch", strictRun());
+  expect(out.kind).toBe("ready");
+});
+
 // ---------------------------------------------------------------------------
 // reattachLaneWorktree — the non-destructive reattach of a preserved lane branch
 // whose worktree went missing/unregistered. The recreate-elimination replacement:
@@ -4266,7 +4335,10 @@ function reattachGit(
     }
     if (
       a[0] === "rev-parse" &&
-      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+      (has("MERGE_HEAD") ||
+        has("MERGE_AUTOSTASH") ||
+        has("CHERRY_PICK_HEAD") ||
+        has("REVERT_HEAD"))
     ) {
       return { code: 1, stdout: "", stderr: "", signal: null };
     }

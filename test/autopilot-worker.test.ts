@@ -24894,7 +24894,9 @@ function pinnedGit(opts: PinnedGitOpts = {}): { run: FakeRun; calls: string[] } 
     }
     if (
       a[0] === "rev-parse" &&
-      (has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+      (has("MERGE_AUTOSTASH") ||
+        has("CHERRY_PICK_HEAD") ||
+        has("REVERT_HEAD"))
     ) {
       return { code: 1, stdout: "", stderr: "" }; // no non-merge in-progress state
     }
@@ -25205,7 +25207,9 @@ function actorGit(opts: ActorGitOpts = {}): { run: FakeRun; calls: string[] } {
     }
     if (
       a[0] === "rev-parse" &&
-      (has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+      (has("MERGE_AUTOSTASH") ||
+        has("CHERRY_PICK_HEAD") ||
+        has("REVERT_HEAD"))
     ) {
       return { code: 1, stdout: "", stderr: "" };
     }
@@ -25305,7 +25309,10 @@ function reattachGit(
     }
     if (
       a[0] === "rev-parse" &&
-      (has("MERGE_HEAD") || has("CHERRY_PICK_HEAD") || has("REVERT_HEAD"))
+      (has("MERGE_HEAD") ||
+        has("MERGE_AUTOSTASH") ||
+        has("CHERRY_PICK_HEAD") ||
+        has("REVERT_HEAD"))
     ) {
       return { code: 1, stdout: "", stderr: "" };
     }
