@@ -368,6 +368,10 @@ export const DURABLE_AWAIT_CONDITION_KINDS = [
   "finalize-non-ff",
   "instant-death-wall",
   "needs-human",
+  // a durable weekly-quota threshold — freezes a concrete route,
+  // weekly meter, and scope at arm time and re-evaluates from Capacity
+  // sidecars. (`context-used-at-least` is foreground-only — never durable.)
+  "weekly-quota-at-most",
 ] as const;
 
 export type DurableAwaitConditionKind =

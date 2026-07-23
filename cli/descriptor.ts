@@ -990,7 +990,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["human", "json"],
     exit_codes: {
       "3": "own-deadline timeout",
-      "4": "watched target was deleted",
+      "4": "watched target was deleted, or a context runtime subject ended",
       "5": "stuck verdict (only under --fail-on-stuck)",
       "9": "--probe: evaluated cleanly, condition does not hold",
       "10": "external SIGTERM/SIGINT (e.g. Monitor's kill timeout), distinct from the own-deadline timeout",
@@ -1003,6 +1003,18 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         type: "boolean",
         summary:
           "Persist the await and return immediately; keeperd fires a fresh follow-up",
+      },
+      {
+        name: "follow-up",
+        type: "string",
+        summary:
+          "Durable only: the exact follow-up prompt to fire (mutually exclusive with --follow-up-file)",
+      },
+      {
+        name: "follow-up-file",
+        type: "string",
+        summary:
+          "Durable only: read the follow-up prompt from a file (mutually exclusive with --follow-up)",
       },
       {
         name: "timeout",

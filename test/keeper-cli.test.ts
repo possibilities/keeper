@@ -277,6 +277,20 @@ describe("cli/keeper dispatch", () => {
     expect(USAGE).toContain("  usage");
   });
 
+  test("await descriptor + help document the threshold conditions", async () => {
+    const { HELP: AWAIT_HELP } = await import("../cli/await");
+    const descriptor = NATIVE_COMMANDS.find(
+      (command) => command.name === "await",
+    );
+    const flagNames = descriptor?.flags.map((flag) => flag.name) ?? [];
+    expect(flagNames).toContain("follow-up");
+    expect(flagNames).toContain("follow-up-file");
+    // The new conditions are documented in the operator help.
+    expect(AWAIT_HELP).toContain("context-used-at-least");
+    expect(AWAIT_HELP).toContain("weekly-quota-at-most");
+    expect(AWAIT_HELP).toContain("--follow-up");
+  });
+
   for (const retired of ["search-history", "find-file-history"] as const) {
     test(`the retired ${retired} command has no route, descriptor, help, or JSON-index alias`, async () => {
       const h = makeHarness();

@@ -4,6 +4,8 @@ import {
   AWAIT_LEASE_TTL_MS,
   type AwaitDispatchDeps,
   type AwaitDispatchRow,
+  DURABLE_IDLE_REEVAL_MS,
+  type DurableEvalDeps,
   decideAwaitAction,
   dispatchOneAwait,
   evaluateDurableAwaitConditions,
@@ -41,8 +43,12 @@ function row(over: Partial<AwaitDispatchRow> = {}): AwaitDispatchRow {
 
 type AwaitVerdict = "met" | "waiting" | "unknown";
 
-function evalOne(db: Database, condition: DurableAwaitCondition): AwaitVerdict {
-  return evaluateDurableAwaitConditions(db, JSON.stringify([condition]));
+function evalOne(
+  db: Database,
+  condition: DurableAwaitCondition,
+  deps: DurableEvalDeps = {},
+): AwaitVerdict {
+  return evaluateDurableAwaitConditions(db, JSON.stringify([condition]), deps);
 }
 
 function freshAwaitDb(): Database {
@@ -103,8 +109,10 @@ const durableAwaitCases: Array<{
   kind: string;
   seedMet: (db: Database) => void;
   met: DurableAwaitCondition;
+  metDeps?: DurableEvalDeps;
   seedWaiting?: (db: Database) => void;
   waiting: DurableAwaitCondition;
+  waitingDeps?: DurableEvalDeps;
   unknown: DurableAwaitCondition;
 }> = [
   {
@@ -318,6 +326,45 @@ const durableAwaitCases: Array<{
     waiting: { condition: "needs-human" },
     unknown: { condition: "needs-human", since: 1 },
   },
+  {
+    // weekly-quota evaluates from the FROZEN route via injected
+    // Capacity evidence (never a real sidecar under test). Met = usage at or
+    // below the frozen threshold; waiting = stale/missing/above evidence;
+    // unknown = a malformed frozen route.
+    kind: "weekly-quota-at-most",
+    seedMet: () => {},
+    met: {
+      condition: "weekly-quota-at-most",
+      threshold: 50,
+      provider: "claude",
+      route: "acct-1",
+      weekly_meter: "week",
+      quota_scope: null,
+      resolved_at_ms: NOW,
+    },
+    metDeps: {
+      readWeeklyEvidence: () => ({ kind: "usage", used_percent: 30 }),
+    },
+    waiting: {
+      condition: "weekly-quota-at-most",
+      threshold: 50,
+      provider: "claude",
+      route: "acct-1",
+      weekly_meter: "week",
+      quota_scope: null,
+      resolved_at_ms: NOW,
+    },
+    waitingDeps: { readWeeklyEvidence: () => ({ kind: "stale" }) },
+    // Missing `provider` — `parseWeeklyQuotaCondition` refuses → unknown.
+    unknown: {
+      condition: "weekly-quota-at-most",
+      threshold: 50,
+      route: "acct-1",
+      weekly_meter: "week",
+      quota_scope: null,
+      resolved_at_ms: NOW,
+    },
+  },
 ];
 
 test("evaluateDurableAwaitConditions covers every server-side condition kind", () => {
@@ -328,15 +375,56 @@ test("evaluateDurableAwaitConditions covers every server-side condition kind", (
   for (const c of durableAwaitCases) {
     const metDb = freshAwaitDb();
     c.seedMet(metDb);
-    expect(evalOne(metDb, c.met), `${c.kind} met`).toBe("met");
+    expect(evalOne(metDb, c.met, c.metDeps), `${c.kind} met`).toBe("met");
 
     const waitingDb = freshAwaitDb();
     (c.seedWaiting ?? (() => {}))(waitingDb);
-    expect(evalOne(waitingDb, c.waiting), `${c.kind} waiting`).toBe("waiting");
+    expect(
+      evalOne(waitingDb, c.waiting, c.waitingDeps),
+      `${c.kind} waiting`,
+    ).toBe("waiting");
 
     const unknownDb = freshAwaitDb();
     expect(evalOne(unknownDb, c.unknown), `${c.kind} unknown`).toBe("unknown");
   }
+});
+
+test("weekly-quota re-evaluates from frozen-route evidence; non-usage never fires", () => {
+  const db = freshAwaitDb();
+  const cond: DurableAwaitCondition = {
+    condition: "weekly-quota-at-most",
+    threshold: 100, // a false zero would fire here — prove it never does
+    provider: "claude",
+    route: "acct-1",
+    weekly_meter: "week",
+    quota_scope: null,
+    resolved_at_ms: NOW,
+  };
+  // A fresh usage measurement at/under threshold fires.
+  expect(
+    evalOne(db, cond, {
+      readWeeklyEvidence: () => ({ kind: "usage", used_percent: 100 }),
+    }),
+  ).toBe("met");
+  // Every not-yet-decidable reading stays waiting rather than reading as 0%.
+  for (const ev of [
+    { kind: "missing" },
+    { kind: "stale" },
+    { kind: "removed" },
+    { kind: "meter-missing" },
+  ] as const) {
+    expect(
+      evalOne(db, cond, { readWeeklyEvidence: () => ev }),
+      `${ev.kind} waits`,
+    ).toBe("waiting");
+  }
+});
+
+test("the durable idle re-eval cadence stays within 30s", () => {
+  // A weekly-quota sidecar change never advances keeper.db, so the worker
+  // wakes on a coalesced idle tick no slower than 30 seconds.
+  expect(DURABLE_IDLE_REEVAL_MS).toBeGreaterThan(0);
+  expect(DURABLE_IDLE_REEVAL_MS).toBeLessThan(30_000);
 });
 
 test("durable landed consumes the shared completion-backed evidence without lane state", () => {

@@ -27,11 +27,21 @@ import {
   parseAwaitArgs,
   parseMonitorSelector,
   type RunDeps,
+  redactAwaitListRows,
   runAwait,
 } from "../cli/await";
 import { nativeDescriptor } from "../cli/descriptor";
 import { COMPLETE_DWELL_MS } from "../src/await-conditions";
 import { encodeFrame, type ServerFrame } from "../src/protocol";
+import {
+  type ContextEvidence,
+  contextUsedAtLeastMet,
+  evaluateContextThreshold,
+  evaluateWeeklyQuotaThreshold,
+  parseThresholdPercent,
+  type WeeklyQuotaEvidence,
+  weeklyQuotaAtMostMet,
+} from "../src/quota-threshold";
 import type {
   ConnectFactory,
   ReadinessSocket,
@@ -4253,4 +4263,369 @@ test("--probe --json: one parseable JSON envelope", async () => {
   expect(parsed.event).toBe("probe");
   expect(parsed.result).toBe("holds");
   expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// context-used-at-least / weekly-quota-at-most threshold awaits
+// ---------------------------------------------------------------------------
+
+// Pure canonical predicates: raw-percent parse (finite fractional [0,100]),
+// inclusive equality comparison, and the two direction predicates.
+
+test("parseThresholdPercent: accepts inclusive integer/fractional in [0,100]", () => {
+  for (const [raw, value] of [
+    ["0", 0],
+    ["100", 100],
+    ["50", 50],
+    ["50.5", 50.5],
+    ["  75.25  ", 75.25],
+  ] as const) {
+    const r = parseThresholdPercent(raw);
+    expect(r.ok, `parse ${raw}`).toBe(true);
+    if (r.ok) expect(r.value).toBe(value);
+  }
+});
+
+test("parseThresholdPercent: rejects malformed / out-of-range values", () => {
+  for (const raw of [
+    "-1",
+    "101",
+    "abc",
+    "",
+    "1e2",
+    ".5",
+    "50.",
+    "Infinity",
+    "NaN",
+    "+5",
+  ]) {
+    expect(parseThresholdPercent(raw).ok, `reject ${raw}`).toBe(false);
+  }
+});
+
+test("threshold predicates compare raw canonical values at equality (inclusive)", () => {
+  // context: at-or-above; weekly: at-or-below — both inclusive at equality.
+  expect(contextUsedAtLeastMet(50, 50)).toBe(true);
+  expect(contextUsedAtLeastMet(49.99, 50)).toBe(false);
+  expect(contextUsedAtLeastMet(50.01, 50)).toBe(true);
+  expect(weeklyQuotaAtMostMet(50, 50)).toBe(true);
+  expect(weeklyQuotaAtMostMet(50.01, 50)).toBe(false);
+  expect(weeklyQuotaAtMostMet(49.99, 50)).toBe(true);
+});
+
+test("evaluateContextThreshold: usage/ended/waiting evidence never becomes zero", () => {
+  expect(
+    evaluateContextThreshold({ kind: "usage", used_percent: 80 }, 50),
+  ).toMatchObject({ met: true, reason: "met", ended: false });
+  expect(
+    evaluateContextThreshold({ kind: "usage", used_percent: 30 }, 50),
+  ).toMatchObject({ met: false, reason: "below-threshold", ended: false });
+  expect(evaluateContextThreshold({ kind: "ended" }, 50)).toMatchObject({
+    met: false,
+    reason: "target-ended",
+    ended: true,
+  });
+  // A low threshold must NOT let stale/missing/unavailable read as 0% and fire.
+  for (const ev of [
+    { kind: "missing" },
+    { kind: "stale" },
+    { kind: "context-unavailable" },
+  ] as ContextEvidence[]) {
+    const v = evaluateContextThreshold(ev, 0);
+    expect(v.met, `${ev.kind} at threshold 0`).toBe(false);
+    expect(v.ended).toBe(false);
+  }
+});
+
+test("evaluateWeeklyQuotaThreshold: usage decides; missing/stale/removed stay waiting", () => {
+  expect(
+    evaluateWeeklyQuotaThreshold({ kind: "usage", used_percent: 20 }, 50),
+  ).toMatchObject({ met: true, reason: "met" });
+  expect(
+    evaluateWeeklyQuotaThreshold({ kind: "usage", used_percent: 80 }, 50),
+  ).toMatchObject({ met: false, reason: "below-threshold" });
+  // A HIGH threshold (100) would fire on a zero — prove non-usage never does.
+  for (const [ev, reason] of [
+    [{ kind: "missing" }, "route-evidence-missing"],
+    [{ kind: "stale" }, "route-evidence-stale"],
+    [{ kind: "removed" }, "route-removed"],
+    [{ kind: "meter-missing" }, "weekly-meter-missing"],
+  ] as [WeeklyQuotaEvidence, string][]) {
+    const v = evaluateWeeklyQuotaThreshold(ev, 100);
+    expect(v.met, `${ev.kind}`).toBe(false);
+    expect(v.reason as string).toBe(reason);
+    expect(v.used_percent).toBeNull();
+  }
+});
+
+// ---- grammar ---------------------------------------------------------------
+
+test("parseAwaitArgs: context-used-at-least parses one inclusive percent", () => {
+  const r = parseAwaitArgs(["context-used-at-least", "62.5"]);
+  if (!r.ok) throw new Error(r.message);
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "context-used-at-least")
+    throw new Error("expected context segment");
+  expect(seg.threshold).toBe(62.5);
+});
+
+test("parseAwaitArgs: context-used-at-least rejects arity / range", () => {
+  expect(parseAwaitArgs(["context-used-at-least"]).ok).toBe(false);
+  expect(parseAwaitArgs(["context-used-at-least", "50", "60"]).ok).toBe(false);
+  expect(parseAwaitArgs(["context-used-at-least", "101"]).ok).toBe(false);
+});
+
+test("parseAwaitArgs: weekly-quota-at-most default route is route:current", () => {
+  const r = parseAwaitArgs(["weekly-quota-at-most", "80"]);
+  if (!r.ok) throw new Error(r.message);
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "weekly-quota-at-most")
+    throw new Error("expected weekly segment");
+  expect(seg.threshold).toBe(80);
+  expect(seg.routeToken).toBe("route:current");
+});
+
+test("parseAwaitArgs: weekly-quota-at-most accepts explicit route tokens, rejects junk", () => {
+  for (const tok of [
+    "route:current",
+    "route:claude:acct-1",
+    "route:codex:alpha",
+    "route:codex:alpha:generic",
+  ]) {
+    const r = parseAwaitArgs(["weekly-quota-at-most", "80", tok]);
+    expect(r.ok, `accept ${tok}`).toBe(true);
+  }
+  expect(
+    parseAwaitArgs(["weekly-quota-at-most", "80", "route:other:x"]).ok,
+  ).toBe(false);
+  expect(parseAwaitArgs(["weekly-quota-at-most", "80", "notaroute"]).ok).toBe(
+    false,
+  );
+});
+
+test("parseAwaitArgs: --follow-up / --follow-up-file are mutually exclusive and durable-only", () => {
+  expect(
+    parseAwaitArgs([
+      "complete",
+      "fn-1",
+      "--durable",
+      "--follow-up",
+      "go",
+      "--follow-up-file",
+      "/x",
+    ]).ok,
+  ).toBe(false);
+  expect(parseAwaitArgs(["complete", "fn-1", "--follow-up", "go"]).ok).toBe(
+    false,
+  );
+  const r = parseAwaitArgs([
+    "complete",
+    "fn-1",
+    "--durable",
+    "--follow-up",
+    "go",
+  ]);
+  if (!r.ok) throw new Error(r.message);
+  expect(r.args.followUp).toBe("go");
+});
+
+// ---- foreground runAwait ---------------------------------------------------
+
+interface RuntimeHarness {
+  stdout: string[];
+  stderr: string[];
+  exitCode: number | null;
+  timers: Array<{ cb: () => void; ms: number }>;
+  fireTimers: () => void;
+  deps: RunDeps;
+}
+
+function makeRuntimeHarness(over: Partial<RunDeps> = {}): RuntimeHarness {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const timers: Array<{ cb: () => void; ms: number }> = [];
+  const h: RuntimeHarness = {
+    stdout,
+    stderr,
+    exitCode: null,
+    timers,
+    fireTimers: () => {
+      for (const t of timers.splice(0, timers.length)) t.cb();
+    },
+    deps: {
+      writeStdout: (line, cb) => {
+        stdout.push(line);
+        cb();
+      },
+      writeStderr: (line) => {
+        stderr.push(line);
+      },
+      exit: ((code: number) => {
+        h.exitCode = code;
+        return undefined as never;
+      }) as (code: number) => never,
+      installSignals: () => () => {},
+      setTimer: (cb, ms) => {
+        timers.push({ cb, ms });
+        return timers.length - 1;
+      },
+      clearTimer: () => {},
+      gitRoot: null,
+      ownSessionId: "sess-1",
+      ...over,
+    },
+  };
+  return h;
+}
+
+const ctxSeg = (threshold: number): RunnerArgs["segments"][number] => ({
+  condition: "context-used-at-least",
+  threshold,
+  raw: `context-used-at-least ${threshold}`,
+});
+const FROZEN_CLAUDE = {
+  provider: "claude" as const,
+  route: "acct-1",
+  weekly_meter: "week" as const,
+  quota_scope: null,
+  resolved_at_ms: 0,
+};
+const weeklySeg = (threshold: number): RunnerArgs["segments"][number] => ({
+  condition: "weekly-quota-at-most",
+  threshold,
+  routeToken: "route:current",
+  raw: `weekly-quota-at-most ${threshold}`,
+  frozen: FROZEN_CLAUDE,
+});
+
+test("foreground context: an already-true threshold arms then fires met", async () => {
+  const h = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 80 }),
+  });
+  await runAwait(argsFor([ctxSeg(50)]), h.deps);
+  expect(h.exitCode).toBe(0);
+  const met = h.stdout.find((l) => l.includes("met"));
+  expect(met).toContain("condition=context-used-at-least");
+});
+
+test("foreground context: below threshold waits, then an out-of-band leaf change fires met", async () => {
+  let pct = 30;
+  const h = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: pct }),
+  });
+  await runAwait(argsFor([ctxSeg(50)]), h.deps);
+  expect(h.exitCode).toBeNull();
+  expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
+  pct = 60; // the exact-runtime leaf grew — no keeper.db commit
+  h.fireTimers();
+  expect(h.exitCode).toBe(0);
+});
+
+test("foreground context: a null ambient subject fails reason=target-ended exit 4", async () => {
+  const h = makeRuntimeHarness({ ownSessionId: null });
+  await runAwait(argsFor([ctxSeg(50)]), h.deps);
+  expect(h.exitCode).toBe(4);
+  const failed = h.stdout.find((l) => l.includes("failed"));
+  expect(failed).toContain("reason=target-ended");
+});
+
+test("foreground context: a proven subject that later ends fails target-ended mid-wait", async () => {
+  let evidence: ContextEvidence = { kind: "usage", used_percent: 30 };
+  const h = makeRuntimeHarness({ readContextEvidence: () => evidence });
+  await runAwait(argsFor([ctxSeg(50)]), h.deps);
+  expect(h.exitCode).toBeNull();
+  evidence = { kind: "ended" };
+  h.fireTimers();
+  expect(h.exitCode).toBe(4);
+});
+
+test("foreground context: --probe holds / does-not-hold without blocking", async () => {
+  const held = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 80 }),
+  });
+  await runAwait(argsFor([ctxSeg(50)], { probe: true }), held.deps);
+  expect(held.exitCode).toBe(0);
+  expect(
+    held.stdout.some((l) => l.includes("probe") && l.includes("holds")),
+  ).toBe(true);
+
+  const notHeld = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 30 }),
+  });
+  await runAwait(argsFor([ctxSeg(50)], { probe: true }), notHeld.deps);
+  expect(notHeld.exitCode).toBe(9);
+});
+
+test("foreground context: --require-transition holds an already-true condition at arm", async () => {
+  const h = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 80 }),
+  });
+  await runAwait(argsFor([ctxSeg(50)], { requireTransition: true }), h.deps);
+  expect(h.exitCode).toBeNull(); // armed, not fired on the arm tick
+  h.fireTimers(); // a later evaluation is a real edge → fires
+  expect(h.exitCode).toBe(0);
+});
+
+test("foreground weekly-quota: usage under threshold fires; stale/missing stay waiting", async () => {
+  const met = makeRuntimeHarness({
+    readWeeklyEvidence: () => ({ kind: "usage", used_percent: 20 }),
+  });
+  await runAwait(argsFor([weeklySeg(50)]), met.deps);
+  expect(met.exitCode).toBe(0);
+
+  for (const ev of [
+    { kind: "stale" },
+    { kind: "missing" },
+    { kind: "removed" },
+  ] as WeeklyQuotaEvidence[]) {
+    // A threshold of 100 would fire on a false zero — prove it never does.
+    const h = makeRuntimeHarness({ readWeeklyEvidence: () => ev });
+    await runAwait(argsFor([weeklySeg(100)]), h.deps);
+    expect(h.exitCode, `${ev.kind} must wait`).toBeNull();
+  }
+});
+
+test("foreground AND: context AND weekly both met fires; one unmet waits", async () => {
+  const both = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 80 }),
+    readWeeklyEvidence: () => ({ kind: "usage", used_percent: 20 }),
+  });
+  await runAwait(argsFor([ctxSeg(50), weeklySeg(50)]), both.deps);
+  expect(both.exitCode).toBe(0);
+
+  const one = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 80 }),
+    readWeeklyEvidence: () => ({ kind: "usage", used_percent: 80 }), // over 50
+  });
+  await runAwait(argsFor([ctxSeg(50), weeklySeg(50)]), one.deps);
+  expect(one.exitCode).toBeNull();
+});
+
+test("foreground runtime lines expose only PII-free reason codes + raw percent", async () => {
+  const h = makeRuntimeHarness({
+    readContextEvidence: () => ({ kind: "usage", used_percent: 42 }),
+  });
+  await runAwait(argsFor([ctxSeg(50)]), h.deps);
+  const all = [...h.stdout, ...h.stderr].join("\n");
+  // The detail carries the reason code + percent, never a credential/prompt.
+  expect(all).toContain("below-threshold");
+  expect(all).not.toMatch(/secret|token|password|credential|Bearer/i);
+});
+
+test("durable list redacts the follow-up prompt to a presence boolean", () => {
+  const rows = [
+    {
+      await_id: "await-1",
+      status: "waiting",
+      follow_up: "SECRET prompt: do the thing with token abc123",
+    },
+    { await_id: "await-2", status: "waiting", follow_up: "" },
+  ];
+  const redacted = redactAwaitListRows(rows) as Array<Record<string, unknown>>;
+  const serialized = JSON.stringify(redacted);
+  expect(serialized).not.toContain("SECRET");
+  expect(serialized).not.toContain("token abc123");
+  expect(redacted[0]).not.toHaveProperty("follow_up");
+  expect(redacted[0]?.has_follow_up).toBe(true);
+  expect(redacted[1]?.has_follow_up).toBe(false);
 });
