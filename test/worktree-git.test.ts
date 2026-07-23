@@ -57,6 +57,7 @@ import {
   losslessPremergeClean,
   measureBaseDrift,
   mergeBranchInto,
+  mergePinnedObjectFenced,
   mergeReadiness,
   parseWorktreeList,
   provisionScratchWorktree,
@@ -3691,4 +3692,227 @@ test("losslessPremergeClean: a failed restore → retry (never proceeds to merge
   );
   expect(res.kind).toBe("retry");
   if (res.kind === "retry") expect(res.reason).toContain("restore failed");
+});
+
+// ---------------------------------------------------------------------------
+// mergePinnedObjectFenced — the lock-owning pinned-object merge primitive the
+// parts-6 progress actor routes every destructive effect through. A stateful fake
+// git (the under-lock no-op `is-ancestor <src> HEAD` reads NOT-contained BEFORE the
+// merge and contained AFTER); no real git, lock, or fs.
+// ---------------------------------------------------------------------------
+
+const FENCE_WT = "/wt/fn-1-foo.4";
+const FENCE_TGT = "keeper/epic/fn-1-foo--fn-1-foo.4";
+const FENCE_HEAD_OID = "a".repeat(40);
+const FENCE_SRC_OID = "b".repeat(40);
+const nullFenceLock: LockAcquirer = () => null;
+
+function fencedGit(
+  opts: {
+    headOid?: string; // HEAD under the CAS (default matches the expected snapshot)
+    registeredBranch?: string | null; // the branch the path is registered on (null = absent)
+    containedBefore?: boolean; // the source is ALREADY an ancestor of HEAD (the no-op arm)
+    ffRefused?: boolean;
+  } = {},
+): { run: GitRunner; calls: string[] } {
+  let merged = false;
+  const calls: string[] = [];
+  const run: GitRunner = async (a) => {
+    calls.push(a.join(" "));
+    const has = (t: string): boolean => a.includes(t);
+    if (a[0] === "rev-parse" && has("--git-dir")) {
+      return {
+        code: 0,
+        stdout: `${FENCE_WT}/.git\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "rev-parse" && has("HEAD^{commit}")) {
+      return {
+        code: 0,
+        stdout: `${opts.headOid ?? FENCE_HEAD_OID}\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "worktree" && a[1] === "list") {
+      if (opts.registeredBranch === null) {
+        return {
+          code: 0,
+          stdout: "worktree /other\nbranch refs/heads/other\n",
+          stderr: "",
+          signal: null,
+        };
+      }
+      const br = opts.registeredBranch ?? `refs/heads/${FENCE_TGT}`;
+      return {
+        code: 0,
+        stdout: `worktree ${FENCE_WT}\nbranch ${br}\n`,
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "rev-parse" && has("MERGE_HEAD")) {
+      return { code: 1, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "status") {
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "rev-parse" && has("--abbrev-ref")) {
+      return { code: 0, stdout: `${FENCE_TGT}\n`, stderr: "", signal: null };
+    }
+    if (a[0] === "merge-base" && a[1] === "--is-ancestor") {
+      if (merged) return { code: 0, stdout: "", stderr: "", signal: null }; // post-check → contained
+      return {
+        code: opts.containedBefore ? 0 : 1,
+        stdout: "",
+        stderr: "",
+        signal: null,
+      };
+    }
+    if (a[0] === "merge" && a[1] === "--ff-only") {
+      if (opts.ffRefused) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "fatal: Not possible to fast-forward",
+          signal: null,
+        };
+      }
+      merged = true;
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    if (a[0] === "merge" && a[1] === "--no-ff") {
+      merged = true;
+      return { code: 0, stdout: "", stderr: "", signal: null };
+    }
+    return { code: 0, stdout: "", stderr: "", signal: null };
+  };
+  return { run, calls };
+}
+
+test("mergePinnedObjectFenced: a lock timeout → defer (no CAS, no merge)", async () => {
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: nullFenceLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer") expect(out.reason).toContain("lock timeout");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the source already contained (proven under the lock) → already-integrated, no merge", async () => {
+  const { run, calls } = fencedGit({ containedBefore: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "ff",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("already-integrated");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: strategy ff, source ahead → integrated via `merge --ff-only <oid>`", async () => {
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "ff",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("integrated");
+  expect(calls.some((c) => c === `merge --ff-only ${FENCE_SRC_OID}`)).toBe(
+    true,
+  );
+});
+
+test("mergePinnedObjectFenced: strategy diverged → integrated via `merge --no-ff --no-edit <oid>`", async () => {
+  const { run, calls } = fencedGit();
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("integrated");
+  expect(
+    calls.some((c) => c === `merge --no-ff --no-edit ${FENCE_SRC_OID}`),
+  ).toBe(true);
+});
+
+test("mergePinnedObjectFenced: the target HEAD moved under the fence (CAS) → defer, no merge", async () => {
+  const { run, calls } = fencedGit({ headOid: "d".repeat(40) });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("moved under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the path is re-registered on ANOTHER branch → defer, no merge", async () => {
+  const { run, calls } = fencedGit({ registeredBranch: "refs/heads/other" });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("registered on refs/heads/other");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: the path is UNREGISTERED under the fence → defer, no merge", async () => {
+  const { run, calls } = fencedGit({ registeredBranch: null });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "diverged",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("registration absent under the fence");
+  expect(calls.some((c) => c.startsWith("merge "))).toBe(false);
+});
+
+test("mergePinnedObjectFenced: a fast-forward REFUSED (raced non-ff) → defer, never a merge commit", async () => {
+  const { run, calls } = fencedGit({ ffRefused: true });
+  const out = await mergePinnedObjectFenced(FENCE_WT, {
+    sourceOid: FENCE_SRC_OID,
+    expectedHeadOid: FENCE_HEAD_OID,
+    targetBranch: FENCE_TGT,
+    strategy: "ff",
+    run,
+    acquireLock: okLock,
+  });
+  expect(out.kind).toBe("defer");
+  if (out.kind === "defer")
+    expect(out.reason).toContain("fast-forward refused");
+  expect(calls.some((c) => c.includes("--no-ff"))).toBe(false);
 });

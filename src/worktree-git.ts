@@ -2201,8 +2201,11 @@ export async function mergeBranchInto(
  * ONLY the merge-state + U signals of the worktree, never the merged source's name, so it
  * is identical whether a branch or a pinned commit object was merged. The caller still
  * owns the lock (this never acquires or releases it) and passes the raw `git merge` result.
+ * PRIVATE to this module: `mergeBranchInto` and {@link mergePinnedObjectFenced} are its two
+ * same-module callers, and the pinned-object integration path acquires the lock through the
+ * fenced helper rather than reaching this classifier across a module boundary.
  */
-export async function classifyMergeAttempt(
+async function classifyMergeAttempt(
   worktreePath: string,
   merge: Awaited<ReturnType<GitRunner>>,
   run: GitRunner,
@@ -2297,6 +2300,189 @@ export async function classifyMergeAttempt(
   return uEvidence === "zero"
     ? { kind: "merge-failed", stderr: merged }
     : { kind: "merge-inconclusive", stderr: merged };
+}
+
+/** The outcome of a fenced pinned-object merge into a target checkout — structurally the
+ *  actor's rib-integration outcome, but OWNED here since the flock, the CAS, the fresh
+ *  worktree-list registration, the readiness re-assert, the UNDER-LOCK no-op arm, the
+ *  pinned merge, and the positive post-checks all live behind this one lock boundary. */
+export type FencedMergeOutcome =
+  | { kind: "integrated" }
+  | { kind: "already-integrated" }
+  | { kind: "conflict"; conflictedFiles: string[]; stderr: string }
+  | { kind: "defer"; reason: string };
+
+/**
+ * Merge a PINNED source object into `targetBranch` at `worktreePath`, race-free at the
+ * destructive edge — the single lock-owning primitive the parts-6 progress actor's
+ * pinned-object integration routes every effect through (both no-op arms included). The
+ * caller has already classified `strategy` from the pinned oids (a fast-forward when the
+ * target is contained in the source, else a two-parent divergence merge); this function
+ * owns the whole effect boundary UNDER the commit-work flock:
+ *  1. acquire the per-worktree commit-work flock (a timeout → `defer`, never a freeze);
+ *  2. CAS the target HEAD is STILL the pinned `expectedHeadOid` (any drift → `defer`);
+ *  3. FRESH `git worktree list` registration — the exact normalized `worktreePath` is a
+ *     registered worktree on `targetBranch` (a path swapped out / re-registered / torn down
+ *     between observation and effect → `defer`, NEVER a silent merge into the wrong tree);
+ *  4. {@link mergeReadiness} clean + on-branch + residue-free;
+ *  5. the NO-OP arm proven HERE, under the lock: the pinned source already an ancestor of
+ *     HEAD → `already-integrated` (never certified on a pre-lock read);
+ *  6. `git merge --ff-only <sourceOid>` (ff) or `git merge --no-ff --no-edit <sourceOid>`
+ *     (diverged) classified via the module-private {@link classifyMergeAttempt} — a raced
+ *     non-ff fails cleanly to `defer`, a content conflict aborts cleanly to `conflict`;
+ *  7. POSITIVE post-checks — the pinned source is now an ancestor of the NEW HEAD AND the
+ *     tree is clean + on-branch — before `integrated` is claimed.
+ * Producer-only; NEVER throws (a thrown probe is a `defer`).
+ */
+export async function mergePinnedObjectFenced(
+  worktreePath: string,
+  opts: {
+    sourceOid: string;
+    expectedHeadOid: string;
+    targetBranch: string;
+    strategy: "ff" | "diverged";
+    run?: GitRunner;
+    acquireLock?: LockAcquirer;
+  },
+): Promise<FencedMergeOutcome> {
+  const run = opts.run ?? gitExec;
+  const acquire = opts.acquireLock ?? defaultLockAcquirer;
+  try {
+    const lockPath = await commitWorkLockPath(worktreePath, run);
+    const lock = await acquire(lockPath);
+    if (lock === null) {
+      return { kind: "defer", reason: "commit-work lock timeout" };
+    }
+    try {
+      // (2) CAS: HEAD still at the pinned snapshot — any movement between observation
+      //     and this fence → defer (never merge into a target that drifted).
+      const head = await run(
+        [
+          "rev-parse",
+          "--verify",
+          "--quiet",
+          "--end-of-options",
+          "HEAD^{commit}",
+        ],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (head.code !== 0 || head.stdout.trim() !== opts.expectedHeadOid) {
+        return { kind: "defer", reason: "target head moved under the fence" };
+      }
+      // (3) FRESH registration: the exact path is a registered worktree on the target
+      //     branch. A path-replacement / re-registration / teardown → defer, NEVER a
+      //     silent merge into a swapped tree (the actor's cycle memo is never trusted here).
+      const listed = await listWorktreesResult(worktreePath, run);
+      if (listed.kind !== "ok") {
+        return {
+          kind: "defer",
+          reason: `worktree registration probe ${listed.kind} under the fence`,
+        };
+      }
+      const entry = listed.value.find((e) => samePath(e.path, worktreePath));
+      if (entry === undefined) {
+        return {
+          kind: "defer",
+          reason: "target worktree registration absent under the fence",
+        };
+      }
+      if (entry.branch !== `refs/heads/${opts.targetBranch}`) {
+        return {
+          kind: "defer",
+          reason: `target worktree registered on ${entry.branch ?? "(detached)"}, expected ${opts.targetBranch}`,
+        };
+      }
+      // (4) Clean, on-branch, residue-free right before the merge.
+      const ready = await mergeReadiness(worktreePath, opts.targetBranch, run);
+      if (ready.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `target not ready under lock: ${ready.kind}`,
+        };
+      }
+      // (5) NO-OP arm PROVEN under the lock: the pinned source already contained in HEAD.
+      //     exit 0 = ancestor (nothing to do), exit 1 = not yet, anything else = UNKNOWN
+      //     (never certify already-integrated on an inconclusive probe).
+      const contained = await run(
+        ["merge-base", "--is-ancestor", opts.sourceOid, "HEAD"],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (contained.code === 0) {
+        return { kind: "already-integrated" };
+      }
+      if (contained.code !== 1) {
+        return {
+          kind: "defer",
+          reason: "under-lock source-ancestry inconclusive",
+        };
+      }
+      // (6) Merge the PINNED OBJECT — ff refuses to synthesize a merge (a raced non-ff
+      //     fails cleanly), divergence takes a clean two-parent merge classified by the
+      //     module-private grammar.
+      if (opts.strategy === "ff") {
+        const ff = await run(["merge", "--ff-only", opts.sourceOid], {
+          cwd: worktreePath,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        });
+        if (ff.code !== 0) {
+          return {
+            kind: "defer",
+            reason: `fast-forward refused: ${(ff.stdout + ff.stderr).trim().slice(0, 200)}`,
+          };
+        }
+      } else {
+        const merge = await run(
+          ["merge", "--no-ff", "--no-edit", opts.sourceOid],
+          { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+        );
+        const outcome = await classifyMergeAttempt(worktreePath, merge, run);
+        switch (outcome.kind) {
+          case "merged":
+          case "already-merged":
+            break;
+          case "conflict":
+            return {
+              kind: "conflict",
+              conflictedFiles: outcome.conflictedFiles,
+              stderr: outcome.stderr,
+            };
+          default:
+            return {
+              kind: "defer",
+              reason: `merge ${outcome.kind}${"stderr" in outcome && outcome.stderr ? `: ${outcome.stderr.slice(0, 160)}` : ""}`,
+            };
+        }
+      }
+      // (7) POSITIVE post-checks: the pinned source is now an ancestor of HEAD AND the
+      //     tree is clean + on-branch. Only then is the integration proven.
+      const post = await run(
+        ["merge-base", "--is-ancestor", opts.sourceOid, "HEAD"],
+        { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      );
+      if (post.code !== 0) {
+        return { kind: "defer", reason: "post-merge source-ancestry unproven" };
+      }
+      const postReady = await mergeReadiness(
+        worktreePath,
+        opts.targetBranch,
+        run,
+      );
+      if (postReady.kind !== "ready") {
+        return {
+          kind: "defer",
+          reason: `post-merge tree not clean: ${postReady.kind}`,
+        };
+      }
+      return { kind: "integrated" };
+    } finally {
+      lock.release();
+    }
+  } catch (err) {
+    return {
+      kind: "defer",
+      reason: `fenced merge threw: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 /** A recover-pass lane ownership verdict. Only `owned` permits teardown. */
