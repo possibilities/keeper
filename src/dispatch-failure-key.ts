@@ -1226,3 +1226,70 @@ export function classifyPendingIntegration(
   }
   return parsePendingIntegrationHeads(reason) != null ? "pinned" : "malformed";
 }
+
+/**
+ * The CLOSED fence-KIND of a merge-conflict `dispatch_failures.reason` — the SINGLE
+ * discriminant every consumer of a fan-in incident's durable authority routes on (the
+ * escalation brief's `fence_state`, the autopilot incident-resolution probe), so the two can
+ * never diverge on which authority a row carries. Distinct from {@link
+ * classifyPendingIntegration} (which grades ONLY the pending family): this spans BOTH the
+ * genuine-actor `[conflict …]` family and the pending `[expected …]` family in one closed
+ * union.
+ *   - `actor-conflict`    — a GENUINE actor content conflict carrying EXACTLY ONE valid
+ *     `[conflict …]` head fence ({@link parseConflictHeadFence}): AUTHORITATIVE PINNED — the
+ *     resolver merges the pinned source OBJECT, gated on the target-arrival pin.
+ *   - `malformed-actor`   — a content conflict whose stderr tail carries a `[conflict …]`
+ *     control token that is duplicated / ambiguous / malformed (short / uppercase /
+ *     cross-length id) so no valid fence parses: DISTINCT from `legacy`, FAIL CLOSED (the
+ *     probe touches ZERO git; the resolver never substitutes live branch heads).
+ *   - `pending`           — a pending-owner-integration request with EXACTLY one valid
+ *     `[expected …]` fence ({@link parsePendingIntegrationHeads}): the mechanical
+ *     fast-forward the resolver owns.
+ *   - `malformed-pending` — a pending request whose `[expected …]` fence is absent /
+ *     duplicated / malformed (a legacy pre-fence pending row): FAIL CLOSED, ZERO git.
+ *   - `legacy`            — no actor control token AND no pending tail: a fence-less genuine
+ *     content conflict (the ONLY class the live-branch snapshot path may grade), or any
+ *     non-merge reason.
+ * ORDERING is load-bearing: the actor `[conflict …]` token is classified BEFORE the pending
+ * prefix, so a valid actor reason whose git stderr HAPPENS to begin `pending owner
+ * integration` (an echoed branch / path name) classifies `actor-conflict`, never
+ * `malformed-pending`. This can never steal a real pending row: a valid pending tail is
+ * whole-tail-anchored (`^pending owner integration [expected …]$`), so it has no room for a
+ * `[conflict …]` token, and the loose actor-token count is taken over the ISOLATED stderr
+ * tail (never the branch-name head). Pure; NEVER throws.
+ */
+export type MergeConflictFenceKind =
+  | "actor-conflict"
+  | "malformed-actor"
+  | "pending"
+  | "malformed-pending"
+  | "legacy";
+
+export function classifyMergeConflictFence(
+  reason: string,
+): MergeConflictFenceKind {
+  // Isolate the git-stderr tail — the SAME segment {@link parseConflictHeadFence} keys on —
+  // so a `[conflict …]` look-alike in a branch NAME (the head, before the em-dash) never
+  // counts as an actor control token.
+  const stderr = parseMergeConflictReason(reason)?.stderr ?? null;
+  // ACTOR FAMILY FIRST (the ordering fix). A single valid fence is authoritative.
+  if (parseConflictHeadFence(reason) != null) {
+    return "actor-conflict";
+  }
+  // Any `[conflict …]` token in the tail without a valid fence is malformed-actor —
+  // classified DISTINCTLY, never null-collapsed to legacy.
+  if (
+    stderr != null &&
+    (stderr.match(CONFLICT_MARKER_LOOSE)?.length ?? 0) > 0
+  ) {
+    return "malformed-actor";
+  }
+  // PENDING FAMILY SECOND.
+  if (isPendingIntegrationReason(reason)) {
+    return parsePendingIntegrationHeads(reason) != null
+      ? "pending"
+      : "malformed-pending";
+  }
+  // No actor token, no pending tail: a fence-less legacy conflict, or a non-merge reason.
+  return "legacy";
+}

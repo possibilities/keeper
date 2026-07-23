@@ -97,7 +97,7 @@ import {
   assertNever,
   buildConflictHeadFence,
   buildPendingIntegrationTail,
-  classifyPendingIntegration,
+  classifyMergeConflictFence,
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   epicIdFromFatalAuditId,
@@ -801,14 +801,17 @@ export async function probeWorkMergeIncidentResolutions(
 ): Promise<Map<string, WorkMergeIncidentVerdict>> {
   const out = new Map<string, WorkMergeIncidentVerdict>();
   for (const row of rows) {
-    // CLASSIFY FIRST — the tri-state fence class decides the routing before any
-    // source probe. A MALFORMED / legacy pre-fence pending row (pending class, no
-    // valid fence) produces its `defer` verdict with ZERO git calls: it is EXCLUDED
-    // from movable-branch and source-absence evidence (a fence-less request has no
-    // authority to grade its own integration), clearing only on independently
-    // positive epic-landed evidence (the caller's straggler fallback) or an explicit
-    // operator clear / re-mint — never here, preserving the fail-closed distinction.
-    if (classifyPendingIntegration(row.reason) === "malformed") {
+    // CLASSIFY FIRST — the CLOSED fence KIND decides the routing before any source probe.
+    // MALFORMED-ACTOR (a `[conflict …]` control token present but no valid fence) and
+    // MALFORMED-PENDING (a legacy pre-fence pending request) BOTH produce their `defer`
+    // verdict with ZERO git calls: a fence-less / malformed request has no authority to
+    // grade its own integration, so it is EXCLUDED from movable-branch and source-absence
+    // evidence, clearing only on independently positive epic-landed evidence (the caller's
+    // straggler fallback) or an explicit operator clear / re-mint — never here, preserving
+    // the fail-closed distinction. (A malformed-actor previously fell through to the
+    // live-branch path and touched git — the fallback-to-live-git bug this closes.)
+    const kind = classifyMergeConflictFence(row.reason);
+    if (kind === "malformed-actor" || kind === "malformed-pending") {
       out.set(row.id, "defer");
       continue;
     }
@@ -818,25 +821,34 @@ export async function probeWorkMergeIncidentResolutions(
       continue;
     }
     const { source, base } = parsed;
-    const pins = parsePendingIntegrationHeads(row.reason);
     try {
-      if (pins !== null) {
-        // PINNED row: clear authority comes from the DURABLE OBJECTS only. Branch
-        // ABSENCE and the current source REF are never positive evidence here — a
-        // post-mint source advance would wedge a landed pin, and a force-move /
-        // delete could misgrade the obligation.
+      if (kind === "pending") {
+        // PINNED pending row: clear authority comes from the DURABLE OBJECTS only. Branch
+        // ABSENCE and the current source REF are never positive evidence here — a post-mint
+        // source advance would wedge a landed pin, and a force-move / delete could misgrade
+        // the obligation. A "pending" kind guarantees a valid fence; the guard stays honest.
+        const pins = parsePendingIntegrationHeads(row.reason);
+        if (pins === null) {
+          out.set(row.id, "defer");
+          continue;
+        }
         out.set(
           row.id,
           await probePinnedMergeResolution(row.dir, base, pins, run),
         );
         continue;
       }
-      // A GENUINE actor conflict carrying a durable head fence — clear from the DURABLE
-      // objects (both pinned oids ancestors of the current base + a stable clean target),
-      // the SAME race-free pinned grading the pending class uses, never the movable source
-      // ref or branch absence (a post-mint source advance must never misgrade the pin).
-      const conflictPins = parseConflictHeadFence(row.reason);
-      if (conflictPins !== null) {
+      if (kind === "actor-conflict") {
+        // A GENUINE actor conflict carrying a durable head fence — clear from the DURABLE
+        // objects (both pinned oids ancestors of the current base + a stable clean target),
+        // the SAME race-free pinned grading the pending class uses, never the movable source
+        // ref or branch absence (a post-mint source advance must never misgrade the pin). An
+        // "actor-conflict" kind guarantees a valid fence; the guard stays honest.
+        const conflictPins = parseConflictHeadFence(row.reason);
+        if (conflictPins === null) {
+          out.set(row.id, "defer");
+          continue;
+        }
         out.set(
           row.id,
           await probePinnedMergeResolution(
@@ -851,7 +863,7 @@ export async function probeWorkMergeIncidentResolutions(
         );
         continue;
       }
-      // UNPINNED genuine content conflict → the legacy branch-name grading.
+      // kind === "legacy": UNPINNED genuine content conflict → the legacy branch-name grading.
       const srcRef = await run(
         [
           "rev-parse",

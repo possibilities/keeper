@@ -16,6 +16,7 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  classifyMergeConflictFence,
   classifyPendingIntegration,
   DISPATCH_FAILURE_DISPLAY_RULES,
   type DispatchFailureIdentity,
@@ -1603,6 +1604,136 @@ describe("genuine-conflict head fence (P0-4 negative matrix)", () => {
     expect(classifyDispatchFailure(conflict)).toBe("merge-conflict");
     // The conflict fence is NOT the pending class — it stays `unpinned` (a genuine conflict).
     expect(classifyPendingIntegration(conflict)).toBe("unpinned");
+  });
+});
+
+describe("classifyMergeConflictFence — the CLOSED fan-in fence-KIND discriminant", () => {
+  const src = "a".repeat(40);
+  const target = "b".repeat(40);
+  const src64 = "c".repeat(64);
+  const target64 = "d".repeat(64);
+  // A full merge-conflict reason whose git-stderr tail carries `tail` (a leading space
+  // before a fence, exactly as the actor mints it after the truncated stderr).
+  const conflictReason = (tail: string) =>
+    `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.3 into keeper/epic/fn-1--fn-1.4 — CONFLICT (content): foo.ts ${tail}`;
+  // A pending-owner-integration reason with an arbitrary suffix after the tail marker.
+  const pendingReason = (suffix: string) =>
+    `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/fn-1--fn-1.2 into keeper/epic/fn-1 — ${PENDING_OWNER_INTEGRATION_TAIL}${suffix}`;
+
+  test("a valid `[conflict …]` fence → actor-conflict (sha1 AND sha256, both classes)", () => {
+    for (const cls of ["rib", "canonical-base"] as const) {
+      expect(
+        classifyMergeConflictFence(
+          conflictReason(buildConflictHeadFence(src, target, cls)),
+        ),
+      ).toBe("actor-conflict");
+    }
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(buildConflictHeadFence(src64, target64, "rib")),
+      ),
+    ).toBe("actor-conflict");
+  });
+
+  test("a `[conflict …]` control token present but no valid fence → malformed-actor (DISTINCT from legacy)", () => {
+    // short id, uppercase id, cross-format 40/64 pair, bad class token, duplicated marker.
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(
+          `[conflict src=${"a".repeat(12)} target=${target} class=rib]`,
+        ),
+      ),
+    ).toBe("malformed-actor");
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(
+          `[conflict src=${"A".repeat(40)} target=${target} class=rib]`,
+        ),
+      ),
+    ).toBe("malformed-actor");
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(`[conflict src=${src} target=${target64} class=rib]`),
+      ),
+    ).toBe("malformed-actor");
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(`[conflict src=${src} target=${target} class=merge]`),
+      ),
+    ).toBe("malformed-actor");
+    expect(
+      classifyMergeConflictFence(
+        conflictReason(
+          `${buildConflictHeadFence(src, target, "rib")} ${buildConflictHeadFence(target, src, "canonical-base")}`,
+        ),
+      ),
+    ).toBe("malformed-actor");
+  });
+
+  test("a valid `[expected …]` pending fence → pending; an absent/malformed one → malformed-pending", () => {
+    expect(
+      classifyMergeConflictFence(
+        pendingReason(` [expected src=${src} base=${target}]`),
+      ),
+    ).toBe("pending");
+    expect(classifyMergeConflictFence(pendingReason(""))).toBe(
+      "malformed-pending",
+    );
+    expect(
+      classifyMergeConflictFence(
+        pendingReason(` [expected src=${"a".repeat(12)} base=${target}]`),
+      ),
+    ).toBe("malformed-pending");
+  });
+
+  test("no actor token and no pending tail → legacy (a fence-less conflict OR a non-merge reason)", () => {
+    expect(
+      classifyMergeConflictFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging s into b — CONFLICT (content): x.ts`,
+      ),
+    ).toBe("legacy");
+    expect(classifyMergeConflictFence("confirm_timeout")).toBe("legacy");
+    expect(classifyMergeConflictFence("not a merge-conflict reason")).toBe(
+      "legacy",
+    );
+  });
+
+  test("ORDERING FIX — a valid actor reason whose stderr BEGINS `pending owner integration` classifies actor-conflict, never malformed-pending", () => {
+    // A git stderr echoing the pending-marker literal, with the REAL actor fence at the tail.
+    const stderr = `pending owner integration ${buildConflictHeadFence(src, target, "rib")}`;
+    expect(
+      classifyMergeConflictFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/a into keeper/epic/b — ${stderr}`,
+      ),
+    ).toBe("actor-conflict");
+    // A MALFORMED actor token that ALSO begins with the pending prefix stays malformed-actor
+    // (the actor family is classified before the pending prefix) — never malformed-pending.
+    const malformedTail = `pending owner integration [conflict src=${"a".repeat(12)} target=${target} class=rib]`;
+    expect(
+      classifyMergeConflictFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/a into keeper/epic/b — ${malformedTail}`,
+      ),
+    ).toBe("malformed-actor");
+  });
+
+  test("a valid pending row (no conflict token) is never stolen by the actor-first ordering", () => {
+    // A whole-tail-anchored pending marker has no room for a `[conflict …]` token, so the
+    // actor-first classification never misroutes it.
+    expect(
+      classifyMergeConflictFence(
+        pendingReason(` [expected src=${src} base=${target}]`),
+      ),
+    ).toBe("pending");
+  });
+
+  test("a branch-name fence look-alike (in the head, before the em-dash) never counts as an actor token", () => {
+    // The look-alike lives in the branch-name HEAD; the classifier keys only on the isolated
+    // stderr tail, so this is a fence-less legacy conflict, not malformed-actor.
+    expect(
+      classifyMergeConflictFence(
+        `${MERGE_ESCALATION_REASON_TOKEN}: merging keeper/epic/x[conflict src=${src} target=${target} class=rib] into keeper/epic/y — CONFLICT (content): foo.ts`,
+      ),
+    ).toBe("legacy");
   });
 });
 

@@ -28975,6 +28975,31 @@ test("probeWorkMergeIncidentResolutions: an unparseable reason or a missing dir 
   expect(ran).toBe(false);
 });
 
+test("probeWorkMergeIncidentResolutions: a MALFORMED-ACTOR fence (a `[conflict …]` token with no valid fence) → `defer` with ZERO git — never the unpinned live-branch fallback", async () => {
+  let calls = 0;
+  const trap: GitRunner = (async () => {
+    calls += 1;
+    return { code: 0, stdout: "", stderr: "" };
+  }) as unknown as GitRunner;
+  // Genuine actor content-conflict reasons carrying a `[conflict …]` control token that
+  // parses to NO valid fence: a short source id, and a duplicated/ambiguous double marker.
+  // Both previously fell through to the unpinned live-branch grading and touched git; each
+  // must now defer WITHOUT any probe (the caller's epic-landed fallback or an operator clear
+  // owns it), the DOWNSTREAM zero-git the fence-kind reroute guarantees.
+  const shortId = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.1 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict src=${"a".repeat(12)} target=${"b".repeat(40)} class=rib]`;
+  const ambiguous = `worktree-merge-conflict: merging keeper/epic/fn-3-widget--fn-3-widget.2 into ${MERGE_INCIDENT_BASE} — CONFLICT (content): x.ts [conflict src=${"a".repeat(40)} target=${"b".repeat(40)} class=rib] [conflict src=${"b".repeat(40)} target=${"a".repeat(40)} class=canonical-base]`;
+  const verdicts = await probeWorkMergeIncidentResolutions(
+    [
+      { id: "fn-3-widget.1", reason: shortId, dir: "/lane" },
+      { id: "fn-3-widget.2", reason: ambiguous, dir: "/lane" },
+    ],
+    trap,
+  );
+  expect(verdicts.get("fn-3-widget.1")).toBe("defer");
+  expect(verdicts.get("fn-3-widget.2")).toBe("defer");
+  expect(calls).toBe(0);
+});
+
 test("parseMergeConflictReason round-trips the pendingIntegrationReason builder — the source/target the incident probe reads", () => {
   const parsed = parseMergeConflictReason(MERGE_INCIDENT_REASON);
   expect(parsed).toEqual({
