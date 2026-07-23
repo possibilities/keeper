@@ -96,6 +96,48 @@ and `wrong_cwd`. Follow `error.recovery`; `wrong_cwd` carries the shell-safe
 re-entry command. `binary_not_found` and `launch_failed` identify native harness
 startup failures—confirm no process started before retrying.
 
+## Runtime, Usage, and routing diagnostics (`keeper session runtime`, `keeper usage --json`, `keeper accounts inspect`)
+
+`keeper session runtime` and `keeper accounts inspect` resolve their target Session
+through the same shared catalog `history show`/`show-job` use, so a missing or
+ambiguous reference emits the SAME bounded codes documented above under *Unified
+history, job reads, and foreground resume* — `catalog_read_failed`,
+`keeper_jobs_unavailable`, `session_not_found`, `session_ambiguous`, `not_tracked`,
+`job_ambiguous`. Neither command otherwise fails on missing runtime evidence: an
+absent exact/coalesced sample or Pi route reports as an explicit `unavailable` /
+`no_session` / `not_pi` status inside a normal `ok:true` envelope (see
+[agent-surface-contracts.md](./agent-surface-contracts.md#partial-data-semantics)),
+never a problem-code exit. `keeper usage --json` never fails on a missing or stale
+observation either — a `missing` / `invalid` / `stale` / `unhealthy` source status
+rides the same `ok:true` envelope with `detail` naming the bounded reason.
+
+| code | emitted by | meaning | recovery | retry-safe |
+| --- | --- | --- | --- | --- |
+| `session_not_found`, `session_ambiguous`, `not_tracked`, `job_ambiguous`, `catalog_read_failed`, `keeper_jobs_unavailable` | `keeper session runtime`, `keeper accounts inspect` | The supplied (or ambient) Session reference could not resolve. Same family as `history show`/`show-job` above. | Run `keeper history list --format json` and retry with a qualified reference, or omit the reference to use the ambient identity. | yes; read-only |
+
+## Threshold awaits (`keeper await context-used-at-least`, `weekly-quota-at-most`)
+
+The two runtime-threshold conditions read out-of-band evidence rather than a daemon
+projection (see [agent-surface-contracts.md](./agent-surface-contracts.md#runtime-usage-and-routing-diagnostics)
+and [`plugins/keeper/skills/await/SKILL.md`](../plugins/keeper/skills/await/SKILL.md#threshold-awaits--context-and-weekly-quota)
+for the full grammar). Missing or stale evidence stays `waiting` and is never a
+problem code; only the codes below are terminal for these two conditions
+specifically. The ordinary `keeper await` reasons — `failed reason=timeout` (exit
+`3`, the caller's own `--timeout` budget), `failed reason=signal` (exit `10`, an
+external kill, e.g. Monitor's `timeout_ms`), and cancellation via `keeper await
+cancel <await-id>` — apply identically to a threshold wait as to any other
+condition; see the SKILL's reasons table for their recovery.
+
+| code | emitted by | meaning | recovery | retry-safe |
+| --- | --- | --- | --- | --- |
+| `route-unresolved` | `keeper await weekly-quota-at-most` (arm time) | No authoritative current route resolved for the given route token when the wait tried to freeze it. | Confirm a resolvable route with `keeper accounts inspect --json` (or `keeper agent accounts check --json`), then re-arm the same invocation. | yes, once a route resolves |
+| `target-ended` | `keeper await context-used-at-least` | The bound Session reached a terminal state before the context threshold was met. | A fresh Session has a fresh context window; re-arm against the new Session if the pause point is still wanted. This exact wait is not retryable. | no (re-arm fresh instead) |
+
+A `--durable` expression containing `context-used-at-least` refuses to arm outright
+(a plain usage error on stderr, exit `2`, before any `armed`/`failed` line) — it is
+foreground-only because a fresh follow-up Session starts with a fresh context
+window, never the arming Session's.
+
 ## Offline Session conversion (`keeper conversation convert`)
 
 Conversion resolves an exact Claude or Pi Session reference, snapshots the selected native

@@ -36,6 +36,9 @@ You need a fact out of keeper's own state:
 - *"when did this file last change / who touched it"*
 - *"which jobs are running / failed / stuck"*, *"what's on the board"*
 - *"read the dead letters / dispatch failures / handoffs"*
+- *"what model/context is this session actually running"*, *"what are my
+  usage meters right now"*, *"what route would this launch pick / did my Pi
+  session actually get"*
 
 **Near-miss exclusions — these are NOT this skill:**
 
@@ -46,7 +49,7 @@ You need a fact out of keeper's own state:
   `keeper:autopilot` (or `keeper:dispatch`). This skill never changes control
   state; only the disposable History index may refresh.
 
-## The three-tier read hierarchy
+## The four-tier read hierarchy
 
 Reach in this order — each tier is cheaper and more stable than the one below
 it. Drop to the next tier only when the one above cannot answer.
@@ -70,7 +73,27 @@ reading a raw transcript:
 
 Use `keeper resume <session-reference>` when the next step is to continue the session in the foreground instead of inspecting it. `keeper transcript` stays only for explicit Claude subagent/tool-detail or Pi branch-aware turns.
 
-### Tier 2 — live projections (query / status)
+### Tier 2 — purpose-built runtime, Usage, and routing reads
+
+Before falling to a generic projection, three independent schema-v1,
+side-effect-free commands answer a specific class of question directly. Each
+prints one `{schema_version, ok, error, data}` envelope on stdout; partial or
+unavailable evidence is reported explicitly (a bounded status/reason field),
+never presented as a false zero. The full contracts — provenance, freshness,
+partial-data semantics — live in `docs/agent-surface-contracts.md`.
+
+| Verb | Answers |
+|---|---|
+| `keeper session runtime [<session-reference>]` | "What model/effort/context is THIS session actually running right now" — proven identity scope, exact-vs-coalesced provenance, freshness, and (for a Pi session) the current route. With no reference, resolves the ambient Harness identity. |
+| `keeper usage --json` | Every normalized Claude/Codex Capacity meter — category, multiplier, source status, last-good measurement. Display data only; it never authorizes a routing decision. |
+| `keeper accounts inspect [<session-reference>] --json` | Separate Claude launch-routing and Codex launch-seed routing blocks, plus — for a scoped Pi session — the actual PROVEN route after selection/retry, distinct from the initial launch alias. |
+
+`keeper agent accounts check --json` remains compatible for existing callers,
+but `keeper accounts inspect` is the preferred routing read — it keeps the
+three provenance classes (Claude launch, Codex launch-seed, proven Pi runtime)
+separate rather than folding them together.
+
+### Tier 3 — live projections (query / status)
 
 When you need current derived state rather than session history, read the
 daemon's projections over its socket — a read-only round-trip:
@@ -88,16 +111,16 @@ The everyday view is `keeper query tasks --json` — one row per open-epic task
 verdict + pill), the derived per-task read you'd otherwise hand-assemble from
 `query epics --json | jq`.
 
-### Tier 3 — read-only sqlite (last resort)
+### Tier 4 — read-only sqlite (last resort)
 
-Only when tiers 1–2 cannot express the read — an ad-hoc column or a join no verb
+Only when tiers 1–3 cannot express the read — an ad-hoc column or a join no verb
 exposes. Never a default.
 
 - Open read-only: `sqlite3 -readonly "$KEEPER_DB" '<sql>'`.
 - `.schema <table>` FIRST — never guess columns.
 - One single-statement `SELECT` with a `LIMIT`. No multi-statement scripts.
 - The `-readonly` flag is the guard; if you cannot express it as one bounded
-  SELECT, stop and reconsider tier 1–2.
+  SELECT, stop and reconsider tiers 1–3.
 
 ## Orient the board
 
@@ -120,24 +143,18 @@ engineering/keeper-history-forensics` for the full recipe set.
 
 ## The query collections
 
-`keeper query --help` is the canonical, always-current list — read it rather
-than trusting this enumeration if they ever disagree. The read allowlist is 16
-collections:
-
-`armed_epics`, `autopilot_state`, `block_escalations`, `builds`, `dead_letters`,
-`dispatch_failures`, `epics`, `git`, `handoffs`, `jobs`, `lane_merged`,
-`pending_dispatches`, `scheduled_tasks`, `subagent_invocations`,
-`tmux_client_focus`, `worktree_repo_status`.
-
-`tasks` is a derived view layered on top (one row per open-epic task) — the most
-useful read of all, and what you want over `epics` for per-task detail. An
-off-allowlist name is rejected at parse time before any daemon round-trip, so
-`--help` and this list are the whole surface.
+`keeper query --help` is the canonical, always-current list — run it rather
+than trusting a hand-maintained inventory here, which drifts stale as
+collections are added or renamed. `tasks` is a derived view layered on top
+(one row per open-epic task) — the most useful read of all, and what you want
+over `epics` for per-task detail. An off-allowlist name is rejected at parse
+time before any daemon round-trip, so `--help` is the whole surface.
 
 ## Guardrails
 
-- **Reach top-down.** Tier 1 before tier 2 before tier 3 — a history verb over a
-  raw SELECT every time it can answer. Drop a tier only when the one above
+- **Reach top-down.** Tier 1 before tier 2 before tier 3 before tier 4 — a
+  history verb or a purpose-built runtime/Usage/routing read over a raw
+  SELECT every time it can answer. Drop a tier only when the one above
   genuinely cannot express the read.
 - **Read-only is enforced at the connection, not the prose.** `sqlite3
   -readonly` and the daemon round-trip are the guard; never open a writable

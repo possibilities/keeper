@@ -152,6 +152,45 @@ live, snapshot, frame, sidecar, and copied output. Off focuses collapse to one l
 show target, lifetime, current eligibility, and effective routing state, while unavailable sections preserve
 the effective state and delivery diagnostic.
 
+#### Agent-facing runtime, Usage, and routing reads
+
+An agent scripting its own diagnostics prefers three narrower, schema-versioned JSON commands over
+`accounts check`, each documented in full in [agent-surface-contracts.md](./agent-surface-contracts.md#runtime-usage-and-routing-diagnostics):
+
+```sh
+keeper session runtime | jq '{schema_version, ok, data: {subject: .data.subject, model: .data.model, context: .data.context, route: .data.route}}'
+keeper usage --json | jq '{schema_version, ok, sources: .data.sources}'
+keeper accounts inspect --json | jq '{schema_version, ok, claude: .data.claude_launch, codex: .data.codex_launch, runtime: .data.pi_runtime}'
+```
+
+`keeper session runtime` reports THIS Session's actual model/effort/context (exact when a fresh out-of-band
+sample exists, falling back to the coalesced `jobs` row otherwise — `data.source` names which), plus, for a
+Pi Session, `data.route.provenance: "scoped_actual"` once a route has actually been selected or retried —
+never the initial launch alias treated as authoritative. `keeper accounts inspect` separates Claude
+launch-routing, Codex launch-seed routing, and that same proven Pi runtime route into three independent
+blocks instead of `accounts check`'s single folded view. `keeper usage --json` is the one-shot machine
+counterpart of the `keeper usage` TUI — every normalized meter, unavailable/stale sources reported
+explicitly rather than omitted. `keeper agent accounts check --json` remains fully compatible for existing
+callers; these three are the preferred reads for a fresh integration.
+
+#### Threshold awaits: context and weekly-quota
+
+`keeper await context-used-at-least <percent>` (foreground-only, same-Session) and `keeper await
+weekly-quota-at-most <percent> [route]` (foreground or `--durable`) turn the runtime/Usage reads above into
+wait conditions. A `weekly-quota-at-most` route is resolved once and frozen at arm time — `route:current`
+(default), `route:claude:<id>`, or `route:codex:<alias>[:<scope>]` — and the wait watches that one concrete
+route for its whole life, never a later routing change. Full grammar, terminal handling, and durable
+follow-up documents (`--follow-up` / `--follow-up-file`) are in
+[`plugins/keeper/skills/await/SKILL.md`](../plugins/keeper/skills/await/SKILL.md#threshold-awaits--context-and-weekly-quota);
+recovery for a stale/unresolved/timed-out wait is in
+[problem-codes.md](./problem-codes.md#threshold-awaits-keeper-await-context-used-at-least-weekly-quota-at-most).
+
+```sh
+keeper await context-used-at-least 0 --probe
+keeper await weekly-quota-at-most 20 route:current --durable \
+  --follow-up "Re-orient on the board and continue the requested follow-up."
+```
+
 #### Operate Account focuses
 
 Use a stable route from fresh inspection. Ordinary changes are scope-specific: setting or clearing one

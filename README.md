@@ -15,11 +15,15 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   Dispatch claims, and exact Resource holds remain independently observable and recoverable
 - **Account routing** — Claude launches use process-bound claude-swap Account routes from
   a fresh Capacity observation. claude-swap owns `usageStatus`, raw quota values, and
-  bounded account-capacity metadata; `keeper usage` shows available categories, explicit
+  bounded account-capacity metadata; `keeper usage --json` shows available categories, explicit
   multipliers, and producer-marked last-good meters without making stale data routeable.
   Keeper-launched Pi sessions use an isolated Codex companion with its own visible native
-  fallback and proof-gated activation. `keeper agent accounts check --json` reports both
-  without reading credentials; see the [routing operations guide](./docs/install.md#pi-codex-account-pool)
+  fallback and proof-gated activation. `keeper session runtime` and `keeper accounts inspect --json`
+  are the preferred agent diagnostics — proven current model/context/route and separated
+  Claude/Codex/Pi routing blocks; `keeper agent accounts check --json` remains a compatible
+  read of the same routing. None reads credentials; see the
+  [routing operations guide](./docs/install.md#pi-codex-account-pool) and the
+  [agent surface contracts](./docs/agent-surface-contracts.md#runtime-usage-and-routing-diagnostics)
 - **Account focuses** — independent, PII-free stable-route preferences: Fable focus matches
   proven Fable work and Non-Fable focus matches proven non-Fable work. Explicit `--x-account`
   wins, then the matching eligible focus, Fable soft avoidance, and normal route selection.
