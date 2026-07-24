@@ -201,13 +201,43 @@ function shouldRetrySameAlias(
   }
 }
 
-function substantive(
+type DeferredContentStart = Extract<
+  AssistantMessageEvent,
+  { type: "text_start" | "thinking_start" }
+>;
+
+function deferredContentStart(
+  event: AssistantMessageEvent | { type?: unknown },
+): event is DeferredContentStart {
+  return event.type === "text_start" || event.type === "thinking_start";
+}
+
+function snapshotDeferredContentStart(
+  event: DeferredContentStart,
+): DeferredContentStart {
+  return structuredClone(event);
+}
+
+function withoutDeferredContent(
+  source: AssistantMessage,
+  pending: readonly DeferredContentStart[],
+): AssistantMessage {
+  if (pending.length === 0) return source;
+  const contentIndexes = new Set(pending.map((event) => event.contentIndex));
+  return {
+    ...source,
+    content: source.content.filter((_, index) => !contentIndexes.has(index)),
+  };
+}
+
+export function isCodexPoolSubstantiveEvent(
   event: AssistantMessageEvent | { type?: unknown },
 ): boolean {
   if (
     event.type === "start" ||
     event.type === "done" ||
-    event.type === "error"
+    event.type === "error" ||
+    deferredContentStart(event)
   ) {
     return false;
   }
@@ -380,7 +410,8 @@ function createMidStreamProofFault(
           if (event.type === "done") resolve(event.message);
           if (event.type === "error") resolve(event.error);
           yield event;
-          if (!substantive(event) || injected || inactive) continue;
+          if (!isCodexPoolSubstantiveEvent(event) || injected || inactive)
+            continue;
           if (!proofFaultActive(options)) {
             inactive = true;
             reportProofFaultOutcome(options, {
@@ -495,6 +526,39 @@ function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+async function forwardNativeEvents(
+  output: ForwardingEventStream,
+  source: AsyncIterable<AssistantMessageEvent>,
+): Promise<void> {
+  const pendingContentStarts: DeferredContentStart[] = [];
+  const flushPendingContentStarts = (): void => {
+    for (const event of pendingContentStarts) output.push(event);
+    pendingContentStarts.length = 0;
+  };
+  for await (const event of source) {
+    if (event.type === "start") {
+      output.push(structuredClone(event));
+      continue;
+    }
+    if (deferredContentStart(event)) {
+      pendingContentStarts.push(snapshotDeferredContentStart(event));
+      continue;
+    }
+    if (event.type === "error") {
+      output.push({
+        ...event,
+        error: withoutDeferredContent(event.error, pendingContentStarts),
+      });
+      pendingContentStarts.length = 0;
+      continue;
+    }
+    if (event.type === "done" || isCodexPoolSubstantiveEvent(event)) {
+      flushPendingContentStarts();
+    }
+    output.push(event);
+  }
+}
+
 function startNativeFallback(
   output: ForwardingEventStream,
   deps: PoolStreamDependencies,
@@ -512,7 +576,7 @@ function startNativeFallback(
   void (async () => {
     try {
       const native = deps.nativeDelegate(model, context, options);
-      for await (const event of native) output.push(event);
+      await forwardNativeEvents(output, native);
     } catch {
       output.push(sanitizedErrorEvent(model, "error", "other"));
     } finally {
@@ -710,27 +774,39 @@ export function createPooledCodexStream(
         timeoutMs: attemptTimeoutMs,
       };
       let bufferedStart: AssistantMessageEvent | undefined;
+      const pendingContentStarts: DeferredContentStart[] = [];
       let exposedSubstantive = false;
       let terminal = false;
+      const flushAttemptStart = (): void => {
+        if (!bufferedStart) return;
+        output.push(bufferedStart);
+        bufferedStart = undefined;
+      };
+      const flushPendingContentStarts = (): void => {
+        flushAttemptStart();
+        for (const event of pendingContentStarts) output.push(event);
+        pendingContentStarts.length = 0;
+      };
       try {
         const upstream = delegate(model, context, attemptOptions);
         for await (const rawEvent of upstream as AsyncIterable<AssistantMessageEvent>) {
           const event = rawEvent as AssistantMessageEvent & { type: string };
           if (event.type === "start") {
-            bufferedStart ??= event;
+            bufferedStart ??= structuredClone(event);
             continue;
           }
-          if (substantive(event)) {
-            if (bufferedStart) {
-              output.push(bufferedStart);
-              bufferedStart = undefined;
-            }
+          if (deferredContentStart(event)) {
+            pendingContentStarts.push(snapshotDeferredContentStart(event));
+            continue;
+          }
+          if (isCodexPoolSubstantiveEvent(event)) {
+            flushPendingContentStarts();
             exposedSubstantive = true;
             output.push(event);
             continue;
           }
           if (event.type === "done") {
-            if (bufferedStart) output.push(bufferedStart);
+            flushPendingContentStarts();
             output.push(event);
             deps.routes.recordSuccess(sessionId, alias, quotaScope);
             terminal = true;
@@ -739,16 +815,20 @@ export function createPooledCodexStream(
           if (event.type === "error") {
             const reason = event.reason === "aborted" ? "aborted" : "error";
             const failureClass = classifyPoolFailure(failureMessage(event));
+            const visibleError = withoutDeferredContent(
+              event.error,
+              pendingContentStarts,
+            );
             lastFailure = failureClass;
-            lastErrorMessage = event.error;
+            lastErrorMessage = visibleError;
             if (reason === "aborted" || options?.signal?.aborted) {
-              if (bufferedStart) output.push(bufferedStart);
+              flushAttemptStart();
               output.push(
                 sanitizedErrorEvent(
                   model,
                   "aborted",
                   failureClass,
-                  event.error,
+                  visibleError,
                 ),
               );
               deps.routes.recordFailure(
@@ -781,7 +861,7 @@ export function createPooledCodexStream(
               }
               break;
             }
-            if (bufferedStart) output.push(bufferedStart);
+            flushAttemptStart();
             recordPoolFailure(
               deps,
               { sessionId, alias, attempt: delegatedAttempts },
@@ -789,7 +869,7 @@ export function createPooledCodexStream(
               failureMessage(event),
             );
             output.push(
-              sanitizedErrorEvent(model, "error", failureClass, event.error),
+              sanitizedErrorEvent(model, "error", failureClass, visibleError),
             );
             deps.routes.recordFailure(
               sessionId,

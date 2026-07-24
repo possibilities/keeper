@@ -747,10 +747,21 @@ describe("classified fault proof seam", () => {
     ]);
   });
 
-  test("reports a mid-stream request without substantive output as inconclusive", async () => {
+  test("reports a content start without payload as inconclusive", async () => {
     const outcomes: unknown[] = [];
     const base = (() =>
-      eventStream([START_EVENT, DONE_EVENT])) as CodexDelegate;
+      eventStream([
+        START_EVENT,
+        {
+          type: "thinking_start",
+          contentIndex: 0,
+          partial: {
+            ...DONE_MESSAGE,
+            content: [{ type: "thinking", thinking: "" }],
+          },
+        },
+        DONE_EVENT,
+      ])) as CodexDelegate;
     const delegate = createCodexPoolProofFaultDelegate(base, {
       request: {
         schema_version: 1,
@@ -767,7 +778,7 @@ describe("classified fault proof seam", () => {
           delegate(MODEL as never, CONTEXT as never) as AsyncIterable<unknown>,
         )
       ).map((event) => event.type),
-    ).toEqual(["start", "done"]);
+    ).toEqual(["start", "thinking_start", "done"]);
     expect(outcomes).toEqual([
       {
         status: "inconclusive",

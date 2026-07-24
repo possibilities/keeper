@@ -95,7 +95,8 @@ function successfulStream() {
   };
 }
 
-const nativeStream = () => successfulStream();
+let nativeStreamImpl: () => any = successfulStream;
+const nativeStream = () => nativeStreamImpl();
 let refreshSequence = 0;
 mock.module("@earendil-works/pi-ai", () => ({
   openAICodexResponsesApi: () => ({ streamSimple: nativeStream }),
@@ -204,6 +205,7 @@ interface InstalledProof {
   binding: string;
   aliasBinding: string;
   openaiStream: any;
+  proofCommand: any;
   tool: any;
   reportPath: string;
 }
@@ -276,6 +278,7 @@ async function installProof(
   });
 
   let openaiStream: any;
+  let proofCommand: any;
   let tool: any;
   let sessionStart: any;
   installCodexPool(
@@ -286,7 +289,9 @@ async function installProof(
       registerProvider(name: string, config: { streamSimple?: unknown }) {
         if (name === "openai-codex") openaiStream = config.streamSimple;
       },
-      registerCommand() {},
+      registerCommand(name: string, options: unknown) {
+        if (name === "codex-pool-proof") proofCommand = options;
+      },
       registerTool(definition: unknown) {
         tool = definition;
       },
@@ -318,12 +323,14 @@ async function installProof(
       { alias: ALIASES[1], role: "alternate" },
     ]),
     openaiStream,
+    proofCommand,
     tool,
     reportPath: join(sandbox, "live-proof.json"),
   };
 }
 
 afterEach(() => {
+  nativeStreamImpl = successfulStream;
   refreshSequence = 0;
   for (const key of ENV_KEYS) {
     const value = savedEnv[key];
@@ -409,6 +416,74 @@ describe("atomic Codex pool proof tool", () => {
           now_ms: report.completed_at_ms,
         }),
       ).toEqual({ verdict: "proven", reasons: [] });
+    } finally {
+      console.warn = originalWarn;
+      rmSync(installed.sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("records empty content starts as pre-output proof evidence", async () => {
+    const installed = await installProof();
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      let attempts = 0;
+      nativeStreamImpl = () => {
+        attempts += 1;
+        return {
+          async *[Symbol.asyncIterator]() {
+            const partial: any = message();
+            const emptyThinking = { type: "thinking", thinking: "" };
+            yield { type: "start", partial };
+            partial.content.push(emptyThinking);
+            yield {
+              type: "thinking_start",
+              contentIndex: 0,
+              partial,
+            };
+            yield {
+              type: "error",
+              reason: "error",
+              error: {
+                ...message("error"),
+                content: partial.content,
+                errorMessage: "WebSocket error",
+              },
+            };
+          },
+          result: async () => ({
+            ...message("error"),
+            content: [{ type: "thinking", thinking: "" }],
+            errorMessage: "WebSocket error",
+          }),
+        };
+      };
+
+      await consume(
+        installed.openaiStream(MODEL, CONTEXT, {
+          sessionId: "empty-start-proof-session",
+        }),
+      );
+      expect(attempts).toBe(2);
+
+      const notifications: string[] = [];
+      await installed.proofCommand.handler("", {
+        ui: {
+          notify(rendered: string) {
+            notifications.push(rendered);
+          },
+        },
+      });
+      expect(JSON.parse(notifications.at(-1) as string).status).toBe("written");
+      const report = JSON.parse(readFileSync(installed.reportPath, "utf8"));
+      expect(
+        report.routes.some(
+          (route: any) =>
+            route.attempts === 2 &&
+            route.failure_class === "transport" &&
+            route.substantive_output === false,
+        ),
+      ).toBe(true);
     } finally {
       console.warn = originalWarn;
       rmSync(installed.sandbox, { recursive: true, force: true });

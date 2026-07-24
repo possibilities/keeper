@@ -40,6 +40,7 @@ import {
   classifyPoolFailure,
   createCodexPoolProofFaultDelegate,
   createPooledCodexStream,
+  isCodexPoolSubstantiveEvent,
 } from "./pool.ts";
 import type {
   ArtifactSurface,
@@ -163,10 +164,6 @@ function eventFailureClass(event: AssistantMessageEvent): ReportFailureClass {
     : classified;
 }
 
-function isSubstantiveEvent(event: AssistantMessageEvent): boolean {
-  return !["start", "done", "error"].includes(event.type);
-}
-
 function sameRequestContract(
   originalModel: Model<"openai-codex-responses">,
   originalContext: Context,
@@ -286,7 +283,7 @@ class ProofEvidence {
     event: AssistantMessageEvent,
   ): void {
     if (route === null) return;
-    if (isSubstantiveEvent(event)) route.substantiveOutput = true;
+    if (isCodexPoolSubstantiveEvent(event)) route.substantiveOutput = true;
     const failureClass = eventFailureClass(event);
     if (failureClass !== "none" && route.failureClass === "none") {
       route.failureClass = failureClass;
@@ -310,7 +307,7 @@ class ProofEvidence {
 
   outputEvent(route: RouteEvidence | null, event: AssistantMessageEvent): void {
     if (route === null) return;
-    if (isSubstantiveEvent(event)) route.substantiveOutput = true;
+    if (isCodexPoolSubstantiveEvent(event)) route.substantiveOutput = true;
     if (event.type === "done" || event.type === "error") {
       route.terminal = true;
       route.restored = true;
@@ -1077,7 +1074,7 @@ export function installCodexPool(
         upstream,
         (event) => {
           terminal ||= event.type === "done" || event.type === "error";
-          substantive ||= isSubstantiveEvent(event);
+          substantive ||= isCodexPoolSubstantiveEvent(event);
           evidence.attemptEvent(route, event);
         },
         () => evidence.attemptEnded(route, terminal, substantive),

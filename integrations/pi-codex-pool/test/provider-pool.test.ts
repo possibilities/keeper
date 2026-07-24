@@ -2852,35 +2852,188 @@ describe("pooled Codex stream", () => {
     ]);
   });
 
-  test("text, thinking, tool-call, and unknown events all close the retry window", async () => {
-    const cutoffEvents = [
-      {
-        type: "text_start",
-        contentIndex: 0,
-        partial: message(),
-      },
-      {
-        type: "thinking_start",
-        contentIndex: 0,
-        partial: message(),
-      },
-      {
-        type: "toolcall_start",
-        contentIndex: 0,
-        partial: message(),
-      },
-      { type: "future_provider_event", opaque: true },
-    ];
-    for (const cutoff of cutoffEvents) {
+  test("defers empty text and thinking starts so a failed attempt can retry", async () => {
+    for (const kind of ["text", "thinking"] as const) {
       let calls = 0;
-      const vault = new CredentialVault(
-        new MemoryCredentialStorage(credentials()),
-        async (credential) => credential,
-        () => 100,
+      const emptyContent =
+        kind === "text"
+          ? { type: "text", text: "" }
+          : { type: "thinking", thinking: "" };
+      const events = await collect(
+        createPooledCodexStream(
+          {
+            vault: new CredentialVault(
+              new MemoryCredentialStorage(credentials()),
+              async (credential) => credential,
+              () => 100,
+            ),
+            routes: routeState(),
+            warn: () => {},
+            nativeDelegate: () => stream([]) as any,
+            delegate: () => {
+              calls += 1;
+              if (calls === 2) {
+                return stream([
+                  { type: "start", partial: message() },
+                  { type: "done", reason: "stop", message: message() },
+                ]) as any;
+              }
+              return stream([
+                { type: "start", partial: message() },
+                {
+                  type: `${kind}_start`,
+                  contentIndex: 0,
+                  partial: { ...message(), content: [emptyContent] },
+                },
+                {
+                  type: "error",
+                  reason: "error",
+                  error: {
+                    ...message("error", RETRYABLE_CODEX_PROVIDER_ERROR),
+                    content: [emptyContent],
+                  },
+                },
+              ]) as any;
+            },
+          },
+          MODEL as any,
+          CONTEXT as any,
+          { sessionId: `empty-${kind}-start-session` },
+        ),
       );
+      expect(calls).toBe(2);
+      expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+    }
+  });
+
+  test("flushes overlapping content starts in wire order before real payload", async () => {
+    let calls = 0;
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes: routeState(),
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: () => {
+          calls += 1;
+          return {
+            async *[Symbol.asyncIterator]() {
+              const partial: any = message();
+              yield { type: "start", partial };
+              partial.content.push({ type: "thinking", thinking: "" });
+              yield {
+                type: "thinking_start",
+                contentIndex: 0,
+                partial,
+              };
+              partial.content.push({ type: "text", text: "" });
+              yield { type: "text_start", contentIndex: 1, partial };
+              partial.content[1].text = "payload";
+              yield {
+                type: "text_delta",
+                contentIndex: 1,
+                delta: "payload",
+                partial,
+              };
+              yield {
+                type: "error",
+                reason: "error",
+                error: {
+                  ...message("error", "rate limit Bearer hidden-secret"),
+                  content: partial.content,
+                },
+              };
+            },
+          } as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "overlapping-content-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(calls).toBe(1);
+    expect(events.map((event: any) => event.type)).toEqual([
+      "start",
+      "thinking_start",
+      "text_start",
+      "text_delta",
+      "error",
+    ]);
+    expect((events[0] as any).partial.content).toEqual([]);
+    expect((events[1] as any).partial.content).toEqual([
+      { type: "thinking", thinking: "" },
+    ]);
+    expect((events[2] as any).partial.content).toEqual([
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("hidden-secret");
+  });
+
+  test("content completion, tool-call, and unknown events close the retry window", async () => {
+    const cutoffSequences = [
+      [
+        {
+          type: "text_start",
+          contentIndex: 0,
+          partial: {
+            ...message(),
+            content: [{ type: "text", text: "" }],
+          },
+        },
+        {
+          type: "text_end",
+          contentIndex: 0,
+          content: "",
+          partial: {
+            ...message(),
+            content: [{ type: "text", text: "" }],
+          },
+        },
+      ],
+      [
+        {
+          type: "thinking_start",
+          contentIndex: 0,
+          partial: {
+            ...message(),
+            content: [{ type: "thinking", thinking: "" }],
+          },
+        },
+        {
+          type: "thinking_end",
+          contentIndex: 0,
+          content: "",
+          partial: {
+            ...message(),
+            content: [{ type: "thinking", thinking: "" }],
+          },
+        },
+      ],
+      [
+        {
+          type: "toolcall_start",
+          contentIndex: 0,
+          partial: message(),
+        },
+      ],
+      [{ type: "future_provider_event", opaque: true }],
+    ];
+    for (const cutoffSequence of cutoffSequences) {
+      let calls = 0;
       const pooled = createPooledCodexStream(
         {
-          vault,
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+            () => 100,
+          ),
           routes: routeState(),
           warn: () => {},
           nativeDelegate: () => stream([]) as any,
@@ -2888,7 +3041,7 @@ describe("pooled Codex stream", () => {
             calls += 1;
             return stream([
               { type: "start", partial: message() },
-              cutoff,
+              ...cutoffSequence,
               {
                 type: "error",
                 reason: "error",
@@ -2899,17 +3052,103 @@ describe("pooled Codex stream", () => {
         },
         MODEL as any,
         CONTEXT as any,
-        { sessionId: `session-${cutoff.type}` },
+        { sessionId: `session-${cutoffSequence.at(-1)?.type}` },
       );
       const events = await collect(pooled);
       expect(calls).toBe(1);
       expect(events.map((event: any) => event.type)).toEqual([
         "start",
-        cutoff.type,
+        ...cutoffSequence.map((event) => event.type),
         "error",
       ]);
       expect(JSON.stringify(events)).not.toContain("hidden-secret");
     }
+  });
+
+  test("discards a deferred content start when an attempt ends early", async () => {
+    let calls = 0;
+    const events = await collect(
+      createPooledCodexStream(
+        {
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+            () => 100,
+          ),
+          routes: routeState(),
+          warn: () => {},
+          nativeDelegate: () => stream([]) as any,
+          delegate: () => {
+            calls += 1;
+            return calls === 1
+              ? (stream([
+                  { type: "start", partial: message() },
+                  {
+                    type: "text_start",
+                    contentIndex: 0,
+                    partial: {
+                      ...message(),
+                      content: [{ type: "text", text: "" }],
+                    },
+                  },
+                ]) as any)
+              : (stream([
+                  { type: "start", partial: message() },
+                  { type: "done", reason: "stop", message: message() },
+                ]) as any);
+          },
+        },
+        MODEL as any,
+        CONTEXT as any,
+        { sessionId: "deferred-start-eof-session" },
+      ),
+    );
+    expect(calls).toBe(2);
+    expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+  });
+
+  test("strips unexposed empty content when both attempts fail", async () => {
+    let calls = 0;
+    const events = await collect(
+      createPooledCodexStream(
+        {
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+            () => 100,
+          ),
+          routes: routeState(),
+          warn: () => {},
+          nativeDelegate: () => stream([]) as any,
+          delegate: () => {
+            calls += 1;
+            const emptyThinking = { type: "thinking", thinking: "" };
+            return stream([
+              { type: "start", partial: message() },
+              {
+                type: "thinking_start",
+                contentIndex: 0,
+                partial: { ...message(), content: [emptyThinking] },
+              },
+              {
+                type: "error",
+                reason: "error",
+                error: {
+                  ...message("error", RETRYABLE_CODEX_PROVIDER_ERROR),
+                  content: [emptyThinking],
+                },
+              },
+            ]) as any;
+          },
+        },
+        MODEL as any,
+        CONTEXT as any,
+        { sessionId: "empty-content-terminal-session" },
+      ),
+    );
+    expect(calls).toBe(2);
+    expect(events.map((event: any) => event.type)).toEqual(["error"]);
+    expect((events[0] as any).error.content).toEqual([]);
   });
 
   test("surfaces context overflow for Pi recovery without cooling the account", async () => {
@@ -3779,12 +4018,21 @@ describe("pooled Codex stream", () => {
             streamCalls += 1;
             return {
               async *[Symbol.asyncIterator]() {
+                const emptyThinking = { type: "thinking", thinking: "" };
                 yield { type: "start", partial: message() };
+                yield {
+                  type: "thinking_start",
+                  contentIndex: 0,
+                  partial: { ...message(), content: [emptyThinking] },
+                };
                 duringStream.abort();
                 yield {
                   type: "error",
                   reason: "aborted",
-                  error: message("aborted", "Bearer private-stream-token"),
+                  error: {
+                    ...message("aborted", "Bearer private-stream-token"),
+                    content: [emptyThinking],
+                  },
                 };
               },
             } as any;
@@ -3796,7 +4044,12 @@ describe("pooled Codex stream", () => {
       ),
     );
     expect(streamCalls).toBe(1);
+    expect(streamEvents.map((event: any) => event.type)).toEqual([
+      "start",
+      "error",
+    ]);
     expect((streamEvents.at(-1) as any).reason).toBe("aborted");
+    expect((streamEvents.at(-1) as any).error.content).toEqual([]);
     expect(JSON.stringify(streamEvents)).not.toContain("private-stream-token");
   });
 
@@ -3833,6 +4086,58 @@ describe("pooled Codex stream", () => {
     await collect(pooled);
     expect(delegatedSessionIds).toEqual(["root-session"]);
     expect(nativeCalls).toBe(0);
+  });
+
+  test("discards empty content starts from native fallback failures", async () => {
+    let delegateCalls = 0;
+    const emptyThinking = { type: "thinking", thinking: "" };
+    const events = await collect(
+      createPooledCodexStream(
+        {
+          vault: new CredentialVault(
+            new MemoryCredentialStorage(credentials()),
+            async (credential) => credential,
+          ),
+          routes: routeState(),
+          warn: () => {},
+          delegate: () => {
+            delegateCalls += 1;
+            return stream([]) as any;
+          },
+          nativeDelegate: () =>
+            ({
+              async *[Symbol.asyncIterator]() {
+                const partial: any = message();
+                yield { type: "start", partial };
+                partial.content.push(emptyThinking);
+                yield {
+                  type: "thinking_start",
+                  contentIndex: 0,
+                  partial,
+                };
+                yield {
+                  type: "error",
+                  reason: "error",
+                  error: {
+                    ...message("error", RETRYABLE_CODEX_PROVIDER_ERROR),
+                    content: partial.content,
+                  },
+                };
+              },
+            }) as any,
+        },
+        MODEL as any,
+        CONTEXT as any,
+      ),
+    );
+
+    expect(delegateCalls).toBe(0);
+    expect(events.map((event: any) => event.type)).toEqual(["start", "error"]);
+    expect((events[0] as any).partial.content).toEqual([]);
+    expect((events.at(-1) as any).error.content).toEqual([]);
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      RETRYABLE_CODEX_PROVIDER_ERROR,
+    );
   });
 
   test("falls visibly back to native Codex when Spark is not policy-authorized", async () => {
