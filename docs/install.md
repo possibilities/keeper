@@ -151,7 +151,7 @@ keeper agent accounts fable-focus show --json
 keeper usage
 keeper agent accounts non-fable-focus show --json
 keeper status --json
-keeper board
+keeper usage
 ```
 
 `accounts recover cN [--json]` makes an owned list before resolving the current zero-based label and
@@ -164,10 +164,12 @@ verification failure, and 2 means the current label is absent or not token-expir
 `accounts check --json` reports `claude_launch_routing.fable_focus` and
 `claude_launch_routing.non_fable_focus`, alongside current capacity and the route it would choose without
 creating a reservation. `keeper status --json` exposes the same views as `data.fable_focus` and
-`data.non_fable_focus`. `keeper board` renders full `Fable focus` and `Non-Fable focus` sections in its
-live, snapshot, frame, sidecar, and copied output. Off focuses collapse to one line; configured sections
-show target, lifetime, current eligibility, and effective routing state, while unavailable sections preserve
-the effective state and delivery diagnostic.
+`data.non_fable_focus`. The human `keeper usage` view appends full `Fable focus` and `Non-Fable focus`
+sections after the Claude and Codex capacity blocks in live and snapshot output. Off focuses collapse to
+one line; configured sections show target, lifetime, current eligibility, and effective routing state, while
+unavailable sections preserve the effective state and delivery diagnostic. `keeper usage --json` remains
+the capacity-only schema-v1 machine contract; use account inspection or status JSON for machine-readable
+focus state.
 
 #### Agent-facing runtime, Usage, and routing reads
 
@@ -249,7 +251,7 @@ keeper agent accounts non-fable-focus set "$route" absolute "$deadline" \
 keeper agent accounts non-fable-focus show --json
 keeper agent accounts check --json
 keeper status --json
-keeper board
+keeper usage
 ```
 
 `--require-eligible` requires fresh global capacity evidence and an eligible target. An elapsed deadline,

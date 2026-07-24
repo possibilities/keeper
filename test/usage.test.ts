@@ -8,13 +8,17 @@ import {
   USAGE_JSON_SCHEMA_VERSION,
   main as usageMain,
 } from "../cli/usage";
+import { publishNonFableFocusLeaf } from "../src/account-focus";
 import {
   type Observation,
   writeObservationSidecar,
 } from "../src/account-observation";
 import {
   CODEX_OBSERVATION_SCHEMA_VERSION,
+  fableFocusPolicyPath,
+  nonFableFocusPolicyPath,
   OBSERVATION_SCHEMA_VERSION,
+  observationSidecarPath,
 } from "../src/account-routing-config";
 import {
   CODEX_PROVIDER,
@@ -25,11 +29,14 @@ import {
   CODEX_GENERIC_QUOTA_SCOPE,
   CODEX_SPARK_QUOTA_SCOPE,
 } from "../src/codex-quota-scope";
+import { publishFableFocusLeaf } from "../src/fable-focus";
 import {
   buildUsageJsonData,
   createUsagePoller,
   loadUsageSnapshot,
+  renderUsageFocusLines,
   renderUsageLines,
+  type UsageFocusSnapshot,
   type UsageSnapshot,
   usageSemanticFingerprint,
 } from "../src/usage-observation-view";
@@ -49,6 +56,16 @@ function paths() {
   return {
     claude: join(root, "claude.json"),
     codex: join(root, "codex.json"),
+  };
+}
+
+function pathsWithFocus() {
+  const accountRoutingRoot = mkdtempSync(join(tmpdir(), "keeper-usage-focus-"));
+  roots.push(accountRoutingRoot);
+  return {
+    claude: observationSidecarPath(accountRoutingRoot),
+    codex: join(accountRoutingRoot, "codex.json"),
+    accountRoutingRoot,
   };
 }
 
@@ -248,6 +265,155 @@ describe("usage observation view", () => {
     expect(text).toContain("GPT-5.3-Codex-Spark · 7d");
   });
 
+  test("renders Account focuses after provider usage and keeps them out of JSON", () => {
+    const target = pathsWithFocus();
+    writeHealthySidecars(target);
+    publishFableFocusLeaf(fableFocusPolicyPath(target.accountRoutingRoot), {
+      schema_version: 1,
+      policy_id: "event:1",
+      target_route: "claude-swap:2",
+      fable_intent: true,
+      set_at: new Date(NOW - 24 * 60 * 60_000).toISOString(),
+      lifetime: { kind: "permanent" },
+    });
+    publishNonFableFocusLeaf(
+      nonFableFocusPolicyPath(target.accountRoutingRoot),
+      {
+        schema_version: 1,
+        policy_id: "event:2",
+        target_route: "claude-swap:2",
+        fable_intent: false,
+        set_at: new Date(NOW - 24 * 60 * 60_000).toISOString(),
+        lifetime: {
+          kind: "absolute",
+          deadline_at: new Date(NOW + 1_000).toISOString(),
+        },
+      },
+    );
+
+    const snapshot = loadUsageSnapshot(target, NOW);
+    const lines = renderUsageLines(snapshot, "America/New_York");
+    const codexStart = lines.indexOf("[codex] fresh 0s");
+    const fableStart = lines.indexOf("Fable focus");
+    const nonFableStart = lines.indexOf("Non-Fable focus");
+    expect(codexStart).toBeGreaterThan(-1);
+    expect(fableStart).toBeGreaterThan(codexStart);
+    expect(nonFableStart).toBeGreaterThan(fableStart);
+    expect(lines.slice(fableStart, fableStart + 5)).toEqual([
+      "Fable focus",
+      "  target account route: claude-swap:2",
+      "  lifetime: permanent",
+      "  target currently eligible: yes",
+      "  effective routing state: focused",
+    ]);
+    expect(lines[nonFableStart + 1]).toBe(
+      "  target account route: claude-swap:2",
+    );
+    expect(lines[nonFableStart + 2]).toContain("less than 1 minute remaining");
+    expect(lines[nonFableStart + 4]).toBe("  effective routing state: focused");
+    expect(lines.at(-1)).toBe("  diagnostic: none");
+    expect(
+      lines.filter((line) => line === "  target account route: claude-swap:2"),
+    ).toHaveLength(2);
+    expect(buildUsageJsonData(snapshot)).not.toHaveProperty("focus");
+
+    const expired = loadUsageSnapshot(target, NOW + 1_001);
+    const expiredLines = renderUsageLines(expired, "America/New_York");
+    expect(expiredLines.join("\n")).toContain("expired less than 1 minute ago");
+    expect(expiredLines).toContain(
+      "  effective routing state: fallback to normal account balancing",
+    );
+    expect(usageSemanticFingerprint(expired)).not.toBe(
+      usageSemanticFingerprint(snapshot),
+    );
+
+    publishFableFocusLeaf(
+      fableFocusPolicyPath(target.accountRoutingRoot),
+      null,
+    );
+    const changed = loadUsageSnapshot(target, NOW);
+    expect(renderUsageLines(changed).join("\n")).toContain("Fable focus: off");
+    expect(usageSemanticFingerprint(changed)).not.toBe(
+      usageSemanticFingerprint(snapshot),
+    );
+  });
+
+  test("renders off, unavailable, fallback, and timezone focus details", () => {
+    const base: UsageFocusSnapshot = {
+      fable: {
+        configured: true,
+        state: "active",
+        target_route: "claude-swap:2",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2023-11-14T22:13:20.000Z",
+        },
+        target_eligible: true,
+        outcome: "focused",
+        reason: "target-focused",
+        diagnostic: "none",
+      },
+      nonFable: {
+        configured: false,
+        state: "off",
+        target_route: null,
+        lifetime: null,
+        target_eligible: null,
+        outcome: "off",
+        reason: "policy-off",
+        diagnostic: "none",
+      },
+    };
+    const active = renderUsageFocusLines(
+      base,
+      1_699_991_000_000,
+      "America/New_York",
+    );
+    expect(active).toContain(
+      "  lifetime: until Nov 14, 2023 at 5:13 PM EST (2 hours 30 minutes remaining)",
+    );
+    expect(active.at(-1)).toBe("Non-Fable focus: off");
+
+    const unavailableAndFallback: UsageFocusSnapshot = {
+      fable: {
+        configured: false,
+        state: "unavailable",
+        target_route: null,
+        lifetime: null,
+        target_eligible: null,
+        outcome: "fallback",
+        reason: "policy-unavailable",
+        diagnostic: "delivery-malformed",
+      },
+      nonFable: {
+        configured: true,
+        state: "active",
+        target_route: "claude-swap:4",
+        lifetime: { kind: "permanent" },
+        target_eligible: false,
+        outcome: "fallback",
+        reason: "target-ineligible",
+        diagnostic: "none",
+      },
+    };
+    const lines = renderUsageFocusLines(unavailableAndFallback, NOW, "UTC");
+    expect(lines).toContain("  configured: no");
+    expect(lines).toContain(
+      "  effective routing state: unavailable; using normal account balancing",
+    );
+    expect(lines).toContain("  diagnostic: delivery-malformed");
+    const nonFableStart = lines.indexOf("Non-Fable focus");
+    expect(lines.slice(nonFableStart, nonFableStart + 6)).toEqual([
+      "Non-Fable focus",
+      "  target account route: claude-swap:4",
+      "  lifetime: permanent",
+      "  target currently eligible: no",
+      "  effective routing state: fallback to normal account balancing",
+      "  diagnostic: none",
+    ]);
+    expect(lines.join("\n")).not.toContain("\x1b[");
+  });
+
   test("removed meters disappear because arrays are full snapshots", () => {
     const target = paths();
     writeHealthySidecars(target);
@@ -360,8 +526,39 @@ describe("usage observation view", () => {
     secondTimer();
     expect(semantic).toHaveLength(2);
 
+    current = {
+      ...current,
+      focus: {
+        fable: {
+          configured: false,
+          state: "off",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off",
+          reason: "policy-off",
+          diagnostic: "none",
+        },
+        nonFable: {
+          configured: false,
+          state: "off",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off",
+          reason: "policy-off",
+          diagnostic: "none",
+        },
+      },
+    };
+    const thirdTimer = timers.get(3);
+    if (!thirdTimer) throw new Error("third poll timer missing");
+    timers.delete(3);
+    thirdTimer();
+    expect(semantic).toHaveLength(3);
+
     poller.dispose();
-    expect(cleared).toEqual([3]);
+    expect(cleared).toEqual([4]);
     expect(timers.size).toBe(0);
   });
 });

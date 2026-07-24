@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readNonFableFocusLeaf } from "./account-focus";
 import {
   type CapacityMultiplier,
   type ClaudeSubscriptionType,
@@ -8,8 +9,15 @@ import {
   readObservationSidecar,
 } from "./account-observation";
 import {
+  type FableFocusRoutingView,
+  inspectAccountFocuses,
+  type NonFableFocusRoutingView,
+} from "./account-router";
+import {
   CODEX_OBSERVATION_FRESHNESS_CEILING_MS,
   codexObservationSidecarPath,
+  fableFocusPolicyPath,
+  nonFableFocusPolicyPath,
   OBSERVATION_FRESHNESS_CEILING_MS,
   observationSidecarPath,
   resolveAccountRoutingRoot,
@@ -23,6 +31,7 @@ import {
   isCodexObservationFresh,
   readCodexObservationSidecar,
 } from "./codex-account-observation";
+import { readFableFocusLeaf } from "./fable-focus";
 
 export type UsageProvider = "claude" | "codex";
 export type UsageSourceStatus =
@@ -68,21 +77,32 @@ export interface UsageSource {
   accounts: UsageAccount[];
 }
 
+export interface UsageFocusSnapshot {
+  fable: FableFocusRoutingView;
+  nonFable: NonFableFocusRoutingView;
+}
+
 export interface UsageSnapshot {
   loadedAtMs: number;
   claude: UsageSource;
   codex: UsageSource;
+  /** Human-view focus detail; intentionally omitted from `keeper usage --json`. */
+  focus: UsageFocusSnapshot | null;
 }
 
 export interface UsageSnapshotPaths {
   claude: string;
   codex: string;
+  /** Present on the production path; omission keeps custom snapshot readers isolated. */
+  accountRoutingRoot?: string;
 }
 
 export function resolveUsageSnapshotPaths(): UsageSnapshotPaths {
+  const accountRoutingRoot = resolveAccountRoutingRoot();
   return {
-    claude: observationSidecarPath(resolveAccountRoutingRoot()),
+    claude: observationSidecarPath(accountRoutingRoot),
     codex: codexObservationSidecarPath(resolveCodexAccountRoutingRoot()),
+    accountRoutingRoot,
   };
 }
 
@@ -377,6 +397,21 @@ export function buildUsageJsonData(snapshot: UsageSnapshot): UsageJsonData {
   };
 }
 
+function loadUsageFocus(
+  accountRoutingRoot: string,
+  observation: Observation | null,
+  nowMs: number,
+): UsageFocusSnapshot {
+  return inspectAccountFocuses({
+    observation,
+    nowMs,
+    fableDelivery: readFableFocusLeaf(fableFocusPolicyPath(accountRoutingRoot)),
+    nonFableDelivery: readNonFableFocusLeaf(
+      nonFableFocusPolicyPath(accountRoutingRoot),
+    ),
+  });
+}
+
 export function loadUsageSnapshot(
   paths: UsageSnapshotPaths = resolveUsageSnapshotPaths(),
   nowMs: number = Date.now(),
@@ -397,7 +432,11 @@ export function loadUsageSnapshot(
           "codex",
           existsSync(paths.codex) ? "invalid" : "missing",
         );
-  return { loadedAtMs: nowMs, claude, codex };
+  const focus =
+    paths.accountRoutingRoot === undefined
+      ? null
+      : loadUsageFocus(paths.accountRoutingRoot, claudeObservation, nowMs);
+  return { loadedAtMs: nowMs, claude, codex, focus };
 }
 
 const BAR_WIDTH = 24;
@@ -521,11 +560,171 @@ function renderSource(source: UsageSource, nowMs: number): string[] {
   return lines;
 }
 
-export function renderUsageLines(snapshot: UsageSnapshot): string[] {
+type UsageFocusRoutingView = FableFocusRoutingView | NonFableFocusRoutingView;
+
+function focusDeadlineDistance(deadlineMs: number, nowMs: number): string {
+  const distanceMs = Math.abs(deadlineMs - nowMs);
+  if (distanceMs < 60_000) return "less than 1 minute";
+
+  const totalMinutes = Math.max(1, Math.round(distanceMs / 60_000));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} ${days === 1 ? "day" : "days"}`);
+  if (hours > 0) parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+  if (days === 0 && minutes > 0) {
+    parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
+  }
+  return parts.slice(0, 2).join(" ");
+}
+
+function focusDeadline(value: string, nowMs: number, timeZone: string): string {
+  const deadlineMs = Date.parse(value);
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(nowMs)) return value;
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "short",
+    })
+      .formatToParts(deadlineMs)
+      .map(({ type, value: part }) => [type, part]),
+  );
+  const local = `${parts.month} ${parts.day}, ${parts.year} at ${parts.hour}:${parts.minute} ${parts.dayPeriod} ${parts.timeZoneName}`;
+  const distance = focusDeadlineDistance(deadlineMs, nowMs);
+  const relative =
+    deadlineMs > nowMs
+      ? `${distance} remaining`
+      : deadlineMs < nowMs
+        ? `expired ${distance} ago`
+        : "expires now";
+  return `${local} (${relative})`;
+}
+
+function focusLifetime(
+  focus: UsageFocusRoutingView,
+  nowMs: number,
+  timeZone: string,
+): string {
+  const lifetime = focus.lifetime;
+  if (lifetime === null) return "unavailable";
+  if (lifetime.kind === "permanent") return "permanent";
+  return lifetime.kind === "absolute"
+    ? `until ${focusDeadline(lifetime.deadline_at, nowMs, timeZone)}`
+    : `until the Fable cycle ending ${focusDeadline(lifetime.reset_at, nowMs, timeZone)}`;
+}
+
+function focusEligibility(focus: UsageFocusRoutingView): string {
+  return focus.target_eligible === null
+    ? "unknown"
+    : focus.target_eligible
+      ? "yes"
+      : "no";
+}
+
+function focusState(focus: UsageFocusRoutingView, nowMs: number): string {
+  if (focus.state === "unavailable" || focus.state === "invalid") {
+    return "unavailable; using normal account balancing";
+  }
+  if (focus.state === "off") return "off";
+  const lifetime = focus.lifetime;
+  if (
+    focus.state === "active" &&
+    lifetime !== null &&
+    lifetime.kind !== "permanent" &&
+    Number.isFinite(nowMs) &&
+    Date.parse(
+      lifetime.kind === "absolute" ? lifetime.deadline_at : lifetime.reset_at,
+    ) <= nowMs
+  ) {
+    return "fallback to normal account balancing";
+  }
+  return focus.state === "active" && focus.outcome === "focused"
+    ? "focused"
+    : "fallback to normal account balancing";
+}
+
+function fableFocusLines(
+  focus: FableFocusRoutingView,
+  nowMs: number,
+  timeZone: string,
+): string[] {
+  if (!focus.configured && focus.state === "off") {
+    return ["Fable focus: off"];
+  }
+  const lines = ["Fable focus"];
+  if (focus.configured) {
+    lines.push(
+      `  target account route: ${focus.target_route ?? "unavailable"}`,
+      `  lifetime: ${focusLifetime(focus, nowMs, timeZone)}`,
+      `  target currently eligible: ${focusEligibility(focus)}`,
+    );
+  } else {
+    lines.push("  configured: no");
+  }
+  lines.push(`  effective routing state: ${focusState(focus, nowMs)}`);
+  if (focus.diagnostic !== "none") {
+    lines.push(`  diagnostic: ${focus.diagnostic}`);
+  }
+  return lines;
+}
+
+function nonFableFocusLines(
+  focus: NonFableFocusRoutingView,
+  nowMs: number,
+  timeZone: string,
+): string[] {
+  if (
+    !focus.configured &&
+    focus.state === "off" &&
+    focus.diagnostic === "none"
+  ) {
+    return ["Non-Fable focus: off"];
+  }
+  return [
+    "Non-Fable focus",
+    `  target account route: ${focus.target_route ?? "unavailable"}`,
+    `  lifetime: ${focusLifetime(focus, nowMs, timeZone)}`,
+    `  target currently eligible: ${focusEligibility(focus)}`,
+    `  effective routing state: ${focusState(focus, nowMs)}`,
+    `  diagnostic: ${focus.diagnostic}`,
+  ];
+}
+
+export function renderUsageFocusLines(
+  focus: UsageFocusSnapshot,
+  nowMs: number,
+  timeZone: string,
+): string[] {
+  return [
+    ...fableFocusLines(focus.fable, nowMs, timeZone),
+    ...nonFableFocusLines(focus.nonFable, nowMs, timeZone),
+  ];
+}
+
+export function renderUsageLines(
+  snapshot: UsageSnapshot,
+  timeZone: string = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+): string[] {
   return [
     ...renderSource(snapshot.claude, snapshot.loadedAtMs),
     "",
     ...renderSource(snapshot.codex, snapshot.loadedAtMs),
+    ...(snapshot.focus === null
+      ? []
+      : [
+          "",
+          ...renderUsageFocusLines(
+            snapshot.focus,
+            snapshot.loadedAtMs,
+            timeZone,
+          ),
+        ]),
   ];
 }
 
@@ -550,6 +749,7 @@ export function usageSemanticFingerprint(snapshot: UsageSnapshot): string {
   return JSON.stringify({
     claude: source(snapshot.claude),
     codex: source(snapshot.codex),
+    focus: snapshot.focus,
   });
 }
 

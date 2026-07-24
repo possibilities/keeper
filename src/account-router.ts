@@ -1132,6 +1132,44 @@ function unavailableNonFableFocusView(): NonFableFocusRoutingView {
   return unavailableFocusView("unavailable", "delivery-unreachable");
 }
 
+export interface AccountFocusInspectionViews {
+  fable: FableFocusRoutingView;
+  nonFable: NonFableFocusRoutingView;
+}
+
+/** Inspect both focus scopes against one coherent Capacity observation. */
+export function inspectAccountFocuses(input: {
+  observation: Observation | null;
+  nowMs: number;
+  fableDelivery: FableFocusDelivery;
+  nonFableDelivery: NonFableFocusDelivery;
+}): AccountFocusInspectionViews {
+  const usableObservation =
+    input.observation !== null &&
+    input.observation.health === "ok" &&
+    isObservationFresh(input.observation, input.nowMs)
+      ? input.observation
+      : null;
+  return {
+    fable: inspectionFocusView(
+      effectiveFableFocus(input.fableDelivery, input.observation, input.nowMs),
+      usableObservation,
+      true,
+      { nowMs: input.nowMs },
+    ),
+    nonFable: inspectionFocusView(
+      effectiveNonFableFocus(
+        input.nonFableDelivery,
+        input.observation,
+        input.nowMs,
+      ),
+      usableObservation,
+      false,
+      { nowMs: input.nowMs },
+    ),
+  };
+}
+
 export function inspectRouting(deps: SelectRouteDeps = {}): RoutingInspection {
   try {
     return doInspectRouting(deps);

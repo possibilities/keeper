@@ -37,15 +37,6 @@
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  type FableFocusRoutingView,
-  inspectRouting,
-  type NonFableFocusRoutingView,
-} from "../src/account-router";
-import {
-  projectFableFocus,
-  projectNonFableFocus,
-} from "../src/autopilot-projection";
-import {
   apiErrorPillSeg,
   armedPill,
   colorizePillsInLine,
@@ -438,15 +429,11 @@ export interface BoardHeaderViewModel {
   readonly summary: BoardSummaryCounts;
   readonly autopilot: BoardHeaderAutopilot;
   readonly needsHumanCount: number;
-  readonly fableFocus: FableFocusRoutingView;
-  readonly nonFableFocus: NonFableFocusRoutingView;
 }
 
 export interface BoardHeaderFormatInput {
   readonly viewModel: BoardHeaderViewModel;
   readonly width: number;
-  readonly now: number;
-  readonly timeZone?: string;
 }
 
 function stripHeaderAnsi(value: string): string {
@@ -515,159 +502,8 @@ export function wrapBoardHeaderLine(value: string, width: number): string[] {
   return rows;
 }
 
-type HeaderFocusRoutingView = FableFocusRoutingView | NonFableFocusRoutingView;
-
-function focusDeadlineDistance(deadlineMs: number, now: number): string {
-  const distanceMs = Math.abs(deadlineMs - now);
-  if (distanceMs < 60_000) {
-    return "less than 1 minute";
-  }
-
-  const totalMinutes = Math.max(1, Math.round(distanceMs / 60_000));
-  const days = Math.floor(totalMinutes / (24 * 60));
-  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-  const minutes = totalMinutes % 60;
-  const parts: string[] = [];
-  if (days > 0) {
-    parts.push(`${days} ${days === 1 ? "day" : "days"}`);
-  }
-  if (hours > 0) {
-    parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
-  }
-  if (days === 0 && minutes > 0) {
-    parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
-  }
-  return parts.slice(0, 2).join(" ");
-}
-
-function focusDeadline(value: string, now: number, timeZone: string): string {
-  const deadlineMs = Date.parse(value);
-  if (!Number.isFinite(deadlineMs) || !Number.isFinite(now)) {
-    return value;
-  }
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "short",
-    })
-      .formatToParts(deadlineMs)
-      .map(({ type, value }) => [type, value]),
-  );
-  const local = `${parts.month} ${parts.day}, ${parts.year} at ${parts.hour}:${parts.minute} ${parts.dayPeriod} ${parts.timeZoneName}`;
-  const distance = focusDeadlineDistance(deadlineMs, now);
-  const relative =
-    deadlineMs > now
-      ? `${distance} remaining`
-      : deadlineMs < now
-        ? `expired ${distance} ago`
-        : "expires now";
-  return `${local} (${relative})`;
-}
-
-function focusLifetime(
-  focus: HeaderFocusRoutingView,
-  now: number,
-  timeZone: string,
-): string {
-  const lifetime = focus.lifetime;
-  if (lifetime === null) {
-    return "unavailable";
-  }
-  if (lifetime.kind === "permanent") {
-    return "permanent";
-  }
-  return lifetime.kind === "absolute"
-    ? `until ${focusDeadline(lifetime.deadline_at, now, timeZone)}`
-    : `until the Fable cycle ending ${focusDeadline(lifetime.reset_at, now, timeZone)}`;
-}
-
-function focusEligibility(focus: HeaderFocusRoutingView): string {
-  return focus.target_eligible === null
-    ? "unknown"
-    : focus.target_eligible
-      ? "yes"
-      : "no";
-}
-
-function focusState(focus: HeaderFocusRoutingView, now: number): string {
-  if (focus.state === "unavailable" || focus.state === "invalid") {
-    return "unavailable; using normal account balancing";
-  }
-  if (focus.state === "off") {
-    return "off";
-  }
-  const lifetime = focus.lifetime;
-  if (
-    focus.state === "active" &&
-    lifetime !== null &&
-    lifetime.kind !== "permanent" &&
-    Number.isFinite(now) &&
-    Date.parse(
-      lifetime.kind === "absolute" ? lifetime.deadline_at : lifetime.reset_at,
-    ) <= now
-  ) {
-    return "fallback to normal account balancing";
-  }
-  return focus.state === "active" && focus.outcome === "focused"
-    ? "focused"
-    : "fallback to normal account balancing";
-}
-
-function fableFocusHeaderLines(
-  focus: FableFocusRoutingView,
-  now: number,
-  timeZone: string,
-): string[] {
-  if (!focus.configured && focus.state === "off") {
-    return ["Fable focus: off"];
-  }
-  const lines = ["Fable focus"];
-  if (focus.configured) {
-    lines.push(
-      `  target account route: ${focus.target_route ?? "unavailable"}`,
-      `  lifetime: ${focusLifetime(focus, now, timeZone)}`,
-      `  target currently eligible: ${focusEligibility(focus)}`,
-    );
-  } else {
-    lines.push("  configured: no");
-  }
-  lines.push(`  effective routing state: ${focusState(focus, now)}`);
-  if (focus.diagnostic !== "none") {
-    lines.push(`  diagnostic: ${focus.diagnostic}`);
-  }
-  return lines;
-}
-
-function nonFableFocusHeaderLines(
-  focus: NonFableFocusRoutingView,
-  now: number,
-  timeZone: string,
-): string[] {
-  if (
-    !focus.configured &&
-    focus.state === "off" &&
-    focus.diagnostic === "none"
-  ) {
-    return ["Non-Fable focus: off"];
-  }
-  return [
-    "Non-Fable focus",
-    `  target account route: ${focus.target_route ?? "unavailable"}`,
-    `  lifetime: ${focusLifetime(focus, now, timeZone)}`,
-    `  target currently eligible: ${focusEligibility(focus)}`,
-    `  effective routing state: ${focusState(focus, now)}`,
-    `  diagnostic: ${focus.diagnostic}`,
-  ];
-}
-
 export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
-  const { autopilot, fableFocus, needsHumanCount, nonFableFocus, summary } =
-    input.viewModel;
+  const { autopilot, needsHumanCount, summary } = input.viewModel;
   const width = Math.max(1, Math.floor(input.width));
   const cap =
     autopilot.maxConcurrentJobs === null
@@ -688,13 +524,7 @@ export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
     `  worktree mode: ${autopilot.worktreeMode ? "on" : "off"}`,
     `  worker provider: ${autopilot.workerProvider ?? "assigned task cell"}`,
   ];
-  const timeZone = input.timeZone ?? "UTC";
-  const logicalLines = [
-    ...fableFocusHeaderLines(fableFocus, input.now, timeZone),
-    ...nonFableFocusHeaderLines(nonFableFocus, input.now, timeZone),
-    ...boardSummaryLines(summary),
-    ...autopilotLines,
-  ];
+  const logicalLines = [...boardSummaryLines(summary), ...autopilotLines];
   return logicalLines.flatMap((line) => wrapBoardHeaderLine(line, width));
 }
 
@@ -1032,7 +862,6 @@ export function boardFrameStateJson(
     readonly viewModel: BoardHeaderViewModel;
     readonly width: number;
     readonly renderedAtMs: number;
-    readonly timeZone: string;
   } | null = null,
 ): {
   epics: readonly unknown[];
@@ -1041,7 +870,6 @@ export function boardFrameStateJson(
     readonly viewModel: BoardHeaderViewModel;
     readonly width: number;
     readonly renderedAtMs: number;
-    readonly timeZone: string;
   } | null;
 } {
   return { epics, subagents: serializeSubagentIndex(subagentIndex), header };
@@ -1150,8 +978,6 @@ export async function runBoardFrames(config: {
 
 export async function runBoard(config: RunBoardConfig): Promise<void> {
   const { mode, sockPath, timeoutMs } = config;
-  const localTimeZone =
-    Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   // Readiness diagnostics JSONL log, a sibling of the sock in the state dir.
   // Two processes (board + autopilot) can append concurrently; POSIX O_APPEND
   // under PIPE_BUF gives the atomicity guarantee, no flock.
@@ -1223,26 +1049,6 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     mode: "yolo" as "yolo" | "armed",
     worktreeMode: false,
     workerProvider: null as "claude" | "gpt" | null,
-    fableFocus: {
-      configured: false,
-      state: "off",
-      target_route: null,
-      lifetime: null,
-      target_eligible: null,
-      outcome: "off",
-      reason: "policy-off",
-      diagnostic: "none",
-    } as FableFocusRoutingView,
-    nonFableFocus: {
-      configured: false,
-      state: "off",
-      target_route: null,
-      lifetime: null,
-      target_eligible: null,
-      outcome: "off",
-      reason: "policy-off",
-      diagnostic: "none",
-    } as NonFableFocusRoutingView,
   };
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -1623,33 +1429,20 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
           workerProvider: apState.workerProvider,
         },
         needsHumanCount,
-        fableFocus: apState.fableFocus,
-        nonFableFocus: apState.nonFableFocus,
       };
       const renderedAtMs = Date.now();
       const width = boardHeaderWidth();
       return {
         bodyLines,
         semanticHeader: {
-          lines: formatBoardHeader({
-            viewModel,
-            width,
-            now: renderedAtMs,
-            timeZone: localTimeZone,
-          }),
+          lines: formatBoardHeader({ viewModel, width }),
           renderAtWidth: (nextWidth) =>
-            formatBoardHeader({
-              viewModel,
-              width: nextWidth,
-              now: Date.now(),
-              timeZone: localTimeZone,
-            }),
+            formatBoardHeader({ viewModel, width: nextWidth }),
         },
         stateJson: boardFrameStateJson(snap.epics, subagentIndex, {
           viewModel,
           width,
           renderedAtMs,
-          timeZone: localTimeZone,
         }),
       };
     },
@@ -1764,45 +1557,6 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
       apState.workerProvider = projectWorkerProvider(rows);
-      const fableFocus = projectFableFocus(rows);
-      apState.fableFocus = fableFocus.valid
-        ? inspectRouting({
-            model: "fable",
-            fableIntent: true,
-            focusDelivery: { available: true, policy: fableFocus.policy },
-            nonFableFocusDelivery: { available: true, policy: null },
-          }).fable_focus
-        : {
-            configured: false,
-            state: "unavailable",
-            target_route: null,
-            lifetime: null,
-            target_eligible: null,
-            outcome: "fallback",
-            reason: "policy-unavailable",
-            diagnostic: "policy-invalid",
-          };
-      const nonFableFocus = projectNonFableFocus(rows);
-      apState.nonFableFocus = nonFableFocus.valid
-        ? inspectRouting({
-            model: null,
-            fableIntent: false,
-            focusDelivery: { available: true, policy: null },
-            nonFableFocusDelivery: {
-              available: true,
-              policy: nonFableFocus.policy,
-            },
-          }).non_fable_focus
-        : {
-            configured: false,
-            state: "unavailable",
-            target_route: null,
-            lifetime: null,
-            target_eligible: null,
-            outcome: "fallback",
-            reason: "policy-unavailable",
-            diagnostic: "policy-invalid",
-          };
       if (lastSnap !== null) {
         emitFrame(lastSnap);
       }

@@ -34,7 +34,8 @@ Usage: keeper usage [--snapshot | --watch] [--timeout <duration>]
                   (rejects --watch; ignores --snapshot/--timeout)
   --help, -h      Show this help
 
-The viewer reads Keeper's private, PII-free Capacity observation sidecars.
+The viewer reads Keeper's private, PII-free Capacity observation sidecars and
+appends Fable and Non-Fable Account-focus state after the provider usage blocks.
 Claude meters use cswap's dynamic window keys; Codex meters retain bounded
 provider names such as GPT-5.3-Codex-Spark and derive unnamed base windows from
 their duration. Added meters appear and removed meters disappear on the next

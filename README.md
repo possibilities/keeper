@@ -28,7 +28,7 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   proven Fable work and Non-Fable focus matches proven non-Fable work. Explicit `--x-account`
   wins, then the matching eligible focus, Fable soft avoidance, and normal route selection.
   Focus fallback is visible and delivery health is independent; each scope rolls back with its
-  own `clear`. Inspect both through account checks, `keeper status`, and `keeper board`. See the
+  own `clear`. Inspect both through account checks, `keeper status`, and the bottom of `keeper usage`. See the
   [routing operations guide](./docs/install.md#claude-account-routing-and-account-focuses)
 - **History forensics** — `keeper history list|show|search|files|index` is the
   canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
