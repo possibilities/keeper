@@ -111,6 +111,7 @@ const exactPane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
   tmuxGenerationId: "105:1005",
   paneId: "%5",
   windowId: "@5",
+  paneIndex: 0,
   currentCommand: "pi",
   paneDead: "0",
   sessionName: "wrapped",

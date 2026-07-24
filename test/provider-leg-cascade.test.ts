@@ -182,6 +182,7 @@ function deps(overrides: Partial<ProviderLegCascadeDeps> = {}) {
         tmuxGenerationId: "999:9999",
         paneId: "%unrelated",
         windowId: "@unrelated",
+        paneIndex: 0,
         currentCommand: "zsh",
         paneDead: "0",
         sessionName: "manual",

@@ -187,7 +187,7 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "list-panes",
     "-a",
     "-F",
-    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_index}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
   ]);
 });
 
@@ -396,7 +396,7 @@ test("createTmuxPaneOps.listPanes: parses topology and pane-local Keeper ownersh
     {
       "tmux:list-panes": {
         stdout:
-          "900:1700000000\t%1\t@1\tclaude\t0\tautopilot\tjob-1\twork::fn-1-x.2\n900:1700000000\t%2\t@2\tzsh\t1\tmisc\t\tplain shell\n",
+          "900:1700000000\t%1\t@1\t0\tclaude\t0\tautopilot\tjob-1\twork::fn-1-x.2\n900:1700000000\t%2\t@2\t1\tzsh\t1\tmisc\t\tplain shell\n",
         exitCode: 0,
       },
     },
@@ -410,6 +410,7 @@ test("createTmuxPaneOps.listPanes: parses topology and pane-local Keeper ownersh
       tmuxGenerationId: "900:1700000000",
       paneId: "%1",
       windowId: "@1",
+      paneIndex: 0,
       currentCommand: "claude",
       paneDead: "0",
       sessionName: "autopilot",
@@ -420,6 +421,7 @@ test("createTmuxPaneOps.listPanes: parses topology and pane-local Keeper ownersh
       tmuxGenerationId: "900:1700000000",
       paneId: "%2",
       windowId: "@2",
+      paneIndex: 1,
       currentCommand: "zsh",
       paneDead: "1",
       sessionName: "misc",
@@ -434,11 +436,12 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // window name itself contains a tab, a colon, and unicode; the seven
-        // leading fixed fields (generation/pane/window/command/dead/session/owner)
-        // are taken off the first seven tabs, so a name-internal tab never bleeds
+        // window name itself contains a tab, a colon, and unicode; the eight
+        // leading fixed fields (generation/pane/window/index/command/dead/session/owner)
+        // are taken off the first eight tabs, so a name-internal tab never bleeds
         // into them.
-        stdout: "900:1700000000\t%7\t@7\tzsh\t0\tsess\tjob-7\tweird:\tname é\n",
+        stdout:
+          "900:1700000000\t%7\t@7\t3\tzsh\t0\tsess\tjob-7\tweird:\tname é\n",
         exitCode: 0,
       },
     },
@@ -451,6 +454,7 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
       tmuxGenerationId: "900:1700000000",
       paneId: "%7",
       windowId: "@7",
+      paneIndex: 3,
       currentCommand: "zsh",
       paneDead: "0",
       sessionName: "sess",
@@ -466,10 +470,11 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
     {
       "tmux:list-panes": {
         // line 1 has no tab; line 2 has too few fixed fields; line 3 is
-        // seven-tab but has an empty pane id; line 4 is well-formed (an owner
+        // eight-tab but has an empty pane id; line 4 has a non-numeric pane
+        // index; line 5 is well-formed (an owner
         // and a name may both be empty — valid).
         stdout:
-          "garbage\n900:1\t%2\t@2\tsh\t0\tsess\n900:1\t\t@3\tsh\t0\tsess\t\tname\n900:1\t%4\t@4\tsh\t0\tsess\t\t\n",
+          "garbage\n900:1\t%2\t@2\t0\tsh\t0\tsess\n900:1\t\t@3\t0\tsh\t0\tsess\t\tname\n900:1\t%9\t@9\tx\tsh\t0\tsess\t\tname\n900:1\t%4\t@4\t0\tsh\t0\tsess\t\t\n",
         exitCode: 0,
       },
     },
@@ -482,6 +487,7 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
       tmuxGenerationId: "900:1",
       paneId: "%4",
       windowId: "@4",
+      paneIndex: 0,
       currentCommand: "sh",
       paneDead: "0",
       sessionName: "sess",

@@ -122,6 +122,7 @@ const pane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
   tmuxGenerationId: "101:1001",
   paneId: "%1",
   windowId: "@1",
+  paneIndex: 0,
   currentCommand: "claude",
   paneDead: "0",
   sessionName: "autopilot",

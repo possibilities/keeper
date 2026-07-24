@@ -197,7 +197,8 @@ export interface LaunchSpec {
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
- *  server-global pane id, its window id (`@N`), the pane's current foreground
+ *  server-global pane id, its window id (`@N`), the pane's positional index
+ *  within that window (`pane_index`), the pane's current foreground
  *  command (`pane_current_command`), the pane's dead flag / hosting session,
  *  its pane-local Keeper job owner, and the window's current name. The renamer
  *  worker keys windows by `windowId` and
@@ -220,6 +221,8 @@ export interface PaneInfo {
   readonly tmuxGenerationId: string;
   readonly paneId: string;
   readonly windowId: string;
+  /** `#{pane_index}` — the pane's positional index within its window. */
+  readonly paneIndex: number;
   readonly currentCommand: string;
   readonly paneDead: string;
   readonly sessionName: string;
@@ -620,7 +623,7 @@ export function buildTmuxListPanesArgs(): string[] {
     "list-panes",
     "-a",
     "-F",
-    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_index}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
   ];
 }
 
@@ -1010,11 +1013,12 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
-      // to skip this cycle. Parse takes the SEVEN leading fixed fields (generation
-      // / pane id / window id / current command / pane dead flag / session name /
-      // Keeper owner) off the first seven tabs, with `window_name` LAST so a tab inside an
+      // to skip this cycle. Parse takes the EIGHT leading fixed fields (generation
+      // / pane id / window id / pane index / current command / pane dead flag /
+      // session name / Keeper owner) off the first eight tabs, with `window_name`
+      // LAST so a tab inside an
       // arbitrary window name cannot bleed into them. Malformed lines (fewer than
-      // seven tabs) are dropped silently — a partial sweep is still a usable
+      // eight tabs, or a non-numeric pane index) are dropped silently — a partial sweep is still a usable
       // snapshot. The locale-defaulted env is LOAD-BEARING: a C-locale client
       // sanitizes the TAB delimiters to `_`, which would drop every line and read
       // as an empty sweep.
@@ -1026,7 +1030,7 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
       if (res == null || res.exitCode !== 0) {
         return null;
       }
-      const FIXED_FIELDS = 7;
+      const FIXED_FIELDS = 8;
       const panes: PaneInfo[] = [];
       for (const line of res.stdout.split("\n")) {
         if (line === "") {
@@ -1050,18 +1054,21 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
         const tmuxGenerationId = line.slice(0, tabs[0]);
         const paneId = line.slice(tabs[0] + 1, tabs[1]);
         const windowId = line.slice(tabs[1] + 1, tabs[2]);
-        const currentCommand = line.slice(tabs[2] + 1, tabs[3]);
-        const paneDead = line.slice(tabs[3] + 1, tabs[4]);
-        const sessionName = line.slice(tabs[4] + 1, tabs[5]);
-        const rawKeeperJobId = line.slice(tabs[5] + 1, tabs[6]);
-        const windowName = line.slice(tabs[6] + 1);
-        if (paneId === "" || windowId === "") {
+        const rawPaneIndex = line.slice(tabs[2] + 1, tabs[3]);
+        const currentCommand = line.slice(tabs[3] + 1, tabs[4]);
+        const paneDead = line.slice(tabs[4] + 1, tabs[5]);
+        const sessionName = line.slice(tabs[5] + 1, tabs[6]);
+        const rawKeeperJobId = line.slice(tabs[6] + 1, tabs[7]);
+        const windowName = line.slice(tabs[7] + 1);
+        const paneIndex = Number.parseInt(rawPaneIndex, 10);
+        if (paneId === "" || windowId === "" || Number.isNaN(paneIndex)) {
           continue;
         }
         panes.push({
           tmuxGenerationId,
           paneId,
           windowId,
+          paneIndex,
           currentCommand,
           paneDead,
           sessionName,

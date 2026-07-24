@@ -4,8 +4,9 @@
  * it opens its own read-only connection, watches the `jobs` projection
  * (level-triggered on `PRAGMA data_version` via the shared `watchLoop`
  * primitive), and on every change names each tmux WINDOW hosting a live
- * keeper session after that session's job title, regardless of harness. The
- * latest-appeared session in a window wins.
+ * keeper session after that session's job title, regardless of harness. A
+ * window hosting several sessions is named after the one in the LOWEST
+ * `pane_index`.
  *
  * It reads the projection read-only and writes ONLY to tmux
  * (`rename-window`); it NEVER writes the DB and posts NOTHING to main beyond
@@ -26,7 +27,8 @@
  *     hash gate is LOAD-BEARING, not an optimization.
  *  4. `backend.listPanes()` — `null` (degraded/missing tmux) → skip the cycle.
  *  5. Pure {@link computeRenames}: join candidates to panes by pane id, group
- *     by window id, winner = max `created_at` (tie → higher `job_id`), target
+ *     by window id, winner = the candidate on the LOWEST `pane_index` (tie →
+ *     lower `job_id`), target
  *     = the winner's title verbatim; emit a rename ONLY where the swept
  *     `windowName !== target`. Every `rename-window` SUPPRESSES
  *     that window's automatic-rename, so a matching name must not re-rename;
@@ -78,14 +80,12 @@ export interface ShutdownMessage {
 
 /**
  * One live-job candidate the rename decision keys on: the tmux pane the job
- * runs in, the title the winning job lends its window, and the
- * `(created_at, job_id)` ordinal that breaks the latest-appeared-wins race.
+ * runs in and the title the winning job lends its window.
  */
 export interface RenameCandidate {
   job_id: string;
   pane_id: string;
   title: string;
-  created_at: number;
 }
 
 /** One window rename the decision emits: rename `windowId` (`@N`) to `name`. */
@@ -124,7 +124,6 @@ export function renameCandidates(jobs: Job[]): RenameCandidate[] {
       job_id: job.job_id,
       pane_id: job.backend_exec_pane_id,
       title: job.title,
-      created_at: job.created_at,
     });
   }
   return out;
@@ -133,7 +132,7 @@ export function renameCandidates(jobs: Job[]): RenameCandidate[] {
 /**
  * Stable hash of the candidate set for the INPUT-side dedup gate. Sorts by
  * `(pane_id, job_id)` so SELECT order doesn't churn the hash, then hashes the
- * joined `(pane_id, title, created_at, job_id)` tuple. An empty set is the
+ * joined `(pane_id, title, job_id)` tuple. An empty set is the
  * empty-string hash. Mirrors restore-worker's `hashPairs`.
  */
 export function hashCandidates(candidates: RenameCandidate[]): string {
@@ -150,18 +149,18 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
   );
   return String(
     Bun.hash(
-      sorted
-        .map((c) => `${c.pane_id}\t${c.title}\t${c.created_at}\t${c.job_id}`)
-        .join("\n"),
+      sorted.map((c) => `${c.pane_id}\t${c.title}\t${c.job_id}`).join("\n"),
     ),
   );
 }
 
 /**
  * Pure rename decision: join candidates to swept panes by pane id, group by
- * window id, pick the winner per window (max `created_at`; tie → higher
- * `job_id` — a deterministic tiebreak so equal-aged sessions don't flicker
- * the window name every pulse), and emit a `{windowId, name}` ONLY where the
+ * window id, pick the winner per window (the candidate on the LOWEST
+ * `pane_index` — the stable leftmost/topmost agent names its window; a tie is
+ * impossible in a real tmux window, but a lower `job_id` breaks one so a
+ * fabricated sweep can't flicker the name every pulse), and emit a
+ * `{windowId, name}` ONLY where the
  * sweep's current `windowName` differs from the winner's title. The comparison
  * uses the title verbatim, so a window already wearing it is NOT re-emitted —
  * every `rename-window` permanently suppresses
@@ -174,16 +173,24 @@ export function computeRenames(
   candidates: RenameCandidate[],
   panes: PaneInfo[],
 ): WindowRename[] {
-  // pane id → its window's id + current name. A pane appears once per sweep.
-  const paneToWindow = new Map<string, { windowId: string; name: string }>();
+  // pane id → its window's id + current name + the pane's index in it. A pane
+  // appears once per sweep.
+  const paneToWindow = new Map<
+    string,
+    { windowId: string; name: string; paneIndex: number }
+  >();
   for (const p of panes) {
-    paneToWindow.set(p.paneId, { windowId: p.windowId, name: p.windowName });
+    paneToWindow.set(p.paneId, {
+      windowId: p.windowId,
+      name: p.windowName,
+      paneIndex: p.paneIndex,
+    });
   }
 
   // window id → its current swept name + the winning candidate so far.
   const winners = new Map<
     string,
-    { windowName: string; winner: RenameCandidate }
+    { windowName: string; winner: RenameCandidate; winnerPaneIndex: number }
   >();
   for (const c of candidates) {
     const w = paneToWindow.get(c.pane_id);
@@ -192,18 +199,25 @@ export function computeRenames(
     }
     const cur = winners.get(w.windowId);
     if (cur === undefined) {
-      winners.set(w.windowId, { windowName: w.name, winner: c });
+      winners.set(w.windowId, {
+        windowName: w.name,
+        winner: c,
+        winnerPaneIndex: w.paneIndex,
+      });
       continue;
     }
-    // Latest-appeared wins: higher created_at, tie broken by higher job_id.
-    const incoming = c;
-    const held = cur.winner;
+    // Lowest pane index wins: the leftmost/topmost agent names the window. An
+    // index tie can't occur in a real window; the lower job_id keeps a
+    // fabricated sweep deterministic.
     const incomingWins =
-      incoming.created_at > held.created_at ||
-      (incoming.created_at === held.created_at &&
-        incoming.job_id > held.job_id);
+      w.paneIndex < cur.winnerPaneIndex ||
+      (w.paneIndex === cur.winnerPaneIndex && c.job_id < cur.winner.job_id);
     if (incomingWins) {
-      winners.set(w.windowId, { windowName: cur.windowName, winner: incoming });
+      winners.set(w.windowId, {
+        windowName: cur.windowName,
+        winner: c,
+        winnerPaneIndex: w.paneIndex,
+      });
     }
   }
 

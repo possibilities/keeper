@@ -10,7 +10,7 @@
  * uses. Worker lifecycle is covered by the daemon ALL_WORKERS pin + test:full.
  *
  * Coverage:
- *  - winner selection: latest `created_at` wins; `job_id` breaks the tie.
+ *  - winner selection: the lowest `pane_index` wins; `job_id` breaks the tie.
  *  - mismatch filter: a window already named its winning title is NOT renamed.
  *  - exclusion: NULL pane, empty title, non-tmux backend, dead state drop.
  *  - dedup hash: an unchanged candidate picture skips the tmux sweep entirely.
@@ -80,7 +80,6 @@ function candidate(
     job_id: opts.job_id ?? "job",
     pane_id: opts.pane_id,
     title: opts.title ?? "title",
-    created_at: opts.created_at ?? 1000,
   };
 }
 
@@ -129,9 +128,11 @@ const pane = (
   paneId: string,
   windowId: string,
   windowName: string,
+  paneIndex = 0,
 ): PaneInfo => ({
   paneId,
   windowId,
+  paneIndex,
   currentCommand: "zsh",
   // The renamer never reads these fields; fixed placeholders keep the sweep
   // shape complete so PaneInfo type-checks.
@@ -225,7 +226,6 @@ test("renameCandidates keeps only live tmux jobs with a pane and a title", () =>
     job_id: "a",
     pane_id: "%1",
     title: "alpha",
-    created_at: 1,
   });
 });
 
@@ -238,13 +238,11 @@ test("hashCandidates is order-independent and reacts to title/pane changes", () 
     pane_id: "%1",
     job_id: "a",
     title: "x",
-    created_at: 1,
   });
   const b = candidate({
     pane_id: "%2",
     job_id: "b",
     title: "y",
-    created_at: 2,
   });
   // SELECT-order shuffle hashes identically.
   expect(hashCandidates([a, b])).toBe(hashCandidates([b, a]));
@@ -262,41 +260,48 @@ test("hashCandidates is order-independent and reacts to title/pane changes", () 
 // computeRenames — the pure rename decision
 // ---------------------------------------------------------------------------
 
-test("computeRenames: latest created_at wins, target is the winner's title", () => {
-  const older = candidate({
+test("computeRenames: the lowest pane_index wins, target is the winner's title", () => {
+  const topmost = candidate({
     pane_id: "%1",
     job_id: "a",
-    title: "old",
-    created_at: 100,
+    title: "first",
   });
-  const newer = candidate({
+  const below = candidate({
     pane_id: "%2",
     job_id: "b",
-    title: "new",
-    created_at: 200,
+    title: "second",
   });
-  const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
-  expect(computeRenames([older, newer], panes)).toEqual([
-    { windowId: "@1", name: "new" },
+  // Candidate order is irrelevant — the swept pane index decides.
+  const panes = [pane("%1", "@1", "stale", 0), pane("%2", "@1", "stale", 1)];
+  expect(computeRenames([below, topmost], panes)).toEqual([
+    { windowId: "@1", name: "first" },
   ]);
 });
 
-test("computeRenames: created_at tie breaks on higher job_id", () => {
-  const lo = candidate({
-    pane_id: "%1",
-    job_id: "aaa",
-    title: "lo",
-    created_at: 100,
-  });
+test("computeRenames: a renumbered sweep re-picks the winner on the next pulse", () => {
+  const a = candidate({ pane_id: "%1", job_id: "a", title: "alpha" });
+  const b = candidate({ pane_id: "%2", job_id: "b", title: "beta" });
+  // a sits below b in the window → b names it.
+  const panes = [pane("%1", "@1", "stale", 1), pane("%2", "@1", "stale", 0)];
+  expect(computeRenames([a, b], panes)).toEqual([
+    { windowId: "@1", name: "beta" },
+  ]);
+});
+
+test("computeRenames: a pane_index tie breaks on lower job_id", () => {
   const hi = candidate({
-    pane_id: "%2",
+    pane_id: "%1",
     job_id: "bbb",
     title: "hi",
-    created_at: 100,
   });
-  const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
-  expect(computeRenames([lo, hi], panes)).toEqual([
-    { windowId: "@1", name: "hi" },
+  const lo = candidate({
+    pane_id: "%2",
+    job_id: "aaa",
+    title: "lo",
+  });
+  const panes = [pane("%1", "@1", "stale", 0), pane("%2", "@1", "stale", 0)];
+  expect(computeRenames([hi, lo], panes)).toEqual([
+    { windowId: "@1", name: "lo" },
   ]);
 });
 
@@ -305,7 +310,6 @@ test("computeRenames: a window already named its winner is NOT re-renamed", () =
     pane_id: "%1",
     job_id: "a",
     title: "match",
-    created_at: 100,
   });
   const panes = [pane("%1", "@1", "match")];
   expect(computeRenames([c], panes)).toEqual([]);
@@ -316,7 +320,6 @@ test("computeRenames: a spawn-name `::`/`.` title tabs verbatim, and is not re-r
     pane_id: "%1",
     job_id: "a",
     title: "work::fn-1019.2",
-    created_at: 100,
   });
   // Fresh window: the title lands verbatim — tmux accepts `:` and `.` in a
   // window name, so no rewriting is needed.
@@ -333,7 +336,6 @@ test("computeRenames: a candidate whose pane is absent from the sweep is skipped
     pane_id: "%missing",
     job_id: "a",
     title: "x",
-    created_at: 100,
   });
   expect(computeRenames([c], [pane("%1", "@1", "stale")])).toEqual([]);
 });
@@ -343,13 +345,11 @@ test("computeRenames: independent windows each get their own winner, sorted by w
     pane_id: "%1",
     job_id: "a",
     title: "one",
-    created_at: 100,
   });
   const c2 = candidate({
     pane_id: "%2",
     job_id: "b",
     title: "two",
-    created_at: 200,
   });
   const panes = [pane("%2", "@2", "stale"), pane("%1", "@1", "stale")];
   expect(computeRenames([c1, c2], panes)).toEqual([
